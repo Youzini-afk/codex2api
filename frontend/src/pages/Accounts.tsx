@@ -29,6 +29,7 @@ import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, Upload } from '
 export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned'>('all')
   const PAGE_SIZE = 20
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: '',
@@ -74,9 +75,6 @@ export default function Accounts() {
     return () => window.clearTimeout(timer)
   }, [accounts, reloadSilently])
 
-  const totalPages = Math.max(1, Math.ceil(accounts.length / PAGE_SIZE))
-  const pagedAccounts = accounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
-  const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited').length
@@ -84,6 +82,23 @@ export default function Accounts() {
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
   const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
+
+  const filteredAccounts = accounts.filter((account) => {
+    switch (statusFilter) {
+      case 'normal':
+        return account.status === 'active' || account.status === 'ready'
+      case 'rate_limited':
+        return account.status === 'rate_limited'
+      case 'banned':
+        return account.status === 'unauthorized'
+      default:
+        return true
+    }
+  })
+
+  const totalPages = Math.max(1, Math.ceil(filteredAccounts.length / PAGE_SIZE))
+  const pagedAccounts = filteredAccounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
 
   const toggleSelect = (id: number) => {
     setSelected((prev) => {
@@ -344,6 +359,23 @@ export default function Accounts() {
           <CompactStat label="正常账号" value={normalAccounts} tone="success" />
           <CompactStat label="限流账号" value={rateLimitedAccounts} tone="warning" />
           <CompactStat label="封禁账号" value={bannedAccounts} tone="danger" />
+        </div>
+
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
+          <span className="font-semibold text-foreground">筛选</span>
+          {([['all', '全部'], ['normal', '正常'], ['rate_limited', '限流'], ['banned', '封禁']] as const).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => { setStatusFilter(key); setPage(1) }}
+              className={`rounded-full px-3 py-1 font-semibold transition-colors ${
+                statusFilter === key
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-muted/50 text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : bannedAccounts}
+            </button>
+          ))}  
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">

@@ -55,7 +55,7 @@ export default function Layout({ children }: PropsWithChildren) {
                   to={item.to}
                   end={item.end}
                   className={({ isActive }) =>
-                    `flex items-center gap-3 min-h-[50px] px-3.5 py-3 border rounded-2xl text-[14px] font-semibold transition-all duration-150 ${
+                    `flex items-center gap-3 min-h-[50px] px-3.5 py-3 border rounded-2xl text-[20px] font-semibold transition-all duration-150 ${
                       isActive
                         ? 'bg-gradient-to-br from-primary/8 to-blue-500/6 border-primary/20 text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]'
                         : 'border-transparent text-muted-foreground hover:-translate-y-px hover:bg-white/50 hover:border-border hover:text-foreground'

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { ArrowLeft, RefreshCw } from 'lucide-react'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
+import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import StatusBadge from '../components/StatusBadge'
@@ -15,6 +16,8 @@ import { Select } from '@/components/ui/select'
 export default function SchedulerBoard() {
   const [tierFilter, setTierFilter] = useState('all')
   const [sortBy, setSortBy] = useState('risk')
+  const [page, setPage] = useState(1)
+  const PAGE_SIZE = 12
 
   const loadSchedulerData = useCallback(async () => {
     const [overview, accountsResponse] = await Promise.all([
@@ -81,8 +84,12 @@ export default function SchedulerBoard() {
 
     return [...accounts]
       .filter((account) => {
+        if (tierFilter === 'everything') return true
         if (tierFilter === 'all') {
           return priority(account) > 0
+        }
+        if (tierFilter === 'healthy') {
+          return account.health_tier === 'healthy'
         }
         if (tierFilter === 'banned') {
           return account.health_tier === 'banned' || account.status === 'unauthorized'
@@ -107,8 +114,15 @@ export default function SchedulerBoard() {
           }
         }
       })
-      .slice(0, 8)
   }, [accounts, tierFilter, sortBy])
+
+  const totalPages = Math.max(1, Math.ceil(spotlightAccounts.length / PAGE_SIZE))
+  const pagedAccounts = spotlightAccounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+
+  // 筛选/排序变更时重置页码
+  useEffect(() => {
+    setPage(1)
+  }, [tierFilter, sortBy])
 
   return (
     <StateShell
@@ -194,6 +208,8 @@ export default function SchedulerBoard() {
                       onValueChange={setTierFilter}
                       options={[
                         { label: '全部风险账号', value: 'all' },
+                        { label: '全部账号', value: 'everything' },
+                        { label: 'Healthy', value: 'healthy' },
                         { label: 'Warm', value: 'warm' },
                         { label: 'Risky', value: 'risky' },
                         { label: 'Banned', value: 'banned' },
@@ -216,9 +232,10 @@ export default function SchedulerBoard() {
                   </div>
                 </div>
 
-                <div className="mt-5 grid gap-3 md:grid-cols-2">
-                  {spotlightAccounts.length > 0 ? (
-                    spotlightAccounts.map((account) => (
+                {spotlightAccounts.length > 0 ? (
+                  <>
+                    <div className="mt-5 grid gap-3 md:grid-cols-2">
+                    {pagedAccounts.map((account) => (
                       <div key={account.id} className="rounded-2xl border border-border bg-white/50 px-4 py-3">
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
@@ -249,13 +266,25 @@ export default function SchedulerBoard() {
                           ))}
                         </div>
                       </div>
-                    ))
-                  ) : (
-                    <div className="rounded-2xl border border-border bg-white/40 px-4 py-4 text-sm text-muted-foreground">
-                      当前没有需要重点关注的风险账号，号池整体处于稳定状态。
+                    ))}
                     </div>
-                  )}
-                </div>
+                    {totalPages > 1 && (
+                      <div className="mt-4">
+                        <Pagination
+                          page={page}
+                          totalPages={totalPages}
+                          onPageChange={setPage}
+                          totalItems={spotlightAccounts.length}
+                          pageSize={PAGE_SIZE}
+                        />
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="mt-5 rounded-2xl border border-border bg-white/40 px-4 py-4 text-sm text-muted-foreground">
+                    当前没有需要重点关注的风险账号，号池整体处于稳定状态。
+                  </div>
+                )}
               </CardContent>
             </Card>
           </>

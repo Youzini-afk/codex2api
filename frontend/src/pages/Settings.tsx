@@ -203,7 +203,7 @@ export default function Settings() {
                       <TableRow key={keyRow.id}>
                         <TableCell className="text-[14px] font-medium">{keyRow.name}</TableCell>
                         <TableCell>
-                          <span className="font-mono text-[13px]">{maskKey(keyRow.key)}</span>
+                          <span className="font-mono text-[20px]">{maskKey(keyRow.key)}</span>
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           {formatRelativeTime(keyRow.created_at, { variant: 'compact' })}
