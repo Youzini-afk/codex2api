@@ -61,6 +61,7 @@ export interface SystemSettings {
   max_concurrency: number
   global_rpm: number
   test_model: string
+  test_concurrency: number
 }
 
 export interface UsageStats {

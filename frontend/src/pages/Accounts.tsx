@@ -22,7 +22,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer } from 'lucide-react'
 
 export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
@@ -36,6 +36,9 @@ export default function Accounts() {
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set())
   const [batchLoading, setBatchLoading] = useState(false)
+  const [batchTesting, setBatchTesting] = useState(false)
+  const [cleaningBanned, setCleaningBanned] = useState(false)
+  const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null)
   const { toast, showToast } = useToast()
 
@@ -160,6 +163,47 @@ export default function Accounts() {
     void reload()
   }
 
+  const handleBatchTest = async () => {
+    setBatchTesting(true)
+    try {
+      const result = await api.batchTestAccounts()
+      showToast(`批量测试完成：成功 ${result.success} / 封禁 ${result.banned} / 限流 ${result.rate_limited} / 失败 ${result.failed}`)
+      void reload()
+    } catch (error) {
+      showToast(`批量测试失败: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setBatchTesting(false)
+    }
+  }
+
+  const handleCleanBanned = async () => {
+    if (!confirm('确定清理所有封禁（unauthorized）账号吗？')) return
+    setCleaningBanned(true)
+    try {
+      const result = await api.cleanBanned()
+      showToast(result.message)
+      void reload()
+    } catch (error) {
+      showToast(`清理失败: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setCleaningBanned(false)
+    }
+  }
+
+  const handleCleanRateLimited = async () => {
+    if (!confirm('确定清理所有限流（rate_limited）账号吗？')) return
+    setCleaningRateLimited(true)
+    try {
+      const result = await api.cleanRateLimited()
+      showToast(result.message)
+      void reload()
+    } catch (error) {
+      showToast(`清理失败: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setCleaningRateLimited(false)
+    }
+  }
+
   return (
     <StateShell
       variant="page"
@@ -176,10 +220,24 @@ export default function Accounts() {
           description="管理 Codex 反代账号（Refresh Token）"
           onRefresh={() => void reload()}
           actions={(
-            <Button onClick={() => setShowAdd(true)}>
-              <Plus className="size-3.5" />
-              添加账号
-            </Button>
+            <div className="flex items-center gap-1.5">
+              <Button variant="outline" size="sm" disabled={batchTesting} onClick={() => void handleBatchTest()}>
+                <FlaskConical className="size-3" />
+                {batchTesting ? '测试中...' : '批量测试'}
+              </Button>
+              <Button variant="outline" size="sm" disabled={cleaningBanned} onClick={() => void handleCleanBanned()}>
+                <Ban className="size-3" />
+                {cleaningBanned ? '清理中...' : '清理封禁'}
+              </Button>
+              <Button variant="outline" size="sm" disabled={cleaningRateLimited} onClick={() => void handleCleanRateLimited()}>
+                <Timer className="size-3" />
+                {cleaningRateLimited ? '清理中...' : '清理限流'}
+              </Button>
+              <Button onClick={() => setShowAdd(true)}>
+                <Plus className="size-3.5" />
+                添加账号
+              </Button>
+            </div>
           )}
         />
 

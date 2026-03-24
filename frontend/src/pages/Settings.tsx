@@ -30,7 +30,7 @@ export default function Settings() {
   const [newKeyName, setNewKeyName] = useState('')
   const [newKeyValue, setNewKeyValue] = useState('')
   const [createdKey, setCreatedKey] = useState<string | null>(null)
-  const [settingsForm, setSettingsForm] = useState<SystemSettings>({ max_concurrency: 2, global_rpm: 0, test_model: '' })
+  const [settingsForm, setSettingsForm] = useState<SystemSettings>({ max_concurrency: 2, global_rpm: 0, test_model: '', test_concurrency: 50 })
   const [savingSettings, setSavingSettings] = useState(false)
   const [modelList, setModelList] = useState<string[]>([])
   const { toast, showToast } = useToast()
@@ -280,6 +280,17 @@ export default function Settings() {
                   ))}
                 </select>
                 <p className="text-xs text-muted-foreground mt-1">账号测试连接时使用的模型</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">测试并发数</label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={settingsForm.test_concurrency}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">批量测试连接时的并发数（范围 1~200）</p>
               </div>
             </div>
             <Button onClick={() => void handleSaveSettings()} disabled={savingSettings}>

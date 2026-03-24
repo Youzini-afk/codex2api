@@ -7,8 +7,11 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -76,6 +79,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// 401 → 标记账号为封禁状态
+		if resp.StatusCode == http.StatusUnauthorized {
+			account.SetCooldownWithReason(24*time.Hour, "unauthorized")
+		}
 		errBody, _ := io.ReadAll(resp.Body)
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
@@ -158,4 +165,76 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// BatchTest 批量测试所有账号连接
+// POST /api/admin/accounts/batch-test
+func (h *Handler) BatchTest(c *gin.Context) {
+	accounts := h.store.Accounts()
+	if len(accounts) == 0 {
+		c.JSON(http.StatusOK, gin.H{"total": 0, "success": 0, "failed": 0, "banned": 0, "rate_limited": 0})
+		return
+	}
+
+	testModel := h.store.GetTestModel()
+	payload := buildTestPayload(testModel)
+	concurrency := h.store.GetTestConcurrency()
+
+	var (
+		successCount    int64
+		failedCount     int64
+		bannedCount     int64
+		rateLimitCount  int64
+		wg              sync.WaitGroup
+		sem             = make(chan struct{}, concurrency)
+	)
+
+	for _, account := range accounts {
+		// 跳过没有 token 的账号
+		account.Mu().RLock()
+		hasToken := account.AccessToken != ""
+		account.Mu().RUnlock()
+		if !hasToken {
+			atomic.AddInt64(&failedCount, 1)
+			continue
+		}
+
+		wg.Add(1)
+		go func(acc *auth.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			resp, err := proxy.ExecuteRequest(acc, payload, "")
+			if err != nil {
+				atomic.AddInt64(&failedCount, 1)
+				return
+			}
+			defer resp.Body.Close()
+			io.ReadAll(resp.Body) // 消费 body
+
+			switch resp.StatusCode {
+			case http.StatusOK:
+				atomic.AddInt64(&successCount, 1)
+			case http.StatusUnauthorized:
+				acc.SetCooldownWithReason(24*time.Hour, "unauthorized")
+				atomic.AddInt64(&bannedCount, 1)
+			case http.StatusTooManyRequests:
+				acc.SetCooldownWithReason(5*time.Minute, "rate_limited")
+				atomic.AddInt64(&rateLimitCount, 1)
+			default:
+				atomic.AddInt64(&failedCount, 1)
+			}
+		}(account)
+	}
+
+	wg.Wait()
+
+	c.JSON(http.StatusOK, gin.H{
+		"total":        len(accounts),
+		"success":      successCount,
+		"failed":       failedCount,
+		"banned":       bannedCount,
+		"rate_limited": rateLimitCount,
+	})
 }

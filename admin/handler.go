@@ -38,6 +38,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.GET("/accounts/:id/test", h.TestConnection)
+	api.POST("/accounts/batch-test", h.BatchTest)
+	api.POST("/accounts/clean-banned", h.CleanBanned)
+	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
@@ -426,23 +429,26 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	MaxConcurrency int    `json:"max_concurrency"`
-	GlobalRPM      int    `json:"global_rpm"`
-	TestModel      string `json:"test_model"`
+	MaxConcurrency  int    `json:"max_concurrency"`
+	GlobalRPM       int    `json:"global_rpm"`
+	TestModel       string `json:"test_model"`
+	TestConcurrency int    `json:"test_concurrency"`
 }
 
 type updateSettingsReq struct {
-	MaxConcurrency *int    `json:"max_concurrency"`
-	GlobalRPM      *int    `json:"global_rpm"`
-	TestModel      *string `json:"test_model"`
+	MaxConcurrency  *int    `json:"max_concurrency"`
+	GlobalRPM       *int    `json:"global_rpm"`
+	TestModel       *string `json:"test_model"`
+	TestConcurrency *int    `json:"test_concurrency"`
 }
 
 // GetSettings 获取当前系统设置
 func (h *Handler) GetSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, settingsResponse{
-		MaxConcurrency: h.store.GetMaxConcurrency(),
-		GlobalRPM:      h.rateLimiter.GetRPM(),
-		TestModel:      h.store.GetTestModel(),
+		MaxConcurrency:  h.store.GetMaxConcurrency(),
+		GlobalRPM:       h.rateLimiter.GetRPM(),
+		TestModel:       h.store.GetTestModel(),
+		TestConcurrency: h.store.GetTestConcurrency(),
 	})
 }
 
@@ -480,10 +486,23 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: test_model = %s", *req.TestModel)
 	}
 
+	if req.TestConcurrency != nil {
+		v := *req.TestConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 200 {
+			v = 200
+		}
+		h.store.SetTestConcurrency(v)
+		log.Printf("设置已更新: test_concurrency = %d", v)
+	}
+
 	c.JSON(http.StatusOK, settingsResponse{
-		MaxConcurrency: h.store.GetMaxConcurrency(),
-		GlobalRPM:      h.rateLimiter.GetRPM(),
-		TestModel:      h.store.GetTestModel(),
+		MaxConcurrency:  h.store.GetMaxConcurrency(),
+		GlobalRPM:       h.rateLimiter.GetRPM(),
+		TestModel:       h.store.GetTestModel(),
+		TestConcurrency: h.store.GetTestConcurrency(),
 	})
 }
 
@@ -492,4 +511,35 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": proxy.SupportedModels})
+}
+
+// ==================== 清理 ====================
+
+// CleanBanned 清理封禁（unauthorized）账号
+func (h *Handler) CleanBanned(c *gin.Context) {
+	h.cleanByStatus(c, "unauthorized")
+}
+
+// CleanRateLimited 清理限流（rate_limited）账号
+func (h *Handler) CleanRateLimited(c *gin.Context) {
+	h.cleanByStatus(c, "rate_limited")
+}
+
+// cleanByStatus 按运行时状态清理账号
+func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	accounts := h.store.Accounts()
+	cleaned := 0
+
+	for _, acc := range accounts {
+		if acc.RuntimeStatus() == targetStatus {
+			_ = h.db.SetError(ctx, acc.DBID, "deleted")
+			h.store.RemoveAccount(acc.DBID)
+			cleaned++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
 }

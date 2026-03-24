@@ -77,4 +77,10 @@ export const api = {
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
   getModels: () => request<{ models: string[] }>('/models'),
+  batchTestAccounts: () =>
+    request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', { method: 'POST' }),
+  cleanBanned: () =>
+    request<{ message: string; cleaned: number }>('/accounts/clean-banned', { method: 'POST' }),
+  cleanRateLimited: () =>
+    request<{ message: string; cleaned: number }>('/accounts/clean-rate-limited', { method: 'POST' }),
 }
