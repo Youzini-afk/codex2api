@@ -98,12 +98,17 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number }) => {
+  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; fast?: string; stream?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
     searchParams.set('page', String(params.page))
     if (params.pageSize) searchParams.set('page_size', String(params.pageSize))
+    if (params.email) searchParams.set('email', params.email)
+    if (params.model) searchParams.set('model', params.model)
+    if (params.endpoint) searchParams.set('endpoint', params.endpoint)
+    if (params.fast) searchParams.set('fast', params.fast)
+    if (params.stream) searchParams.set('stream', params.stream)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
   },
   getChartData: (params: { start: string; end: string; bucketMinutes: number }) => {

@@ -390,7 +390,12 @@
     "tableCached": "读取缓存",
     "tableFirstToken": "首字时间",
     "tableDuration": "总耗时",
-    "tableTime": "时间"
+    "tableTime": "时间",
+    "searchEmail": "搜索账号邮箱…",
+    "allModels": "全部模型",
+    "allEndpoints": "全部端点",
+    "allTypes": "全部类型",
+    "clearFilters": "清除筛选"
   },
   "settings": {
     "title": "系统设置",

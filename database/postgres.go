@@ -1014,15 +1014,64 @@ type UsageLogPage struct {
 	Total int64       `json:"total"`
 }
 
-// ListUsageLogsByTimeRangePaged 按时间范围分页查询请求日志
-func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, start, end time.Time, page, pageSize int) (*UsageLogPage, error) {
-	if page < 1 {
-		page = 1
+// UsageLogFilter 日志查询过滤条件
+type UsageLogFilter struct {
+	Start    time.Time
+	End      time.Time
+	Page     int
+	PageSize int
+	Email    string // LIKE 模糊匹配
+	Model    string // 精确匹配
+	Endpoint string // 精确匹配 inbound_endpoint
+	FastOnly   *bool // nil=全部, true=仅fast, false=仅非fast
+	StreamOnly *bool // nil=全部, true=仅stream, false=仅sync
+}
+
+// ListUsageLogsByTimeRangePaged 按时间范围分页查询请求日志（支持筛选）
+func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilter) (*UsageLogPage, error) {
+	if f.Page < 1 {
+		f.Page = 1
 	}
-	if pageSize < 1 || pageSize > 200 {
-		pageSize = 20
+	if f.PageSize < 1 || f.PageSize > 200 {
+		f.PageSize = 20
 	}
-	offset := (page - 1) * pageSize
+
+	// 动态拼接 WHERE 条件
+	where := `u.created_at >= $1 AND u.created_at <= $2 AND u.status_code <> 499`
+	args := []interface{}{f.Start, f.End}
+	paramIdx := 3
+
+	if f.Email != "" {
+		where += fmt.Sprintf(` AND a.credentials->>'email' ILIKE $%d`, paramIdx)
+		args = append(args, "%"+f.Email+"%")
+		paramIdx++
+	}
+	if f.Model != "" {
+		where += fmt.Sprintf(` AND u.model = $%d`, paramIdx)
+		args = append(args, f.Model)
+		paramIdx++
+	}
+	if f.Endpoint != "" {
+		where += fmt.Sprintf(` AND u.inbound_endpoint = $%d`, paramIdx)
+		args = append(args, f.Endpoint)
+		paramIdx++
+	}
+	if f.FastOnly != nil {
+		if *f.FastOnly {
+			where += ` AND COALESCE(u.service_tier, '') = 'fast'`
+		} else {
+			where += ` AND COALESCE(u.service_tier, '') <> 'fast'`
+		}
+	}
+	if f.StreamOnly != nil {
+		where += fmt.Sprintf(` AND COALESCE(u.stream, false) = $%d`, paramIdx)
+		args = append(args, *f.StreamOnly)
+		paramIdx++
+	}
+
+	offset := (f.Page - 1) * f.PageSize
+	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)
+	args = append(args, f.PageSize, offset)
 
 	query := `SELECT u.id, u.account_id, u.endpoint, u.model, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
@@ -1032,11 +1081,9 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, start, end time
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
-	           WHERE u.created_at >= $1 AND u.created_at <= $2
-	             AND u.status_code <> 499
-	           ORDER BY u.created_at DESC
-	           LIMIT $3 OFFSET $4`
-	rows, err := db.conn.QueryContext(ctx, query, start, end, pageSize, offset)
+	           WHERE ` + where
+
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import { getTimeRangeISO } from '../components/DashboardUsageCharts'
@@ -22,7 +22,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X } from 'lucide-react'
+import { Input } from '@/components/ui/input'
 
 function formatTokens(value?: number | null): string {
   if (value === undefined || value === null) return '0'
@@ -31,22 +32,11 @@ function formatTokens(value?: number | null): string {
 
 function formatTime(iso: string): string {
   try {
-    // 后端如果直接按本地时间存入无时区 DB 字段，再序列化时会被默认当成 UTC 并加上 Z。
-    // 这会导致浏览器根据本地时区再次 +8 小时。
-    // 我们强制去掉时区后缀，让浏览器把这个字符串直接当作本地时间进行处理
     const normalizedIso = iso.replace(/(Z|[+-]\d{2}(:\d{2})?)$/, '')
     const d = new Date(normalizedIso)
-    
     if (isNaN(d.getTime())) return '-'
-    const now = new Date()
     const pad = (n: number) => String(n).padStart(2, '0')
-    const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-    
-    // 如果不是今天则加上日期
-    if (d.toDateString() !== now.toDateString()) {
-      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${time}`
-    }
-    return time
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
   } catch {
     return '-'
   }
@@ -83,7 +73,24 @@ export default function Usage() {
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
+  const [searchInput, setSearchInput] = useState('')
+  const [searchEmail, setSearchEmail] = useState('')
+  const [filterModel, setFilterModel] = useState('')
+  const [filterEndpoint, setFilterEndpoint] = useState('')
+  const [filterFast, setFilterFast] = useState('')
+  const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
   const PAGE_SIZE = 20
+  const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
+
+  // 搜索防抖：输入停止 400ms 后触发查询
+  const handleSearchChange = useCallback((value: string) => {
+    setSearchInput(value)
+    if (searchTimer.current) clearTimeout(searchTimer.current)
+    searchTimer.current = setTimeout(() => {
+      setSearchEmail(value)
+      setPage(1)
+    }, 400)
+  }, [])
 
   // 仅加载轻量统计（秒级）
   const loadStats = useCallback(async () => {
@@ -103,7 +110,14 @@ export default function Usage() {
     setLogsLoading(true)
     try {
       const { start, end } = getTimeRangeISO(timeRange)
-      const res = await api.getUsageLogsPaged({ start, end, page, pageSize: PAGE_SIZE })
+      const res = await api.getUsageLogsPaged({
+        start, end, page, pageSize: PAGE_SIZE,
+        email: searchEmail || undefined,
+        model: filterModel || undefined,
+        endpoint: filterEndpoint || undefined,
+        fast: filterFast || undefined,
+        stream: filterStream || undefined,
+      })
       setLogs(res.logs ?? [])
       setLogsTotal(res.total ?? 0)
     } catch {
@@ -111,7 +125,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page])
+  }, [timeRange, page, searchEmail, filterModel, filterEndpoint, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -298,6 +312,86 @@ export default function Usage() {
                 </Button>
               </div>
             </div>
+
+            {/* 筛选栏 */}
+            <div className="flex items-center gap-2 mb-4 flex-wrap">
+              {/* 搜索框 */}
+              <div className="relative w-52">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground pointer-events-none" />
+                <Input
+                  className="pl-8 h-8 rounded-lg text-[13px]"
+                  placeholder={t('usage.searchEmail')}
+                  value={searchInput}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleSearchChange(e.target.value)}
+                />
+              </div>
+
+              {/* 模型下拉 */}
+              <select
+                value={filterModel}
+                onChange={(e) => { setFilterModel(e.target.value); setPage(1) }}
+                className="h-8 rounded-lg border border-border bg-background px-2.5 text-[13px] text-foreground outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="">{t('usage.allModels')}</option>
+                {['gpt-5.4', 'gpt-5.4-mini', 'gpt-5', 'gpt-5-codex', 'gpt-5-codex-mini', 'gpt-5.1', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1-codex-max', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5.3-codex'].map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+
+              {/* 端点下拉 */}
+              <select
+                value={filterEndpoint}
+                onChange={(e) => { setFilterEndpoint(e.target.value); setPage(1) }}
+                className="h-8 rounded-lg border border-border bg-background px-2.5 text-[13px] text-foreground outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="">{t('usage.allEndpoints')}</option>
+                <option value="/v1/chat/completions">/v1/chat/completions</option>
+                <option value="/v1/responses">/v1/responses</option>
+              </select>
+
+              {/* 类型下拉 */}
+              <select
+                value={filterStream}
+                onChange={(e) => { setFilterStream(e.target.value as '' | 'true' | 'false'); setPage(1) }}
+                className="h-8 rounded-lg border border-border bg-background px-2.5 text-[13px] text-foreground outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="">{t('usage.allTypes')}</option>
+                <option value="true">Stream</option>
+                <option value="false">Sync</option>
+              </select>
+
+              {/* Fast 筛选 */}
+              <button
+                type="button"
+                onClick={() => { setFilterFast(filterFast === 'true' ? '' : 'true'); setPage(1) }}
+                className={`h-8 px-2.5 rounded-lg border text-[13px] font-medium transition-colors inline-flex items-center gap-1 ${
+                  filterFast === 'true'
+                    ? 'border-blue-500/40 bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400'
+                    : 'border-border bg-background text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                }`}
+              >
+                <Zap className="size-3.5" />
+                Fast
+              </button>
+
+              {/* 清除筛选 */}
+              {(searchInput || filterModel || filterEndpoint || filterStream || filterFast) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchInput(''); setSearchEmail('')
+                    setFilterModel(''); setFilterEndpoint('')
+                    setFilterStream(''); setFilterFast('')
+                    setPage(1)
+                  }}
+                  className="h-8 px-2.5 rounded-lg border border-border bg-background text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors inline-flex items-center gap-1"
+                >
+                  <X className="size-3.5" />
+                  {t('usage.clearFilters')}
+                </button>
+              )}
+            </div>
+
             <StateShell
               variant="section"
               isEmpty={logs.length === 0}
@@ -317,7 +411,7 @@ export default function Usage() {
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableCached')}</TableHead>
                       <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableFirstToken')}</TableHead>
                       <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableDuration')}</TableHead>
-                      <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableTime')}</TableHead>
+                      <TableHead className="text-[13px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableTime')}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -340,16 +434,13 @@ export default function Usage() {
                             {log.reasoning_effort && (
                               <Badge
                                 variant="outline"
-                                className="text-[12px]"
-                                style={{
-                                  background: log.reasoning_effort === 'high' ? 'rgba(239, 68, 68, 0.12)' :
-                                             log.reasoning_effort === 'medium' ? 'rgba(245, 158, 11, 0.12)' :
-                                             'rgba(34, 197, 94, 0.12)',
-                                  color: log.reasoning_effort === 'high' ? '#ef4444' :
-                                         log.reasoning_effort === 'medium' ? '#f59e0b' :
-                                         '#22c55e',
-                                  borderColor: 'transparent',
-                                }}
+                                className={`text-[11px] font-medium border-transparent ${
+                                  log.reasoning_effort === 'xhigh' || log.reasoning_effort === 'high'
+                                    ? 'bg-red-500/12 text-red-600 dark:bg-red-500/20 dark:text-red-400'
+                                    : log.reasoning_effort === 'medium'
+                                      ? 'bg-amber-500/12 text-amber-600 dark:bg-amber-500/20 dark:text-amber-400'
+                                      : 'bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400'
+                                }`}
                               >
                                 {log.reasoning_effort}
                               </Badge>
@@ -357,14 +448,10 @@ export default function Usage() {
                             {log.service_tier === 'fast' && (
                               <Badge
                                 variant="outline"
-                                className="text-[11px] font-bold"
-                                style={{
-                                  background: 'rgba(59, 130, 246, 0.12)',
-                                  color: '#3b82f6',
-                                  borderColor: 'transparent',
-                                }}
+                                className="text-[11px] font-semibold gap-0.5 border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"
                               >
-                                ⚡ Fast
+                                <Zap className="size-3" />
+                                Fast
                               </Badge>
                             )}
                           </div>
@@ -404,7 +491,7 @@ export default function Usage() {
                               {log.reasoning_tokens > 0 && (
                                 <>
                                   <span className="mx-1 text-border">|</span>
-                                  <span className="text-amber-500">💡{formatTokens(log.reasoning_tokens)}</span>
+                                  <span className="text-amber-500 inline-flex items-center gap-0.5"><Brain className="size-3.5 inline" />{formatTokens(log.reasoning_tokens)}</span>
                                 </>
                               )}
                             </div>
@@ -414,8 +501,9 @@ export default function Usage() {
                         </TableCell>
                         <TableCell>
                           {log.cached_tokens > 0 ? (
-                            <Badge variant="outline" className="text-[13px] gap-1" style={{ background: 'rgba(99, 102, 241, 0.10)', color: '#6366f1', borderColor: 'transparent' }}>
-                              📦 {formatTokens(log.cached_tokens)}
+                            <Badge variant="outline" className="text-[13px] gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400">
+                              <DatabaseZap className="size-3.5" />
+                              {formatTokens(log.cached_tokens)}
                             </Badge>
                           ) : (
                             <span className="text-[14px] text-muted-foreground">-</span>
@@ -433,7 +521,7 @@ export default function Usage() {
                             {log.duration_ms > 1000 ? `${(log.duration_ms / 1000).toFixed(1)}s` : `${log.duration_ms}ms`}
                           </span>
                         </TableCell>
-                        <TableCell className="text-[16px] text-muted-foreground whitespace-nowrap" style={{ fontFamily: "'Geist Mono', monospace" }}>
+                        <TableCell className="text-[12px] text-muted-foreground whitespace-nowrap" style={{ fontFamily: "'Geist Mono', monospace" }}>
                           {formatTime(log.created_at)}
                         </TableCell>
                       </TableRow>

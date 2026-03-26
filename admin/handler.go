@@ -795,7 +795,26 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 					pageSize = n
 				}
 			}
-			result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, startTime, endTime, page, pageSize)
+
+			filter := database.UsageLogFilter{
+				Start:    startTime,
+				End:      endTime,
+				Page:     page,
+				PageSize: pageSize,
+				Email:    c.Query("email"),
+				Model:    c.Query("model"),
+				Endpoint: c.Query("endpoint"),
+			}
+			if fastStr := c.Query("fast"); fastStr != "" {
+				v := fastStr == "true"
+				filter.FastOnly = &v
+			}
+			if streamStr := c.Query("stream"); streamStr != "" {
+				v := streamStr == "true"
+				filter.StreamOnly = &v
+			}
+
+			result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
 			if err != nil {
 				writeInternalError(c, err)
 				return
