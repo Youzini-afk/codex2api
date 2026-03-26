@@ -117,7 +117,10 @@ func extractReasoningEffort(body []byte) string {
 
 // extractServiceTier 从请求体提取服务等级
 func extractServiceTier(body []byte) string {
-	return gjson.GetBytes(body, "service_tier").String()
+	if tier := gjson.GetBytes(body, "service_tier").String(); tier != "" {
+		return tier
+	}
+	return gjson.GetBytes(body, "serviceTier").String()
 }
 
 func classifyTransportFailure(err error) string {
