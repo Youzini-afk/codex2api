@@ -25,14 +25,19 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store         *auth.Store
-	cache         *cache.TokenCache
-	db            *database.DB
-	rateLimiter   *proxy.RateLimiter
-	cpuSampler    *cpuSampler
-	startedAt     time.Time
-	pgMaxConns    int
-	redisPoolSize int
+	store          *auth.Store
+	cache          cache.TokenCache
+	db             *database.DB
+	rateLimiter    *proxy.RateLimiter
+	cpuSampler     *cpuSampler
+	startedAt      time.Time
+	pgMaxConns     int
+	redisPoolSize  int
+	databaseDriver string
+	databaseLabel  string
+	cacheDriver    string
+	cacheLabel     string
+	adminSecretEnv string
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -45,7 +50,7 @@ type chartCacheEntry struct {
 }
 
 // NewHandler 创建管理后台处理器
-func NewHandler(store *auth.Store, db *database.DB, tc *cache.TokenCache, rl *proxy.RateLimiter) *Handler {
+func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	return &Handler{
 		store:          store,
 		cache:          tc,
@@ -53,6 +58,11 @@ func NewHandler(store *auth.Store, db *database.DB, tc *cache.TokenCache, rl *pr
 		rateLimiter:    rl,
 		cpuSampler:     newCPUSampler(),
 		startedAt:      time.Now(),
+		databaseDriver: db.Driver(),
+		databaseLabel:  db.Label(),
+		cacheDriver:    tc.Driver(),
+		cacheLabel:     tc.Label(),
+		adminSecretEnv: adminSecretEnv,
 		chartCacheData: make(map[string]*chartCacheEntry),
 	}
 }
@@ -105,11 +115,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 // adminAuthMiddleware 管理接口鉴权中间件
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-		defer cancel()
-
-		settings, err := h.db.GetSystemSettings(ctx)
-		if err != nil || settings == nil || settings.AdminSecret == "" {
+		adminSecret, _ := h.resolveAdminSecret(c.Request.Context())
+		if adminSecret == "" {
 			// 未配置管理密钥，跳过鉴权
 			c.Next()
 			return
@@ -124,7 +131,7 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 			}
 		}
 
-		if adminKey != settings.AdminSecret {
+		if adminKey != adminSecret {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "管理密钥无效或缺失",
 			})
@@ -133,6 +140,20 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func (h *Handler) resolveAdminSecret(ctx context.Context) (string, string) {
+	if h.adminSecretEnv != "" {
+		return h.adminSecretEnv, "env"
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	settings, err := h.db.GetSystemSettings(readCtx)
+	if err != nil || settings == nil || settings.AdminSecret == "" {
+		return "", "disabled"
+	}
+	return settings.AdminSecret, "database"
 }
 
 // ==================== Stats ====================
@@ -958,8 +979,13 @@ type settingsResponse struct {
 	AutoCleanUnauthorized bool   `json:"auto_clean_unauthorized"`
 	AutoCleanRateLimited  bool   `json:"auto_clean_rate_limited"`
 	AdminSecret           string `json:"admin_secret"`
+	AdminAuthSource       string `json:"admin_auth_source"`
 	AutoCleanFullUsage    bool   `json:"auto_clean_full_usage"`
 	ProxyPoolEnabled      bool   `json:"proxy_pool_enabled"`
+	DatabaseDriver        string `json:"database_driver"`
+	DatabaseLabel         string `json:"database_label"`
+	CacheDriver           string `json:"cache_driver"`
+	CacheLabel            string `json:"cache_label"`
 }
 
 type updateSettingsReq struct {
@@ -982,8 +1008,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
 	dbSettings, _ := h.db.GetSystemSettings(ctx)
+	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
-	if dbSettings != nil {
+	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
 	c.JSON(http.StatusOK, settingsResponse{
@@ -997,8 +1024,13 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanUnauthorized: h.store.GetAutoCleanUnauthorized(),
 		AutoCleanRateLimited:  h.store.GetAutoCleanRateLimited(),
 		AdminSecret:           adminSecret,
+		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
+		DatabaseDriver:        h.databaseDriver,
+		DatabaseLabel:         h.databaseLabel,
+		CacheDriver:           h.cacheDriver,
+		CacheLabel:            h.cacheLabel,
 	})
 }
 
@@ -1108,8 +1140,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		currentAdminSecret = dbSettings.AdminSecret
 	}
 	if req.AdminSecret != nil {
-		currentAdminSecret = *req.AdminSecret
-		log.Printf("设置已更新: admin_secret (长度=%d)", len(currentAdminSecret))
+		if h.adminSecretEnv == "" {
+			currentAdminSecret = *req.AdminSecret
+			log.Printf("设置已更新: admin_secret (长度=%d)", len(currentAdminSecret))
+		} else {
+			log.Printf("检测到环境变量 ADMIN_SECRET，忽略前端提交的 admin_secret")
+		}
 	}
 
 	// 持久化保存到数据库
@@ -1135,6 +1171,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.TriggerAutoCleanupAsync()
 	}
 
+	adminSecretForDisplay := currentAdminSecret
+	adminAuthSource := func() string {
+		_, source := h.resolveAdminSecret(c.Request.Context())
+		return source
+	}()
+	if adminAuthSource == "env" {
+		adminSecretForDisplay = ""
+	}
+
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:        h.store.GetMaxConcurrency(),
 		GlobalRPM:             h.rateLimiter.GetRPM(),
@@ -1145,9 +1190,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RedisPoolSize:         h.redisPoolSize,
 		AutoCleanUnauthorized: h.store.GetAutoCleanUnauthorized(),
 		AutoCleanRateLimited:  h.store.GetAutoCleanRateLimited(),
-		AdminSecret:           currentAdminSecret,
+		AdminSecret:           adminSecretForDisplay,
+		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
+		DatabaseDriver:        h.databaseDriver,
+		DatabaseLabel:         h.databaseLabel,
+		CacheDriver:           h.cacheDriver,
+		CacheLabel:            h.cacheLabel,
 	})
 }
 

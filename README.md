@@ -1,6 +1,9 @@
 # Codex2API
 
-Codex2API 是一个基于 **Go + Gin + PostgreSQL + Redis + React/Vite** 的 Codex 反向代理与管理后台项目。
+Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管理后台项目，支持：
+
+- 标准模式：**PostgreSQL + Redis**
+- 轻量模式：**SQLite + 内存缓存**
 
 它对外提供兼容 OpenAI 风格的接口，并在内部维护一套基于 **Refresh Token 账号池** 的调度、刷新、测试、限流恢复、用量观测与后台管理能力。
 
@@ -16,38 +19,24 @@ Codex2API 是一个基于 **Go + Gin + PostgreSQL + Redis + React/Vite** 的 Cod
 | --- | --- | --- |
 | Docker 镜像部署 | `docker-compose.yml` | **推荐**，服务器 / 测试环境，直接拉取预构建镜像 |
 | 本地源码容器构建 | `docker-compose.local.yml` | 本地改代码后做完整容器验证 |
+| SQLite 轻量部署 | `docker-compose.sqlite.yml` | 单机轻量部署，不依赖 PostgreSQL / Redis |
+| SQLite 本地源码构建 | `docker-compose.sqlite.local.yml` | 本地改代码后验证 SQLite 轻量模式 |
 | 本地开发 | `go run .` + `npm run dev` | 前后端联调与调试 |
 
-### 方案一：Docker 镜像部署（推荐）
+### 部署命令速查
+
+标准镜像版：
 
 ```bash
-# 1. 克隆仓库并创建环境配置
 git clone https://github.com/james-6-23/codex2api.git
 cd codex2api
 cp .env.example .env
-
-# 2. 按需编辑 .env 中的端口、数据库和 Redis 参数
-
-# 3. 拉取镜像并启动
 docker compose pull
 docker compose up -d
-
-# 4. 查看日志
 docker compose logs -f codex2api
 ```
 
-启动后访问：
-
-- 管理台：`http://localhost:8080/admin/`
-- 健康检查：`http://localhost:8080/health`
-
-升级命令：
-
-```bash
-git pull && docker compose pull && docker compose up -d && docker compose logs -f codex2api
-```
-
-### 方案二：本地源码构建容器
+标准本地构建版：
 
 ```bash
 cp .env.example .env
@@ -55,7 +44,44 @@ docker compose -f docker-compose.local.yml up -d --build
 docker compose -f docker-compose.local.yml logs -f codex2api
 ```
 
-### 方案三：本地开发模式
+SQLite 镜像版：
+
+```bash
+cp .env.sqlite.example .env
+docker compose -f docker-compose.sqlite.yml pull
+docker compose -f docker-compose.sqlite.yml up -d
+docker compose -f docker-compose.sqlite.yml logs -f codex2api
+```
+
+SQLite 本地构建版：
+
+```bash
+cp .env.sqlite.example .env
+docker compose -f docker-compose.sqlite.local.yml up -d --build
+docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
+```
+
+补充说明：
+
+- 标准版和 SQLite 版都读取 `.env`
+- 切换部署模式前，需要先用对应的示例文件覆盖当前 `.env`
+- 标准版容器名：`codex2api`
+- SQLite 镜像版容器名：`codex2api-sqlite`
+- SQLite 本地构建版容器名：`codex2api-sqlite-local`
+- SQLite 轻量版只启动 `codex2api` 单容器，数据保存在 `/data/codex2api.db`
+
+启动后访问：
+
+- 管理台：`http://localhost:8080/admin/`
+- 健康检查：`http://localhost:8080/health`
+
+标准镜像版升级命令：
+
+```bash
+git pull && docker compose pull && docker compose up -d && docker compose logs -f codex2api
+```
+
+### 本地开发模式
 
 **后端：**
 
@@ -84,13 +110,17 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | 变量 | 说明 |
 | --- | --- |
 | `CODEX_PORT` | HTTP 端口，默认 `8080` |
-| `DATABASE_HOST` | PostgreSQL 主机 |
+| `ADMIN_SECRET` | 管理后台登录密钥；设置后首次访问 `/admin` 会弹出密码输入框 |
+| `DATABASE_DRIVER` | 数据库驱动，支持 `postgres` / `sqlite` |
+| `DATABASE_PATH` | SQLite 数据文件路径，`DATABASE_DRIVER=sqlite` 时生效 |
+| `DATABASE_HOST` | PostgreSQL 主机，`DATABASE_DRIVER=postgres` 时生效 |
 | `DATABASE_PORT` | PostgreSQL 端口，默认 `5432` |
 | `DATABASE_USER` | PostgreSQL 用户 |
 | `DATABASE_PASSWORD` | PostgreSQL 密码 |
 | `DATABASE_NAME` | PostgreSQL 数据库名 |
-| `DATABASE_SSLMODE` | SSL 模式，默认 `disable` |
-| `REDIS_ADDR` | Redis 地址，例如 `redis:6379` |
+| `DATABASE_SSLMODE` | PostgreSQL SSL 模式，默认 `disable` |
+| `CACHE_DRIVER` | 缓存驱动，支持 `redis` / `memory` |
+| `REDIS_ADDR` | Redis 地址，例如 `redis:6379`，`CACHE_DRIVER=redis` 时生效 |
 | `REDIS_PASSWORD` | Redis 密码 |
 | `REDIS_DB` | Redis DB 库号 |
 | `TZ` | 时区，例如 `Asia/Shanghai` |
@@ -106,7 +136,10 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 ### API Key 与管理密钥
 
 - **对外 API Key**：以数据库中的 API Keys 为准。如果没有配置任何 Key，则 `/v1/*` 跳过鉴权。
-- **管理后台 Admin Secret**：保存在数据库的 `AdminSecret` 中。为空时跳过鉴权；已设置时前端通过 `X-Admin-Key` 头进行认证。
+- **管理后台 Admin Secret**：
+  - 如果 `.env` 中设置了 `ADMIN_SECRET`，则优先使用环境变量。
+  - 如果未设置 `ADMIN_SECRET`，则回退到数据库中的 `AdminSecret`。
+  - 鉴权生效时，首次访问 `/admin` 会弹出密码输入框；前端登录成功后通过 `X-Admin-Key` 请求头访问 `/api/admin/*`。
 
 ---
 
@@ -144,14 +177,14 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 - 对外提供统一的 OpenAI 风格入口，屏蔽上游多账号差异
 - 对内维护基于 `Refresh Token` 的账号池、`Access Token` 生命周期和运行时调度
-- 通过 PostgreSQL 与 Redis 实现配置持久化、运行态缓存和高频协调
+- 通过 PostgreSQL + Redis 或 SQLite + 内存缓存实现配置持久化与运行态协调
 - 通过 `/admin` 管理台提供全面的运维观测能力
 
 ### 架构概览
 
 **对外请求链路：** 客户端请求 → Gin RPM 限流 → `proxy.Handler` API Key 校验 → `auth.Store` 调度选号 → 上游请求 → 响应回传 + 用量写入
 
-**管理后台链路：** 浏览器 → `/admin/` 嵌入式前端 → `/api/admin/*` 管理接口 → 数据库 / 账号池 / Redis
+**管理后台链路：** 浏览器 → `/admin/` 嵌入式前端 → `/api/admin/*` 管理接口 → 数据库 / 账号池 / 缓存层
 
 ### 调度系统
 

@@ -80,6 +80,7 @@ export default function Usage() {
   const [filterEndpoint, setFilterEndpoint] = useState('')
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
+  const showFastFilter = false
   const PAGE_SIZE = 20
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
 
@@ -368,19 +369,20 @@ export default function Usage() {
                 ]}
               />
 
-              {/* Fast 筛选 */}
-              <button
-                type="button"
-                onClick={() => { setFilterFast(filterFast === 'true' ? '' : 'true'); setPage(1) }}
-                className={`h-8 px-2.5 rounded-lg border text-[13px] font-medium transition-colors inline-flex items-center gap-1 ${
-                  filterFast === 'true'
-                    ? 'border-blue-500/40 bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400'
-                    : 'border-border bg-background text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                }`}
-              >
-                <Zap className="size-3.5" />
-                Fast
-              </button>
+              {showFastFilter && (
+                <button
+                  type="button"
+                  onClick={() => { setFilterFast(filterFast === 'true' ? '' : 'true'); setPage(1) }}
+                  className={`h-8 px-2.5 rounded-lg border text-[13px] font-medium transition-colors inline-flex items-center gap-1 ${
+                    filterFast === 'true'
+                      ? 'border-blue-500/40 bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400'
+                      : 'border-border bg-background text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                  }`}
+                >
+                  <Zap className="size-3.5" />
+                  Fast
+                </button>
+              )}
 
               {/* 清除筛选 */}
               {(searchInput || filterModel || filterEndpoint || filterStream || filterFast) && (

@@ -1,7 +1,7 @@
 import type { ChangeEvent, KeyboardEvent } from 'react'
 import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, setAdminKey } from '../api'
+import { api, resetAdminAuthState, setAdminKey } from '../api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
@@ -49,10 +49,16 @@ export default function Settings() {
     auto_clean_unauthorized: false,
     auto_clean_rate_limited: false,
     admin_secret: '',
+    admin_auth_source: 'disabled',
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
+    database_driver: 'postgres',
+    database_label: 'PostgreSQL',
+    cache_driver: 'redis',
+    cache_label: 'Redis',
   })
   const [savingSettings, setSavingSettings] = useState(false)
+  const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
@@ -60,6 +66,7 @@ export default function Settings() {
   const loadSettingsData = useCallback(async () => {
     const [health, keysResponse, settings, modelsResp] = await Promise.all([api.getHealth(), api.getAPIKeys(), api.getSettings(), api.getModels()])
     setSettingsForm(settings)
+    setLoadedAdminSecret(settings.admin_secret ?? '')
     setModelList(modelsResp.models ?? [])
     return {
       health,
@@ -112,17 +119,50 @@ export default function Settings() {
     }
   }
 
-  const handleCopy = (text: string) => {
-    void navigator.clipboard.writeText(text)
-    showToast(t('common.copied'))
+  const handleCopy = async (text: string) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+        showToast(t('common.copied'))
+        return
+      }
+
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.setAttribute('readonly', 'true')
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      textarea.style.pointerEvents = 'none'
+      document.body.appendChild(textarea)
+      textarea.select()
+      textarea.setSelectionRange(0, text.length)
+      const copied = document.execCommand('copy')
+      document.body.removeChild(textarea)
+
+      if (!copied) {
+        throw new Error('copy failed')
+      }
+
+      showToast(t('common.copied'))
+    } catch {
+      showToast(t('common.copyFailed'), 'error')
+    }
   }
 
   const handleSaveSettings = async () => {
     setSavingSettings(true)
     try {
+      const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
       const updated = await api.updateSettings(settingsForm)
       setSettingsForm(updated)
-      setAdminKey(updated.admin_secret ?? '')
+      setLoadedAdminSecret(updated.admin_secret ?? '')
+      if (updated.admin_auth_source !== 'env') {
+        setAdminKey(updated.admin_secret ?? '')
+      }
+      if (adminSecretChanged) {
+        resetAdminAuthState()
+        return
+      }
       showToast(t('settings.saveSuccess'))
     } catch (error) {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
@@ -132,6 +172,9 @@ export default function Settings() {
   }
 
   const { health, keys } = data
+  const isExternalDatabase = settingsForm.database_driver === 'postgres'
+  const isExternalCache = settingsForm.cache_driver === 'redis'
+  const showConnectionPool = isExternalDatabase || isExternalCache
   return (
     <StateShell
       variant="page"
@@ -183,7 +226,7 @@ export default function Settings() {
                 <div className="font-semibold mb-1 text-[hsl(var(--success))]">{t('settings.keyCreated')}</div>
                 <div className="flex items-center gap-2">
                   <code className="flex-1 font-mono text-[13px] break-all">{createdKey}</code>
-                  <Button variant="outline" size="sm" onClick={() => handleCopy(createdKey)}>{t('common.copy')}</Button>
+                  <Button variant="outline" size="sm" onClick={() => void handleCopy(createdKey)}>{t('common.copy')}</Button>
                 </div>
               </div>
             ) : null}
@@ -251,20 +294,20 @@ export default function Settings() {
                 <div className="text-[15px] font-semibold">{health?.available ?? 0} / {health?.total ?? 0}</div>
               </div>
               <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
-                <label className="text-xs font-bold text-muted-foreground">PostgreSQL</label>
+                <label className="text-xs font-bold text-muted-foreground">{settingsForm.database_label}</label>
                 <div className="text-[15px] font-semibold">
                   <Badge variant="default" className="gap-1.5">
                     <span className="size-1.5 rounded-full bg-emerald-500" />
-                    {t('common.connected')}
+                    {isExternalDatabase ? t('common.connected') : t('common.running')}
                   </Badge>
                 </div>
               </div>
               <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
-                <label className="text-xs font-bold text-muted-foreground">Redis</label>
+                <label className="text-xs font-bold text-muted-foreground">{settingsForm.cache_label}</label>
                 <div className="text-[15px] font-semibold">
                   <Badge variant="default" className="gap-1.5">
                     <span className="size-1.5 rounded-full bg-emerald-500" />
-                    {t('common.connected')}
+                    {isExternalCache ? t('common.connected') : t('common.running')}
                   </Badge>
                 </div>
               </div>
@@ -319,31 +362,39 @@ export default function Settings() {
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.testConcurrencyRange')}</p>
               </div>
             </div>
-            <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.connectionPool')}</h3>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4 mb-4">
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.pgMaxConns')}</label>
-                <Input
-                  type="number"
-                  min={5}
-                  max={500}
-                  value={settingsForm.pg_max_conns}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, pg_max_conns: parseInt(e.target.value) || 50 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.pgMaxConnsRange')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.redisPoolSize')}</label>
-                <Input
-                  type="number"
-                  min={5}
-                  max={500}
-                  value={settingsForm.redis_pool_size}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, redis_pool_size: parseInt(e.target.value) || 30 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.redisPoolSizeRange')}</p>
-              </div>
-            </div>
+            {showConnectionPool ? (
+              <>
+                <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.connectionPool')}</h3>
+                <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4 mb-4">
+                  {isExternalDatabase ? (
+                    <div>
+                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.pgMaxConns')}</label>
+                      <Input
+                        type="number"
+                        min={5}
+                        max={500}
+                        value={settingsForm.pg_max_conns}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, pg_max_conns: parseInt(e.target.value) || 50 }))}
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">{t('settings.pgMaxConnsRange')}</p>
+                    </div>
+                  ) : null}
+                  {isExternalCache ? (
+                    <div>
+                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.redisPoolSize')}</label>
+                      <Input
+                        type="number"
+                        min={5}
+                        max={500}
+                        value={settingsForm.redis_pool_size}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, redis_pool_size: parseInt(e.target.value) || 30 }))}
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">{t('settings.redisPoolSizeRange')}</p>
+                    </div>
+                  ) : null}
+                </div>
+              </>
+            ) : null}
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.autoCleanup')}</h3>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
               <div>
@@ -382,9 +433,13 @@ export default function Settings() {
                   type="text"
                   placeholder={t('settings.adminSecretPlaceholder')}
                   value={settingsForm.admin_secret}
+                  disabled={settingsForm.admin_auth_source === 'env'}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, admin_secret: e.target.value }))}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.adminSecretDesc')}</p>
+                {settingsForm.admin_auth_source === 'env' ? (
+                  <p className="text-xs text-amber-600 mt-1">{t('settings.adminSecretEnvOverride')}</p>
+                ) : null}
               </div>
             </div>
             <Button onClick={() => void handleSaveSettings()} disabled={savingSettings}>

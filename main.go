@@ -34,17 +34,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
-	log.Printf("物理层配置加载成功: port=%d", cfg.Port)
+	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label())
 
-	// 2. 初始化 PostgreSQL
-	db, err := database.New(cfg.Database.DSN())
+	// 2. 初始化数据库
+	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN())
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
-	log.Printf("PostgreSQL 连接成功: %s:%d/%s", cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
+	switch cfg.Database.Driver {
+	case "sqlite":
+		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)
+	default:
+		log.Printf("%s 连接成功: %s:%d/%s", cfg.Database.Label(), cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
+	}
 
-	// 3. 读取运行时的系统逻辑设置（需在 Redis 初始化之前，以获取 pool size）
+	// 3. 读取运行时的系统逻辑设置（需在缓存初始化之前，以获取连接池大小）
 	sysCtx, sysCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	settings, err := db.GetSystemSettings(sysCtx)
 	sysCancel()
@@ -72,22 +77,33 @@ func main() {
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
 	}
 
-	// 4. 初始化 Redis（使用数据库中保存的 pool size）
+	// 4. 初始化缓存（使用数据库中保存的连接池大小）
 	redisPoolSize := 30
 	if settings.RedisPoolSize > 0 {
 		redisPoolSize = settings.RedisPoolSize
 	}
-	tc, err := cache.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB, redisPoolSize)
-	if err != nil {
-		log.Fatalf("Redis 初始化失败: %v", err)
+	var tc cache.TokenCache
+	switch cfg.Cache.Driver {
+	case "memory":
+		tc = cache.NewMemory(redisPoolSize)
+	default:
+		tc, err = cache.NewRedis(cfg.Cache.Redis.Addr, cfg.Cache.Redis.Password, cfg.Cache.Redis.DB, redisPoolSize)
+		if err != nil {
+			log.Fatalf("缓存初始化失败: %v", err)
+		}
 	}
 	defer tc.Close()
-	log.Printf("Redis 连接成功: %s, pool_size=%d", cfg.Redis.Addr, redisPoolSize)
+	switch cfg.Cache.Driver {
+	case "memory":
+		log.Printf("%s 缓存已启用: pool_size=%d", cfg.Cache.Label(), redisPoolSize)
+	default:
+		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), cfg.Cache.Redis.Addr, redisPoolSize)
+	}
 
-	// 4b. 应用 PostgreSQL 连接池设置
+	// 4b. 应用数据库连接池设置
 	if settings.PgMaxConns > 0 {
 		db.SetMaxOpenConns(settings.PgMaxConns)
-		log.Printf("PostgreSQL 连接池: max_conns=%d", settings.PgMaxConns)
+		log.Printf("%s 连接池: max_conns=%d", cfg.Database.Label(), settings.PgMaxConns)
 	}
 
 	// 5. 初始化账号管理器
@@ -102,7 +118,7 @@ func main() {
 
 	// 全局 RPM 限流器
 	rateLimiter := proxy.NewRateLimiter(settings.GlobalRPM)
-	adminHandler := admin.NewHandler(store, db, tc, rateLimiter)
+	adminHandler := admin.NewHandler(store, db, tc, rateLimiter, cfg.AdminSecret)
 	// 初始化 admin handler 的连接池设置跟踪
 	adminHandler.SetPoolSizes(settings.PgMaxConns, settings.RedisPoolSize)
 	store.SetUsageProbeFunc(adminHandler.ProbeUsageSnapshot)

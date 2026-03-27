@@ -103,7 +103,7 @@ export default function Operations() {
                     t={t}
                   />
                   <OpsMetricCard
-                    label={t('ops.postgres')}
+                    label={overview.database_label || t('ops.postgres')}
                     value={`${overview.postgres.usage_percent.toFixed(1)}%`}
                     sub={t('ops.pgConn', { open: overview.postgres.open, max: overview.postgres.max_open || '∞' })}
                     icon={<Database className="size-5" />}
@@ -111,7 +111,7 @@ export default function Operations() {
                     t={t}
                   />
                   <OpsMetricCard
-                    label={t('ops.redis')}
+                    label={overview.cache_label || t('ops.redis')}
                     value={`${overview.redis.usage_percent.toFixed(1)}%`}
                     sub={t('ops.redisConn', { open: overview.redis.total_conns, max: overview.redis.pool_size || '-' })}
                     icon={<Server className="size-5" />}

@@ -1,7 +1,7 @@
 import type { PropsWithChildren } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { getAdminKey, setAdminKey } from '../api'
+import { ADMIN_AUTH_REQUIRED_EVENT, getAdminKey, setAdminKey } from '../api'
 import logoImg from '../assets/logo.png'
 
 type AuthStatus = 'checking' | 'authenticated' | 'need_login'
@@ -20,6 +20,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
       if (key) headers['X-Admin-Key'] = key
       const res = await fetch('/api/admin/health', { headers })
       if (res.status === 401) {
+        setAdminKey('')
         setStatus('need_login')
       } else {
         setStatus('authenticated')
@@ -31,6 +32,32 @@ export default function AuthGate({ children }: PropsWithChildren) {
 
   useEffect(() => {
     void checkAuth()
+  }, [checkAuth])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void checkAuth()
+    }, 30000)
+
+    const handleAuthRequired = () => {
+      setError('')
+      setInputKey('')
+      setStatus('need_login')
+    }
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === 'admin_auth_reset_at') {
+        handleAuthRequired()
+      }
+    }
+
+    window.addEventListener(ADMIN_AUTH_REQUIRED_EVENT, handleAuthRequired)
+    window.addEventListener('storage', handleStorage)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener(ADMIN_AUTH_REQUIRED_EVENT, handleAuthRequired)
+      window.removeEventListener('storage', handleStorage)
+    }
   }, [checkAuth])
 
   const handleLogin = async () => {

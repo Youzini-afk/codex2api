@@ -52,15 +52,19 @@ type createAPIKeyResponse struct {
 }
 
 type opsOverviewResponse struct {
-	UpdatedAt     string              `json:"updated_at"`
-	UptimeSeconds int64               `json:"uptime_seconds"`
-	CPU           opsCPUResponse      `json:"cpu"`
-	Memory        opsMemoryResponse   `json:"memory"`
-	Runtime       opsRuntimeResponse  `json:"runtime"`
-	Requests      opsRequestsResponse `json:"requests"`
-	Postgres      opsDatabaseResponse `json:"postgres"`
-	Redis         opsRedisResponse    `json:"redis"`
-	Traffic       opsTrafficResponse  `json:"traffic"`
+	UpdatedAt      string              `json:"updated_at"`
+	UptimeSeconds  int64               `json:"uptime_seconds"`
+	DatabaseDriver string              `json:"database_driver"`
+	DatabaseLabel  string              `json:"database_label"`
+	CacheDriver    string              `json:"cache_driver"`
+	CacheLabel     string              `json:"cache_label"`
+	CPU            opsCPUResponse      `json:"cpu"`
+	Memory         opsMemoryResponse   `json:"memory"`
+	Runtime        opsRuntimeResponse  `json:"runtime"`
+	Requests       opsRequestsResponse `json:"requests"`
+	Postgres       opsDatabaseResponse `json:"postgres"`
+	Redis          opsRedisResponse    `json:"redis"`
+	Traffic        opsTrafficResponse  `json:"traffic"`
 }
 
 type opsCPUResponse struct {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	_ "modernc.org/sqlite"
 )
 
 // AccountRow 数据库中的账号行
@@ -50,7 +51,8 @@ func (a *AccountRow) GetCredential(key string) string {
 
 // DB PostgreSQL 数据库操作
 type DB struct {
-	conn *sql.DB
+	conn   *sql.DB
+	driver string
 
 	// 使用日志批量写入缓冲
 	logBuf  []usageLogEntry
@@ -81,19 +83,30 @@ type usageLogEntry struct {
 	ServiceTier      string
 }
 
-// New 创建数据库连接并自动建表
-func New(dsn string) (*DB, error) {
-	conn, err := sql.Open("postgres", dsn)
+// New 创建数据库连接并自动建表。
+func New(driver string, dsn string) (*DB, error) {
+	driver = normalizeDriver(driver)
+	driverName := driver
+	if driver == "sqlite" {
+		driverName = "sqlite"
+	}
+
+	conn, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("连接数据库失败: %w", err)
 	}
 
 	// ==================== 连接池优化 ====================
-	// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
-	conn.SetMaxOpenConns(50)                  // 最大打开连接数（默认无限制，限制避免 PG too many connections）
-	conn.SetMaxIdleConns(25)                  // 空闲连接数（保持足够的热连接避免频繁建连）
-	conn.SetConnMaxLifetime(30 * time.Minute) // 连接最大生存时间（避免长连接僵死）
-	conn.SetConnMaxIdleTime(10 * time.Minute) // 空闲连接最大闲置时间
+	if driver == "sqlite" {
+		conn.SetMaxOpenConns(1)
+		conn.SetMaxIdleConns(1)
+	} else {
+		// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
+		conn.SetMaxOpenConns(50)                  // 最大打开连接数（默认无限制，限制避免 PG too many connections）
+		conn.SetMaxIdleConns(25)                  // 空闲连接数（保持足够的热连接避免频繁建连）
+		conn.SetConnMaxLifetime(30 * time.Minute) // 连接最大生存时间（避免长连接僵死）
+		conn.SetConnMaxIdleTime(10 * time.Minute) // 空闲连接最大闲置时间
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -104,7 +117,13 @@ func New(dsn string) (*DB, error) {
 
 	db := &DB{
 		conn:    conn,
+		driver:  driver,
 		logStop: make(chan struct{}),
+	}
+	if db.isSQLite() {
+		if err := db.configureSQLite(ctx); err != nil {
+			return nil, fmt.Errorf("配置 SQLite 失败: %w", err)
+		}
 	}
 	if err := db.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
@@ -113,6 +132,14 @@ func New(dsn string) (*DB, error) {
 	// 启动批量写入后台协程
 	db.startLogFlusher()
 
+	baselineInsert := `
+		INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING
+	`
+	if db.isSQLite() {
+		baselineInsert = `
+			INSERT OR IGNORE INTO usage_stats_baseline (id) VALUES (1)
+		`
+	}
 	_, err = db.conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS usage_stats_baseline (
 			id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -128,9 +155,7 @@ func New(dsn string) (*DB, error) {
 	}
 
 	// 确保 baseline 行存在
-	_, err = db.conn.ExecContext(ctx, `
-		INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING
-	`)
+	_, err = db.conn.ExecContext(ctx, baselineInsert)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 usage_stats_baseline 失败: %w", err)
 	}
@@ -147,14 +172,11 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
-// SetMaxOpenConns 运行时调整最大连接数（管理后台调用）
-func (db *DB) SetMaxOpenConns(n int) {
-	db.conn.SetMaxOpenConns(n)
-	db.conn.SetMaxIdleConns(n / 2)
-}
-
 // migrate 自动建表
 func (db *DB) migrate(ctx context.Context) error {
+	if db.isSQLite() {
+		return db.migrateSQLite(ctx)
+	}
 	query := `
 	CREATE TABLE IF NOT EXISTS accounts (
 		id            SERIAL PRIMARY KEY,
@@ -270,7 +292,12 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
 	var keys []*APIKeyRow
 	for rows.Next() {
 		k := &APIKeyRow{}
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.CreatedAt); err != nil {
+		var createdAtRaw interface{}
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		k.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
 			return nil, err
 		}
 		keys = append(keys, k)
@@ -280,10 +307,11 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
 
 // InsertAPIKey 插入新 API 密钥
 func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error) {
-	var id int64
-	err := db.conn.QueryRowContext(ctx,
-		`INSERT INTO api_keys (name, key) VALUES ($1, $2) RETURNING id`, name, key).Scan(&id)
-	return id, err
+	return db.insertRowID(ctx,
+		`INSERT INTO api_keys (name, key) VALUES ($1, $2) RETURNING id`,
+		`INSERT INTO api_keys (name, key) VALUES ($1, $2)`,
+		name, key,
+	)
 }
 
 // ==================== System Settings ====================
@@ -399,7 +427,12 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 	var proxies []*ProxyRow
 	for rows.Next() {
 		p := &ProxyRow{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &p.CreatedAt, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+		var createdAtRaw interface{}
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+			return nil, err
+		}
+		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
 			return nil, err
 		}
 		proxies = append(proxies, p)
@@ -409,7 +442,11 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 
 // ListEnabledProxies 获取已启用的代理
 func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = true ORDER BY id`)
+	query := `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = true ORDER BY id`
+	if db.isSQLite() {
+		query = `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = 1 ORDER BY id`
+	}
+	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +455,12 @@ func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
 	var proxies []*ProxyRow
 	for rows.Next() {
 		p := &ProxyRow{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &p.CreatedAt, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+		var createdAtRaw interface{}
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+			return nil, err
+		}
+		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
 			return nil, err
 		}
 		proxies = append(proxies, p)
@@ -428,16 +470,28 @@ func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
 
 // InsertProxy 插入单个代理
 func (db *DB) InsertProxy(ctx context.Context, url, label string) (int64, error) {
-	var id int64
-	err := db.conn.QueryRowContext(ctx,
-		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`, url, label).Scan(&id)
-	return id, err
+	return db.insertRowID(ctx,
+		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`,
+		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING`,
+		url, label,
+	)
 }
 
 // InsertProxies 批量插入代理（跳过已存在的）
 func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (int, error) {
 	inserted := 0
 	for _, u := range urls {
+		if db.isSQLite() {
+			res, err := db.conn.ExecContext(ctx, `INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING`, u, label)
+			if err != nil {
+				continue
+			}
+			affected, _ := res.RowsAffected()
+			if affected > 0 {
+				inserted++
+			}
+			continue
+		}
 		var id int64
 		err := db.conn.QueryRowContext(ctx,
 			`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`, u, label).Scan(&id)
@@ -673,29 +727,28 @@ type TrafficSnapshot struct {
 // GetUsageStats 获取使用统计（基线 + 当前日志）
 func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	stats := &UsageStats{}
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	minuteAgo := now.Add(-1 * time.Minute)
 
-	// 只扫描今日数据（走 idx_usage_logs_created_at 索引，极快）
 	todayQuery := `
 	SELECT
-		COUNT(*)                                                     AS today_requests,
-		COALESCE(SUM(total_tokens), 0)                               AS today_tokens,
-		COALESCE(SUM(prompt_tokens), 0)                              AS today_prompt,
-		COALESCE(SUM(completion_tokens), 0)                          AS today_completion,
-		COALESCE(SUM(cached_tokens), 0)                              AS today_cached,
-		-- RPM / TPM（最近 1 分钟）
-		COUNT(*)    FILTER (WHERE created_at >= NOW() - INTERVAL '1 minute')     AS rpm,
-		COALESCE(SUM(total_tokens) FILTER (WHERE created_at >= NOW() - INTERVAL '1 minute'), 0) AS tpm,
-		-- 平均延迟（今日）
-		COALESCE(AVG(duration_ms), 0)                                AS avg_duration_ms,
-		-- 今日错误数
-		COUNT(*)    FILTER (WHERE status_code >= 400)                AS today_errors
+		COUNT(*) AS today_requests,
+		COALESCE(SUM(total_tokens), 0) AS today_tokens,
+		COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
+		COALESCE(SUM(completion_tokens), 0) AS today_completion,
+		COALESCE(SUM(cached_tokens), 0) AS today_cached,
+		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
+		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
+		COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
 	FROM usage_logs
-	WHERE created_at >= CURRENT_DATE
+	WHERE created_at >= $1
 	  AND status_code <> 499
 	`
 
 	var todayErrors int64
-	err := db.conn.QueryRowContext(ctx, todayQuery).Scan(
+	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
@@ -733,6 +786,10 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 
 // GetTrafficSnapshot 获取近实时流量快照
 func (db *DB) GetTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, error) {
+	if db.isSQLite() {
+		return db.getTrafficSnapshotSQLite(ctx)
+	}
+
 	snapshot := &TrafficSnapshot{}
 	query := `
 	WITH per_second AS (
@@ -781,7 +838,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
-	            COALESCE(a.credentials->>'email', ''), u.created_at
+	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.status_code <> 499
@@ -795,9 +852,16 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	var logs []*UsageLog
 	for rows.Next() {
 		l := &UsageLog{}
+		var credentialRaw interface{}
+		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&l.AccountEmail, &l.CreatedAt); err != nil {
+			&credentialRaw, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
+		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
 			return nil, err
 		}
 		logs = append(logs, l)
@@ -850,6 +914,10 @@ type AccountUsageDetail struct {
 
 // GetChartAggregation 在数据库层完成图表数据的分桶聚合（无需传输原始行）
 func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
+	if db.isSQLite() {
+		return db.getChartAggregationSQLite(ctx, start, end, bucketMinutes)
+	}
+
 	if bucketMinutes < 1 {
 		bucketMinutes = 5
 	}
@@ -983,7 +1051,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
-	            COALESCE(a.credentials->>'email', ''), u.created_at
+	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.created_at >= $1 AND u.created_at <= $2
@@ -998,9 +1066,16 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	var logs []*UsageLog
 	for rows.Next() {
 		l := &UsageLog{}
+		var credentialRaw interface{}
+		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&l.AccountEmail, &l.CreatedAt); err != nil {
+			&credentialRaw, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
+		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
 			return nil, err
 		}
 		logs = append(logs, l)
@@ -1016,15 +1091,15 @@ type UsageLogPage struct {
 
 // UsageLogFilter 日志查询过滤条件
 type UsageLogFilter struct {
-	Start    time.Time
-	End      time.Time
-	Page     int
-	PageSize int
-	Email    string // LIKE 模糊匹配
-	Model    string // 精确匹配
-	Endpoint string // 精确匹配 inbound_endpoint
-	FastOnly   *bool // nil=全部, true=仅fast, false=仅非fast
-	StreamOnly *bool // nil=全部, true=仅stream, false=仅sync
+	Start      time.Time
+	End        time.Time
+	Page       int
+	PageSize   int
+	Email      string // LIKE 模糊匹配
+	Model      string // 精确匹配
+	Endpoint   string // 精确匹配 inbound_endpoint
+	FastOnly   *bool  // nil=全部, true=仅fast, false=仅非fast
+	StreamOnly *bool  // nil=全部, true=仅stream, false=仅sync
 }
 
 // ListUsageLogsByTimeRangePaged 按时间范围分页查询请求日志（支持筛选）
@@ -1042,7 +1117,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	paramIdx := 3
 
 	if f.Email != "" {
-		where += fmt.Sprintf(` AND a.credentials->>'email' ILIKE $%d`, paramIdx)
+		where += fmt.Sprintf(` AND LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER($%d)`, paramIdx)
 		args = append(args, "%"+f.Email+"%")
 		paramIdx++
 	}
@@ -1077,7 +1152,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
-	            COALESCE(a.credentials->>'email', ''), u.created_at,
+	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1092,9 +1167,16 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	result := &UsageLogPage{}
 	for rows.Next() {
 		l := &UsageLog{}
+		var credentialRaw interface{}
+		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens,
-			&l.ServiceTier, &l.AccountEmail, &l.CreatedAt, &result.Total); err != nil {
+			&l.ServiceTier, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			return nil, err
+		}
+		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
+		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
 			return nil, err
 		}
 		result.Logs = append(result.Logs, l)
@@ -1122,6 +1204,13 @@ func (db *DB) ClearUsageLogs(ctx context.Context) error {
 	}
 
 	// 再清空日志
+	if db.isSQLite() {
+		if _, err = db.conn.ExecContext(ctx, `DELETE FROM usage_logs`); err != nil {
+			return err
+		}
+		_, err = db.conn.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'usage_logs'`)
+		return err
+	}
 	_, err = db.conn.ExecContext(ctx, `TRUNCATE TABLE usage_logs RESTART IDENTITY`)
 	return err
 }
@@ -1147,8 +1236,8 @@ type AccountRequestCount struct {
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
 	query := `
 	SELECT account_id,
-		COUNT(*) FILTER (WHERE status_code < 400) AS success_count,
-		COUNT(*) FILTER (WHERE status_code >= 400) AS error_count
+		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
 	FROM usage_logs GROUP BY account_id
 	`
 	rows, err := db.conn.QueryContext(ctx, query)
@@ -1187,26 +1276,38 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	var accounts []*AccountRow
 	for rows.Next() {
 		a := &AccountRow{}
-		var credJSON []byte
+		var credRaw interface{}
+		var cooldownUntilRaw interface{}
+		var createdAtRaw interface{}
+		var updatedAtRaw interface{}
 		if err := rows.Scan(
 			&a.ID,
 			&a.Name,
 			&a.Platform,
 			&a.Type,
-			&credJSON,
+			&credRaw,
 			&a.ProxyURL,
 			&a.Status,
 			&a.CooldownReason,
-			&a.CooldownUntil,
+			&cooldownUntilRaw,
 			&a.ErrorMessage,
-			&a.CreatedAt,
-			&a.UpdatedAt,
+			&createdAtRaw,
+			&updatedAtRaw,
 		); err != nil {
 			return nil, fmt.Errorf("扫描账号行失败: %w", err)
 		}
-		if err := json.Unmarshal(credJSON, &a.Credentials); err != nil {
-			log.Printf("[账号 %d] 解析 credentials 失败: %v", a.ID, err)
-			a.Credentials = make(map[string]interface{})
+		a.Credentials = decodeCredentials(credRaw)
+		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+		}
+		a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 created_at 失败: %w", err)
+		}
+		a.UpdatedAt, err = parseDBTimeValue(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 updated_at 失败: %w", err)
 		}
 		accounts = append(accounts, a)
 	}
@@ -1216,16 +1317,36 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）
 // 解决并发刷新时一个进程覆盖另一个进程写入的字段的问题
 func (db *DB) UpdateCredentials(ctx context.Context, id int64, credentials map[string]interface{}) error {
-	credJSON, err := json.Marshal(credentials)
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	selectQuery := `SELECT credentials FROM accounts WHERE id = $1`
+	if !db.isSQLite() {
+		selectQuery += ` FOR UPDATE`
+	}
+
+	var currentRaw interface{}
+	if err := tx.QueryRowContext(ctx, selectQuery, id).Scan(&currentRaw); err != nil {
+		return err
+	}
+
+	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	credJSON, err := json.Marshal(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
 
-	// 使用 || 运算符原子合并 JSONB，而非整体覆盖
-	// 例如：进程 A 更新 access_token，进程 B 同时更新 email，两者不会互相覆盖
-	query := `UPDATE accounts SET credentials = credentials || $1::jsonb, updated_at = NOW() WHERE id = $2`
-	_, err = db.conn.ExecContext(ctx, query, credJSON, id)
-	return err
+	updateQuery := `UPDATE accounts SET credentials = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+	if !db.isSQLite() {
+		updateQuery = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+	}
+	if _, err := tx.ExecContext(ctx, updateQuery, credJSON, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateUsageSnapshot 持久化账号用量快照（7d + 5h）
@@ -1240,9 +1361,9 @@ func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, 
 func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float64, reset7dAt time.Time, pct5h float64, reset5hAt time.Time, updatedAt time.Time) error {
 	fields := map[string]interface{}{
 		"codex_7d_used_percent":  pct7d,
-		"codex_7d_reset_at":     reset7dAt.Format(time.RFC3339),
+		"codex_7d_reset_at":      reset7dAt.Format(time.RFC3339),
 		"codex_5h_used_percent":  pct5h,
-		"codex_5h_reset_at":     reset5hAt.Format(time.RFC3339),
+		"codex_5h_reset_at":      reset5hAt.Format(time.RFC3339),
 		"codex_usage_updated_at": updatedAt.Format(time.RFC3339),
 	}
 	return db.UpdateCredentials(ctx, id, fields)
@@ -1250,28 +1371,28 @@ func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float
 
 // SetError 标记账号错误状态
 func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
-	query := `UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = NOW() WHERE id = $2`
+	query := `UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	_, err := db.conn.ExecContext(ctx, query, errorMsg, id)
 	return err
 }
 
 // ClearError 清除账号错误状态
 func (db *DB) ClearError(ctx context.Context, id int64) error {
-	query := `UPDATE accounts SET status = 'active', error_message = '', cooldown_reason = '', cooldown_until = NULL, updated_at = NOW() WHERE id = $1`
+	query := `UPDATE accounts SET status = 'active', error_message = '', cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`
 	_, err := db.conn.ExecContext(ctx, query, id)
 	return err
 }
 
 // SetCooldown 持久化账号冷却状态
 func (db *DB) SetCooldown(ctx context.Context, id int64, reason string, until time.Time) error {
-	query := `UPDATE accounts SET cooldown_reason = $1, cooldown_until = $2, updated_at = NOW() WHERE id = $3`
+	query := `UPDATE accounts SET cooldown_reason = $1, cooldown_until = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`
 	_, err := db.conn.ExecContext(ctx, query, reason, until, id)
 	return err
 }
 
 // ClearCooldown 清除账号冷却状态
 func (db *DB) ClearCooldown(ctx context.Context, id int64) error {
-	query := `UPDATE accounts SET cooldown_reason = '', cooldown_until = NULL, updated_at = NOW() WHERE id = $1`
+	query := `UPDATE accounts SET cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`
 	_, err := db.conn.ExecContext(ctx, query, id)
 	return err
 }
@@ -1286,10 +1407,11 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 		return 0, err
 	}
 
-	var id int64
-	query := `INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`
-	err = db.conn.QueryRowContext(ctx, query, name, credJSON, proxyURL).Scan(&id)
-	return id, err
+	return db.insertRowID(ctx,
+		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
+		name, credJSON, proxyURL,
+	)
 }
 
 // CountAll 获取账号总数
@@ -1301,7 +1423,7 @@ func (db *DB) CountAll(ctx context.Context) (int, error) {
 
 // GetAllRefreshTokens 获取所有已存在的 refresh_token（用于导入去重）
 func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT credentials->>'refresh_token' FROM accounts WHERE credentials->>'refresh_token' IS NOT NULL`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts`)
 	if err != nil {
 		return nil, err
 	}
@@ -1309,8 +1431,12 @@ func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) 
 
 	result := make(map[string]bool)
 	for rows.Next() {
-		var rt string
-		if err := rows.Scan(&rt); err == nil && rt != "" {
+		var raw interface{}
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		rt := credentialString(raw, "refresh_token")
+		if rt != "" {
 			result[rt] = true
 		}
 	}

@@ -660,7 +660,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 	return time.Unix(0, nano)
 }
 
-// Store 多账号管理器（PG + Redis）
+// Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
 	mu                    sync.RWMutex
 	accounts              []*Account
@@ -669,7 +669,7 @@ type Store struct {
 	testConcurrency       int64        // 批量测试并发数
 	testModel             atomic.Value // 测试连接使用的模型（string）
 	db                    *database.DB
-	tokenCache            *cache.TokenCache
+	tokenCache            cache.TokenCache
 	usageProbeMu          sync.RWMutex
 	usageProbe            func(context.Context, *Account) error
 	usageProbeBatch       atomic.Bool
@@ -688,7 +688,7 @@ type Store struct {
 }
 
 // NewStore 创建账号管理器
-func NewStore(db *database.DB, tc *cache.TokenCache, settings *database.SystemSettings) *Store {
+func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
 			MaxConcurrency:  2,
@@ -819,7 +819,7 @@ func (s *Store) SetAutoCleanFullUsage(enabled bool) {
 	s.autoCleanFullUsage.Store(enabled)
 }
 
-// Init 初始化：从 PG 加载账号
+// Init 初始化：从数据库加载账号
 func (s *Store) Init(ctx context.Context) error {
 	// 1. 从 PG 加载账号
 	if err := s.loadFromDB(ctx); err != nil {
@@ -850,7 +850,7 @@ func (s *Store) Init(ctx context.Context) error {
 	return nil
 }
 
-// loadFromDB 从 PostgreSQL 加载账号
+// loadFromDB 从数据库加载账号
 func (s *Store) loadFromDB(ctx context.Context) error {
 	rows, err := s.db.ListActive(ctx)
 	if err != nil {
@@ -1654,7 +1654,7 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// refreshAccount 刷新单个账号的 AT（带 Redis 锁和缓存）
+// refreshAccount 刷新单个账号的 AT（带缓存锁与 token 缓存）
 func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.mu.RLock()
 	rt := acc.RefreshToken
@@ -1666,7 +1666,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	expiredCooldown := acc.Status == StatusCooldown && !time.Now().Before(acc.CooldownUtil)
 	acc.mu.RUnlock()
 
-	// 1. 尝试从 Redis 缓存读取 AT
+	// 1. 尝试从缓存读取 AT
 	cachedToken, err := s.tokenCache.GetAccessToken(ctx, dbID)
 	if err == nil && cachedToken != "" {
 		acc.mu.Lock()
@@ -1691,7 +1691,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		return nil
 	}
 
-	// 2. 获取分布式刷新锁
+	// 2. 获取刷新锁
 	acquired, lockErr := s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
 	if lockErr != nil {
 		log.Printf("[账号 %d] 获取刷新锁失败: %v", dbID, lockErr)
@@ -1760,13 +1760,13 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 
-	// 5. 写入 Redis 缓存
+	// 5. 写入缓存
 	ttl := time.Until(td.ExpiresAt) - 5*time.Minute
 	if ttl > 0 {
 		_ = s.tokenCache.SetAccessToken(ctx, dbID, td.AccessToken, ttl)
 	}
 
-	// 6. 更新 PG credentials
+	// 6. 更新数据库 credentials
 	credentials := map[string]interface{}{
 		"refresh_token": td.RefreshToken,
 		"access_token":  td.AccessToken,

@@ -20,17 +20,29 @@ import type {
 } from './types'
 
 const BASE = '/api/admin'
+export const ADMIN_AUTH_REQUIRED_EVENT = 'codex2api:admin-auth-required'
+const ADMIN_AUTH_RESET_KEY = 'admin_auth_reset_at'
 
 export function getAdminKey(): string {
   return localStorage.getItem('admin_key') ?? ''
+}
+
+export function clearAdminKey() {
+  localStorage.removeItem('admin_key')
 }
 
 export function setAdminKey(key: string) {
   if (key) {
     localStorage.setItem('admin_key', key)
   } else {
-    localStorage.removeItem('admin_key')
+    clearAdminKey()
   }
+}
+
+export function resetAdminAuthState() {
+  clearAdminKey()
+  localStorage.setItem(ADMIN_AUTH_RESET_KEY, String(Date.now()))
+  window.dispatchEvent(new Event(ADMIN_AUTH_REQUIRED_EVENT))
 }
 
 function extractAdminErrorMessage(body: string, status: number): string {
@@ -68,6 +80,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   if (!res.ok) {
     const body = await res.text()
+    if (res.status === 401) {
+      resetAdminAuthState()
+    }
     throw new Error(extractAdminErrorMessage(body, res.status))
   }
 

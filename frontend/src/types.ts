@@ -97,6 +97,10 @@ export interface HealthResponse {
 export interface OpsOverviewResponse {
   updated_at: ISODateString
   uptime_seconds: number
+  database_driver: string
+  database_label: string
+  cache_driver: string
+  cache_label: string
   cpu: {
     percent: number
     cores: number
@@ -157,8 +161,13 @@ export interface SystemSettings {
   auto_clean_unauthorized: boolean
   auto_clean_rate_limited: boolean
   admin_secret: string
+  admin_auth_source: 'env' | 'database' | 'disabled' | string
   auto_clean_full_usage: boolean
   proxy_pool_enabled: boolean
+  database_driver: string
+  database_label: string
+  cache_driver: string
+  cache_label: string
 }
 
 export interface UsageStats {
