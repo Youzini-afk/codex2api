@@ -37,12 +37,15 @@ func (e *poolEntry) touch() {
 var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL
 
 // clientPoolTTL 未使用超过此时间的 Client 将被淘汰
-const clientPoolTTL = 2 * time.Minute
+const clientPoolTTL = 5 * time.Minute
+
+// clientPoolCleanupInterval 清理协程执行间隔
+const clientPoolCleanupInterval = 60 * time.Second
 
 func init() {
-	// 后台清理：每 30 秒扫描一次，淘汰过期的 Client
+	// 后台清理：每 60 秒扫描一次，淘汰过期的 Client
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(clientPoolCleanupInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			evictExpiredClients()
@@ -244,7 +247,10 @@ func ResolveSessionID(authHeader string, body []byte) string {
 // ReadSSEStream 从上游 SSE 响应读取事件流
 // callback 返回 true 表示继续读取，false 表示停止
 func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
-	buf := make([]byte, 4096)
+	// 使用 sync.Pool 复用缓冲区，减少 GC 压力
+	buf := sseBufferPool.Get().([]byte)
+	defer sseBufferPool.Put(buf)
+
 	var lineBuf []byte
 	var dataLines [][]byte
 
@@ -291,7 +297,10 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 				if bytes.HasPrefix(line, []byte("data:")) {
 					data := bytes.TrimPrefix(line, []byte("data:"))
 					data = bytes.TrimPrefix(data, []byte(" "))
-					dataLines = append(dataLines, append([]byte(nil), data...))
+					// 使用 copy 避免底层数组共享导致的内存泄漏
+					dataCopy := make([]byte, len(data))
+					copy(dataCopy, data)
+					dataLines = append(dataLines, dataCopy)
 				}
 			}
 		}
@@ -303,7 +312,9 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 					if bytes.HasPrefix(line, []byte("data:")) {
 						data := bytes.TrimPrefix(line, []byte("data:"))
 						data = bytes.TrimPrefix(data, []byte(" "))
-						dataLines = append(dataLines, append([]byte(nil), data...))
+						dataCopy := make([]byte, len(data))
+						copy(dataCopy, data)
+						dataLines = append(dataLines, dataCopy)
 					}
 				}
 				if !emitEvent() {
@@ -314,4 +325,11 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 			return err
 		}
 	}
+}
+
+// sseBufferPool 用于复用 SSE 读取缓冲区
+var sseBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 8192) // 增加到 8KB 提高读取效率
+	},
 }

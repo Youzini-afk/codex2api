@@ -102,10 +102,10 @@ func New(driver string, dsn string) (*DB, error) {
 		conn.SetMaxIdleConns(1)
 	} else {
 		// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
-		conn.SetMaxOpenConns(50)                  // 最大打开连接数（默认无限制，限制避免 PG too many connections）
-		conn.SetMaxIdleConns(25)                  // 空闲连接数（保持足够的热连接避免频繁建连）
-		conn.SetConnMaxLifetime(30 * time.Minute) // 连接最大生存时间（避免长连接僵死）
-		conn.SetConnMaxIdleTime(10 * time.Minute) // 空闲连接最大闲置时间
+		conn.SetMaxOpenConns(100)                  // 增加最大打开连接数以处理更高并发
+		conn.SetMaxIdleConns(50)                   // 增加空闲连接数以保持热连接
+		conn.SetConnMaxLifetime(60 * time.Minute)  // 增加连接最大生存时间
+		conn.SetConnMaxIdleTime(30 * time.Minute)  // 增加空闲连接最大闲置时间
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
