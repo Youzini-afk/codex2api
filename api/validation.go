@@ -4,7 +4,6 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -377,7 +376,7 @@ func MaxItems(max int) ValidationRule {
 func ChatCompletionValidationRules() map[string][]ValidationRule {
 	return map[string][]ValidationRule{
 		"model":        {Required(), TypeString(), MaxLength(64)},
-		"messages":     {Required(), TypeArray(), MinItems(1), MaxItems(4096)},
+		"messages":     {Required(), TypeArray(), MinItems(1), MaxItems(4096), ValidateMessages()},
 		"max_tokens":   {TypeNumber(), MinValue(1), MaxValue(65536)},
 		"temperature":  {TypeNumber(), Range(0, 2)},
 		"top_p":        {TypeNumber(), Range(0, 1)},
@@ -387,39 +386,47 @@ func ChatCompletionValidationRules() map[string][]ValidationRule {
 		"presence_penalty":  {TypeNumber(), Range(-2, 2)},
 		"frequency_penalty": {TypeNumber(), Range(-2, 2)},
 		"user":         {TypeString(), MaxLength(256)},
-		"reasoning_effort": {TypeString(), Enum("low", "medium", "high")},
-		"service_tier": {TypeString(), Enum("auto", "default", "fast")},
+		"reasoning_effort":  {TypeString(), Enum("low", "medium", "high")},
+		"service_tier":      {TypeString(), Enum("auto", "default", "fast")},
+		"tools":             {TypeArray(), MaxItems(128)},
+		"tool_choice":       {TypeString(), MaxLength(64)},
 	}
 }
 
 // ResponsesAPIValidationRules returns validation rules for responses API request
 func ResponsesAPIValidationRules() map[string][]ValidationRule {
 	return map[string][]ValidationRule{
-		"model":        {Required(), TypeString(), MaxLength(64)},
-		"input":        {Required(), TypeArray(), MinItems(1)},
+		"model":             {Required(), TypeString(), MaxLength(64)},
+		"input":             {Required(), TypeArray(), MinItems(1), ValidateInput()},
 		"max_output_tokens": {TypeNumber(), MinValue(1), MaxValue(65536)},
-		"temperature":  {TypeNumber(), Range(0, 2)},
-		"top_p":        {TypeNumber(), Range(0, 1)},
-		"stream":       {TypeBoolean()},
-		"stop":         {TypeString(), MaxLength(256)},
-		"user":         {TypeString(), MaxLength(256)},
-		"reasoning.effort": {TypeString(), Enum("low", "medium", "high")},
-		"service_tier": {TypeString(), Enum("auto", "default", "fast")},
-		"store":        {TypeBoolean()},
-		"truncation":   {TypeString(), Enum("auto", "disabled")},
+		"temperature":       {TypeNumber(), Range(0, 2)},
+		"top_p":             {TypeNumber(), Range(0, 1)},
+		"stream":            {TypeBoolean()},
+		"stop":              {TypeString(), MaxLength(256)},
+		"user":              {TypeString(), MaxLength(256)},
+		"reasoning.effort":  {TypeString(), Enum("low", "medium", "high")},
+		"service_tier":      {TypeString(), Enum("auto", "default", "fast")},
+		"store":             {TypeBoolean()},
+		"truncation":        {TypeString(), Enum("auto", "disabled")},
+		"tools":             {TypeArray(), MaxItems(128)},
+		"tool_choice":       {TypeString(), MaxLength(64)},
 	}
 }
 
-// ValidateChatCompletionsRequest validates a chat completions request
-func ValidateChatCompletionsRequest(body []byte) *ValidationResult {
+// ValidateChatCompletionsRequest validates a chat completions request with model validation
+func ValidateChatCompletionsRequest(body []byte, supportedModels []string) *ValidationResult {
+	rules := ChatCompletionValidationRules()
+	rules["model"] = append(rules["model"], ModelValidator(supportedModels))
 	validator := NewValidator(body)
-	return validator.ValidateRequest(ChatCompletionValidationRules())
+	return validator.ValidateRequest(rules)
 }
 
-// ValidateResponsesAPIRequest validates a responses API request
-func ValidateResponsesAPIRequest(body []byte) *ValidationResult {
+// ValidateResponsesAPIRequest validates a responses API request with model validation
+func ValidateResponsesAPIRequest(body []byte, supportedModels []string) *ValidationResult {
+	rules := ResponsesAPIValidationRules()
+	rules["model"] = append(rules["model"], ModelValidator(supportedModels))
 	validator := NewValidator(body)
-	return validator.ValidateRequest(ResponsesAPIValidationRules())
+	return validator.ValidateRequest(rules)
 }
 
 // ============ Gin Middleware ============

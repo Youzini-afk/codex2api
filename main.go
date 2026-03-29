@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/codex2api/admin"
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/config"
@@ -135,7 +136,12 @@ func main() {
 	// 6. 启动 HTTP 服务
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Recovery())
+	r.Use(api.RecoveryMiddleware())
+	r.Use(api.RequestContextMiddleware())
+	r.Use(api.VersionMiddleware())
+	r.Use(api.BodyCacheMiddleware())
+	r.Use(api.CORSMiddleware())
+	r.Use(api.SecurityHeadersMiddleware())
 	r.Use(loggerMiddleware())
 
 	// handler 不再接收 cfg.APIKeys

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
@@ -239,26 +240,16 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": gin.H{
-					"message": "缺少 Authorization 头",
-					"type":    "authentication_error",
-					"code":    "missing_api_key",
-				},
-			})
+			// Use standardized error format from api package
+			api.SendError(c, api.ErrMissingAPIKey)
 			c.Abort()
 			return
 		}
 
 		key := strings.TrimPrefix(authHeader, "Bearer ")
 		if !h.isValidKey(key) {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": gin.H{
-					"message": "无效的 API Key",
-					"type":    "authentication_error",
-					"code":    "invalid_api_key",
-				},
-			})
+			// Use standardized error format from api package
+			api.SendError(c, api.ErrInvalidAPIKey)
 			c.Abort()
 			return
 		}
@@ -303,17 +294,23 @@ func (h *Handler) Responses(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "读取请求体失败", "type": "invalid_request_error"},
-		})
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
+		return
+	}
+
+	// Validate request
+	validator := api.NewValidator(rawBody)
+	rules := api.ResponsesAPIValidationRules()
+	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	result := validator.ValidateRequest(rules)
+	if !result.Valid {
+		api.SendError(c, validator.ToAPIError())
 		return
 	}
 
 	model := gjson.GetBytes(rawBody, "model").String()
 	if model == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "model is required", "type": "invalid_request_error"},
-		})
+		api.SendMissingFieldError(c, "model")
 		return
 	}
 
@@ -656,9 +653,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "读取请求体失败", "type": "invalid_request_error"},
-		})
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
+		return
+	}
+
+	// Validate request
+	validator := api.NewValidator(rawBody)
+	rules := api.ChatCompletionValidationRules()
+	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	result := validator.ValidateRequest(rules)
+	if !result.Valid {
+		api.SendError(c, validator.ToAPIError())
 		return
 	}
 
@@ -676,9 +681,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
 	codexBody, err := TranslateRequest(rawBody)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "请求翻译失败: " + err.Error(), "type": "invalid_request_error"},
-		})
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
 
@@ -1345,12 +1348,15 @@ var SupportedModels = []string{
 
 // ListModels 列出可用模型
 func (h *Handler) ListModels(c *gin.Context) {
-	models := make([]gin.H, 0, len(SupportedModels))
+	models := make([]api.Model, 0, len(SupportedModels))
+	now := time.Now().Unix()
 	for _, id := range SupportedModels {
-		models = append(models, gin.H{"id": id, "object": "model", "owned_by": "openai"})
+		models = append(models, api.Model{
+			ID:      id,
+			Object:  "model",
+			Created: now,
+			OwnedBy: "openai",
+		})
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   models,
-	})
+	api.SendList(c, "list", models)
 }
