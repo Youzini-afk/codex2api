@@ -692,9 +692,7 @@ func (db *DB) flushLogs() {
 		return
 	}
 	batch := db.logBuf
-	db.logMu.Lock()
 	db.logBuf = make([]usageLogEntry, 0, db.logBufCap)
-	db.logMu.Unlock()
 	db.logMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
@@ -747,7 +745,31 @@ func (db *DB) flushLogs() {
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行18个参数，每批最多3640行）
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	const maxRowsPerBatch = 3000 // 安全阈值，低于3640行的理论上限
+
+	// 分批处理
+	for start := 0; start < len(batch); start += maxRowsPerBatch {
+		end := start + maxRowsPerBatch
+		if end > len(batch) {
+			end = len(batch)
+		}
+		subBatch := batch[start:end]
+
+		if err := db.batchInsertLogsChunk(ctx, subBatch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// batchInsertLogsChunk 插入单批日志（内部辅助函数）
+func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}

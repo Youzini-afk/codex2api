@@ -88,8 +88,6 @@ type Account struct {
 	TotalRequests  int64 // 累计总请求数
 	LastUsedAt     int64 // 最后使用时间（UnixNano）
 
-	// 对象池复用的预分配切片
-	recentResultsPool []uint8
 }
 
 // SchedulerBreakdown 调度评分拆解

@@ -27,13 +27,6 @@ type responseCacheEntry struct {
 	createdAt time.Time
 }
 
-// respCachePool 用于复用 entry 的切片，减少内存分配
-var respCachePool = sync.Pool{
-	New: func() interface{} {
-		return make([]json.RawMessage, 0, 32)
-	},
-}
-
 var respCache struct {
 	mu    sync.RWMutex
 	store map[string]*responseCacheEntry
@@ -47,9 +40,9 @@ func init() {
 // setResponseCache 存储响应上下文
 func setResponseCache(responseID string, items []json.RawMessage) {
 	respCache.mu.Lock()
-	// 超过上限时使用 LRU 策略清理最老的 10%
+	// 超过上限时随机清理10%的条目
+	// 注意：Go map 遍历顺序是随机的，这不是真正的 LRU，但简单高效
 	if len(respCache.store) >= responseCacheMaxItems {
-		// 简单策略：删除最老的条目直到低于阈值
 		deleteCount := responseCacheMaxItems / 10
 		for k := range respCache.store {
 			delete(respCache.store, k)
@@ -80,15 +73,15 @@ func getResponseCache(responseID string) []json.RawMessage {
 		return nil
 	}
 	if time.Since(entry.createdAt) > responseCacheTTL {
-		// 异步删除过期条目，减少锁持有时间
-		go func() {
-			respCache.mu.Lock()
-			// 双重检查
-			if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {
-				delete(respCache.store, responseID)
-			}
-			respCache.mu.Unlock()
-		}()
+		// 同步删除过期条目，避免goroutine爆炸
+		// 先释放读锁，再获取写锁进行删除
+		respCache.mu.RUnlock()
+		respCache.mu.Lock()
+		// 双重检查：确认条目仍然存在且已过期
+		if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {
+			delete(respCache.store, responseID)
+		}
+		respCache.mu.Unlock()
 		return nil
 	}
 	return entry.items

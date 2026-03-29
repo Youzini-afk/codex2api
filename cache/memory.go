@@ -80,12 +80,13 @@ func (tc *MemoryTokenCache) GetAccessToken(ctx context.Context, accountID int64)
 		return "", nil
 	}
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
-		// 异步删除过期条目
-		go func() {
-			tc.mu.Lock()
+		// 同步删除过期条目，避免删除刚刷新的 token
+		tc.mu.Lock()
+		current, ok := tc.tokens[accountID]
+		if ok && current == entry && !current.expiresAt.IsZero() && time.Now().After(current.expiresAt) {
 			delete(tc.tokens, accountID)
-			tc.mu.Unlock()
-		}()
+		}
+		tc.mu.Unlock()
 		return "", nil
 	}
 	return entry.token, nil
