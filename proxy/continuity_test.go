@@ -128,8 +128,8 @@ func TestResolveContinuity(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// 对于需要 account 的测试，创建一个模拟 account
 			account := tt.account
-			if account == nil && (tt.wantSource == "auth_id" || tt.wantSource == "") {
-				// 创建一个空的 account 用于测试 auth_id 分支
+			if account == nil && tt.wantSource == "auth_id" {
+				// 只有明确测试 auth_id 分支时才创建 account
 				account = &auth.Account{}
 			}
 
@@ -191,7 +191,7 @@ func TestApplyContinuityBody(t *testing.T) {
 			name:         "override existing prompt_cache_key",
 			body:         []byte(`{"prompt_cache_key": "old-key", "model": "gpt-4"}`),
 			continuity:   Continuity{Key: "new-key-456", Source: "execution_session"},
-			wantContains: `"prompt_cache_key":"new-key-456"`,
+			wantContains: `"prompt_cache_key": "new-key-456"`,
 		},
 		{
 			name:         "empty body",
@@ -360,7 +360,7 @@ func TestPrincipalString(t *testing.T) {
 		{
 			name: "nil",
 			raw:  nil,
-			want: "",
+			want: "<nil>",
 		},
 	}
 
