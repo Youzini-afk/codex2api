@@ -363,6 +363,24 @@ data: [DONE]
 }
 ```
 
+**curl 示例:**
+
+单个添加:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-account", "refresh_token": "rt_xxxxxxxxxxxx", "proxy_url": ""}'
+```
+
+批量添加（换行分隔）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "batch", "refresh_token": "rt_xxx1\nrt_xxx2\nrt_xxx3"}'
+```
+
 > 添加后系统自动在后台刷新 Access Token，无需手动触发。
 
 #### POST /api/admin/accounts/at
@@ -402,6 +420,15 @@ data: [DONE]
   "success": 3,
   "failed": 0
 }
+```
+
+**curl 示例:**
+
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/at \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-at", "access_token": "eyJhbGciOiJSUzI1NiIs..."}'
 ```
 
 > AT-only 账号无法自动刷新，过期后需重新添加。系统会自动解析 JWT 提取 email、plan_type 等信息。
@@ -497,6 +524,33 @@ data: [DONE]
   ```
 
 > 所有格式均自动文件内去重 + 数据库去重，已存在的 Token 计入 `duplicate` 不重复导入。
+
+**curl 示例:**
+
+导入 RT（TXT 格式）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@tokens.txt" \
+  -F "format=txt" \
+  -F "proxy_url=http://proxy.example.com:8080"
+```
+
+导入 RT（JSON 格式）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@credentials.json" \
+  -F "format=json"
+```
+
+导入 AT（AT-TXT 格式）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@access_tokens.txt" \
+  -F "format=at_txt"
+```
 
 **响应:** SSE 流式进度
 ```
