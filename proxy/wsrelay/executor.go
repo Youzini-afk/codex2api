@@ -101,7 +101,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if err := e.sendRequest(wc, wsBody, pr.RequestID); err != nil {
 		// 发送失败，尝试重连一次
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL, sessionID)
+		e.manager.RemoveConnection(account.ID(), wsURL, sessionID, proxyOverride)
 
 		wc, err = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
 		if err != nil {

@@ -15,7 +15,7 @@ func TestAcquireConnectionReusesIdleConnectedConnection(t *testing.T) {
 
 	account := &auth.Account{DBID: 42}
 	wsURL := "wss://example.test/responses"
-	key := manager.poolKey(account.ID(), wsURL, "session-1")
+	key := manager.poolKey(account.ID(), wsURL, "session-1", "")
 
 	session := NewSession(account.ID(), manager)
 	session.SetConnected(true)
@@ -43,8 +43,8 @@ func TestPoolKeyIncludesSessionKey(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
 
-	keyA := manager.poolKey(42, "wss://example.test/responses", "session-a")
-	keyB := manager.poolKey(42, "wss://example.test/responses", "session-b")
+	keyA := manager.poolKey(42, "wss://example.test/responses", "session-a", "")
+	keyB := manager.poolKey(42, "wss://example.test/responses", "session-b", "")
 	if keyA == keyB {
 		t.Fatal("expected different session keys to produce different pool keys")
 	}
@@ -54,10 +54,21 @@ func TestPoolKeyKeepsSameSessionStable(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
 
-	keyA := manager.poolKey(42, "wss://example.test/responses", "session-a")
-	keyB := manager.poolKey(42, "wss://example.test/responses", "session-a")
+	keyA := manager.poolKey(42, "wss://example.test/responses", "session-a", "http://proxy-a")
+	keyB := manager.poolKey(42, "wss://example.test/responses", "session-a", "http://proxy-a")
 	if keyA != keyB {
 		t.Fatal("expected identical session keys to produce the same pool key")
+	}
+}
+
+func TestPoolKeyIncludesProxyScope(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	keyA := manager.poolKey(42, "wss://example.test/responses", "session-a", "http://proxy-a")
+	keyB := manager.poolKey(42, "wss://example.test/responses", "session-a", "http://proxy-b")
+	if keyA == keyB {
+		t.Fatal("expected different proxies to produce different pool keys")
 	}
 }
 

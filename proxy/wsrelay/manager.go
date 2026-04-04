@@ -58,6 +58,19 @@ type WsConnection struct {
 	onDisconnected func(accountID int64)
 }
 
+func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
+	proxyURL := ""
+	if account != nil {
+		account.Mu().RLock()
+		proxyURL = account.ProxyURL
+		account.Mu().RUnlock()
+	}
+	if strings.TrimSpace(proxyOverride) != "" {
+		proxyURL = proxyOverride
+	}
+	return strings.TrimSpace(proxyURL)
+}
+
 // NewWsConnection 创建 WebSocket 连接
 func NewWsConnection(conn *websocket.Conn, session *Session, wsURL string) *WsConnection {
 	wc := &WsConnection{
@@ -280,7 +293,7 @@ func (m *Manager) AcquireConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, error) {
-	key := m.poolKey(account.ID(), wsURL, sessionKey)
+	key := m.poolKey(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
 
 	if v, ok := m.connections.Load(key); ok {
 		wc := v.(*WsConnection)
@@ -338,13 +351,7 @@ func (m *Manager) createConnection(
 	}
 
 	// 配置代理
-	account.Mu().RLock()
-	proxyURL := account.ProxyURL
-	account.Mu().RUnlock()
-
-	if proxyOverride != "" {
-		proxyURL = proxyOverride
-	}
+	proxyURL := effectiveProxyURL(account, proxyOverride)
 
 	if proxyURL != "" {
 		proxyURLParsed, err := url.Parse(proxyURL)
@@ -357,7 +364,7 @@ func (m *Manager) createConnection(
 	}
 
 	// 创建会话（先关闭旧 session 避免泄漏）
-	poolKey := m.poolKey(account.ID(), wsURL, sessionKey)
+	poolKey := m.poolKey(account.ID(), wsURL, sessionKey, proxyURL)
 	if oldSessionVal, ok := m.sessions.Load(poolKey); ok {
 		oldSession := oldSessionVal.(*Session)
 		oldSession.Close()
@@ -402,8 +409,8 @@ func (m *Manager) ReleaseConnection(wc *WsConnection) {
 }
 
 // RemoveConnection 移除连接
-func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey string) {
-	key := m.poolKey(accountID, wsURL, sessionKey)
+func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey string, proxyURL string) {
+	key := m.poolKey(accountID, wsURL, sessionKey, proxyURL)
 	if v, ok := m.connections.LoadAndDelete(key); ok {
 		wc := v.(*WsConnection)
 		wc.Close()
@@ -412,13 +419,13 @@ func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey str
 }
 
 // poolKey 生成连接池键
-func (m *Manager) poolKey(accountID int64, wsURL string, sessionKey string) string {
-	return fmt.Sprintf("%d|%s|%s", accountID, wsURL, strings.TrimSpace(sessionKey))
+func (m *Manager) poolKey(accountID int64, wsURL string, sessionKey string, proxyURL string) string {
+	return fmt.Sprintf("%d|%s|%s|%s", accountID, wsURL, strings.TrimSpace(sessionKey), strings.TrimSpace(proxyURL))
 }
 
 // GetSession 获取会话
-func (m *Manager) GetSession(accountID int64, wsURL string, sessionKey string) (*Session, bool) {
-	if v, ok := m.sessions.Load(m.poolKey(accountID, wsURL, sessionKey)); ok {
+func (m *Manager) GetSession(accountID int64, wsURL string, sessionKey string, proxyURL string) (*Session, bool) {
+	if v, ok := m.sessions.Load(m.poolKey(accountID, wsURL, sessionKey, proxyURL)); ok {
 		return v.(*Session), true
 	}
 	return nil, false
@@ -454,7 +461,7 @@ func (m *Manager) ReplaceConnection(
 	proxyOverride string,
 ) (*WsConnection, error) {
 	// 先移除旧连接
-	m.RemoveConnection(account.ID(), wsURL, sessionKey)
+	m.RemoveConnection(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
 
 	// 创建新连接
 	return m.AcquireConnection(ctx, account, wsURL, sessionKey, headers, proxyOverride)
