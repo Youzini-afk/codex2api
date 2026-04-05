@@ -726,9 +726,19 @@ type Store struct {
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
-	allowRemoteMigration atomic.Bool // 是否允许远程迁移拉取账号
+	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
+	sessionMu            sync.RWMutex
+	sessionBindings      map[string]sessionAffinity
 }
+
+type sessionAffinity struct {
+	accountID int64
+	proxyURL  string
+	expiresAt time.Time
+}
+
+const sessionAffinityTTL = 30 * time.Minute
 
 func fastSchedulerEnabledFromEnv() bool {
 	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
@@ -766,6 +776,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		tokenCache:       tc,
 		stopCh:           make(chan struct{}),
 		proxyPoolEnabled: settings.ProxyPoolEnabled,
+		sessionBindings:  make(map[string]sessionAffinity),
 	}
 	s.testModel.Store(settings.TestModel)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
@@ -1276,8 +1287,120 @@ func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 	return best
 }
 
+// BindSessionAffinity 记录会话与账号/代理的亲和关系。
+func (s *Store) BindSessionAffinity(key string, account *Account, proxyURL string) {
+	s.bindSessionAffinity(key, account, proxyURL)
+}
+
+func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL string) {
+	if s == nil || account == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+
+	s.sessionMu.Lock()
+	if s.sessionBindings == nil {
+		s.sessionBindings = make(map[string]sessionAffinity)
+	}
+	s.sessionBindings[key] = sessionAffinity{
+		accountID: account.DBID,
+		proxyURL:  strings.TrimSpace(proxyURL),
+		expiresAt: time.Now().Add(sessionAffinityTTL),
+	}
+	s.sessionMu.Unlock()
+}
+
+// UnbindSessionAffinity removes a session binding when it still points to the failed account.
+func (s *Store) UnbindSessionAffinity(key string, accountID int64) {
+	if s == nil || accountID == 0 {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+
+	s.sessionMu.Lock()
+	if binding, ok := s.sessionBindings[key]; ok && binding.accountID == accountID {
+		delete(s.sessionBindings, key)
+	}
+	s.sessionMu.Unlock()
+}
+
+// NextForSession 优先复用已绑定的账号和代理，失败时回退到普通选号。
+func (s *Store) NextForSession(key string, exclude map[int64]bool) (*Account, string) {
+	if s == nil {
+		return nil, ""
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return s.NextExcluding(exclude), ""
+	}
+
+	now := time.Now()
+	s.sessionMu.RLock()
+	binding, ok := s.sessionBindings[key]
+	s.sessionMu.RUnlock()
+
+	if ok {
+		if !binding.expiresAt.After(now) {
+			s.sessionMu.Lock()
+			if current, exists := s.sessionBindings[key]; exists && !current.expiresAt.After(now) {
+				delete(s.sessionBindings, key)
+			}
+			s.sessionMu.Unlock()
+		} else if acc := s.takeByIDExcluding(binding.accountID, exclude); acc != nil {
+			return acc, binding.proxyURL
+		}
+	}
+
+	return s.NextExcluding(exclude), ""
+}
+
+func (s *Store) takeByIDExcluding(id int64, exclude map[int64]bool) *Account {
+	if s == nil || id == 0 {
+		return nil
+	}
+	if exclude != nil && exclude[id] {
+		return nil
+	}
+
+	s.mu.RLock()
+	var target *Account
+	for _, acc := range s.accounts {
+		if acc != nil && acc.DBID == id {
+			target = acc
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if target == nil || !target.IsAvailable() {
+		return nil
+	}
+
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
+	now := time.Now()
+	_, _, limit, available := target.fastSchedulerSnapshot(maxConcurrency, now)
+	if !available || limit <= 0 {
+		return nil
+	}
+	if !tryAcquireAccount(target, limit) {
+		return nil
+	}
+	return target
+}
+
 // WaitForAvailable 等待可用账号（带超时的请求排队）
 func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Account {
+	acc, _ := s.WaitForSessionAvailable(ctx, "", timeout, nil)
+	return acc
+}
+
+// WaitForSessionAvailable waits for a session-preferred account and proxy pair.
+func (s *Store) WaitForSessionAvailable(ctx context.Context, key string, timeout time.Duration, exclude map[int64]bool) (*Account, string) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
@@ -1288,13 +1411,13 @@ func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Ac
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return nil, ""
 		case <-deadline.C:
-			return nil
+			return nil, ""
 		default:
-			acc := s.Next()
+			acc, proxyURL := s.NextForSession(key, exclude)
 			if acc != nil {
-				return acc
+				return acc, proxyURL
 			}
 			// 等待一下再重试（指数退避，最大 500ms）
 			backoffTimer.Reset(backoff)
@@ -1304,9 +1427,9 @@ func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Ac
 					backoff *= 2
 				}
 			case <-ctx.Done():
-				return nil
+				return nil, ""
 			case <-deadline.C:
-				return nil
+				return nil, ""
 			}
 		}
 	}

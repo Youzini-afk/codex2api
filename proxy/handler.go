@@ -36,6 +36,13 @@ type Handler struct {
 	dbKeysUntil time.Time
 }
 
+func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool) (*auth.Account, string) {
+	if h == nil || h.store == nil {
+		return nil, ""
+	}
+	return h.store.NextForSession(sessionID, exclude)
+}
+
 type usageLimitDetails struct {
 	message         string
 	planType        string
@@ -426,7 +433,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	rawBody = normalizeServiceTierField(rawBody)
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
-	sessionID := ResolveSessionID(c.GetHeader("Authorization"), rawBody)
+	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -444,10 +451,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account := h.store.NextExcluding(excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
-			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -461,7 +468,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := h.store.NextProxy()
+		proxyURL := stickyProxyURL
+		if proxyURL == "" {
+			proxyURL = h.store.NextProxy()
+		}
 		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -487,6 +497,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(sessionID, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
@@ -510,6 +521,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(sessionID, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
@@ -669,6 +681,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			continue
 		}
+
+		h.store.BindSessionAffinity(sessionID, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
@@ -798,7 +812,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	sessionID := ResolveSessionID(c.GetHeader("Authorization"), codexBody)
+	sessionID := ResolveSessionID(c.Request.Header, codexBody)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -808,10 +822,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account := h.store.NextExcluding(excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
-			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -825,7 +839,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := h.store.NextProxy()
+		proxyURL := stickyProxyURL
+		if proxyURL == "" {
+			proxyURL = h.store.NextProxy()
+		}
 		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -851,6 +868,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(sessionID, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
@@ -874,6 +892,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(sessionID, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
@@ -1038,6 +1057,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			continue
 		}
+
+		h.store.BindSessionAffinity(sessionID, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
