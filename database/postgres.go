@@ -1673,9 +1673,9 @@ func (db *DB) CountAll(ctx context.Context) (int, error) {
 	return count, err
 }
 
-// GetAllRefreshTokens 获取所有已存在的 refresh_token（用于导入去重）
+// GetAllRefreshTokens 获取所有已存在的 refresh_token（用于导入去重，排除已删除账号）
 func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts WHERE status <> 'deleted'`)
 	if err != nil {
 		return nil, err
 	}
@@ -1712,9 +1712,9 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 	)
 }
 
-// GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重）
+// GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重，排除已删除账号）
 func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts WHERE status <> 'deleted'`)
 	if err != nil {
 		return nil, err
 	}
@@ -1745,13 +1745,21 @@ func (db *DB) InsertAccountEvent(ctx context.Context, accountID int64, eventType
 	return err
 }
 
-// InsertAccountEventAsync 异步插入账号事件（不阻塞调用方）
+// InsertAccountEventAsync 异步插入账号事件（不阻塞调用方，SQLite 下带重试）
 func (db *DB) InsertAccountEventAsync(accountID int64, eventType string, source string) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := db.InsertAccountEvent(ctx, accountID, eventType, source); err != nil {
-			log.Printf("[账号事件] 记录失败: account=%d type=%s source=%s err=%v", accountID, eventType, source, err)
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err = db.InsertAccountEvent(ctx, accountID, eventType, source)
+			cancel()
+			if err == nil {
+				return
+			}
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+		}
+		if err != nil {
+			log.Printf("[账号事件] 记录失败（已重试3次）: account=%d type=%s source=%s err=%v", accountID, eventType, source, err)
 		}
 	}()
 }

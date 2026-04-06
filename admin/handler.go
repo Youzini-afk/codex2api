@@ -97,9 +97,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
+	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.POST("/accounts/batch-test", h.BatchTest)
+	api.POST("/accounts/batch-reset-status", h.BatchResetStatus)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
 	api.POST("/accounts/clean-error", h.CleanError)
@@ -128,6 +130,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// OAuth 授权流程
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
 	api.POST("/oauth/exchange-code", h.ExchangeOAuthCode)
+	api.GET("/oauth/poll-callback", h.PollOAuthCallback)
+
+	// OAuth 回调端点（无需 admin 鉴权，供 OpenAI 重定向调用）
+	r.GET("/auth/callback", h.OAuthCallback)
 }
 
 // adminAuthMiddleware 管理接口鉴权中间件（增强版，增加安全审计日志）
@@ -912,6 +918,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dedupeCancel()
 
+	log.Printf("导入解析: 文件内 %d 条, 去重后 %d 条（%d 条文件内重复）", len(tokens), len(unique), len(tokens)-len(unique))
+
 	existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
 	if err != nil {
 		log.Printf("查询已有 RT 失败: %v", err)
@@ -948,6 +956,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	}
 
 	total := len(unique)
+
+	log.Printf("导入去重: 总计 %d 条, 数据库已存在 %d 条, 待导入 %d 条", total, duplicateCount, len(newTokens))
 
 	if len(newTokens) == 0 {
 		c.JSON(http.StatusOK, gin.H{
@@ -1382,6 +1392,53 @@ func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	} else {
 		writeMessage(c, http.StatusOK, "账号已解锁")
 	}
+}
+
+// ResetAccountStatus 重置单个账号状态为正常
+func (h *Handler) ResetAccountStatus(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+
+	h.store.ClearCooldown(acc)
+	writeMessage(c, http.StatusOK, "账号状态已重置")
+}
+
+// BatchResetStatus 批量重置账号状态为正常
+func (h *Handler) BatchResetStatus(c *gin.Context) {
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要重置的账号 ID 列表")
+		return
+	}
+
+	success := 0
+	fail := 0
+	for _, id := range req.IDs {
+		acc := h.store.FindByID(id)
+		if acc == nil {
+			fail++
+			continue
+		}
+		h.store.ClearCooldown(acc)
+		success++
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已重置 %d 个账号状态", success),
+		"success": success,
+		"failed":  fail,
+	})
 }
 
 func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {

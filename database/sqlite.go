@@ -11,7 +11,7 @@ import (
 func (db *DB) configureSQLite(ctx context.Context) error {
 	pragmas := []string{
 		`PRAGMA journal_mode=WAL;`,
-		`PRAGMA busy_timeout=5000;`,
+		`PRAGMA busy_timeout=15000;`,
 		`PRAGMA synchronous=NORMAL;`,
 	}
 	for _, pragma := range pragmas {

@@ -12,6 +12,8 @@ import (
 func TestAcquireConnectionReusesIdleConnectedConnection(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
+	// 测试环境无真实 WebSocket 连接，注入探活函数跳过 Ping
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
 
 	account := &auth.Account{DBID: 42}
 	wsURL := "wss://example.test/responses"
@@ -126,6 +128,7 @@ func TestCanReuseConnection(t *testing.T) {
 func TestAcquireConnectionWaitsWhileSessionHasPendingRequest(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
 
 	account := &auth.Account{DBID: 42}
 	wsURL := "wss://example.test/responses"
