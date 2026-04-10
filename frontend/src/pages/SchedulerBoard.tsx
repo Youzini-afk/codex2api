@@ -14,12 +14,15 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Select } from '@/components/ui/select'
 
+const DEFAULT_PAGE_SIZE = 12
+const PAGE_SIZE_OPTIONS = [12, 20, 50, 100]
+
 export default function SchedulerBoard() {
   const { t } = useTranslation()
   const [tierFilter, setTierFilter] = useState('all')
   const [sortBy, setSortBy] = useState('risk')
   const [page, setPage] = useState(1)
-  const PAGE_SIZE = 12
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
 
   const loadSchedulerData = useCallback(async () => {
     const [overview, accountsResponse] = await Promise.all([
@@ -118,13 +121,25 @@ export default function SchedulerBoard() {
       })
   }, [accounts, tierFilter, sortBy])
 
-  const totalPages = Math.max(1, Math.ceil(spotlightAccounts.length / PAGE_SIZE))
-  const pagedAccounts = spotlightAccounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const totalPages = Math.max(1, Math.ceil(spotlightAccounts.length / pageSize))
+  const currentPage = Math.min(page, totalPages)
+  const pagedAccounts = spotlightAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize)
 
   // 筛选/排序变更时重置页码
   useEffect(() => {
     setPage(1)
   }, [tierFilter, sortBy])
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages)
+    }
+  }, [page, totalPages])
+
+  const handlePageSizeChange = useCallback((nextPageSize: number) => {
+    setPageSize(nextPageSize)
+    setPage(1)
+  }, [])
 
   return (
     <StateShell
@@ -270,17 +285,17 @@ export default function SchedulerBoard() {
                       </div>
                     ))}
                     </div>
-                    {totalPages > 1 && (
-                      <div className="mt-4">
-                        <Pagination
-                          page={page}
-                          totalPages={totalPages}
-                          onPageChange={setPage}
-                          totalItems={spotlightAccounts.length}
-                          pageSize={PAGE_SIZE}
-                        />
-                      </div>
-                    )}
+                    <div className="mt-4">
+                      <Pagination
+                        page={currentPage}
+                        totalPages={totalPages}
+                        onPageChange={setPage}
+                        totalItems={spotlightAccounts.length}
+                        pageSize={pageSize}
+                        pageSizeOptions={PAGE_SIZE_OPTIONS}
+                        onPageSizeChange={handlePageSizeChange}
+                      />
+                    </div>
                   </>
                 ) : (
                   <div className="mt-5 rounded-2xl border border-border bg-white/40 dark:bg-white/5 px-4 py-4 text-sm text-muted-foreground">

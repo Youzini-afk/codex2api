@@ -31,6 +31,8 @@
     "page": "Page",
     "prev": "Previous",
     "next": "Next",
+    "pageSize": "Rows",
+    "pageSizeOption": "{{size}} / page",
     "selected": "{{count}} selected",
     "pageInfo": "Page {{current}} / {{total}}",
     "showingRange": "Showing {{start}}-{{end}} of {{total}}",

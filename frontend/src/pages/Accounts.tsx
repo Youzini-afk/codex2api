@@ -30,15 +30,15 @@ import AccountUsageModal from '../components/AccountUsageModal'
 
 export default function Accounts() {
   const { t } = useTranslation()
+  const pageSizeOptions = [10, 20, 50, 100]
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'plus' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
-
-  const PAGE_SIZE = 20
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: '',
     proxy_url: '',
@@ -163,9 +163,16 @@ export default function Accounts() {
     return sortDir === 'asc' ? diff : -diff
   })
 
-  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / PAGE_SIZE))
-  const pagedAccounts = sortedAccounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize))
+  const currentPage = Math.min(page, totalPages)
+  const pagedAccounts = sortedAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize)
   const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages)
+    }
+  }, [page, totalPages])
 
   const toggleSelect = (id: number) => {
     setSelected((prev) => {
@@ -1127,11 +1134,16 @@ export default function Accounts() {
                 </Table>
               </div>
               <Pagination
-                page={page}
+                page={currentPage}
                 totalPages={totalPages}
                 onPageChange={setPage}
-                totalItems={accounts.length}
-                pageSize={PAGE_SIZE}
+                totalItems={sortedAccounts.length}
+                pageSize={pageSize}
+                pageSizeOptions={pageSizeOptions}
+                onPageSizeChange={(nextPageSize) => {
+                  setPageSize(nextPageSize)
+                  setPage(1)
+                }}
               />
             </StateShell>
           </CardContent>
