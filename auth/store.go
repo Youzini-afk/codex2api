@@ -2380,8 +2380,9 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
 	}
 
-	// 3. 执行 RT 刷新
-	td, info, err := RefreshWithRetry(ctx, rt, proxy)
+	// 3. 执行 RT 刷新（Resin 启用时传入 DBID 用于粘性代理）
+	resinID := fmt.Sprintf("%d", dbID)
+	td, info, err := RefreshWithRetry(ctx, rt, proxy, resinID)
 	if err != nil {
 		if isNonRetryable(err) {
 			acc.mu.Lock()

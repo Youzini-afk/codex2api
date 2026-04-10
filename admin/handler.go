@@ -1773,6 +1773,8 @@ type settingsResponse struct {
 	CacheLabel                       string `json:"cache_label"`
 	ExpiredCleaned                   int    `json:"expired_cleaned,omitempty"`
 	ModelMapping                     string `json:"model_mapping"`
+	ResinURL                         string `json:"resin_url"`
+	ResinPlatformName                string `json:"resin_platform_name"`
 }
 
 type updateSettingsReq struct {
@@ -1797,6 +1799,8 @@ type updateSettingsReq struct {
 	MaxRetries                       *int    `json:"max_retries"`
 	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
 	ModelMapping                     *string `json:"model_mapping"`
+	ResinURL                         *string `json:"resin_url"`
+	ResinPlatformName                *string `json:"resin_platform_name"`
 }
 
 // GetSettings 获取当前系统设置
@@ -1806,8 +1810,13 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	dbSettings, _ := h.db.GetSystemSettings(ctx)
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
+	var resinURL, resinPlatformName string
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
+	}
+	if dbSettings != nil {
+		resinURL = dbSettings.ResinURL
+		resinPlatformName = dbSettings.ResinPlatformName
 	}
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -1836,6 +1845,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CacheDriver:                      h.cacheDriver,
 		CacheLabel:                       h.cacheLabel,
 		ModelMapping:                     h.store.GetModelMapping(),
+		ResinURL:                         resinURL,
+		ResinPlatformName:                resinPlatformName,
 	})
 }
 
@@ -2037,6 +2048,28 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: model_mapping")
 	}
 
+	// Resin 粘性代理池配置
+	resinURL := ""
+	resinPlatformName := ""
+	if existSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && existSettings != nil {
+		resinURL = existSettings.ResinURL
+		resinPlatformName = existSettings.ResinPlatformName
+	}
+	if req.ResinURL != nil {
+		resinURL = *req.ResinURL
+		log.Printf("设置已更新: resin_url")
+	}
+	if req.ResinPlatformName != nil {
+		resinPlatformName = *req.ResinPlatformName
+		log.Printf("设置已更新: resin_platform_name")
+	}
+	if req.ResinURL != nil || req.ResinPlatformName != nil {
+		proxy.SetResinConfig(&proxy.ResinConfig{
+			BaseURL:      resinURL,
+			PlatformName: resinPlatformName,
+		})
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2060,6 +2093,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxRetries:                       h.store.GetMaxRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                     h.store.GetModelMapping(),
+		ResinURL:                         resinURL,
+		ResinPlatformName:                resinPlatformName,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2106,6 +2141,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CacheLabel:                       h.cacheLabel,
 		ExpiredCleaned:                   expiredCleaned,
 		ModelMapping:                     h.store.GetModelMapping(),
+		ResinURL:                         resinURL,
+		ResinPlatformName:                resinPlatformName,
 	})
 }
 

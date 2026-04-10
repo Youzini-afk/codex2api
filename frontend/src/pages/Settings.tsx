@@ -153,6 +153,8 @@ export default function Settings() {
     cache_driver: 'redis',
     cache_label: 'Redis',
     model_mapping: '{}',
+    resin_url: '',
+    resin_platform_name: '',
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
@@ -708,6 +710,37 @@ export default function Settings() {
               value={settingsForm.model_mapping}
               onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
             />
+          </CardContent>
+        </Card>
+
+        {/* Resin Proxy Pool */}
+        <Card className="mb-4">
+          <CardContent className="p-6">
+            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings.resinTitle')}</h3>
+            <p className="text-xs text-muted-foreground mb-4">{t('settings.resinDesc')}</p>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4">
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.resinUrl')}</label>
+                <Input
+                  placeholder="http://127.0.0.1:2260/your-token"
+                  value={settingsForm.resin_url}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_url: e.target.value }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.resinUrlDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.resinPlatformName')}</label>
+                <Input
+                  placeholder="codex2api"
+                  value={settingsForm.resin_platform_name}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_platform_name: e.target.value }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.resinPlatformNameDesc')}</p>
+              </div>
+            </div>
+            <Button className="mt-4" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+              {savingSettings ? t('common.saving') : t('settings.saveSettings')}
+            </Button>
           </CardContent>
         </Card>
 

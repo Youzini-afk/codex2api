@@ -34,7 +34,7 @@ export default function Accounts() {
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
-  const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'team' | 'free'>('all')
+  const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'plus' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
@@ -916,7 +916,7 @@ export default function Accounts() {
             />
           </div>
           <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
-            {(['all', 'pro', 'team', 'free'] as const).map((key) => (
+            {(['all', 'pro', 'plus', 'team', 'free'] as const).map((key) => (
               <button
                 key={key}
                 onClick={() => { setPlanFilter(key); setPage(1) }}

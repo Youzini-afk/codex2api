@@ -122,6 +122,18 @@ func main() {
 		log.Printf("%s 连接池: max_conns=%d", cfg.Database.Label(), settings.PgMaxConns)
 	}
 
+	// 4c. 初始化 Resin 粘性代理池
+	if settings.ResinURL != "" && settings.ResinPlatformName != "" {
+		proxy.SetResinConfig(&proxy.ResinConfig{
+			BaseURL:      settings.ResinURL,
+			PlatformName: settings.ResinPlatformName,
+		})
+		// 注入 Resin URL 装饰器到 auth 包（避免 auth → proxy 循环依赖）
+		auth.ResinRequestDecorator = func(targetURL, accountID string) string {
+			return proxy.BuildReverseProxyURL(targetURL)
+		}
+	}
+
 	// 5. 初始化账号管理器
 	store := auth.NewStore(db, tc, settings)
 
