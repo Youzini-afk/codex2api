@@ -41,9 +41,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM alpine:3.19
 
 RUN apk --no-cache add ca-certificates tzdata
+RUN mkdir -p /data /app/logs
 
 COPY --from=go-builder /codex2api /usr/local/bin/codex2api
 
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD sh -c 'wget -q -O - "http://127.0.0.1:${PORT:-${CODEX_PORT:-8080}}/health" >/dev/null || exit 1'
 
 ENTRYPOINT ["/usr/local/bin/codex2api"]

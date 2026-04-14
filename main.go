@@ -103,7 +103,15 @@ func main() {
 	case "memory":
 		tc = cache.NewMemory(redisPoolSize)
 	default:
-		tc, err = cache.NewRedis(cfg.Cache.Redis.Addr, cfg.Cache.Redis.Password, cfg.Cache.Redis.DB, redisPoolSize)
+		if cfg.Cache.Redis.URL != "" && strings.Contains(cfg.Cache.Redis.URL, "://") {
+			tc, err = cache.NewRedisFromURL(cfg.Cache.Redis.URL, redisPoolSize)
+		} else {
+			addr := cfg.Cache.Redis.Addr
+			if addr == "" {
+				addr = cfg.Cache.Redis.URL
+			}
+			tc, err = cache.NewRedis(addr, cfg.Cache.Redis.Password, cfg.Cache.Redis.DB, redisPoolSize)
+		}
 		if err != nil {
 			log.Fatalf("缓存初始化失败: %v", err)
 		}
@@ -113,7 +121,11 @@ func main() {
 	case "memory":
 		log.Printf("%s 缓存已启用: pool_size=%d", cfg.Cache.Label(), redisPoolSize)
 	default:
-		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), cfg.Cache.Redis.Addr, redisPoolSize)
+		redisTarget := cfg.Cache.Redis.Addr
+		if redisTarget == "" {
+			redisTarget = cfg.Cache.Redis.URL
+		}
+		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), redisTarget, redisPoolSize)
 	}
 
 	// 4b. 应用数据库连接池设置

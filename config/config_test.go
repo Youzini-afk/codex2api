@@ -3,27 +3,7 @@ package config
 import "testing"
 
 func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
-	keys := []string{
-		"CODEX_PORT",
-		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
-		"PORT",
-		"ADMIN_SECRET",
-		"DATABASE_DRIVER",
-		"DATABASE_PATH",
-		"DATABASE_HOST",
-		"DATABASE_PORT",
-		"DATABASE_USER",
-		"DATABASE_PASSWORD",
-		"DATABASE_NAME",
-		"DATABASE_SSLMODE",
-		"CACHE_DRIVER",
-		"REDIS_ADDR",
-		"REDIS_PASSWORD",
-		"REDIS_DB",
-	}
-	for _, key := range keys {
-		t.Setenv(key, "")
-	}
+	resetConfigEnv(t)
 
 	// 不设置 DATABASE_DRIVER / CACHE_DRIVER，只提供各自默认驱动所需的最小参数。
 	t.Setenv("DATABASE_HOST", "postgres")
@@ -55,27 +35,7 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 }
 
 func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
-	keys := []string{
-		"CODEX_PORT",
-		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
-		"PORT",
-		"ADMIN_SECRET",
-		"DATABASE_DRIVER",
-		"DATABASE_PATH",
-		"DATABASE_HOST",
-		"DATABASE_PORT",
-		"DATABASE_USER",
-		"DATABASE_PASSWORD",
-		"DATABASE_NAME",
-		"DATABASE_SSLMODE",
-		"CACHE_DRIVER",
-		"REDIS_ADDR",
-		"REDIS_PASSWORD",
-		"REDIS_DB",
-	}
-	for _, key := range keys {
-		t.Setenv(key, "")
-	}
+	resetConfigEnv(t)
 
 	t.Setenv("DATABASE_DRIVER", "sqlite")
 	t.Setenv("DATABASE_PATH", "/data/codex2api.db")
@@ -98,27 +58,7 @@ func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
 }
 
 func TestLoadReadsAdminSecretFromEnv(t *testing.T) {
-	keys := []string{
-		"CODEX_PORT",
-		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
-		"PORT",
-		"ADMIN_SECRET",
-		"DATABASE_DRIVER",
-		"DATABASE_PATH",
-		"DATABASE_HOST",
-		"DATABASE_PORT",
-		"DATABASE_USER",
-		"DATABASE_PASSWORD",
-		"DATABASE_NAME",
-		"DATABASE_SSLMODE",
-		"CACHE_DRIVER",
-		"REDIS_ADDR",
-		"REDIS_PASSWORD",
-		"REDIS_DB",
-	}
-	for _, key := range keys {
-		t.Setenv(key, "")
-	}
+	resetConfigEnv(t)
 
 	t.Setenv("DATABASE_HOST", "postgres")
 	t.Setenv("REDIS_ADDR", "redis:6379")
@@ -135,27 +75,7 @@ func TestLoadReadsAdminSecretFromEnv(t *testing.T) {
 }
 
 func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
-	keys := []string{
-		"CODEX_PORT",
-		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
-		"PORT",
-		"ADMIN_SECRET",
-		"DATABASE_DRIVER",
-		"DATABASE_PATH",
-		"DATABASE_HOST",
-		"DATABASE_PORT",
-		"DATABASE_USER",
-		"DATABASE_PASSWORD",
-		"DATABASE_NAME",
-		"DATABASE_SSLMODE",
-		"CACHE_DRIVER",
-		"REDIS_ADDR",
-		"REDIS_PASSWORD",
-		"REDIS_DB",
-	}
-	for _, key := range keys {
-		t.Setenv(key, "")
-	}
+	resetConfigEnv(t)
 
 	t.Setenv("DATABASE_HOST", "postgres")
 	t.Setenv("REDIS_ADDR", "redis:6379")
@@ -168,5 +88,134 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 
 	if got := cfg.MaxRequestBodySize; got != 64*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 64*1024*1024)
+	}
+}
+
+func TestLoadUsesZeaburFallbacks(t *testing.T) {
+	resetConfigEnv(t)
+
+	t.Setenv("ZEABUR_PROJECT_ID", "project-123")
+	t.Setenv("PORT", "5000")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+
+	if got := cfg.Port; got != 5000 {
+		t.Fatalf("Port = %d, want %d", got, 5000)
+	}
+	if got := cfg.Database.Driver; got != "sqlite" {
+		t.Fatalf("Database.Driver = %q, want %q", got, "sqlite")
+	}
+	if got := cfg.Database.Path; got != "/data/codex2api.db" {
+		t.Fatalf("Database.Path = %q, want %q", got, "/data/codex2api.db")
+	}
+	if got := cfg.Cache.Driver; got != "memory" {
+		t.Fatalf("Cache.Driver = %q, want %q", got, "memory")
+	}
+}
+
+func TestLoadSupportsConnectionStringEnvs(t *testing.T) {
+	resetConfigEnv(t)
+
+	t.Setenv("DATABASE_URL", "postgresql://demo:secret@pg.internal:6543/codex?sslmode=require")
+	t.Setenv("REDIS_URL", "redis://:redispass@redis.internal:6380/2")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+
+	if got := cfg.Database.Driver; got != "postgres" {
+		t.Fatalf("Database.Driver = %q, want %q", got, "postgres")
+	}
+	if got := cfg.Database.DSN(); got != "postgresql://demo:secret@pg.internal:6543/codex?sslmode=require" {
+		t.Fatalf("Database.DSN() = %q", got)
+	}
+	if got := cfg.Database.Host; got != "pg.internal" {
+		t.Fatalf("Database.Host = %q, want %q", got, "pg.internal")
+	}
+	if got := cfg.Database.Port; got != 6543 {
+		t.Fatalf("Database.Port = %d, want %d", got, 6543)
+	}
+	if got := cfg.Database.User; got != "demo" {
+		t.Fatalf("Database.User = %q, want %q", got, "demo")
+	}
+	if got := cfg.Database.DBName; got != "codex" {
+		t.Fatalf("Database.DBName = %q, want %q", got, "codex")
+	}
+	if got := cfg.Database.SSLMode; got != "require" {
+		t.Fatalf("Database.SSLMode = %q, want %q", got, "require")
+	}
+
+	if got := cfg.Cache.Driver; got != "redis" {
+		t.Fatalf("Cache.Driver = %q, want %q", got, "redis")
+	}
+	if got := cfg.Cache.Redis.URL; got != "redis://:redispass@redis.internal:6380/2" {
+		t.Fatalf("Cache.Redis.URL = %q", got)
+	}
+	if got := cfg.Cache.Redis.Addr; got != "redis.internal:6380" {
+		t.Fatalf("Cache.Redis.Addr = %q, want %q", got, "redis.internal:6380")
+	}
+	if got := cfg.Cache.Redis.Password; got != "redispass" {
+		t.Fatalf("Cache.Redis.Password = %q, want %q", got, "redispass")
+	}
+	if got := cfg.Cache.Redis.DB; got != 2 {
+		t.Fatalf("Cache.Redis.DB = %d, want %d", got, 2)
+	}
+}
+
+func resetConfigEnv(t *testing.T) {
+	t.Helper()
+
+	keys := []string{
+		"CODEX_PORT",
+		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"PORT",
+		"ADMIN_SECRET",
+		"DATABASE_DRIVER",
+		"DATABASE_URL",
+		"DATABASE_PATH",
+		"DATABASE_HOST",
+		"DATABASE_PORT",
+		"DATABASE_USER",
+		"DATABASE_PASSWORD",
+		"DATABASE_NAME",
+		"DATABASE_SSLMODE",
+		"POSTGRES_CONNECTION_STRING",
+		"POSTGRESQL_CONNECTION_STRING",
+		"POSTGRES_URL",
+		"POSTGRESQL_URL",
+		"POSTGRES_HOST",
+		"POSTGRESQL_HOST",
+		"POSTGRES_PORT",
+		"POSTGRESQL_PORT",
+		"POSTGRES_USER",
+		"POSTGRES_USERNAME",
+		"POSTGRESQL_USER",
+		"POSTGRESQL_USERNAME",
+		"POSTGRES_PASSWORD",
+		"POSTGRESQL_PASSWORD",
+		"POSTGRES_DB",
+		"POSTGRES_DATABASE",
+		"POSTGRESQL_DB",
+		"POSTGRESQL_DATABASE",
+		"POSTGRES_SSLMODE",
+		"POSTGRESQL_SSLMODE",
+		"CACHE_DRIVER",
+		"REDIS_ADDR",
+		"REDIS_HOST",
+		"REDIS_PORT",
+		"REDIS_PASSWORD",
+		"REDIS_DB",
+		"REDIS_URL",
+		"REDIS_CONNECTION_STRING",
+		"CACHE_URL",
+		"ZEABUR_PROJECT_ID",
+		"ZEABUR_SERVICE_NAME",
+	}
+	for _, key := range keys {
+		t.Setenv(key, "")
 	}
 }

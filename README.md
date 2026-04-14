@@ -38,6 +38,14 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 | SQLite 本地源码构建 | `docker-compose.sqlite.local.yml` | 本地改代码后验证 SQLite 轻量模式 |
 | 本地开发 | `go run .` + `npm run dev` | 前后端联调与调试 |
 
+### Zeabur 自动部署
+
+- 推荐直接使用仓库根目录的 `Dockerfile` 部署
+- 如果你只部署单个应用服务，程序会在检测到 Zeabur 环境且未配置 PostgreSQL / Redis 时，自动回退到 `SQLite + Memory`
+- 建议在 Zeabur 中挂载持久化目录到 `/data`，SQLite 默认会写入 `/data/codex2api.db`
+- 如需托管版 PostgreSQL / Redis，可直接绑定 `DATABASE_URL=${POSTGRES_CONNECTION_STRING}` 与 `REDIS_URL=${REDIS_CONNECTION_STRING}`
+- 可参考示例文件 `.env.zeabur.example`
+
 ### 部署命令速查
 
 标准镜像版：
@@ -180,6 +188,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `TZ` | 时区，例如 `Asia/Shanghai` |
 
 标准版 `.env.example` 已显式声明 `DATABASE_DRIVER=postgres` 与 `CACHE_DRIVER=redis`；SQLite 轻量版请改用 `.env.sqlite.example`。
+Zeabur 场景可参考 `.env.zeabur.example`，也支持直接读取 `DATABASE_URL`、`POSTGRES_CONNECTION_STRING`、`REDIS_URL`、`REDIS_CONNECTION_STRING` 以及 Zeabur 常见的分拆注入变量。
 
 ### 业务运行配置
 

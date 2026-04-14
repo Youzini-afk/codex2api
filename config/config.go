@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,20 +12,24 @@ import (
 
 // DatabaseConfig 数据库核心配置。
 type DatabaseConfig struct {
-	Driver   string
-	Path     string
-	Host     string
-	Port     int
-	User     string
-	Password string
-	DBName   string
-	SSLMode  string
+	Driver           string
+	ConnectionString string
+	Path             string
+	Host             string
+	Port             int
+	User             string
+	Password         string
+	DBName           string
+	SSLMode          string
 }
 
 // DSN 返回当前驱动的连接字符串。
 func (d *DatabaseConfig) DSN() string {
 	if strings.EqualFold(d.Driver, "sqlite") {
 		return d.Path
+	}
+	if strings.TrimSpace(d.ConnectionString) != "" {
+		return d.ConnectionString
 	}
 	sslMode := d.SSLMode
 	if sslMode == "" {
@@ -47,6 +52,7 @@ type RedisConfig struct {
 	Addr     string
 	Password string
 	DB       int
+	URL      string
 }
 
 // CacheConfig 缓存核心配置。
@@ -86,6 +92,7 @@ func Load(envPath string) (*Config, error) {
 		Port:               8080,
 		MaxRequestBodySize: 32 * 1024 * 1024,
 	}
+	zeaburEnv := isZeaburEnvironment()
 
 	// Web服务端口
 	if port := os.Getenv("CODEX_PORT"); port != "" {
@@ -105,30 +112,71 @@ func Load(envPath string) (*Config, error) {
 		cfg.UseWebsocket = true
 	}
 
+	dbDriverEnv := normalizeDriver(os.Getenv("DATABASE_DRIVER"), "")
+	cacheDriverEnv := normalizeDriver(os.Getenv("CACHE_DRIVER"), "")
+
 	// 数据库配置
-	cfg.Database.Driver = normalizeDriver(os.Getenv("DATABASE_DRIVER"), "postgres")
-	cfg.Database.Path = strings.TrimSpace(os.Getenv("DATABASE_PATH"))
-	cfg.Database.Host = os.Getenv("DATABASE_HOST")
-	if v := os.Getenv("DATABASE_PORT"); v != "" {
+	cfg.Database.ConnectionString = firstNonEmptyEnv(
+		"DATABASE_URL",
+		"POSTGRES_CONNECTION_STRING",
+		"POSTGRESQL_CONNECTION_STRING",
+		"POSTGRES_URL",
+		"POSTGRESQL_URL",
+	)
+	if err := applyPostgresConnectionString(&cfg.Database, cfg.Database.ConnectionString); err != nil {
+		return nil, fmt.Errorf("解析 PostgreSQL 连接字符串失败: %w", err)
+	}
+	cfg.Database.Path = strings.TrimSpace(firstNonEmptyEnv("DATABASE_PATH", "SQLITE_PATH"))
+	cfg.Database.Host = firstNonEmpty(cfg.Database.Host, firstNonEmptyEnv("DATABASE_HOST", "POSTGRES_HOST", "POSTGRESQL_HOST"))
+	if v := firstNonEmptyEnv("DATABASE_PORT", "POSTGRES_PORT", "POSTGRESQL_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			cfg.Database.Port = p
 		}
 	}
-	cfg.Database.User = os.Getenv("DATABASE_USER")
-	cfg.Database.Password = os.Getenv("DATABASE_PASSWORD")
-	cfg.Database.DBName = os.Getenv("DATABASE_NAME")
-	if v := os.Getenv("DATABASE_SSLMODE"); v != "" {
+	cfg.Database.User = firstNonEmpty(cfg.Database.User, firstNonEmptyEnv("DATABASE_USER", "POSTGRES_USER", "POSTGRES_USERNAME", "POSTGRESQL_USER", "POSTGRESQL_USERNAME"))
+	cfg.Database.Password = firstNonEmpty(cfg.Database.Password, firstNonEmptyEnv("DATABASE_PASSWORD", "POSTGRES_PASSWORD", "POSTGRESQL_PASSWORD"))
+	cfg.Database.DBName = firstNonEmpty(cfg.Database.DBName, firstNonEmptyEnv("DATABASE_NAME", "POSTGRES_DB", "POSTGRES_DATABASE", "POSTGRESQL_DB", "POSTGRESQL_DATABASE"))
+	if v := firstNonEmptyEnv("DATABASE_SSLMODE", "POSTGRES_SSLMODE", "POSTGRESQL_SSLMODE"); v != "" {
 		cfg.Database.SSLMode = v
+	}
+	switch {
+	case dbDriverEnv != "":
+		cfg.Database.Driver = dbDriverEnv
+	case cfg.Database.ConnectionString != "" || cfg.Database.Host != "":
+		cfg.Database.Driver = "postgres"
+	case zeaburEnv:
+		cfg.Database.Driver = "sqlite"
+	default:
+		cfg.Database.Driver = "postgres"
+	}
+	if cfg.Database.Driver == "sqlite" && cfg.Database.Path == "" && zeaburEnv {
+		cfg.Database.Path = "/data/codex2api.db"
 	}
 
 	// 缓存配置
-	cfg.Cache.Driver = normalizeDriver(os.Getenv("CACHE_DRIVER"), "redis")
-	cfg.Cache.Redis.Addr = os.Getenv("REDIS_ADDR")
-	cfg.Cache.Redis.Password = os.Getenv("REDIS_PASSWORD")
-	if v := os.Getenv("REDIS_DB"); v != "" {
+	cfg.Cache.Redis.URL = firstNonEmptyEnv("REDIS_URL", "REDIS_CONNECTION_STRING", "CACHE_URL")
+	if err := applyRedisConnectionString(&cfg.Cache.Redis, cfg.Cache.Redis.URL); err != nil {
+		return nil, fmt.Errorf("解析 Redis 连接字符串失败: %w", err)
+	}
+	cfg.Cache.Redis.Addr = firstNonEmpty(cfg.Cache.Redis.Addr, firstNonEmptyEnv("REDIS_ADDR", "REDIS_HOST"))
+	cfg.Cache.Redis.Password = firstNonEmpty(cfg.Cache.Redis.Password, firstNonEmptyEnv("REDIS_PASSWORD"))
+	if port := firstNonEmptyEnv("REDIS_PORT"); port != "" && cfg.Cache.Redis.Addr != "" && !strings.Contains(cfg.Cache.Redis.Addr, ":") {
+		cfg.Cache.Redis.Addr = cfg.Cache.Redis.Addr + ":" + port
+	}
+	if v := firstNonEmptyEnv("REDIS_DB"); v != "" {
 		if db, err := strconv.Atoi(v); err == nil {
 			cfg.Cache.Redis.DB = db
 		}
+	}
+	switch {
+	case cacheDriverEnv != "":
+		cfg.Cache.Driver = cacheDriverEnv
+	case cfg.Cache.Redis.URL != "" || cfg.Cache.Redis.Addr != "":
+		cfg.Cache.Driver = "redis"
+	case zeaburEnv:
+		cfg.Cache.Driver = "memory"
+	default:
+		cfg.Cache.Driver = "redis"
 	}
 
 	// 校验必填物理层配置
@@ -138,7 +186,7 @@ func Load(envPath string) (*Config, error) {
 			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 SQLite 数据库路径 (DATABASE_PATH)")
 		}
 	case "postgres":
-		if cfg.Database.Host == "" {
+		if cfg.Database.ConnectionString == "" && cfg.Database.Host == "" {
 			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 PostgreSQL (DATABASE_HOST)")
 		}
 	default:
@@ -154,7 +202,7 @@ func Load(envPath string) (*Config, error) {
 	switch cfg.Cache.Driver {
 	case "memory":
 	case "redis":
-		if cfg.Cache.Redis.Addr == "" {
+		if cfg.Cache.Redis.URL == "" && cfg.Cache.Redis.Addr == "" {
 			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 Redis (REDIS_ADDR)")
 		}
 	default:
@@ -169,4 +217,88 @@ func normalizeDriver(value string, fallback string) string {
 		return fallback
 	}
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func isZeaburEnvironment() bool {
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "ZEABUR_") {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func applyPostgresConnectionString(cfg *DatabaseConfig, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	cfg.ConnectionString = raw
+	if !strings.Contains(raw, "://") {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	cfg.Host = firstNonEmpty(cfg.Host, parsed.Hostname())
+	if port := parsed.Port(); port != "" && cfg.Port == 0 {
+		if p, err := strconv.Atoi(port); err == nil {
+			cfg.Port = p
+		}
+	}
+	if parsed.User != nil {
+		cfg.User = firstNonEmpty(cfg.User, parsed.User.Username())
+		if password, ok := parsed.User.Password(); ok {
+			cfg.Password = firstNonEmpty(cfg.Password, password)
+		}
+	}
+	cfg.DBName = firstNonEmpty(cfg.DBName, strings.TrimPrefix(parsed.Path, "/"))
+	cfg.SSLMode = firstNonEmpty(cfg.SSLMode, parsed.Query().Get("sslmode"))
+	return nil
+}
+
+func applyRedisConnectionString(cfg *RedisConfig, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	cfg.URL = raw
+	if !strings.Contains(raw, "://") {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	cfg.Addr = firstNonEmpty(cfg.Addr, parsed.Host)
+	if parsed.User != nil {
+		if password, ok := parsed.User.Password(); ok {
+			cfg.Password = firstNonEmpty(cfg.Password, password)
+		}
+	}
+	if dbPart := strings.Trim(parsed.Path, "/"); dbPart != "" {
+		if db, err := strconv.Atoi(dbPart); err == nil {
+			cfg.DB = db
+		}
+	}
+	return nil
 }

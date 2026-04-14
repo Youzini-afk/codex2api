@@ -60,12 +60,16 @@ Codex2API 采用三层配置架构：
 | `DATABASE_NAME` | 是 | - | PostgreSQL 数据库名 |
 | `DATABASE_SSLMODE` | 否 | disable | SSL 模式: disable/require/verify-full |
 
+也支持连接字符串形式，例如 `DATABASE_URL`、`POSTGRES_CONNECTION_STRING`、`POSTGRESQL_CONNECTION_STRING`。
+
 #### SQLite 模式
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `DATABASE_DRIVER` | 是 | sqlite | 固定值: sqlite |
 | `DATABASE_PATH` | 是 | - | SQLite 数据库文件路径，如 `/data/codex2api.db` |
+
+在 Zeabur 环境中，如果未配置数据库且未显式指定 `DATABASE_DRIVER`，会自动回退为 SQLite，并默认使用 `/data/codex2api.db`。
 
 ### 缓存配置
 
@@ -78,11 +82,15 @@ Codex2API 采用三层配置架构：
 | `REDIS_PASSWORD` | 否 | - | Redis 密码 |
 | `REDIS_DB` | 否 | 0 | Redis 数据库编号 |
 
+也支持连接字符串形式，例如 `REDIS_URL`、`REDIS_CONNECTION_STRING`。
+
 #### 内存缓存模式
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `CACHE_DRIVER` | 是 | memory | 固定值: memory |
+
+在 Zeabur 环境中，如果未配置 Redis 且未显式指定 `CACHE_DRIVER`，会自动回退为 `memory`。
 
 ---
 

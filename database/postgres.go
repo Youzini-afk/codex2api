@@ -96,6 +96,9 @@ func New(driver string, dsn string) (*DB, error) {
 	driver = normalizeDriver(driver)
 	driverName := driver
 	if driver == "sqlite" {
+		if err := ensureSQLiteParentDir(dsn); err != nil {
+			return nil, fmt.Errorf("创建 SQLite 数据目录失败: %w", err)
+		}
 		driverName = "sqlite"
 	}
 

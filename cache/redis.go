@@ -35,6 +35,27 @@ func NewRedis(addr, password string, db int, poolSize ...int) (TokenCache, error
 	return &redisTokenCache{client: client}, nil
 }
 
+// NewRedisFromURL 使用 Redis URL 创建缓存实例。
+func NewRedisFromURL(rawURL string, poolSize ...int) (TokenCache, error) {
+	opts, err := redis.ParseURL(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("Redis URL 解析失败: %w", err)
+	}
+	if len(poolSize) > 0 && poolSize[0] > 0 {
+		opts.PoolSize = poolSize[0]
+	}
+	client := redis.NewClient(opts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("Redis 连接失败: %w", err)
+	}
+
+	return &redisTokenCache{client: client}, nil
+}
+
 // Close 关闭 Redis 连接
 func (tc *redisTokenCache) Driver() string {
 	return "redis"

@@ -53,6 +53,38 @@ docker compose -f docker-compose.sqlite.yml pull
 docker compose -f docker-compose.sqlite.yml up -d
 ```
 
+### 3. Zeabur 自动部署
+
+适用于 Zeabur 直接从 Git 仓库自动构建部署的场景。
+
+**推荐做法：**
+
+1. 使用仓库根目录的 `Dockerfile`
+2. 在 Zeabur 中为服务挂载持久化目录到 `/data`
+3. 至少设置 `ADMIN_SECRET`
+4. 将健康检查路径指向 `/health`
+
+**默认行为：**
+
+- 检测到 Zeabur 环境且未配置 PostgreSQL / Redis 时，服务会自动回退到 `SQLite + Memory`
+- SQLite 默认写入 `/data/codex2api.db`
+- Zeabur 自动注入的 `PORT` 会被自动识别，无需手动设置 `CODEX_PORT`
+
+**如果接入 Zeabur 托管 PostgreSQL / Redis：**
+
+可直接绑定以下变量：
+
+```bash
+DATABASE_URL=${POSTGRES_CONNECTION_STRING}
+REDIS_URL=${REDIS_CONNECTION_STRING}
+```
+
+也兼容分拆变量，例如 `POSTGRESQL_HOST`、`POSTGRES_PORT`、`POSTGRESQL_USERNAME`、`POSTGRES_PASSWORD`、`POSTGRES_DATABASE`、`REDIS_HOST`、`REDIS_PORT` 等。
+
+**示例文件：**
+
+- 根目录 `.env.zeabur.example`
+
 ---
 
 ## Docker 部署
