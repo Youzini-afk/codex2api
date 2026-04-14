@@ -107,6 +107,14 @@ export interface AdminErrorResponse {
   error: string
 }
 
+export interface AdminSessionStatus {
+  auth_required: boolean
+  authenticated: boolean
+  admin_auth_source: 'env' | 'database' | 'disabled' | string
+  auth_method: 'session' | 'header' | 'disabled' | 'none' | string
+  expires_at?: ISODateString
+}
+
 export interface HealthResponse {
   status: 'ok' | string
   available: number

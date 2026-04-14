@@ -1,7 +1,7 @@
 import type { ChangeEvent, KeyboardEvent } from 'react'
 import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, resetAdminAuthState, setAdminKey } from '../api'
+import { api, clearAdminKey, resetAdminAuthState } from '../api'
 import { getTimezone, setTimezone } from '../utils/time'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
@@ -256,12 +256,14 @@ export default function Settings() {
       const updated = await api.updateSettings(settingsForm)
       setSettingsForm(updated)
       setLoadedAdminSecret(updated.admin_secret ?? '')
-      if (updated.admin_auth_source !== 'env') {
-        setAdminKey(updated.admin_secret ?? '')
-      }
-      if (adminSecretChanged) {
-        resetAdminAuthState()
-        return
+      if (adminSecretChanged && updated.admin_auth_source !== 'env') {
+        await api.logoutAdminSession().catch(() => undefined)
+        clearAdminKey()
+        if ((updated.admin_secret ?? '').trim()) {
+          resetAdminAuthState()
+          showToast(t('settings.adminSecretSessionReset'))
+          return
+        }
       }
       if (updated.expired_cleaned && updated.expired_cleaned > 0) {
         showToast(t('settings.expiredCleanedResult', { count: updated.expired_cleaned }))

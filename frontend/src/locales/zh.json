@@ -68,9 +68,10 @@
   },
   "auth": {
     "title": "管理后台",
-    "subtitle": "请输入管理密钥",
+    "subtitle": "请输入管理密钥以建立登录会话",
     "placeholder": "输入管理密钥…",
     "login": "进入控制台",
+    "logout": "退出登录",
     "error": "密钥错误，请重试"
   },
   "dashboard": {
@@ -560,8 +561,9 @@
     "security": "安全",
     "adminSecret": "管理密钥",
     "adminSecretPlaceholder": "留空则不启用管理接口鉴权",
-    "adminSecretDesc": "设置后，所有 /api/admin/* 管理接口需要携带 X-Admin-Key 请求头。留空则关闭鉴权。",
+    "adminSecretDesc": "设置后，管理后台网页登录会使用安全会话，API 仍支持 X-Admin-Key 请求头。留空则关闭鉴权。",
     "adminSecretEnvOverride": "当前已启用环境变量 ADMIN_SECRET，后台登录优先使用环境变量中的密钥。",
+    "adminSecretSessionReset": "管理密钥已更新，请使用新密钥重新登录。",
     "models": "模型配置",
     "modelsDesc": "以下模型当前可用：",
     "saveSuccess": "设置已保存，实时生效",

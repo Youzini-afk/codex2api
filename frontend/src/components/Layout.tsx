@@ -1,10 +1,11 @@
 import { type PropsWithChildren, type ReactNode, useState } from 'react'
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Workflow, Sun, Moon, Languages, Globe, BookOpen, FileCode2 } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Workflow, Sun, Moon, Languages, Globe, BookOpen, FileCode2, LogOut } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import logoImg from '../assets/logo.png'
 import { useTheme } from '../hooks/useTheme'
 import { useVersionCheck } from '../hooks/useVersionCheck'
+import { useAdminAuth } from './AuthGate'
 
 type NavDef = {
   to: string
@@ -29,6 +30,7 @@ export default function Layout({ children }: PropsWithChildren) {
   const { theme, toggle } = useTheme()
   const { t, i18n } = useTranslation()
   const { hasUpdate, latestVersion } = useVersionCheck()
+  const { authRequired, logout } = useAdminAuth()
   const [spinning, setSpinning] = useState(false)
 
   const handleThemeToggle = (e: React.MouseEvent) => {
@@ -41,6 +43,10 @@ export default function Layout({ children }: PropsWithChildren) {
     const next = i18n.language === 'zh' ? 'en' : 'zh'
     i18n.changeLanguage(next)
     localStorage.setItem('lang', next)
+  }
+
+  const handleLogout = () => {
+    void logout()
   }
 
   return (
@@ -101,6 +107,15 @@ export default function Layout({ children }: PropsWithChildren) {
                 {t('common.online')}
               </span>
               <div className="flex items-center gap-0.5">
+                {authRequired && (
+                  <button
+                    onClick={handleLogout}
+                    className="flex items-center justify-center size-9 rounded-xl text-muted-foreground hover:text-foreground hover:bg-white/60 dark:hover:bg-white/10 transition-all duration-150"
+                    title={t('auth.logout')}
+                  >
+                    <LogOut className="size-[18px]" />
+                  </button>
+                )}
                 <button
                   onClick={toggleLang}
                   className="flex items-center justify-center size-9 rounded-xl text-muted-foreground hover:text-foreground hover:bg-white/60 dark:hover:bg-white/10 transition-all duration-150 text-[12px] font-bold"
@@ -140,6 +155,15 @@ export default function Layout({ children }: PropsWithChildren) {
               <strong className="text-lg">CodexProxy</strong>
             </div>
             <div className="flex items-center gap-2">
+              {authRequired && (
+                <button
+                  onClick={handleLogout}
+                  className="flex items-center justify-center size-8 rounded-lg text-muted-foreground hover:text-foreground transition-colors"
+                  title={t('auth.logout')}
+                >
+                  <LogOut className="size-4" />
+                </button>
+              )}
               <button
                 onClick={toggleLang}
                 className="flex items-center justify-center size-8 rounded-lg text-muted-foreground hover:text-foreground transition-colors text-[11px] font-bold"

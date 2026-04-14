@@ -1,6 +1,7 @@
 import type {
   AccountEventTrendPoint,
   AccountUsageDetail,
+  AdminSessionStatus,
   AddAccountRequest,
   AddATAccountRequest,
   AdminErrorResponse,
@@ -80,6 +81,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(BASE + path, {
     ...options,
     headers,
+    credentials: 'same-origin',
   })
 
   if (!res.ok) {
@@ -93,7 +95,36 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return (await res.json()) as T
 }
 
+async function authRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  if (options.body !== undefined && options.body !== null && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const adminKey = getAdminKey()
+  if (adminKey) {
+    headers.set('X-Admin-Key', adminKey)
+  }
+
+  const res = await fetch(`${BASE}/auth${path}`, {
+    ...options,
+    headers,
+    credentials: 'same-origin',
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return (await res.json()) as T
+}
+
 export const api = {
+  getAdminSessionStatus: () => authRequest<AdminSessionStatus>('/status'),
+  loginAdminSession: (secret: string) =>
+    authRequest<AdminSessionStatus>('/login', { method: 'POST', body: JSON.stringify({ secret }) }),
+  logoutAdminSession: () => authRequest<MessageResponse>('/logout', { method: 'POST' }),
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>

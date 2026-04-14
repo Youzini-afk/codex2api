@@ -45,6 +45,7 @@ type Handler struct {
 	cacheDriver    string
 	cacheLabel     string
 	adminSecretEnv string
+	sessionStore   *adminSessionStore
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -75,6 +76,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheDriver:    tc.Driver(),
 		cacheLabel:     tc.Label(),
 		adminSecretEnv: adminSecretEnv,
+		sessionStore:   newAdminSessionStore(),
 		chartCacheData: make(map[string]*chartCacheEntry),
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
@@ -89,6 +91,11 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	authAPI := r.Group("/api/admin/auth")
+	authAPI.GET("/status", h.GetAdminSessionStatus)
+	authAPI.POST("/login", h.LoginAdminSession)
+	authAPI.POST("/logout", h.LogoutAdminSession)
+
 	api := r.Group("/api/admin")
 	api.Use(h.adminAuthMiddleware())
 	api.GET("/stats", h.GetStats)
@@ -142,27 +149,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 // adminAuthMiddleware 管理接口鉴权中间件（增强版，增加安全审计日志）
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		adminSecret, source := h.resolveAdminSecret(c.Request.Context())
-		if adminSecret == "" {
-			// 未配置管理密钥，跳过鉴权
-			c.Next()
-			return
-		}
-
-		adminKey := c.GetHeader("X-Admin-Key")
-		if adminKey == "" {
-			// 兼容 Authorization: Bearer 方式
-			authHeader := c.GetHeader("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				adminKey = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
-
-		// 清理输入
-		adminKey = security.SanitizeInput(adminKey)
-
-		// 使用安全比较防止时序攻击
-		if !security.SecureCompare(adminKey, adminSecret) {
+		authorized, source, method := h.authorizeAdminRequest(c)
+		if !authorized {
 			// 记录安全审计日志
 			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
 			c.JSON(http.StatusUnauthorized, gin.H{
@@ -176,6 +164,7 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 		if security.IsSensitiveEndpoint(c.Request.URL.Path) {
 			security.SecurityAuditLog("ADMIN_ACCESS", fmt.Sprintf("path=%s ip=%s method=%s", c.Request.URL.Path, c.ClientIP(), c.Request.Method))
 		}
+		c.Set("admin_auth_method", method)
 
 		c.Next()
 	}
@@ -2038,8 +2027,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	currentAdminSecret := ""
+	previousAdminSecret := ""
 	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
 		currentAdminSecret = dbSettings.AdminSecret
+		previousAdminSecret = dbSettings.AdminSecret
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -2050,6 +2041,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
+	adminSecretChanged := h.adminSecretEnv == "" && req.AdminSecret != nil && strings.TrimSpace(currentAdminSecret) != strings.TrimSpace(previousAdminSecret)
 
 	if req.MaxConcurrency != nil {
 		v := *req.MaxConcurrency
@@ -2277,6 +2269,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+	}
+	if adminSecretChanged && h.sessionStore != nil {
+		h.sessionStore.Clear()
 	}
 
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {

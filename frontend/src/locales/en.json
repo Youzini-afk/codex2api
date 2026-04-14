@@ -68,9 +68,10 @@
   },
   "auth": {
     "title": "Admin Panel",
-    "subtitle": "Enter admin secret",
+    "subtitle": "Enter the admin secret to start a session",
     "placeholder": "Enter admin secret…",
     "login": "Sign In",
+    "logout": "Sign Out",
     "error": "Invalid secret, please retry"
   },
   "dashboard": {
@@ -560,8 +561,9 @@
     "security": "Security",
     "adminSecret": "Admin Secret",
     "adminSecretPlaceholder": "Leave empty to disable admin auth",
-    "adminSecretDesc": "When set, all /api/admin/* endpoints require X-Admin-Key header. Leave empty to disable.",
+    "adminSecretDesc": "When set, the admin web UI uses a secure login session, and APIs still support the X-Admin-Key header. Leave empty to disable.",
     "adminSecretEnvOverride": "ADMIN_SECRET is currently enabled in the environment, so admin login uses the environment value first.",
+    "adminSecretSessionReset": "Admin secret updated. Please sign in again with the new secret.",
     "models": "Model Configuration",
     "modelsDesc": "The following models are currently available:",
     "saveSuccess": "Settings saved",
