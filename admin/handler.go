@@ -102,6 +102,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts", h.ListAccounts)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
+	api.POST("/accounts/push-token", h.PushTokenAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
@@ -694,6 +695,17 @@ type addATAccountReq struct {
 	ProxyURL    string `json:"proxy_url"`
 }
 
+type pushTokenAccountReq struct {
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
+	AccountID    string `json:"account_id"`
+	ProxyURL     string `json:"proxy_url"`
+	Source       string `json:"source"`
+}
+
 // AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
 func (h *Handler) AddATAccount(c *gin.Context) {
 	var req addATAccountReq
@@ -815,6 +827,199 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		"message": msg,
 		"success": successCount,
 		"failed":  failCount,
+	})
+}
+
+// PushTokenAccount 接收外部注册器推送的单个 token 包，自动按 RT / AT-only 路径入库。
+func (h *Handler) PushTokenAccount(c *gin.Context) {
+	var req pushTokenAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.Name = security.SanitizeInput(req.Name)
+	req.Email = security.SanitizeInput(req.Email)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.AccountID = security.SanitizeInput(req.AccountID)
+	req.Source = security.SanitizeInput(req.Source)
+
+	if req.RefreshToken == "" && req.AccessToken == "" {
+		writeError(c, http.StatusBadRequest, "refresh_token 或 access_token 至少需要一个")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = strings.TrimSpace(req.Email)
+	}
+	if name == "" {
+		if req.RefreshToken != "" {
+			name = "push-rt-account"
+		} else {
+			name = "push-at-account"
+		}
+	}
+	if utf8.RuneCountInString(name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	if req.RefreshToken != "" {
+		existingRTs, err := h.db.GetAllRefreshTokens(ctx)
+		if err == nil && existingRTs[req.RefreshToken] {
+			c.JSON(http.StatusOK, gin.H{
+				"message":   "refresh_token 已存在，跳过导入",
+				"duplicate": true,
+				"mode":      "refresh_token",
+			})
+			return
+		}
+
+		id, err := h.db.InsertAccount(ctx, name, req.RefreshToken, req.ProxyURL)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "导入 RT 账号失败: "+err.Error())
+			return
+		}
+
+		h.db.InsertAccountEventAsync(id, "added", "push_token")
+		newAcc := &auth.Account{
+			DBID:         id,
+			RefreshToken: req.RefreshToken,
+			ProxyURL:     req.ProxyURL,
+		}
+		h.store.AddAccount(newAcc)
+
+		credentials := map[string]interface{}{}
+		if req.Email != "" {
+			credentials["email"] = req.Email
+		}
+		if req.AccessToken != "" {
+			credentials["access_token"] = req.AccessToken
+			if atInfo := auth.ParseAccessToken(req.AccessToken); atInfo != nil {
+				if atInfo.Email != "" && req.Email == "" {
+					credentials["email"] = atInfo.Email
+				}
+				if atInfo.ChatGPTAccountID != "" {
+					credentials["account_id"] = atInfo.ChatGPTAccountID
+				}
+				if atInfo.PlanType != "" {
+					credentials["plan_type"] = atInfo.PlanType
+				}
+				if !atInfo.ExpiresAt.IsZero() {
+					credentials["expires_at"] = atInfo.ExpiresAt.Format(time.RFC3339)
+				}
+			}
+		}
+		if req.IDToken != "" {
+			credentials["id_token"] = req.IDToken
+		}
+		if req.AccountID != "" {
+			credentials["account_id"] = req.AccountID
+		}
+		if len(credentials) > 0 {
+			if err := h.db.UpdateCredentials(ctx, id, credentials); err != nil {
+				log.Printf("推送 RT 账号 %d 更新 credentials 失败: %v", id, err)
+			}
+		}
+
+		if h.refreshAccount != nil {
+			go func(accountID int64) {
+				refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer refreshCancel()
+				if err := h.refreshAccount(refreshCtx, accountID); err != nil {
+					log.Printf("推送 RT 账号 %d 刷新失败: %v", accountID, err)
+				}
+			}(id)
+		}
+
+		security.SecurityAuditLog("ACCOUNT_PUSH_IMPORTED", fmt.Sprintf("mode=rt id=%d ip=%s source=%s", id, c.ClientIP(), req.Source))
+		c.JSON(http.StatusOK, gin.H{
+			"message":   "RT 账号已导入",
+			"id":        id,
+			"duplicate": false,
+			"mode":      "refresh_token",
+		})
+		return
+	}
+
+	existingATs, err := h.db.GetAllAccessTokens(ctx)
+	if err == nil && existingATs[req.AccessToken] {
+		c.JSON(http.StatusOK, gin.H{
+			"message":   "access_token 已存在，跳过导入",
+			"duplicate": true,
+			"mode":      "access_token",
+		})
+		return
+	}
+
+	id, err := h.db.InsertATAccount(ctx, name, req.AccessToken, req.ProxyURL)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "导入 AT 账号失败: "+err.Error())
+		return
+	}
+
+	h.db.InsertAccountEventAsync(id, "added", "push_token_at")
+	atInfo := auth.ParseAccessToken(req.AccessToken)
+	newAcc := &auth.Account{
+		DBID:        id,
+		AccessToken: req.AccessToken,
+		ExpiresAt:   time.Now().Add(1 * time.Hour),
+		ProxyURL:    req.ProxyURL,
+	}
+	if atInfo != nil {
+		newAcc.Email = atInfo.Email
+		newAcc.AccountID = atInfo.ChatGPTAccountID
+		newAcc.PlanType = atInfo.PlanType
+		if !atInfo.ExpiresAt.IsZero() {
+			newAcc.ExpiresAt = atInfo.ExpiresAt
+		}
+	}
+	h.store.AddAccount(newAcc)
+
+	credentials := map[string]interface{}{}
+	if atInfo != nil {
+		if atInfo.Email != "" {
+			credentials["email"] = atInfo.Email
+		}
+		if atInfo.ChatGPTAccountID != "" {
+			credentials["account_id"] = atInfo.ChatGPTAccountID
+		}
+		if atInfo.PlanType != "" {
+			credentials["plan_type"] = atInfo.PlanType
+		}
+		if !newAcc.ExpiresAt.IsZero() {
+			credentials["expires_at"] = newAcc.ExpiresAt.Format(time.RFC3339)
+		}
+	}
+	if req.Email != "" {
+		credentials["email"] = req.Email
+	}
+	if req.IDToken != "" {
+		credentials["id_token"] = req.IDToken
+	}
+	if req.AccountID != "" {
+		credentials["account_id"] = req.AccountID
+	}
+	if len(credentials) > 0 {
+		if err := h.db.UpdateCredentials(ctx, id, credentials); err != nil {
+			log.Printf("推送 AT 账号 %d 更新 credentials 失败: %v", id, err)
+		}
+	}
+
+	security.SecurityAuditLog("ACCOUNT_PUSH_IMPORTED", fmt.Sprintf("mode=at id=%d ip=%s source=%s", id, c.ClientIP(), req.Source))
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "AT 账号已导入",
+		"id":        id,
+		"duplicate": false,
+		"mode":      "access_token",
 	})
 }
 

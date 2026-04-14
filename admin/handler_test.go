@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -390,5 +391,126 @@ func assertErrorMessage(t *testing.T, recorder *httptest.ResponseRecorder, want 
 	}
 	if got := payload["error"]; got != want {
 		t.Fatalf("error = %q, want %q", got, want)
+	}
+}
+
+func TestPushTokenAccountImportsRefreshTokenAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestDB(t)
+	handler := &Handler{
+		db: db,
+		store: &auth.Store{},
+		refreshAccount: func(_ context.Context, _ int64) error {
+			return nil
+		},
+	}
+
+	body := `{"name":"pushed-rt","email":"rt@example.com","refresh_token":"rt_push_1","access_token":"at_push_1","source":"register-oss"}`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/push-token", bytes.NewBufferString(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.PushTokenAccount(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["mode"]; got != "refresh_token" {
+		t.Fatalf("mode = %v, want refresh_token", got)
+	}
+	if got := payload["duplicate"]; got != false {
+		t.Fatalf("duplicate = %v, want false", got)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("list accounts: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active accounts = %d, want 1", len(rows))
+	}
+	if rows[0].GetCredential("refresh_token") != "rt_push_1" {
+		t.Fatalf("refresh_token = %q, want rt_push_1", rows[0].GetCredential("refresh_token"))
+	}
+}
+
+func TestPushTokenAccountImportsAccessTokenOnlyAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestDB(t)
+	handler := &Handler{
+		db:    db,
+		store: &auth.Store{},
+	}
+
+	body := `{"name":"pushed-at","email":"at@example.com","access_token":"at_push_only","source":"register-oss"}`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/push-token", bytes.NewBufferString(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.PushTokenAccount(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["mode"]; got != "access_token" {
+		t.Fatalf("mode = %v, want access_token", got)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("list accounts: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active accounts = %d, want 1", len(rows))
+	}
+	if rows[0].GetCredential("access_token") != "at_push_only" {
+		t.Fatalf("access_token = %q, want at_push_only", rows[0].GetCredential("access_token"))
+	}
+}
+
+func TestPushTokenAccountReturnsDuplicateForExistingRefreshToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestDB(t)
+	if _, err := db.InsertAccount(context.Background(), "existing", "rt_dup", ""); err != nil {
+		t.Fatalf("insert existing account: %v", err)
+	}
+	handler := &Handler{
+		db:    db,
+		store: &auth.Store{},
+	}
+
+	body := `{"name":"dup","refresh_token":"rt_dup","source":"register-oss"}`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/push-token", bytes.NewBufferString(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.PushTokenAccount(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["duplicate"]; got != true {
+		t.Fatalf("duplicate = %v, want true", got)
 	}
 }
