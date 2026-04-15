@@ -3,6 +3,7 @@ package admin
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"os"
 	"runtime"
 	"strconv"
@@ -18,6 +19,20 @@ type cpuSampler struct {
 	lastTotal uint64
 	lastIdle  uint64
 	hasLast   bool
+}
+
+func databaseUsagePercent(stats sql.DBStats) float64 {
+	if stats.MaxOpenConnections <= 0 {
+		return 0
+	}
+	inUse := stats.InUse
+	if inUse < 0 {
+		inUse = 0
+	}
+	if inUse > stats.MaxOpenConnections {
+		inUse = stats.MaxOpenConnections
+	}
+	return float64(inUse) / float64(stats.MaxOpenConnections) * 100
 }
 
 func newCPUSampler() *cpuSampler {
@@ -173,10 +188,7 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 
 	dbHealthy := h.db.Ping(ctx) == nil
 	dbStats := h.db.Stats()
-	dbUsage := 0.0
-	if dbStats.MaxOpenConnections > 0 {
-		dbUsage = float64(dbStats.OpenConnections) / float64(dbStats.MaxOpenConnections) * 100
-	}
+	dbUsage := databaseUsagePercent(dbStats)
 
 	redisHealthy := h.cache != nil && h.cache.Ping(ctx) == nil
 	var redisTotal uint32
