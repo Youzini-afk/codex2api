@@ -11,6 +11,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { APIKeyRow, UsageLog, UsageStats } from '../types'
+import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -552,7 +553,7 @@ export default function Usage() {
                           </div>
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
-                          {log.account_email || '-'}
+                          {formatCompactEmail(log.account_email)}
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           <span className="block max-w-[180px] truncate whitespace-nowrap" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
