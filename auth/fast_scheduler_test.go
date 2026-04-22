@@ -87,6 +87,46 @@ func TestFastSchedulerRoundRobinWithinTier(t *testing.T) {
 	}
 }
 
+func TestStoreNextExcludingRespectsAPIKeyWhitelist(t *testing.T) {
+	restricted := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	restricted.SetAllowedAPIKeyIDs([]int64{2})
+	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+
+	store := &Store{
+		accounts:       []*Account{restricted, fallback},
+		maxConcurrency: 1,
+	}
+
+	got := store.NextExcluding(1, nil)
+	if got == nil {
+		t.Fatal("NextExcluding() returned nil")
+	}
+	defer store.Release(got)
+
+	if got.DBID != 2 {
+		t.Fatalf("NextExcluding() picked dbID=%d, want 2", got.DBID)
+	}
+}
+
+func TestFastSchedulerAcquireExcludingRespectsAPIKeyWhitelist(t *testing.T) {
+	restricted := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	restricted.SetAllowedAPIKeyIDs([]int64{2})
+	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+
+	scheduler := NewFastScheduler(1)
+	scheduler.Rebuild([]*Account{restricted, fallback})
+
+	got := scheduler.AcquireExcluding(1, nil)
+	if got == nil {
+		t.Fatal("AcquireExcluding() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != 2 {
+		t.Fatalf("AcquireExcluding() picked dbID=%d, want 2", got.DBID)
+	}
+}
+
 func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
 	scheduler := NewFastScheduler(2)

@@ -308,3 +308,15 @@ func TestAuthMiddlewareSetsAPIKeyContext(t *testing.T) {
 		t.Fatalf("raw = %q, want %q", payload.Raw, key)
 	}
 }
+
+func TestSessionAffinityKeySeparatesDifferentAPIKeys(t *testing.T) {
+	key1 := sessionAffinityKey("session-1", 1)
+	key2 := sessionAffinityKey("session-1", 2)
+
+	if key1 == key2 {
+		t.Fatalf("sessionAffinityKey should differ for different apiKeyID: %q", key1)
+	}
+	if got := sessionAffinityKey("session-1", 0); got != "session-1" {
+		t.Fatalf("sessionAffinityKey() with apiKeyID=0 = %q, want session-1", got)
+	}
+}

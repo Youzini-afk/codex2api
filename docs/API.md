@@ -301,6 +301,7 @@ data: [DONE]
       "base_concurrency_override": null,
       "base_concurrency_effective": 2,
       "dynamic_concurrency_limit": 2,
+      "allowed_api_key_ids": [1, 3],
       "proxy_url": "http://proxy.example.com:8080",
       "created_at": "2024-01-01T00:00:00Z",
       "updated_at": "2024-01-01T12:00:00Z",
@@ -339,6 +340,7 @@ data: [DONE]
 | score_bias_effective | integer | 当前生效的加权分 |
 | base_concurrency_override | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency` |
 | base_concurrency_effective | integer | 当前生效的基础并发值 |
+| allowed_api_key_ids | integer[] | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
 
 #### PATCH /api/admin/accounts/:id/scheduler
 
@@ -348,7 +350,8 @@ data: [DONE]
 ```json
 {
   "score_bias_override": 80,
-  "base_concurrency_override": 6
+  "base_concurrency_override": 6,
+  "allowed_api_key_ids": [1, 3]
 }
 ```
 
@@ -357,7 +360,8 @@ data: [DONE]
 ```json
 {
   "score_bias_override": null,
-  "base_concurrency_override": null
+  "base_concurrency_override": null,
+  "allowed_api_key_ids": null
 }
 ```
 
@@ -367,6 +371,7 @@ data: [DONE]
 |------|------|------|------|
 | score_bias_override | integer/null | 否 | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认 |
 | base_concurrency_override | integer/null | 否 | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认 |
+| allowed_api_key_ids | integer[]/null | 否 | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
 
 **响应:**
 ```json

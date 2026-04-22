@@ -33,6 +33,11 @@ type AccountRow struct {
 	UpdatedAt               time.Time
 }
 
+type OptionalInt64Slice struct {
+	Set    bool
+	Values []int64
+}
+
 // GetCredential 从 credentials JSONB 获取字符串字段
 func (a *AccountRow) GetCredential(key string) string {
 	if a.Credentials == nil {
@@ -50,6 +55,17 @@ func (a *AccountRow) GetCredential(key string) string {
 	default:
 		return ""
 	}
+}
+
+func (a *AccountRow) GetCredentialInt64Slice(key string) []int64 {
+	if a.Credentials == nil {
+		return []int64{}
+	}
+	value, ok := a.Credentials[key]
+	if !ok {
+		return []int64{}
+	}
+	return int64SliceFromValue(value)
 }
 
 // DB PostgreSQL 数据库操作
@@ -1535,8 +1551,14 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 }
 
 // UpdateAccountSchedulerConfig 更新账号调度配置。
-func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreBiasOverride sql.NullInt64, baseConcurrencyOverride sql.NullInt64) error {
-	result, err := db.conn.ExecContext(ctx, `
+func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreBiasOverride sql.NullInt64, baseConcurrencyOverride sql.NullInt64, allowedAPIKeyIDs OptionalInt64Slice) error {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
 		UPDATE accounts
 		SET score_bias_override = $1,
 		    base_concurrency_override = $2,
@@ -1553,7 +1575,38 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 	if rowsAffected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+
+	if allowedAPIKeyIDs.Set {
+		selectQuery := `SELECT credentials FROM accounts WHERE id = $1`
+		if db.isSQLite() {
+			selectQuery = `SELECT credentials FROM accounts WHERE id = ?`
+		} else {
+			selectQuery += ` FOR UPDATE`
+		}
+
+		var currentRaw interface{}
+		if err := tx.QueryRowContext(ctx, selectQuery, id).Scan(&currentRaw); err != nil {
+			return err
+		}
+
+		merged := mergeCredentialMaps(decodeCredentials(currentRaw), map[string]interface{}{
+			"allowed_api_key_ids": normalizePositiveInt64Slice(allowedAPIKeyIDs.Values),
+		})
+		credJSON, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("序列化 credentials 失败: %w", err)
+		}
+
+		updateQuery := `UPDATE accounts SET credentials = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+		if !db.isSQLite() {
+			updateQuery = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+		}
+		if _, err := tx.ExecContext(ctx, updateQuery, credJSON, id); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 func nullableInt64Value(v sql.NullInt64) interface{} {

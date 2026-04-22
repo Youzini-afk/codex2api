@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -271,6 +272,7 @@ type accountResponse struct {
 	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
 	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
 	Locked                   bool                       `json:"locked"`
+	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
 }
 
 type schedulerBreakdownResponse struct {
@@ -319,6 +321,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			ProxyURL:                 row.ProxyURL,
 			Locked:                   row.Locked,
+			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
 			ScoreBiasEffective:       effectiveScoreBias(row.GetCredential("plan_type"), row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
@@ -399,6 +402,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 }
 
 // UpdateAccountScheduler 更新账号调度配置。
@@ -427,11 +431,32 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride); err != nil {
+	if allowedAPIKeyIDs.Set {
+		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, allowedAPIKeyIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验 API Key 失败: "+err.Error())
+			return
+		}
+		if len(missingAPIKeyIDs) > 0 {
+			values := make([]string, 0, len(missingAPIKeyIDs))
+			for _, value := range missingAPIKeyIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_api_key_ids 包含不存在的 API Key ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
+
+	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs); err != nil {
 		if err == sql.ErrNoRows {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -441,6 +466,9 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	}
 	if h.store != nil {
 		h.store.ApplyAccountSchedulerOverrides(id, nullableInt64Pointer(scoreBiasOverride), nullableInt64Pointer(baseConcurrencyOverride))
+		if allowedAPIKeyIDs.Set {
+			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
+		}
 	}
 
 	writeMessage(c, http.StatusOK, "账号调度配置已更新")
@@ -463,6 +491,71 @@ func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxV
 		return sql.NullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
 	return sql.NullInt64{Int64: value, Valid: true}, nil
+}
+
+func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
+	if len(raw) == 0 {
+		return database.OptionalInt64Slice{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalInt64Slice{Set: true, Values: []int64{}}, nil
+	}
+
+	var values []json.Number
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return database.OptionalInt64Slice{}, fmt.Errorf("%s 必须是整数数组或 null", field)
+	}
+	if len(values) == 0 {
+		return database.OptionalInt64Slice{Set: true, Values: []int64{}}, nil
+	}
+
+	unique := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, number := range values {
+		value, err := number.Int64()
+		if err != nil {
+			return database.OptionalInt64Slice{}, fmt.Errorf("%s 必须是整数数组或 null", field)
+		}
+		if value <= 0 {
+			return database.OptionalInt64Slice{}, fmt.Errorf("%s 中的值必须是正整数", field)
+		}
+		if _, exists := unique[value]; exists {
+			continue
+		}
+		unique[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i] < result[j]
+	})
+	return database.OptionalInt64Slice{Set: true, Values: result}, nil
+}
+
+func (h *Handler) findMissingAPIKeyIDs(ctx context.Context, ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	keys, err := h.db.ListAPIKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[int64]struct{}, len(keys))
+	for _, key := range keys {
+		if key == nil {
+			continue
+		}
+		existing[key.ID] = struct{}{}
+	}
+
+	missing := make([]int64, 0)
+	for _, id := range ids {
+		if _, ok := existing[id]; ok {
+			continue
+		}
+		missing = append(missing, id)
+	}
+	return missing, nil
 }
 
 func nullableInt64Pointer(v sql.NullInt64) *int64 {

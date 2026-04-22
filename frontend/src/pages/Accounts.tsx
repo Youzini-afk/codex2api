@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest, APIKeyRow } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -24,7 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -59,6 +59,7 @@ export default function Accounts() {
   const [scoreInput, setScoreInput] = useState('')
   const [concurrencyMode, setConcurrencyMode] = useState<'default' | 'custom'>('default')
   const [concurrencyInput, setConcurrencyInput] = useState('')
+  const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<number[]>([])
   const [importing, setImporting] = useState(false)
   const [showImportPicker, setShowImportPicker] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -90,14 +91,22 @@ export default function Accounts() {
   const { confirm, confirmDialog } = useConfirmDialog()
 
   const loadAccounts = useCallback(async () => {
-    const data = await api.getAccounts()
-    return data.accounts ?? []
+    const [accountsResponse, apiKeysResponse] = await Promise.all([api.getAccounts(), api.getAPIKeys()])
+    return {
+      accounts: accountsResponse.accounts ?? [],
+      apiKeys: apiKeysResponse.keys ?? [],
+    }
   }, [])
 
-  const { data: accounts, loading, error, reload, reloadSilently } = useDataLoader<AccountRow[]>({
-    initialData: [],
+  const { data, loading, error, reload, reloadSilently } = useDataLoader<{ accounts: AccountRow[]; apiKeys: APIKeyRow[] }>({
+    initialData: {
+      accounts: [],
+      apiKeys: [],
+    },
     load: loadAccounts,
   })
+  const accounts = data.accounts
+  const apiKeys = data.apiKeys
   const usageBootstrapReloadedRef = useRef(false)
 
   useEffect(() => {
@@ -794,6 +803,7 @@ export default function Accounts() {
     setScoreInput(account.score_bias_override === null || account.score_bias_override === undefined ? '' : String(account.score_bias_override))
     setConcurrencyMode(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? 'default' : 'custom')
     setConcurrencyInput(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? '' : String(account.base_concurrency_override))
+    setAllowedAPIKeySelection(filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys))
   }
 
   const closeSchedulerEditor = (force = false) => {
@@ -803,6 +813,7 @@ export default function Accounts() {
     setScoreInput('')
     setConcurrencyMode('default')
     setConcurrencyInput('')
+    setAllowedAPIKeySelection([])
   }
 
   const parsedScoreBias = scoreMode === 'custom' ? parseIntegerInput(scoreInput) : null
@@ -843,6 +854,7 @@ export default function Accounts() {
       const payload = {
         score_bias_override: scoreMode === 'custom' ? parsedScoreBias : null,
         base_concurrency_override: concurrencyMode === 'custom' ? parsedBaseConcurrency : null,
+        allowed_api_key_ids: allowedAPIKeySelection,
       }
       await api.updateAccountScheduler(editingAccount.id, payload)
       showToast(t('accounts.schedulerSaveSuccess'))
@@ -1621,7 +1633,7 @@ export default function Accounts() {
         <Modal
           show={Boolean(editingAccount)}
           title={t('accounts.schedulerEditTitle')}
-          contentClassName="sm:max-w-[680px]"
+          contentClassName="sm:max-w-[760px]"
           onClose={closeSchedulerEditor}
           footer={(
             <>
@@ -1711,6 +1723,24 @@ export default function Accounts() {
                 </div>
               </div>
 
+              <div className="rounded-xl border border-border p-4">
+                <div className="text-sm font-semibold text-foreground">{t('accounts.allowedAPIKeysLabel')}</div>
+                <div className="mt-1 text-xs text-muted-foreground">{t('accounts.allowedAPIKeysHint')}</div>
+                <div className="mt-3">
+                  <APIKeyMultiSelect
+                    options={apiKeys}
+                    value={allowedAPIKeySelection}
+                    disabled={apiKeys.length === 0}
+                    onChange={setAllowedAPIKeySelection}
+                    allLabel={t('accounts.allowedAPIKeysAll')}
+                    selectedLabel={t('accounts.allowedAPIKeysSelected', { count: allowedAPIKeySelection.length })}
+                    placeholder={t('accounts.allowedAPIKeysPlaceholder')}
+                    emptyLabel={t('accounts.allowedAPIKeysNoOptions')}
+                    emptyHint={t('accounts.allowedAPIKeysNoOptionsHint')}
+                  />
+                </div>
+              </div>
+
               <div className="rounded-xl border border-border bg-white/60 px-4 py-4 dark:bg-white/5">
                 <div className="text-sm font-semibold text-foreground">{t('accounts.schedulerPreviewTitle')}</div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -1780,6 +1810,134 @@ function downloadBlob(blob: Blob, filename: string) {
   a.click()
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
+}
+
+function filterExistingAPIKeyIDs(selected: number[], apiKeys: APIKeyRow[]): number[] {
+  if (!selected.length || !apiKeys.length) {
+    return []
+  }
+  const existing = new Set(apiKeys.map((item) => item.id))
+  return [...new Set(selected.filter((id) => existing.has(id)))].sort((a, b) => a - b)
+}
+
+function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
+  const name = apiKey.name?.trim() || `API Key #${apiKey.id}`
+  return `${name} · ${apiKey.key}`
+}
+
+function APIKeyMultiSelect({
+  options,
+  value,
+  disabled,
+  onChange,
+  allLabel,
+  selectedLabel,
+  placeholder,
+  emptyLabel,
+  emptyHint,
+}: {
+  options: APIKeyRow[]
+  value: number[]
+  disabled: boolean
+  onChange: (value: number[]) => void
+  allLabel: string
+  selectedLabel: string
+  placeholder: string
+  emptyLabel: string
+  emptyHint: string
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleEscape)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [open])
+
+  const summary = value.length === 0 ? allLabel : selectedLabel
+
+  const toggleOption = (id: number) => {
+    if (disabled) return
+    if (value.includes(id)) {
+      onChange(value.filter((item) => item !== id))
+      return
+    }
+    onChange([...value, id].sort((a, b) => a - b))
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        disabled={disabled}
+        className={`flex w-full items-center justify-between gap-3 rounded-xl border border-input bg-background px-3.5 py-3 text-left shadow-xs transition-[border-color,box-shadow] ${
+          disabled
+            ? 'cursor-not-allowed opacity-70'
+            : 'hover:border-primary/30 hover:bg-accent/40'
+        } ${open ? 'border-primary/35 ring-[3px] ring-primary/10' : ''}`}
+        onClick={() => {
+          if (!disabled) {
+            setOpen((current) => !current)
+          }
+        }}
+      >
+        <div className="min-w-0">
+          <div className="truncate text-[15px] text-foreground">{summary}</div>
+          <div className="mt-0.5 truncate text-xs text-muted-foreground">
+            {disabled ? emptyHint : placeholder}
+          </div>
+        </div>
+        <ChevronDown className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+
+      {open ? (
+        <div className="absolute left-0 right-0 top-[calc(100%+0.5rem)] z-50 overflow-hidden rounded-2xl border border-border bg-popover shadow-[0_18px_40px_hsl(258_30%_18%/0.12)] backdrop-blur-sm">
+          {options.length === 0 ? (
+            <div className="px-4 py-3 text-sm text-muted-foreground">{emptyLabel}</div>
+          ) : (
+            <div className="max-h-72 space-y-1 overflow-auto p-2">
+              {options.map((option) => {
+                const checked = value.includes(option.id)
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors ${
+                      checked ? 'bg-primary/10 text-primary' : 'text-foreground hover:bg-accent/70'
+                    }`}
+                    onClick={() => toggleOption(option.id)}
+                  >
+                    <span className={`flex size-4 items-center justify-center rounded border ${checked ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-transparent'}`}>
+                      <Check className="size-3" />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm">{formatAPIKeyOptionLabel(option)}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  )
 }
 
 function TogglePill({
