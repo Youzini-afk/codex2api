@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -118,6 +119,49 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 		if !routes[path] {
 			t.Fatalf("expected POST route %s to be registered; routes=%v", path, routes)
 		}
+	}
+}
+
+func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(auth.NewStore(nil, nil, nil), nil, nil, nil)
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction","summary":"previous context was compacted"}
+		]
+	}`)
+
+	tests := []struct {
+		name    string
+		path    string
+		handler gin.HandlerFunc
+	}{
+		{name: "responses", path: "/v1/responses", handler: handler.Responses},
+		{name: "responses compact", path: "/v1/responses/compact", handler: handler.ResponsesCompact},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = req
+
+			test.handler(ginCtx)
+
+			if recorder.Code == http.StatusBadRequest && strings.Contains(recorder.Body.String(), "invalid_input_type") {
+				t.Fatalf("compaction input type was rejected by local validation: %s", recorder.Body.String())
+			}
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d after validation passes; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+			}
+		})
 	}
 }
 
