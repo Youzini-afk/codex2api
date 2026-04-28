@@ -1150,14 +1150,38 @@ func schemaDeclaresArray(schema map[string]interface{}) bool {
 // ==================== 响应翻译: Codex SSE → OpenAI SSE ====================
 
 // UsageInfo token 使用统计
+type TokenDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
 type UsageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-	InputTokens      int `json:"input_tokens,omitempty"`
-	OutputTokens     int `json:"output_tokens,omitempty"`
-	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
-	CachedTokens     int `json:"cached_tokens,omitempty"`
+	PromptTokens            int           `json:"prompt_tokens"`
+	CompletionTokens        int           `json:"completion_tokens"`
+	TotalTokens             int           `json:"total_tokens"`
+	InputTokens             int           `json:"input_tokens,omitempty"`
+	OutputTokens            int           `json:"output_tokens,omitempty"`
+	ReasoningTokens         int           `json:"reasoning_tokens,omitempty"`
+	CachedTokens            int           `json:"cached_tokens,omitempty"`
+	PromptTokensDetails     *TokenDetails `json:"prompt_tokens_details,omitempty"`
+	InputTokensDetails      *TokenDetails `json:"input_tokens_details,omitempty"`
+}
+
+func newUsageInfo(inputTokens, outputTokens, reasoningTokens, cachedTokens int) *UsageInfo {
+	usage := &UsageInfo{
+		PromptTokens:     inputTokens,
+		CompletionTokens: outputTokens,
+		TotalTokens:      inputTokens + outputTokens,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		ReasoningTokens:  reasoningTokens,
+		CachedTokens:     cachedTokens,
+	}
+	if cachedTokens > 0 {
+		details := &TokenDetails{CachedTokens: cachedTokens}
+		usage.PromptTokensDetails = details
+		usage.InputTokensDetails = details
+	}
+	return usage
 }
 
 // newContentChunk 构建文本内容流式块
@@ -1492,15 +1516,7 @@ func extractUsageFromResult(usage gjson.Result) *UsageInfo {
 	outputTokens := int(usage.Get("output_tokens").Int())
 	reasoningTokens := int(usage.Get("output_tokens_details.reasoning_tokens").Int())
 	cachedTokens := int(usage.Get("input_tokens_details.cached_tokens").Int())
-	return &UsageInfo{
-		PromptTokens:     inputTokens,
-		CompletionTokens: outputTokens,
-		TotalTokens:      inputTokens + outputTokens,
-		InputTokens:      inputTokens,
-		OutputTokens:     outputTokens,
-		ReasoningTokens:  reasoningTokens,
-		CachedTokens:     cachedTokens,
-	}
+	return newUsageInfo(inputTokens, outputTokens, reasoningTokens, cachedTokens)
 }
 
 // ExtractToolCallsFromOutput 从 response.completed 事件的 output 数组中提取 function_call 项
