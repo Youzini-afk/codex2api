@@ -180,15 +180,17 @@ func New(driver string, dsn string) (*DB, error) {
 		`
 	}
 	_, err = db.conn.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS usage_stats_baseline (
-			id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-			total_requests  BIGINT NOT NULL DEFAULT 0,
-			total_tokens    BIGINT NOT NULL DEFAULT 0,
-			prompt_tokens   BIGINT NOT NULL DEFAULT 0,
-			completion_tokens BIGINT NOT NULL DEFAULT 0,
-			cached_tokens   BIGINT NOT NULL DEFAULT 0
-		)
-	`)
+			CREATE TABLE IF NOT EXISTS usage_stats_baseline (
+				id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+				total_requests  BIGINT NOT NULL DEFAULT 0,
+				total_tokens    BIGINT NOT NULL DEFAULT 0,
+				prompt_tokens   BIGINT NOT NULL DEFAULT 0,
+				completion_tokens BIGINT NOT NULL DEFAULT 0,
+				cached_tokens   BIGINT NOT NULL DEFAULT 0,
+				account_billed  DOUBLE PRECISION NOT NULL DEFAULT 0,
+				user_billed     DOUBLE PRECISION NOT NULL DEFAULT 0
+			)
+		`)
 	if err != nil {
 		return nil, fmt.Errorf("创建 usage_stats_baseline 表失败: %w", err)
 	}
@@ -198,8 +200,40 @@ func New(driver string, dsn string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("初始化 usage_stats_baseline 失败: %w", err)
 	}
+	if err := db.ensureUsageStatsBaselineBillingColumns(ctx); err != nil {
+		return nil, err
+	}
 
 	return db, nil
+}
+
+func (db *DB) ensureUsageStatsBaselineBillingColumns(ctx context.Context) error {
+	if db.isSQLite() {
+		columns, err := db.sqliteTableColumns(ctx, "usage_stats_baseline")
+		if err != nil {
+			return err
+		}
+		for _, column := range []struct {
+			name string
+			def  string
+		}{
+			{name: "account_billed", def: "REAL NOT NULL DEFAULT 0"},
+			{name: "user_billed", def: "REAL NOT NULL DEFAULT 0"},
+		} {
+			if _, ok := columns[column.name]; ok {
+				continue
+			}
+			if _, err := db.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE usage_stats_baseline ADD COLUMN %s %s", column.name, column.def)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	_, err := db.conn.ExecContext(ctx, `
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS account_billed DOUBLE PRECISION NOT NULL DEFAULT 0;
+		ALTER TABLE usage_stats_baseline ADD COLUMN IF NOT EXISTS user_billed DOUBLE PRECISION NOT NULL DEFAULT 0;
+	`)
+	return err
 }
 
 // Close 关闭数据库连接
@@ -827,6 +861,16 @@ type UsageLog struct {
 	ImageSize        string    `json:"image_size"`
 	AccountEmail     string    `json:"account_email"`
 	CreatedAt        time.Time `json:"created_at"`
+	AccountBilled    float64   `json:"account_billed"`
+	UserBilled       float64   `json:"user_billed"`
+	InputCost        float64   `json:"input_cost"`
+	OutputCost       float64   `json:"output_cost"`
+	CacheReadCost    float64   `json:"cache_read_cost"`
+	TotalCost        float64   `json:"total_cost"`
+	InputPrice       float64   `json:"input_price_per_mtoken"`
+	OutputPrice      float64   `json:"output_price_per_mtoken"`
+	CacheReadPrice   float64   `json:"cache_read_price_per_mtoken"`
+	RateMultiplier   float64   `json:"rate_multiplier"`
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
@@ -917,6 +961,37 @@ type UsageLogInput struct {
 	ImageBytes       int
 	ImageFormat      string
 	ImageSize        string
+}
+
+func (l *UsageLog) populateBillingBreakdown() {
+	billingModel := l.EffectiveModel
+	if billingModel == "" {
+		billingModel = l.Model
+	}
+	breakdown := calculateCostBreakdown(l.InputTokens, l.OutputTokens, l.CachedTokens, billingModel, l.ServiceTier)
+	l.InputCost = breakdown.InputCost
+	l.OutputCost = breakdown.OutputCost
+	l.CacheReadCost = breakdown.CacheReadCost
+	l.TotalCost = breakdown.TotalCost
+	l.InputPrice = breakdown.InputPricePerMToken
+	l.OutputPrice = breakdown.OutputPricePerMToken
+	l.CacheReadPrice = breakdown.CacheReadPricePerMToken
+	l.RateMultiplier = breakdown.ServiceTierCostMultiplier
+
+	displayTotal := l.UserBilled
+	if displayTotal <= 0 {
+		displayTotal = l.AccountBilled
+	}
+	if displayTotal > 0 && breakdown.TotalCost > 0 && displayTotal != breakdown.TotalCost {
+		scale := displayTotal / breakdown.TotalCost
+		l.InputCost *= scale
+		l.OutputCost *= scale
+		l.CacheReadCost *= scale
+		l.TotalCost = displayTotal
+		l.InputPrice *= scale
+		l.OutputPrice *= scale
+		l.CacheReadPrice *= scale
+	}
 }
 
 // startLogFlusher 启动后台定时 flush 协程（每 5 秒一次）
@@ -1056,17 +1131,21 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) e
 
 // UsageStats 使用统计
 type UsageStats struct {
-	TotalRequests     int64   `json:"total_requests"`
-	TotalTokens       int64   `json:"total_tokens"`
-	TotalPrompt       int64   `json:"total_prompt_tokens"`
-	TotalCompletion   int64   `json:"total_completion_tokens"`
-	TotalCachedTokens int64   `json:"total_cached_tokens"`
-	TodayRequests     int64   `json:"today_requests"`
-	TodayTokens       int64   `json:"today_tokens"`
-	RPM               float64 `json:"rpm"`
-	TPM               float64 `json:"tpm"`
-	AvgDurationMs     float64 `json:"avg_duration_ms"`
-	ErrorRate         float64 `json:"error_rate"`
+	TotalRequests      int64   `json:"total_requests"`
+	TotalTokens        int64   `json:"total_tokens"`
+	TotalPrompt        int64   `json:"total_prompt_tokens"`
+	TotalCompletion    int64   `json:"total_completion_tokens"`
+	TotalCachedTokens  int64   `json:"total_cached_tokens"`
+	TotalAccountBilled float64 `json:"total_account_billed"`
+	TotalUserBilled    float64 `json:"total_user_billed"`
+	TodayRequests      int64   `json:"today_requests"`
+	TodayTokens        int64   `json:"today_tokens"`
+	TodayAccountBilled float64 `json:"today_account_billed"`
+	TodayUserBilled    float64 `json:"today_user_billed"`
+	RPM                float64 `json:"rpm"`
+	TPM                float64 `json:"tpm"`
+	AvgDurationMs      float64 `json:"avg_duration_ms"`
+	ErrorRate          float64 `json:"error_rate"`
 }
 
 // TrafficSnapshot 近实时流量快照
@@ -1092,12 +1171,14 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	SELECT
 		COUNT(*) AS today_requests,
 		COALESCE(SUM(total_tokens), 0) AS today_tokens,
-		COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
-		COALESCE(SUM(completion_tokens), 0) AS today_completion,
-		COALESCE(SUM(cached_tokens), 0) AS today_cached,
-		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
-		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
-		COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+			COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
+			COALESCE(SUM(completion_tokens), 0) AS today_completion,
+			COALESCE(SUM(cached_tokens), 0) AS today_cached,
+			COALESCE(SUM(account_billed), 0) AS today_account_billed,
+			COALESCE(SUM(user_billed), 0) AS today_user_billed,
+			COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
+			COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
+			COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
 	FROM usage_logs
 	WHERE created_at >= $1
@@ -1107,6 +1188,7 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	var todayErrors int64
 	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
+		&stats.TodayAccountBilled, &stats.TodayUserBilled,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
 		&todayErrors,
@@ -1115,24 +1197,30 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		return nil, err
 	}
 
-	// 统计当前可见请求总数（排除 499，保证与使用统计列表口径一致）
+	// 统计当前可见请求总数和计费总额（排除 499，保证与使用统计列表口径一致）
 	var visibleTotal int64
+	var currentAccountBilled, currentUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499
-	`).Scan(&visibleTotal)
+			SELECT COUNT(*), COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0)
+			FROM usage_logs
+			WHERE status_code <> 499
+		`).Scan(&visibleTotal, &currentAccountBilled, &currentUserBilled)
 
 	// 加上基线值（清空日志前保存的累计值）
 	var bReq, bTok, bPrompt, bComp, bCached int64
+	var bAccountBilled, bUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens
-		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
+			SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, account_billed, user_billed
+			FROM usage_stats_baseline WHERE id = 1
+		`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bAccountBilled, &bUserBilled)
 
 	stats.TotalRequests = visibleTotal + bReq
 	stats.TotalTokens = stats.TodayTokens + bTok
 	stats.TotalPrompt += bPrompt
 	stats.TotalCompletion += bComp
 	stats.TotalCachedTokens += bCached
+	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
+	stats.TotalUserBilled = currentUserBilled + bUserBilled
 
 	if stats.TodayRequests > 0 {
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
@@ -1197,8 +1285,9 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
-	            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
-	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
+		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
+		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.status_code <> 499
@@ -1216,7 +1305,8 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &credentialRaw, &createdAtRaw); err != nil {
+			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
+			&credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1224,6 +1314,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		if err != nil {
 			return nil, err
 		}
+		l.populateBillingBreakdown()
 		logs = append(logs, l)
 	}
 	return logs, rows.Err()
@@ -1423,8 +1514,9 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
-	            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
-	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
+		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
+		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.created_at >= $1 AND u.created_at <= $2
@@ -1443,7 +1535,8 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		var createdAtRaw interface{}
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
-			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &credentialRaw, &createdAtRaw); err != nil {
+			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
+			&credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1451,6 +1544,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		if err != nil {
 			return nil, err
 		}
+		l.populateBillingBreakdown()
 		logs = append(logs, l)
 	}
 	return logs, rows.Err()
@@ -1534,8 +1628,9 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
-	            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
-	            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
+		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
+		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
+		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1555,7 +1650,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens,
 			&l.ServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			&l.AccountBilled, &l.UserBilled, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1563,6 +1658,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		if err != nil {
 			return nil, err
 		}
+		l.populateBillingBreakdown()
 		result.Logs = append(result.Logs, l)
 	}
 	if result.Logs == nil {
@@ -1577,12 +1673,14 @@ func (db *DB) ClearUsageLogs(ctx context.Context) error {
 	_, err := db.conn.ExecContext(ctx, `
 		UPDATE usage_stats_baseline SET
 			total_requests  = total_requests  + COALESCE((SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499), 0),
-			total_tokens    = total_tokens    + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-			prompt_tokens   = prompt_tokens   + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-			completion_tokens = completion_tokens + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE status_code <> 499), 0),
-			cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs WHERE status_code <> 499), 0)
-		WHERE id = 1
-	`)
+				total_tokens    = total_tokens    + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+				prompt_tokens   = prompt_tokens   + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+				completion_tokens = completion_tokens + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+				cached_tokens   = cached_tokens   + COALESCE((SELECT SUM(cached_tokens) FROM usage_logs WHERE status_code <> 499), 0),
+				account_billed  = account_billed  + COALESCE((SELECT SUM(account_billed) FROM usage_logs WHERE status_code <> 499), 0),
+				user_billed     = user_billed     + COALESCE((SELECT SUM(user_billed) FROM usage_logs WHERE status_code <> 499), 0)
+			WHERE id = 1
+		`)
 	if err != nil {
 		return fmt.Errorf("快照统计基线失败: %w", err)
 	}

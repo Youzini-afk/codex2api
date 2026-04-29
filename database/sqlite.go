@@ -600,11 +600,11 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	minuteAgo := now.Add(-1 * time.Minute)
 
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
-		       cached_tokens, duration_ms, status_code
-		FROM usage_logs
-		WHERE created_at >= $1 AND status_code <> 499
-	`, db.timeArg(todayStart))
+			SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
+			       cached_tokens, duration_ms, status_code, account_billed, user_billed
+			FROM usage_logs
+			WHERE created_at >= $1 AND status_code <> 499
+		`, db.timeArg(todayStart))
 	if err != nil {
 		return nil, err
 	}
@@ -619,8 +619,9 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		var totalTokens, promptTokens, completionTokens, cachedTokens int64
 		var durationMs int
 		var statusCode int
+		var accountBilled, userBilled float64
 		if err := rows.Scan(&createdRaw, &totalTokens, &promptTokens, &completionTokens,
-			&cachedTokens, &durationMs, &statusCode); err != nil {
+			&cachedTokens, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -633,6 +634,8 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		stats.TotalPrompt += promptTokens
 		stats.TotalCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
+		stats.TodayAccountBilled += accountBilled
+		stats.TodayUserBilled += userBilled
 		totalDuration += float64(durationMs)
 
 		if statusCode >= 400 {
@@ -655,20 +658,28 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 
 	// 可见请求总数（排除 499）
 	var visibleTotal int64
-	_ = db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499`).Scan(&visibleTotal)
+	var currentAccountBilled, currentUserBilled float64
+	_ = db.conn.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0)
+		FROM usage_logs
+		WHERE status_code <> 499
+	`).Scan(&visibleTotal, &currentAccountBilled, &currentUserBilled)
 
 	// 基线值
 	var bReq, bTok, bPrompt, bComp, bCached int64
+	var bAccountBilled, bUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens
+		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, account_billed, user_billed
 		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
+	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bAccountBilled, &bUserBilled)
 
 	stats.TotalRequests = visibleTotal + bReq
 	stats.TotalTokens = stats.TodayTokens + bTok
 	stats.TotalPrompt += bPrompt
 	stats.TotalCompletion += bComp
 	stats.TotalCachedTokens += bCached
+	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
+	stats.TotalUserBilled = currentUserBilled + bUserBilled
 
 	return stats, nil
 }

@@ -17,11 +17,30 @@ type modelPricingRule struct {
 	pricing ModelPricing
 }
 
+type costBreakdown struct {
+	InputCost                 float64
+	OutputCost                float64
+	CacheReadCost             float64
+	TotalCost                 float64
+	InputPricePerMToken       float64
+	OutputPricePerMToken      float64
+	CacheReadPricePerMToken   float64
+	ServiceTierCostMultiplier float64
+}
+
 var (
 	defaultModelPricing = &ModelPricing{InputPricePerMToken: 1.0, OutputPricePerMToken: 2.0}
 
 	modelPricingRules = []modelPricingRule{
 		// Codex/GPT-5 系列，参考 sub2api 的本地 fallback 定价。
+		{model: "gpt-5.5", pricing: ModelPricing{
+			InputPricePerMToken:             5.0,
+			InputPricePerMTokenPriority:     10.0,
+			OutputPricePerMToken:            30.0,
+			OutputPricePerMTokenPriority:    60.0,
+			CacheReadPricePerMToken:         0.5,
+			CacheReadPricePerMTokenPriority: 1.0,
+		}},
 		{model: "gpt-5.4-mini", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 4.5, CacheReadPricePerMToken: 0.075}},
 		{model: "gpt-5.4-nano", pricing: ModelPricing{InputPricePerMToken: 0.2, OutputPricePerMToken: 1.25, CacheReadPricePerMToken: 0.02}},
 		{model: "gpt-5.4", pricing: ModelPricing{
@@ -91,6 +110,10 @@ func getModelPricing(model string) *ModelPricing {
 // model: 模型名称
 // 返回：账号计费金额（美元）
 func calculateCost(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) float64 {
+	return calculateCostBreakdown(inputTokens, outputTokens, cachedTokens, model, serviceTier).TotalCost
+}
+
+func calculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) costBreakdown {
 	pricing := getModelPricing(model)
 	inputPrice := pricing.InputPricePerMToken
 	outputPrice := pricing.OutputPricePerMToken
@@ -126,7 +149,16 @@ func calculateCost(inputTokens, outputTokens, cachedTokens int, model string, se
 	cacheReadCost := float64(cachedTokens) / 1000000.0 * cacheReadPrice
 	outputCost := float64(outputTokens) / 1000000.0 * outputPrice
 
-	return (inputCost + cacheReadCost + outputCost) * tierMultiplier
+	return costBreakdown{
+		InputCost:                 inputCost * tierMultiplier,
+		OutputCost:                outputCost * tierMultiplier,
+		CacheReadCost:             cacheReadCost * tierMultiplier,
+		TotalCost:                 (inputCost + cacheReadCost + outputCost) * tierMultiplier,
+		InputPricePerMToken:       inputPrice * tierMultiplier,
+		OutputPricePerMToken:      outputPrice * tierMultiplier,
+		CacheReadPricePerMToken:   cacheReadPrice * tierMultiplier,
+		ServiceTierCostMultiplier: tierMultiplier,
+	}
 }
 
 func normalizeBillingModelName(model string) string {
@@ -148,6 +180,8 @@ func normalizeBillingModelName(model string) string {
 func normalizeCodexBillingModel(model string) (string, bool) {
 	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(model)
 	switch {
+	case strings.Contains(compact, "gpt-5.5") || strings.Contains(compact, "gpt5-5") || strings.Contains(compact, "gpt5.5"):
+		return "gpt-5.5", true
 	case strings.Contains(compact, "gpt-5.4-mini") || strings.Contains(compact, "gpt5-4-mini") || strings.Contains(compact, "gpt5.4-mini"):
 		return "gpt-5.4-mini", true
 	case strings.Contains(compact, "gpt-5.4-nano") || strings.Contains(compact, "gpt5-4-nano") || strings.Contains(compact, "gpt5.4-nano"):

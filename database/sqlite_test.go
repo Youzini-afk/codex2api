@@ -36,9 +36,30 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "account_billed", "user_billed"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
+		}
+	}
+}
+
+func TestSQLiteUsageStatsBaselineHasBillingColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	columns, err := db.sqliteTableColumns(context.Background(), "usage_stats_baseline")
+	if err != nil {
+		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
+	}
+
+	for _, name := range []string{"account_billed", "user_billed"} {
+		if _, ok := columns[name]; !ok {
+			t.Fatalf("usage_stats_baseline 缺少列 %q", name)
 		}
 	}
 }
@@ -124,6 +145,100 @@ func TestUsageLogsPersistImageMetadata(t *testing.T) {
 	got := logs[0]
 	if got.ImageCount != 1 || got.ImageWidth != 3840 || got.ImageHeight != 2160 || got.ImageBytes != 2457600 || got.ImageFormat != "png" || got.ImageSize != "3840x2160" {
 		t.Fatalf("image metadata = %#v", got)
+	}
+}
+
+func TestUsageLogsReturnBillingFields(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:        1,
+		Endpoint:         "/v1/responses",
+		InboundEndpoint:  "/v1/responses",
+		UpstreamEndpoint: "/v1/responses",
+		Model:            "gpt-5.5",
+		StatusCode:       200,
+		InputTokens:      476,
+		OutputTokens:     252,
+		TotalTokens:      728,
+		ServiceTier:      "default",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+
+	got := logs[0]
+	want := calculateCost(476, 252, 0, "gpt-5.5", "default")
+	if got.AccountBilled != want || got.UserBilled != want {
+		t.Fatalf("billing = account %.12f user %.12f, want %.12f", got.AccountBilled, got.UserBilled, want)
+	}
+	if got.InputCost <= 0 || got.OutputCost <= 0 || got.TotalCost != want {
+		t.Fatalf("billing breakdown = input %.12f output %.12f total %.12f, want total %.12f", got.InputCost, got.OutputCost, got.TotalCost, want)
+	}
+}
+
+func TestUsageStatsIncludeBillingTotals(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	for _, usageLog := range []*UsageLogInput{
+		{
+			AccountID:    1,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.5",
+			StatusCode:   200,
+			InputTokens:  1000,
+			OutputTokens: 500,
+			TotalTokens:  1500,
+		},
+		{
+			AccountID:    1,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.5",
+			StatusCode:   499,
+			InputTokens:  1000,
+			OutputTokens: 500,
+			TotalTokens:  1500,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	stats, err := db.GetUsageStats(ctx)
+	if err != nil {
+		t.Fatalf("GetUsageStats 返回错误: %v", err)
+	}
+
+	want := calculateCost(1000, 500, 0, "gpt-5.5", "")
+	if stats.TotalAccountBilled != want || stats.TotalUserBilled != want {
+		t.Fatalf("total billing = account %.12f user %.12f, want %.12f", stats.TotalAccountBilled, stats.TotalUserBilled, want)
+	}
+	if stats.TodayAccountBilled != want || stats.TodayUserBilled != want {
+		t.Fatalf("today billing = account %.12f user %.12f, want %.12f", stats.TodayAccountBilled, stats.TodayUserBilled, want)
 	}
 }
 

@@ -271,8 +271,12 @@ export interface UsageStats {
   total_prompt_tokens: number
   total_completion_tokens: number
   total_cached_tokens: number
+  total_account_billed: number
+  total_user_billed: number
   today_requests: number
   today_tokens: number
+  today_account_billed: number
+  today_user_billed: number
   rpm: number
   tpm: number
   avg_duration_ms: number
@@ -311,6 +315,16 @@ export interface UsageLog {
   image_size: string
   account_email: string
   created_at: ISODateString
+  account_billed: number
+  user_billed: number
+  input_cost: number
+  output_cost: number
+  cache_read_cost: number
+  total_cost: number
+  input_price_per_mtoken: number
+  output_price_per_mtoken: number
+  cache_read_price_per_mtoken: number
+  rate_multiplier: number
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>
