@@ -118,7 +118,7 @@ type adminSessionStatusResponse struct {
 func (h *Handler) authorizeAdminRequest(c *gin.Context) (bool, string, string) {
 	adminSecret, source := h.resolveAdminSecret(c.Request.Context())
 	if adminSecret == "" {
-		return true, source, "disabled"
+		return false, source, ""
 	}
 
 	if expiresAt, ok := h.validateAdminSession(c.Request); ok {

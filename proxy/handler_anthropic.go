@@ -96,20 +96,31 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "messages is required")
 		return
 	}
+	if h.inspectPromptFilterAnthropic(c, rawBody, "/v1/messages", model) {
+		return
+	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 
 	// 2. 翻译请求: Anthropic → Codex
 	modelMappingJSON := h.store.GetModelMapping()
-	codexBody, originalModel, err := TranslateAnthropicToCodex(rawBody, modelMappingJSON)
+	codexBody, originalModel, err := TranslateAnthropicToCodexWithModels(rawBody, modelMappingJSON, h.supportedModelIDs(c.Request.Context()))
 	if err != nil {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
 		return
 	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	if isImageOnlyModel(effectiveModel) {
+		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
+		return
+	}
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -119,25 +130,23 @@ func (h *Handler) Messages(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
 					return
 				}
-				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "No available accounts, please retry later")
+				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
 				return
 			}
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
-		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		useWebsocket := h.shouldUseWebsocketForHTTP()
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -157,7 +166,8 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		downstreamHeaders := c.Request.Header.Clone()
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -165,7 +175,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
@@ -188,15 +198,17 @@ func (h *Handler) Messages(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/messages",
 				Model:            model,
+				EffectiveModel:   effectiveModel,
 				StatusCode:       resp.StatusCode,
 				DurationMs:       durationMs,
 				ReasoningEffort:  reasoningEffort,
@@ -227,7 +239,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", model)
+		c.Set("x-model", effectiveModel)
 		c.Set("x-reasoning-effort", reasoningEffort)
 
 		var firstTokenMs int
@@ -353,13 +365,14 @@ func (h *Handler) Messages(c *gin.Context) {
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
 			}
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			lastErr = readErr
 			if lastErr == nil {
 				lastErr = errors.New(outcome.failureMessage)
@@ -367,7 +380,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 
-		h.store.BindSessionAffinity(sessionID, account, proxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
@@ -390,6 +403,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/messages",
 			Model:            model,
+			EffectiveModel:   effectiveModel,
 			StatusCode:       logStatusCode,
 			DurationMs:       totalDuration,
 			FirstTokenMs:     firstTokenMs,
@@ -414,8 +428,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.PersistUsageSnapshot(account, usagePct)
 		}
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}

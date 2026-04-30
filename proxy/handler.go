@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,11 +38,39 @@ type Handler struct {
 	dbKeysUntil time.Time
 }
 
-func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool) (*auth.Account, string) {
+func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
+	return h.nextAccountForSessionWithFilter(sessionID, apiKeyID, exclude, nil)
+}
+
+func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
-	return h.store.NextForSession(sessionID, exclude)
+	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
+}
+
+func (h *Handler) shouldUseWebsocketForHTTP() bool {
+	if h == nil || h.cfg == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(h.cfg.CodexUpstreamTransport)) {
+	case "ws":
+		return true
+	case "http", "auto":
+		return false
+	default:
+		return h.cfg.UseWebsocket
+	}
+}
+
+func (h *Handler) resolveProxyForAttempt(account *auth.Account, stickyProxyURL string) string {
+	if proxyURL := strings.TrimSpace(stickyProxyURL); proxyURL != "" {
+		return proxyURL
+	}
+	if h == nil || h.store == nil {
+		return ""
+	}
+	return h.store.ResolveProxyForAccount(account)
 }
 
 type usageLimitDetails struct {
@@ -51,11 +80,100 @@ type usageLimitDetails struct {
 	resetsInSeconds int64
 }
 
+type CodexUsageSyncResult struct {
+	UsagePct7d           float64
+	HasUsage7d           bool
+	UsagePct5h           float64
+	Reset5hAt            time.Time
+	HasUsage5h           bool
+	Used5hHeaders        bool
+	Persisted5hOnly      bool
+	Premium5hRateLimited bool
+}
+
+type codexRateLimitWindow string
+
+const (
+	codexRateLimitWindowUnknown codexRateLimitWindow = ""
+	codexRateLimitWindowShort   codexRateLimitWindow = "short"
+	codexRateLimitWindow5h      codexRateLimitWindow = "5h"
+	codexRateLimitWindow7d      codexRateLimitWindow = "7d"
+)
+
+type codex429Decision struct {
+	Premium5h bool
+	ResetAt   time.Time
+	Cooldown  time.Duration
+}
+
 const (
 	contextAPIKeyID     = "apiKeyID"
 	contextAPIKeyName   = "apiKeyName"
 	contextAPIKeyMasked = "apiKeyMasked"
 )
+
+func requestAPIKeyID(c *gin.Context) int64 {
+	if c == nil {
+		return 0
+	}
+	if value, exists := c.Get(contextAPIKeyID); exists && value != nil {
+		switch typed := value.(type) {
+		case int64:
+			return typed
+		case int:
+			return int64(typed)
+		}
+	}
+	return 0
+}
+
+func sessionAffinityKey(sessionID string, apiKeyID int64) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || apiKeyID <= 0 {
+		return sessionID
+	}
+	return fmt.Sprintf("%s::api-key:%d", sessionID, apiKeyID)
+}
+
+const proOnlySparkModel = "gpt-5.3-codex-spark"
+
+func isProOnlyModel(model string) bool {
+	return strings.EqualFold(strings.TrimSpace(model), proOnlySparkModel)
+}
+
+func accountFilterForModel(model string) auth.AccountFilter {
+	if !isProOnlyModel(model) {
+		return nil
+	}
+	return func(account *auth.Account) bool {
+		if account == nil {
+			return false
+		}
+		return strings.EqualFold(strings.TrimSpace(account.GetPlanType()), "pro")
+	}
+}
+
+func effectiveRequestModel(body []byte, fallback string) string {
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	if model != "" {
+		return model
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func noAvailableAccountMessage(model string) string {
+	if isProOnlyModel(model) {
+		return "无可用 Pro 账号，gpt-5.3-codex-spark 仅支持 Pro 订阅账号"
+	}
+	return "无可用账号，请稍后重试"
+}
+
+func noAvailableAnthropicAccountMessage(model string) string {
+	if isProOnlyModel(model) {
+		return "No available Pro account for gpt-5.3-codex-spark"
+	}
+	return "No available accounts, please retry later"
+}
 
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
@@ -287,6 +405,114 @@ func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries
 	return true
 }
 
+func imageGenerationOutputKey(item gjson.Result) string {
+	if key := strings.TrimSpace(item.Get("id").String()); key != "" {
+		return key
+	}
+	result := strings.TrimSpace(item.Get("result").String())
+	if result == "" {
+		return ""
+	}
+	return strings.TrimSpace(item.Get("output_format").String()) + "|" + result
+}
+
+func extractResponseImageGenerationOutput(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
+	if len(data) == 0 || !gjson.ValidBytes(data) {
+		return nil, false
+	}
+	if gjson.GetBytes(data, "type").String() != "response.output_item.done" {
+		return nil, false
+	}
+	item := gjson.GetBytes(data, "item")
+	if !item.Exists() || !item.IsObject() || item.Get("type").String() != "image_generation_call" {
+		return nil, false
+	}
+	if strings.TrimSpace(item.Get("result").String()) == "" {
+		return nil, false
+	}
+	key := imageGenerationOutputKey(item)
+	if key != "" && seen != nil {
+		if _, ok := seen[key]; ok {
+			return nil, false
+		}
+		seen[key] = struct{}{}
+	}
+	raw := []byte(item.Raw)
+	var output map[string]any
+	if err := json.Unmarshal(raw, &output); err == nil && addImageStatsToMap(output) {
+		if annotated, err := json.Marshal(output); err == nil {
+			raw = annotated
+		}
+	}
+	return json.RawMessage(raw), true
+}
+
+func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.RawMessage) []byte {
+	if len(responseJSON) == 0 {
+		return responseJSON
+	}
+	var response map[string]any
+	if err := json.Unmarshal(responseJSON, &response); err != nil {
+		return responseJSON
+	}
+
+	seen := make(map[string]struct{})
+	changed := false
+	outputs, _ := response["output"].([]any)
+	for _, rawOutput := range outputs {
+		outputMap, ok := rawOutput.(map[string]any)
+		if !ok {
+			continue
+		}
+		if firstNonEmptyAnyString(outputMap["type"]) != "image_generation_call" {
+			continue
+		}
+		outputBytes, err := json.Marshal(outputMap)
+		if err != nil {
+			continue
+		}
+		item := gjson.ParseBytes(outputBytes)
+		if key := imageGenerationOutputKey(item); key != "" {
+			seen[key] = struct{}{}
+		}
+		if addImageStatsToMap(outputMap) {
+			changed = true
+		}
+	}
+
+	for _, rawImage := range imageOutputs {
+		if len(rawImage) == 0 || !gjson.ValidBytes(rawImage) {
+			continue
+		}
+		item := gjson.ParseBytes(rawImage)
+		key := imageGenerationOutputKey(item)
+		if key != "" {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		var decoded any
+		if err := json.Unmarshal(rawImage, &decoded); err != nil {
+			continue
+		}
+		if outputMap, ok := decoded.(map[string]any); ok {
+			addImageStatsToMap(outputMap)
+		}
+		outputs = append(outputs, decoded)
+		changed = true
+	}
+	if !changed {
+		return responseJSON
+	}
+	response["output"] = outputs
+	merged, err := json.Marshal(response)
+	if err != nil {
+		return responseJSON
+	}
+	return merged
+}
+
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	auth := h.authMiddleware()
@@ -297,6 +523,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.POST("/chat/completions", h.ChatCompletions)
 	v1.POST("/responses", h.Responses)
 	v1.POST("/responses/compact", h.ResponsesCompact)
+	v1.POST("/images/generations", h.ImagesGenerations)
+	v1.POST("/images/edits", h.ImagesEdits)
 	v1.POST("/messages", h.Messages)
 	v1.GET("/models", h.ListModels)
 
@@ -304,16 +532,47 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/chat/completions", auth, h.ChatCompletions)
 	r.POST("/responses", auth, h.Responses)
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
+	r.POST("/images/generations", auth, h.ImagesGenerations)
+	r.POST("/images/edits", auth, h.ImagesEdits)
 	r.POST("/messages", auth, h.Messages)
 	r.GET("/models", auth, h.ListModels)
+
+	codexDirect := r.Group("/backend-api/codex")
+	codexDirect.Use(auth)
+	codexDirect.POST("/responses", h.Responses)
+	codexDirect.POST("/responses/*subpath", func(c *gin.Context) {
+		subpath := strings.TrimSpace(c.Param("subpath"))
+		if subpath == "/compact" || strings.HasPrefix(subpath, "/compact/") {
+			h.ResponsesCompact(c)
+			return
+		}
+		h.Responses(c)
+	})
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
+//
+// 安全策略（fail-closed）：
+//   - 默认情况下，未配置任何 API Key 时直接拒绝请求（503），避免裸奔账号池。
+//   - 仅当显式设置 CODEX_ALLOW_ANONYMOUS=true 时才在无密钥情况下放行（兼容内网/测试）。
 func (h *Handler) authMiddleware() gin.HandlerFunc {
+	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
-		// 如果没有配置任何密钥，跳过鉴权
+		// 如果没有配置任何密钥
 		if !h.hasAnyKeys() {
-			c.Next()
+			if allowAnonymous {
+				// 显式允许匿名访问（旧行为，仅在 CODEX_ALLOW_ANONYMOUS=true 时启用）
+				c.Next()
+				return
+			}
+			// fail-closed：未配置 API Key 即拒绝，避免账号池被未授权调用
+			security.SecurityAuditLog("V1_BLOCKED_NO_KEYS", fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
+			api.SendError(c, api.NewAPIError(
+				api.ErrCodeServiceUnavailable,
+				"Service is not configured: no API key has been created yet. Please add at least one API key in the admin dashboard, or set CODEX_ALLOW_ANONYMOUS=true to disable this check.",
+				api.ErrorTypeServer,
+			))
+			c.Abort()
 			return
 		}
 
@@ -404,7 +663,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -433,10 +692,15 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses", model) {
+		return
+	}
 
 	rawBody = normalizeServiceTierField(rawBody)
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -445,6 +709,12 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
 	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
+	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -454,28 +724,26 @@ func (h *Handler) Responses(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
 				})
 				return
 			}
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
-		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		useWebsocket := h.shouldUseWebsocketForHTTP()
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -492,7 +760,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -500,7 +769,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
@@ -518,17 +787,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
+			SyncCodexUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
@@ -570,6 +838,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var responseJSON []byte
+		var imageLogInfo imageUsageLogInfo
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -602,6 +871,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
+				if image, ok := extractImageFromOutputItemDone(data, model); ok {
+					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
+				}
 
 				// 提取 usage + service_tier
 				if eventType == "response.completed" {
@@ -628,9 +900,14 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
+			imageOutputs := make([]json.RawMessage, 0, 1)
+			seenImageOutputs := make(map[string]struct{})
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
+					imageOutputs = append(imageOutputs, imageOutput)
+				}
 				if !ttftRecorded && eventType == "response.output_text.delta" {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -662,6 +939,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				responseObj := gjson.GetBytes(lastResponseData, "response")
 				if responseObj.Exists() {
 					responseJSON = []byte(responseObj.Raw)
+					responseJSON = appendMissingResponseImageOutputs(responseJSON, imageOutputs)
+					imageLogInfo = imageUsageLogInfoFromResponseJSON(responseJSON)
 				}
 			}
 		}
@@ -671,13 +950,12 @@ func (h *Handler) Responses(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
+			recyclePooledClient(account, proxyURL)
+			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			lastErr = readErr
 			if lastErr == nil {
 				lastErr = errors.New(outcome.failureMessage)
@@ -685,7 +963,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			continue
 		}
 
-		h.store.BindSessionAffinity(sessionID, account, proxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
@@ -736,15 +1014,15 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		applyImageUsageLogInfo(logInput, imageLogInfo)
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
-		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-			h.store.PersistUsageSnapshot(account, usagePct)
-		}
+		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
@@ -774,7 +1052,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -799,9 +1077,18 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
+	if isImageOnlyModel(model) {
+		sendImageOnlyModelError(c, model)
+		return
+	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses/compact", model) {
+		return
+	}
 
 	rawBody = normalizeServiceTierField(rawBody)
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -813,6 +1100,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 	// 准备上游请求体
 	codexBody, _ := PrepareCompactResponsesBody(rawBody)
+	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	// 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -822,26 +1115,24 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
 				})
 				return
 			}
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -851,7 +1142,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -859,7 +1151,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
@@ -876,16 +1168,15 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
+			SyncCodexUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses/compact",
@@ -910,9 +1201,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 
 		// 成功：直接透传响应体
-		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-			h.store.PersistUsageSnapshot(account, usagePct)
-		}
+		SyncCodexUsageState(h.store, account, resp)
 
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -973,7 +1262,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -992,12 +1281,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if model == "" {
 		model = "gpt-5.4"
 	}
+	if isImageOnlyModel(model) {
+		sendImageOnlyModelError(c, model)
+		return
+	}
 
 	// 验证 model 参数
 	if err := security.ValidateModelName(model); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": gin.H{"message": "model 参数无效", "type": "invalid_request_error"},
 		})
+		return
+	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/chat/completions", model) {
 		return
 	}
 
@@ -1014,8 +1310,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1025,28 +1325,26 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
 				})
 				return
 			}
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
-		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		useWebsocket := h.shouldUseWebsocketForHTTP()
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -1063,7 +1361,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1071,7 +1370,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
@@ -1089,17 +1388,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
+			SyncCodexUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",
@@ -1247,13 +1545,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
+			recyclePooledClient(account, proxyURL)
+			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			lastErr = readErr
 			if lastErr == nil {
 				lastErr = errors.New(outcome.failureMessage)
@@ -1261,7 +1558,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			continue
 		}
 
-		h.store.BindSessionAffinity(sessionID, account, proxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
@@ -1315,12 +1612,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
-		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-			h.store.PersistUsageSnapshot(account, usagePct)
-		}
+		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
@@ -1443,13 +1739,184 @@ func isMissingScopeUnauthorized(body []byte) bool {
 	return strings.Contains(msg, "scope")
 }
 
+func parseRetryAfterResetAt(body []byte, now time.Time) (time.Time, bool) {
+	if len(body) == 0 {
+		return time.Time{}, false
+	}
+
+	if resetsAt := gjson.GetBytes(body, "error.resets_at").Int(); resetsAt > 0 {
+		resetTime := time.Unix(resetsAt, 0)
+		if resetTime.After(now) {
+			return resetTime, true
+		}
+	}
+
+	if secs := gjson.GetBytes(body, "error.resets_in_seconds").Int(); secs > 0 {
+		return now.Add(time.Duration(secs) * time.Second), true
+	}
+
+	return time.Time{}, false
+}
+
+func codexWindowType(windowMinutes float64) codexRateLimitWindow {
+	switch {
+	case windowMinutes >= 1440:
+		return codexRateLimitWindow7d
+	case windowMinutes >= 60:
+		return codexRateLimitWindow5h
+	case windowMinutes > 0:
+		return codexRateLimitWindowShort
+	default:
+		return codexRateLimitWindowUnknown
+	}
+}
+
+type codexWindowUsage struct {
+	usedPct   float64
+	resetSec  float64
+	windowMin float64
+	valid     bool
+}
+
+func parseCodexWindowUsage(usedStr, windowStr, resetStr string) codexWindowUsage {
+	if usedStr == "" {
+		return codexWindowUsage{}
+	}
+	return codexWindowUsage{
+		usedPct:   parseFloat(usedStr),
+		windowMin: parseFloat(windowStr),
+		resetSec:  parseFloat(resetStr),
+		valid:     true,
+	}
+}
+
+func classifyCodex429Window(resp *http.Response, now time.Time) (codexRateLimitWindow, time.Time, bool) {
+	if resp == nil {
+		return codexRateLimitWindowUnknown, time.Time{}, false
+	}
+
+	primary := parseCodexWindowUsage(
+		resp.Header.Get("x-codex-primary-used-percent"),
+		resp.Header.Get("x-codex-primary-window-minutes"),
+		resp.Header.Get("x-codex-primary-reset-after-seconds"),
+	)
+	secondary := parseCodexWindowUsage(
+		resp.Header.Get("x-codex-secondary-used-percent"),
+		resp.Header.Get("x-codex-secondary-window-minutes"),
+		resp.Header.Get("x-codex-secondary-reset-after-seconds"),
+	)
+
+	var exhausted []codexWindowUsage
+	if primary.valid && primary.usedPct >= 100 {
+		exhausted = append(exhausted, primary)
+	}
+	if secondary.valid && secondary.usedPct >= 100 {
+		exhausted = append(exhausted, secondary)
+	}
+	if len(exhausted) == 0 {
+		return codexRateLimitWindowUnknown, time.Time{}, false
+	}
+
+	chosen := exhausted[0]
+	for _, candidate := range exhausted[1:] {
+		if candidate.windowMin > chosen.windowMin {
+			chosen = candidate
+		}
+	}
+
+	var resetAt time.Time
+	if chosen.resetSec > 0 {
+		resetAt = now.Add(time.Duration(chosen.resetSec) * time.Second)
+	}
+	return codexWindowType(chosen.windowMin), resetAt, !resetAt.IsZero()
+}
+
+func responseHasCodex5hHeaders(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+
+	primary := parseCodexWindowUsage(
+		resp.Header.Get("x-codex-primary-used-percent"),
+		resp.Header.Get("x-codex-primary-window-minutes"),
+		resp.Header.Get("x-codex-primary-reset-after-seconds"),
+	)
+	if primary.valid && codexWindowType(primary.windowMin) == codexRateLimitWindow5h {
+		return true
+	}
+
+	secondary := parseCodexWindowUsage(
+		resp.Header.Get("x-codex-secondary-used-percent"),
+		resp.Header.Get("x-codex-secondary-window-minutes"),
+		resp.Header.Get("x-codex-secondary-reset-after-seconds"),
+	)
+	return secondary.valid && codexWindowType(secondary.windowMin) == codexRateLimitWindow5h
+}
+
+func classify429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time) codex429Decision {
+	if account != nil && account.IsPremium5hPlan() {
+		windowType, resetAt, hasWindowReset := classifyCodex429Window(resp, now)
+		exactResetAt, hasExactReset := parseRetryAfterResetAt(body, now)
+
+		switch windowType {
+		case codexRateLimitWindow5h:
+			if hasExactReset {
+				resetAt = exactResetAt
+			} else if !hasWindowReset {
+				resetAt = now.Add(5 * time.Hour)
+			}
+			return codex429Decision{
+				Premium5h: true,
+				ResetAt:   resetAt,
+				Cooldown:  time.Until(resetAt),
+			}
+		case codexRateLimitWindow7d, codexRateLimitWindowShort:
+			// 明确不是 5h 窗口时，保持原有 cooldown 语义。
+		default:
+			if hasExactReset {
+				return codex429Decision{
+					Premium5h: true,
+					ResetAt:   exactResetAt,
+					Cooldown:  time.Until(exactResetAt),
+				}
+			}
+			resetAt = now.Add(5 * time.Hour)
+			return codex429Decision{
+				Premium5h: true,
+				ResetAt:   resetAt,
+				Cooldown:  5 * time.Hour,
+			}
+		}
+	}
+
+	cooldown := compute429Cooldown(account, body, resp)
+	return codex429Decision{Cooldown: cooldown}
+}
+
+// Apply429Cooldown 统一处理 429 对账号状态的影响，premium 5h 场景优先写入显式限流态。
+func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response) codex429Decision {
+	decision := classify429RateLimit(account, body, resp, time.Now())
+	if store == nil || account == nil {
+		return decision
+	}
+	if decision.Premium5h {
+		store.MarkPremium5hRateLimited(account, decision.ResetAt)
+		return decision
+	}
+	store.MarkCooldown(account, decision.Cooldown, "rate_limited")
+	return decision
+}
+
 // applyCooldown 根据上游状态码设置智能冷却
 func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []byte, resp *http.Response) {
 	switch statusCode {
 	case http.StatusTooManyRequests:
-		cooldown := h.compute429Cooldown(account, body, resp)
-		log.Printf("账号 %d 被限速 (plan=%s)，冷却 %v", account.ID(), account.GetPlanType(), cooldown)
-		h.store.MarkCooldown(account, cooldown, "rate_limited")
+		decision := Apply429Cooldown(h.store, account, body, resp)
+		if decision.Premium5h {
+			log.Printf("账号 %d 触发 premium 5h 限流 (plan=%s)，重置时间 %s", account.ID(), account.GetPlanType(), decision.ResetAt.Format(time.RFC3339))
+			return
+		}
+		log.Printf("账号 %d 被限速 (plan=%s)，冷却 %v", account.ID(), account.GetPlanType(), decision.Cooldown)
 	case http.StatusUnauthorized:
 		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
 		atomic.StoreInt32(&account.Disabled, 1)
@@ -1478,6 +1945,10 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 
 // compute429Cooldown 根据计划类型和 Codex 响应精确计算 429 冷却时间
 func (h *Handler) compute429Cooldown(account *auth.Account, body []byte, resp *http.Response) time.Duration {
+	return compute429Cooldown(account, body, resp)
+}
+
+func compute429Cooldown(account *auth.Account, body []byte, resp *http.Response) time.Duration {
 	// 1. 优先使用 Codex 响应体中的精确重置时间
 	if resetDuration := parseRetryAfter(body); resetDuration > 2*time.Minute {
 		// parseRetryAfter 默认返回 2min（无数据），超过 2min 说明解析到了真实的 resets_at/resets_in_seconds
@@ -1497,7 +1968,7 @@ func (h *Handler) compute429Cooldown(account *auth.Account, body []byte, resp *h
 
 	case "team", "teamplus", "pro", "plus", "enterprise":
 		// Team/Pro/Plus 有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
-		return h.detectTeamCooldownWindow(resp)
+		return detectTeamCooldownWindow(resp)
 
 	default:
 		// 未知套餐，保守默认 5 小时
@@ -1507,6 +1978,10 @@ func (h *Handler) compute429Cooldown(account *auth.Account, body []byte, resp *h
 
 // detectTeamCooldownWindow 通过响应头判断 Team/Pro/Plus 账号是哪个窗口触发的限制
 func (h *Handler) detectTeamCooldownWindow(resp *http.Response) time.Duration {
+	return detectTeamCooldownWindow(resp)
+}
+
+func detectTeamCooldownWindow(resp *http.Response) time.Duration {
 	if resp == nil {
 		return 5 * time.Hour // 保守默认
 	}
@@ -1551,6 +2026,35 @@ func windowMinutesToCooldown(windowMinutes float64) time.Duration {
 	}
 }
 
+// SyncCodexUsageState 解析 Codex 响应头并完成 7d / 5h 快照持久化与 premium 5h 提前限流。
+func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Response) CodexUsageSyncResult {
+	result := CodexUsageSyncResult{}
+	if account == nil || resp == nil {
+		return result
+	}
+
+	result.Used5hHeaders = responseHasCodex5hHeaders(resp)
+	result.UsagePct7d, result.HasUsage7d = parseCodexUsageHeaders(resp, account)
+	if store != nil {
+		if result.HasUsage7d {
+			store.PersistUsageSnapshot(account, result.UsagePct7d)
+		} else if result.Used5hHeaders {
+			store.PersistUsageSnapshot5hOnly(account)
+			result.Persisted5hOnly = true
+		}
+	}
+
+	result.UsagePct5h, result.Reset5hAt, result.HasUsage5h = account.GetUsageSnapshot5h()
+	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 {
+		if store != nil {
+			store.MarkPremium5hRateLimited(account, result.Reset5hAt)
+		}
+		result.Premium5hRateLimited = true
+	}
+
+	return result
+}
+
 // parseCodexUsageHeaders 从 Codex 响应头解析 5h/7d 用量百分比
 func parseCodexUsageHeaders(resp *http.Response, account *auth.Account) (float64, bool) {
 	if resp == nil {
@@ -1565,30 +2069,11 @@ func parseCodexUsageHeaders(resp *http.Response, account *auth.Account) (float64
 	secondaryWindowStr := resp.Header.Get("x-codex-secondary-window-minutes")
 	secondaryResetStr := resp.Header.Get("x-codex-secondary-reset-after-seconds")
 
-	type windowData struct {
-		usedPct   float64
-		resetSec  float64
-		windowMin float64
-		valid     bool
-	}
-
-	parseWindow := func(usedStr, windowStr, resetStr string) windowData {
-		if usedStr == "" {
-			return windowData{}
-		}
-		return windowData{
-			usedPct:   parseFloat(usedStr),
-			windowMin: parseFloat(windowStr),
-			resetSec:  parseFloat(resetStr),
-			valid:     true,
-		}
-	}
-
-	primary := parseWindow(primaryUsedStr, primaryWindowStr, primaryResetStr)
-	secondary := parseWindow(secondaryUsedStr, secondaryWindowStr, secondaryResetStr)
+	primary := parseCodexWindowUsage(primaryUsedStr, primaryWindowStr, primaryResetStr)
+	secondary := parseCodexWindowUsage(secondaryUsedStr, secondaryWindowStr, secondaryResetStr)
 
 	// 归一化：小窗口 (≤360min) → 5h，大窗口 (>360min) → 7d
-	var w5h, w7d windowData
+	var w5h, w7d codexWindowUsage
 	now := time.Now()
 
 	if primary.valid && secondary.valid {
@@ -1694,18 +2179,16 @@ func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, sta
 	h.sendUpstreamError(c, statusCode, body)
 }
 
-// SupportedModels 支持的模型列表（全局共享）
-var SupportedModels = []string{
-	"gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
-	"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
-	"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
-}
-
 // ListModels 列出可用模型
 func (h *Handler) ListModels(c *gin.Context) {
-	models := make([]api.Model, 0, len(SupportedModels))
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	modelIDs := h.supportedModelIDs(ctx)
+	models := make([]api.Model, 0, len(modelIDs))
 	now := time.Now().Unix()
-	for _, id := range SupportedModels {
+	for _, id := range modelIDs {
 		models = append(models, api.Model{
 			ID:      id,
 			Object:  "model",
@@ -1714,4 +2197,8 @@ func (h *Handler) ListModels(c *gin.Context) {
 		})
 	}
 	api.SendList(c, "list", models)
+}
+
+func (h *Handler) supportedModelIDs(ctx context.Context) []string {
+	return SupportedModelIDs(ctx, h.db)
 }

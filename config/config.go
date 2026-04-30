@@ -49,10 +49,13 @@ func (d *DatabaseConfig) Label() string {
 
 // RedisConfig Redis 核心配置
 type RedisConfig struct {
-	Addr     string
-	Password string
-	DB       int
-	URL      string
+	Addr               string
+	Username           string
+	Password           string
+	DB                 int
+	TLS                bool
+	InsecureSkipVerify bool
+	URL                string
 }
 
 // CacheConfig 缓存核心配置。
@@ -72,12 +75,15 @@ func (c *CacheConfig) Label() string {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port           int
-	AdminSecret    string
-	MaxRequestBodySize int
-	Database       DatabaseConfig
-	Cache          CacheConfig
-	UseWebsocket   bool   // 是否启用 WebSocket 传输
+	Port                   int
+	BindAddress            string // 监听地址，默认 0.0.0.0（兼容 Docker / 反代 / 公网）；如需仅本机访问可设为 127.0.0.1
+	AdminSecret            string
+	AllowAnonymousV1       bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
+	MaxRequestBodySize     int
+	Database               DatabaseConfig
+	Cache                  CacheConfig
+	UseWebsocket           bool   // 是否启用 WebSocket 传输
+	CodexUpstreamTransport string // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -101,14 +107,30 @@ func Load(envPath string) (*Config, error) {
 		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
 	cfg.AdminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
+	cfg.AllowAnonymousV1 = parseBoolEnv(os.Getenv("CODEX_ALLOW_ANONYMOUS"))
+	// 默认绑 0.0.0.0 以兼容 Docker 端口映射、反向代理、生产服务器等常规部署。
+	// 安全防护由 fail-closed 中间件 + 首启自助初始化 (/api/admin/bootstrap) + 启动 banner 共同保证；
+	// 想要严格仅本机访问的用户可设 CODEX_BIND=127.0.0.1。
+	cfg.BindAddress = strings.TrimSpace(os.Getenv("CODEX_BIND"))
+	if cfg.BindAddress == "" {
+		cfg.BindAddress = "0.0.0.0"
+	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_REQUEST_BODY_SIZE_MB")); v != "" {
 		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
 			cfg.MaxRequestBodySize = mb * 1024 * 1024
 		}
 	}
 
-	// WebSocket 配置
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("USE_WEBSOCKET"))); v == "true" || v == "1" {
+	// Codex 上游传输配置。CODEX_UPSTREAM_TRANSPORT 优先；USE_WEBSOCKET 保留为旧开关。
+	cfg.CodexUpstreamTransport = normalizeCodexUpstreamTransport(os.Getenv("CODEX_UPSTREAM_TRANSPORT"))
+	if cfg.CodexUpstreamTransport == "" && parseBoolEnv(os.Getenv("USE_WEBSOCKET")) {
+		cfg.CodexUpstreamTransport = "ws"
+		cfg.UseWebsocket = true
+	}
+	if cfg.CodexUpstreamTransport == "" {
+		cfg.CodexUpstreamTransport = "http"
+	}
+	if cfg.CodexUpstreamTransport == "ws" {
 		cfg.UseWebsocket = true
 	}
 
@@ -159,6 +181,7 @@ func Load(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("解析 Redis 连接字符串失败: %w", err)
 	}
 	cfg.Cache.Redis.Addr = firstNonEmpty(cfg.Cache.Redis.Addr, firstNonEmptyEnv("REDIS_ADDR", "REDIS_HOST"))
+	cfg.Cache.Redis.Username = firstNonEmpty(cfg.Cache.Redis.Username, firstNonEmptyEnv("REDIS_USERNAME"))
 	cfg.Cache.Redis.Password = firstNonEmpty(cfg.Cache.Redis.Password, firstNonEmptyEnv("REDIS_PASSWORD"))
 	if port := firstNonEmptyEnv("REDIS_PORT"); port != "" && cfg.Cache.Redis.Addr != "" && !strings.Contains(cfg.Cache.Redis.Addr, ":") {
 		cfg.Cache.Redis.Addr = cfg.Cache.Redis.Addr + ":" + port
@@ -168,6 +191,9 @@ func Load(envPath string) (*Config, error) {
 			cfg.Cache.Redis.DB = db
 		}
 	}
+	cfg.Cache.Redis.TLS = parseBoolEnv(os.Getenv("REDIS_TLS"))
+	cfg.Cache.Redis.InsecureSkipVerify = parseBoolEnv(os.Getenv("REDIS_INSECURE_SKIP_VERIFY"))
+
 	switch {
 	case cacheDriverEnv != "":
 		cfg.Cache.Driver = cacheDriverEnv
@@ -244,6 +270,28 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func parseBoolEnv(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCodexUpstreamTransport(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "http", "https", "sse":
+		return "http"
+	case "auto":
+		return "auto"
+	case "ws", "websocket", "wss":
+		return "ws"
+	default:
+		return ""
+	}
 }
 
 func applyPostgresConnectionString(cfg *DatabaseConfig, raw string) error {

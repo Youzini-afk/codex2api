@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -46,6 +48,7 @@ type Handler struct {
 	cacheLabel     string
 	adminSecretEnv string
 	sessionStore   *adminSessionStore
+	imageProxy     *proxy.Handler
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -77,9 +80,15 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheLabel:     tc.Label(),
 		adminSecretEnv: adminSecretEnv,
 		sessionStore:   newAdminSessionStore(),
+		imageProxy:     proxy.NewHandler(store, db, nil, nil),
 		chartCacheData: make(map[string]*chartCacheEntry),
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
+	if db != nil {
+		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
+			log.Printf("标记中断生图任务失败: %v", err)
+		}
+	}
 	return handler
 }
 
@@ -96,6 +105,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	authAPI.POST("/login", h.LoginAdminSession)
 	authAPI.POST("/logout", h.LogoutAdminSession)
 
+	r.GET("/p/img/:id", h.GetSignedImageAssetFile)
+
+	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
+	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
+	r.GET("/api/admin/bootstrap-status", h.GetBootstrapStatus)
+	r.POST("/api/admin/bootstrap", h.PostBootstrap)
+
 	api := r.Group("/api/admin")
 	api.Use(h.adminAuthMiddleware())
 	api.GET("/stats", h.GetStats)
@@ -107,10 +123,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
+	api.POST("/accounts/:id/enable", h.ToggleAccountEnabled)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
+	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
 	api.POST("/accounts/batch-test", h.BatchTest)
 	api.POST("/accounts/batch-reset-status", h.BatchResetStatus)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
@@ -130,7 +148,22 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
+	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
+	api.POST("/prompt-filter/test", h.TestPromptFilter)
+	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/models", h.ListModels)
+	api.POST("/models/sync", h.SyncModels)
+	api.GET("/image-prompts", h.ListImagePromptTemplates)
+	api.POST("/image-prompts", h.CreateImagePromptTemplate)
+	api.PATCH("/image-prompts/:id", h.UpdateImagePromptTemplate)
+	api.DELETE("/image-prompts/:id", h.DeleteImagePromptTemplate)
+	api.POST("/images/jobs", h.CreateImageGenerationJob)
+	api.GET("/images/jobs", h.ListImageGenerationJobs)
+	api.GET("/images/jobs/:id", h.GetImageGenerationJob)
+	api.GET("/images/assets", h.ListImageAssets)
+	api.GET("/images/assets/:id/file", h.GetImageAssetFile)
+	api.DELETE("/images/assets/:id", h.DeleteImageAsset)
 	api.GET("/proxies", h.ListProxies)
 	api.POST("/proxies", h.AddProxies)
 	api.DELETE("/proxies/:id", h.DeleteProxy)
@@ -148,10 +181,24 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 }
 
 // adminAuthMiddleware 管理接口鉴权中间件（增强版，增加安全审计日志）
+//
+// 安全策略（fail-closed）：
+//   - 未配置 ADMIN_SECRET 时一律拒绝（503），防止 /api/admin/* 裸奔。
+//   - 用户应通过前端「首次初始化」页面（无鉴权的 /api/admin/bootstrap 端点）
+//     设置初始密钥，或者在 .env 中显式设置 ADMIN_SECRET 后重启。
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authorized, source, method := h.authorizeAdminRequest(c)
 		if !authorized {
+			if source == "disabled" {
+				security.SecurityAuditLog("ADMIN_BLOCKED_NO_SECRET", fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": "管理接口未初始化：ADMIN_SECRET 尚未配置。请在浏览器访问 /admin/ 完成首次初始化，或在 .env 中设置 ADMIN_SECRET 后重启。",
+					"code":  "bootstrap_required",
+				})
+				c.Abort()
+				return
+			}
 			// 记录安全审计日志
 			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
 			c.JSON(http.StatusUnauthorized, gin.H{
@@ -253,6 +300,8 @@ type accountResponse struct {
 	ErrorRequests            int64                      `json:"error_requests"`
 	UsagePercent7d           *float64                   `json:"usage_percent_7d"`
 	UsagePercent5h           *float64                   `json:"usage_percent_5h"`
+	Usage5hDetail            *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
+	Usage7dDetail            *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
 	Reset7dAt                string                     `json:"reset_7d_at,omitempty"`
 	ScoreBreakdown           schedulerBreakdownResponse `json:"scheduler_breakdown"`
@@ -260,7 +309,21 @@ type accountResponse struct {
 	LastRateLimitedAt        string                     `json:"last_rate_limited_at,omitempty"`
 	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
 	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
+	Enabled                  bool                       `json:"enabled"`
 	Locked                   bool                       `json:"locked"`
+	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
+	// 图片配额信息
+	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
+	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
+	TodayUsedCount      *int   `json:"today_used_count,omitempty"`
+	ImageQuotaResetAt   string `json:"image_quota_reset_at,omitempty"`
+}
+
+type accountUsageWindow struct {
+	Requests      int64   `json:"requests"`
+	Tokens        int64   `json:"tokens"`
+	AccountBilled float64 `json:"account_billed"`
+	UserBilled    float64 `json:"user_billed"`
 }
 
 type schedulerBreakdownResponse struct {
@@ -297,6 +360,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
 	reqCounts := h.getCachedRequestCounts()
+	usage5h, usage7d := h.getAccountUsageWindows(ctx)
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -308,7 +372,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Status:                   row.Status,
 			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			ProxyURL:                 row.ProxyURL,
+			Enabled:                  row.Enabled,
 			Locked:                   row.Locked,
+			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
 			ScoreBiasEffective:       effectiveScoreBias(row.GetCredential("plan_type"), row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
@@ -380,6 +446,22 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.SuccessRequests = rc.SuccessCount
 			resp.ErrorRequests = rc.ErrorCount
 		}
+		if usage, ok := usage5h[row.ID]; ok {
+			resp.Usage5hDetail = &accountUsageWindow{
+				Requests:      usage.Requests,
+				Tokens:        usage.Tokens,
+				AccountBilled: usage.AccountBilled,
+				UserBilled:    usage.UserBilled,
+			}
+		}
+		if usage, ok := usage7d[row.ID]; ok {
+			resp.Usage7dDetail = &accountUsageWindow{
+				Requests:      usage.Requests,
+				Tokens:        usage.Tokens,
+				AccountBilled: usage.AccountBilled,
+				UserBilled:    usage.UserBilled,
+			}
+		}
 		accounts = append(accounts, resp)
 	}
 
@@ -389,6 +471,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 }
 
 // UpdateAccountScheduler 更新账号调度配置。
@@ -417,11 +500,32 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride); err != nil {
+	if allowedAPIKeyIDs.Set {
+		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, allowedAPIKeyIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验 API Key 失败: "+err.Error())
+			return
+		}
+		if len(missingAPIKeyIDs) > 0 {
+			values := make([]string, 0, len(missingAPIKeyIDs))
+			for _, value := range missingAPIKeyIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_api_key_ids 包含不存在的 API Key ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
+
+	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs); err != nil {
 		if err == sql.ErrNoRows {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -431,6 +535,9 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	}
 	if h.store != nil {
 		h.store.ApplyAccountSchedulerOverrides(id, nullableInt64Pointer(scoreBiasOverride), nullableInt64Pointer(baseConcurrencyOverride))
+		if allowedAPIKeyIDs.Set {
+			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
+		}
 	}
 
 	writeMessage(c, http.StatusOK, "账号调度配置已更新")
@@ -453,6 +560,71 @@ func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxV
 		return sql.NullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
 	return sql.NullInt64{Int64: value, Valid: true}, nil
+}
+
+func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
+	if len(raw) == 0 {
+		return database.OptionalInt64Slice{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalInt64Slice{Set: true, Values: []int64{}}, nil
+	}
+
+	var values []json.Number
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return database.OptionalInt64Slice{}, fmt.Errorf("%s 必须是整数数组或 null", field)
+	}
+	if len(values) == 0 {
+		return database.OptionalInt64Slice{Set: true, Values: []int64{}}, nil
+	}
+
+	unique := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, number := range values {
+		value, err := number.Int64()
+		if err != nil {
+			return database.OptionalInt64Slice{}, fmt.Errorf("%s 必须是整数数组或 null", field)
+		}
+		if value <= 0 {
+			return database.OptionalInt64Slice{}, fmt.Errorf("%s 中的值必须是正整数", field)
+		}
+		if _, exists := unique[value]; exists {
+			continue
+		}
+		unique[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i] < result[j]
+	})
+	return database.OptionalInt64Slice{Set: true, Values: result}, nil
+}
+
+func (h *Handler) findMissingAPIKeyIDs(ctx context.Context, ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	keys, err := h.db.ListAPIKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[int64]struct{}, len(keys))
+	for _, key := range keys {
+		if key == nil {
+			continue
+		}
+		existing[key.ID] = struct{}{}
+	}
+
+	missing := make([]int64, 0)
+	for _, id := range ids {
+		if _, ok := existing[id]; ok {
+			continue
+		}
+		missing = append(missing, id)
+	}
+	return missing, nil
 }
 
 func nullableInt64Pointer(v sql.NullInt64) *int64 {
@@ -565,6 +737,21 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 	h.reqCountMu.Unlock()
 
 	return counts
+}
+
+func (h *Handler) getAccountUsageWindows(ctx context.Context) (map[int64]*database.AccountTimeRangeUsage, map[int64]*database.AccountTimeRangeUsage) {
+	now := time.Now()
+	usage5h, err := h.db.GetAccountTimeRangeUsage(ctx, now.Add(-5*time.Hour))
+	if err != nil {
+		log.Printf("获取账号 5h 用量统计失败: %v", err)
+		usage5h = make(map[int64]*database.AccountTimeRangeUsage)
+	}
+	usage7d, err := h.db.GetAccountTimeRangeUsage(ctx, now.AddDate(0, 0, -7))
+	if err != nil {
+		log.Printf("获取账号 7d 用量统计失败: %v", err)
+		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
+	}
+	return usage5h, usage7d
 }
 
 type addAccountReq struct {
@@ -1026,15 +1213,29 @@ func (h *Handler) PushTokenAccount(c *gin.Context) {
 // importToken 导入时的统一 token 载体
 type importToken struct {
 	refreshToken string
+	sessionToken string
 	accessToken  string // AT-only 兼容路径
 	name         string
+	email        string
+	idToken      string
+	accountID    string
+	planType     string
+	expiresAt    string
 }
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken string `json:"refresh_token"`
-	AccessToken  string `json:"access_token"`
-	Email        string `json:"email"`
+	RefreshToken      string `json:"refresh_token"`
+	SessionToken      string `json:"session_token"`
+	SessionTokenCamel string `json:"sessionToken"`
+	AccessToken       string `json:"access_token"`
+	IDToken           string `json:"id_token"`
+	AccountID         string `json:"account_id"`
+	Email             string `json:"email"`
+	Name              string `json:"name"`
+	PlanType          string `json:"plan_type"`
+	Expired           string `json:"expired"`
+	ExpiresAt         string `json:"expires_at"`
 }
 
 type sub2apiImportPayload struct {
@@ -1047,9 +1248,16 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
-	RefreshToken string `json:"refresh_token"`
-	AccessToken  string `json:"access_token"`
-	Email        string `json:"email"`
+	RefreshToken      string `json:"refresh_token"`
+	SessionToken      string `json:"session_token"`
+	SessionTokenCamel string `json:"sessionToken"`
+	AccessToken       string `json:"access_token"`
+	IDToken           string `json:"id_token"`
+	AccountID         string `json:"account_id"`
+	Email             string `json:"email"`
+	PlanType          string `json:"plan_type"`
+	ExpiresAt         string `json:"expires_at"`
+	Expired           string `json:"expired"`
 }
 
 var utf8BOM = []byte{0xef, 0xbb, 0xbf}
@@ -1094,15 +1302,23 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 	tokens := make([]importToken, 0, len(entries))
 	for _, entry := range entries {
 		rt := strings.TrimSpace(entry.RefreshToken)
+		st := firstNonEmpty(entry.SessionToken, entry.SessionTokenCamel)
 		at := strings.TrimSpace(entry.AccessToken)
 		email := strings.TrimSpace(entry.Email)
+		name := firstNonEmpty(entry.Name, email)
 
-		if rt != "" {
-			tokens = append(tokens, importToken{refreshToken: rt, name: email})
-			continue
-		}
-		if at != "" {
-			tokens = append(tokens, importToken{accessToken: at, name: email})
+		if rt != "" || st != "" || at != "" {
+			tokens = append(tokens, importToken{
+				refreshToken: rt,
+				sessionToken: st,
+				accessToken:  at,
+				name:         name,
+				email:        email,
+				idToken:      strings.TrimSpace(entry.IDToken),
+				accountID:    strings.TrimSpace(entry.AccountID),
+				planType:     strings.TrimSpace(entry.PlanType),
+				expiresAt:    firstNonEmpty(entry.ExpiresAt, entry.Expired),
+			})
 		}
 	}
 	return tokens
@@ -1117,6 +1333,7 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 	tokens := make([]importToken, 0, len(payload.Accounts))
 	for _, account := range payload.Accounts {
 		rt := strings.TrimSpace(account.Credentials.RefreshToken)
+		st := firstNonEmpty(account.Credentials.SessionToken, account.Credentials.SessionTokenCamel)
 		at := strings.TrimSpace(account.Credentials.AccessToken)
 		name := strings.TrimSpace(account.Name)
 		email := strings.TrimSpace(account.Credentials.Email)
@@ -1125,12 +1342,18 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 			name = email
 		}
 
-		if rt != "" {
-			tokens = append(tokens, importToken{refreshToken: rt, name: name})
-			continue
-		}
-		if at != "" {
-			tokens = append(tokens, importToken{accessToken: at, name: name})
+		if rt != "" || st != "" || at != "" {
+			tokens = append(tokens, importToken{
+				refreshToken: rt,
+				sessionToken: st,
+				accessToken:  at,
+				name:         name,
+				email:        email,
+				idToken:      strings.TrimSpace(account.Credentials.IDToken),
+				accountID:    strings.TrimSpace(account.Credentials.AccountID),
+				planType:     strings.TrimSpace(account.Credentials.PlanType),
+				expiresAt:    firstNonEmpty(account.Credentials.ExpiresAt, account.Credentials.Expired),
+			})
 		}
 	}
 
@@ -1152,39 +1375,72 @@ func (h *Handler) ImportAccounts(c *gin.Context) {
 	}
 }
 
-// importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
-func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
-	file, header, err := c.Request.FormFile("file")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "请上传文件（字段名: file）")
-		return
-	}
-	defer file.Close()
+type uploadedImportFile struct {
+	name string
+	data []byte
+}
 
-	if header.Size > 2*1024*1024 {
-		writeError(c, http.StatusBadRequest, "文件大小不能超过 2MB")
-		return
+func readUploadedImportFiles(c *gin.Context) ([]uploadedImportFile, error) {
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		return nil, fmt.Errorf("解析表单失败")
 	}
 
-	data, err := io.ReadAll(file)
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "读取文件失败")
-		return
+	files := c.Request.MultipartForm.File["file"]
+	if len(files) == 0 {
+		return nil, fmt.Errorf("请上传文件（字段名: file）")
 	}
 
-	// 按行分割，去重
-	lines := strings.Split(string(data), "\n")
+	result := make([]uploadedImportFile, 0, len(files))
+	for _, fh := range files {
+		if fh.Size > 2*1024*1024 {
+			return nil, fmt.Errorf("文件 %s 大小超过 2MB", fh.Filename)
+		}
+
+		f, err := fh.Open()
+		if err != nil {
+			return nil, fmt.Errorf("打开文件 %s 失败", fh.Filename)
+		}
+		data, readErr := io.ReadAll(f)
+		closeErr := f.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取文件 %s 失败", fh.Filename)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("关闭文件 %s 失败", fh.Filename)
+		}
+
+		result = append(result, uploadedImportFile{name: fh.Filename, data: data})
+	}
+	return result, nil
+}
+
+func importTokensFromTextFiles(files []uploadedImportFile, makeToken func(string) importToken) []importToken {
 	seen := make(map[string]bool)
 	var tokens []importToken
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		t = strings.TrimPrefix(t, "\xef\xbb\xbf") // 去除 UTF-8 BOM
-		if t != "" && !seen[t] {
-			seen[t] = true
-			tokens = append(tokens, importToken{refreshToken: t})
+	for _, file := range files {
+		lines := strings.Split(string(trimUTF8BOM(file.data)), "\n")
+		for _, line := range lines {
+			t := strings.TrimSpace(line)
+			if t != "" && !seen[t] {
+				seen[t] = true
+				tokens = append(tokens, makeToken(t))
+			}
 		}
 	}
+	return tokens
+}
 
+// importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
+func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
+	files, err := readUploadedImportFiles(c)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tokens := importTokensFromTextFiles(files, func(token string) importToken {
+		return importToken{refreshToken: token}
+	})
 	if len(tokens) == 0 {
 		writeError(c, http.StatusBadRequest, "文件中未找到有效的 Refresh Token")
 		return
@@ -1269,19 +1525,34 @@ func setupSSE(c *gin.Context) {
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
-	// 文件内去重（RT 和 AT 分别去重）
+	// 文件内去重（RT、ST 和 AT 分别去重）
 	seenRT := make(map[string]bool)
+	seenST := make(map[string]bool)
 	seenAT := make(map[string]bool)
 	var unique []importToken
 	for _, t := range tokens {
-		if t.accessToken != "" {
-			if !seenAT[t.accessToken] {
-				seenAT[t.accessToken] = true
-				unique = append(unique, t)
-			}
-		} else {
+		if t.refreshToken != "" {
 			if !seenRT[t.refreshToken] {
 				seenRT[t.refreshToken] = true
+				unique = append(unique, t)
+			}
+			if t.sessionToken != "" {
+				seenST[t.sessionToken] = true
+			}
+			if t.accessToken != "" {
+				seenAT[t.accessToken] = true
+			}
+		} else if t.sessionToken != "" {
+			if !seenST[t.sessionToken] {
+				seenST[t.sessionToken] = true
+				unique = append(unique, t)
+			}
+			if t.accessToken != "" {
+				seenAT[t.accessToken] = true
+			}
+		} else if t.accessToken != "" {
+			if !seenAT[t.accessToken] {
+				seenAT[t.accessToken] = true
 				unique = append(unique, t)
 			}
 		}
@@ -1309,18 +1580,40 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			existingATs = make(map[string]bool)
 		}
 	}
+	hasST := len(seenST) > 0
+	var existingSTs map[string]bool
+	if hasST {
+		existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx)
+		if err != nil {
+			log.Printf("查询已有 ST 失败: %v", err)
+			existingSTs = make(map[string]bool)
+		}
+	}
 
 	var newTokens []importToken
 	duplicateCount := 0
 	for _, t := range unique {
-		if t.accessToken != "" {
-			if existingATs[t.accessToken] {
+		switch {
+		case t.refreshToken != "":
+			if existingRTs[t.refreshToken] {
+				duplicateCount++
+			} else if t.sessionToken != "" && existingSTs[t.sessionToken] {
+				duplicateCount++
+			} else if t.accessToken != "" && existingATs[t.accessToken] {
 				duplicateCount++
 			} else {
 				newTokens = append(newTokens, t)
 			}
-		} else {
-			if existingRTs[t.refreshToken] {
+		case t.sessionToken != "":
+			if existingSTs[t.sessionToken] {
+				duplicateCount++
+			} else if t.accessToken != "" && existingATs[t.accessToken] {
+				duplicateCount++
+			} else {
+				newTokens = append(newTokens, t)
+			}
+		case t.accessToken != "":
+			if existingATs[t.accessToken] {
 				duplicateCount++
 			} else {
 				newTokens = append(newTokens, t)
@@ -1382,7 +1675,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 			name := tok.name
 
-			if tok.accessToken != "" {
+			if tok.accessToken != "" && tok.refreshToken == "" {
 				// AT-only 导入路径
 				if name == "" {
 					name = fmt.Sprintf("at-import-%d", idx+1)
@@ -1403,38 +1696,45 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
-				atInfo := auth.ParseAccessToken(tok.accessToken)
-				newAcc := &auth.Account{
-					DBID:        id,
-					AccessToken: tok.accessToken,
-					ExpiresAt:   time.Now().Add(1 * time.Hour),
-					ProxyURL:    proxyURL,
-				}
-				if atInfo != nil {
-					newAcc.Email = atInfo.Email
-					newAcc.AccountID = atInfo.ChatGPTAccountID
-					newAcc.PlanType = atInfo.PlanType
-					if !atInfo.ExpiresAt.IsZero() {
-						newAcc.ExpiresAt = atInfo.ExpiresAt
-					}
+				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+					sessionToken: tok.sessionToken,
+					accessToken:  tok.accessToken,
+					idToken:      tok.idToken,
+					accountID:    tok.accountID,
+					email:        tok.email,
+					planType:     tok.planType,
+					expiresAtRaw: tok.expiresAt,
+				})
+				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+				if len(tokenCredentialMap(seed)) > 0 {
 					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
-					_ = h.db.UpdateCredentials(credCtx, id, map[string]interface{}{
-						"email":      atInfo.Email,
-						"account_id": atInfo.ChatGPTAccountID,
-						"plan_type":  atInfo.PlanType,
-						"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
-					})
+					_ = h.db.UpdateCredentials(credCtx, id, tokenCredentialMap(seed))
 					credCancel()
 				}
 				h.store.AddAccount(newAcc)
 			} else {
-				// RT 导入路径
+				// RT 导入路径；如果导入文件里同时带 AT，则先沿用它，后台调度到期前再刷新。
 				if name == "" {
 					name = fmt.Sprintf("import-%d", idx+1)
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, err := h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
+				var id int64
+				var err error
+				if tok.refreshToken != "" {
+					id, err = h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
+				} else {
+					seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+						sessionToken: tok.sessionToken,
+						accessToken:  tok.accessToken,
+						idToken:      tok.idToken,
+						accountID:    tok.accountID,
+						email:        tok.email,
+						planType:     tok.planType,
+						expiresAtRaw: tok.expiresAt,
+					})
+					id, err = h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
+				}
 				insertCancel()
 
 				if err != nil {
@@ -1448,23 +1748,38 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import")
 
-				newAcc := &auth.Account{
-					DBID:         id,
-					RefreshToken: tok.refreshToken,
-					ProxyURL:     proxyURL,
+				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+					refreshToken: tok.refreshToken,
+					sessionToken: tok.sessionToken,
+					accessToken:  tok.accessToken,
+					idToken:      tok.idToken,
+					accountID:    tok.accountID,
+					email:        tok.email,
+					planType:     tok.planType,
+					expiresAtRaw: tok.expiresAt,
+				})
+				if len(tokenCredentialMap(seed)) > 0 {
+					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					if err := h.db.UpdateCredentials(credCtx, id, tokenCredentialMap(seed)); err != nil {
+						log.Printf("导入账号 %d 更新 token 信息失败: %v", id, err)
+					}
+					credCancel()
 				}
+				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 				h.store.AddAccount(newAcc)
 
-				// 后台异步刷新，不阻塞导入流程
-				go func(accountID int64) {
-					refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-						log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
-					} else {
-						log.Printf("导入账号 %d 刷新成功", accountID)
-					}
-				}(id)
+				if tok.accessToken == "" {
+					// 后台异步刷新，不阻塞导入流程
+					go func(accountID int64) {
+						refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						defer cancel()
+						if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
+							log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+						} else {
+							log.Printf("导入账号 %d 刷新成功", accountID)
+						}
+					}(id)
+				}
 			}
 		}(i, t)
 	}
@@ -1485,173 +1800,21 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
 func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
-	file, header, err := c.Request.FormFile("file")
+	files, err := readUploadedImportFiles(c)
 	if err != nil {
-		writeError(c, http.StatusBadRequest, "请上传文件（字段名: file）")
-		return
-	}
-	defer file.Close()
-
-	if header.Size > 2*1024*1024 {
-		writeError(c, http.StatusBadRequest, "文件大小不能超过 2MB")
+		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	data, err := io.ReadAll(file)
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "读取文件失败")
-		return
-	}
-
-	// 按行分割，文件内去重
-	lines := strings.Split(string(data), "\n")
-	seen := make(map[string]bool)
-	var atTokens []string
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		t = strings.TrimPrefix(t, "\xef\xbb\xbf")
-		if t != "" && !seen[t] {
-			seen[t] = true
-			atTokens = append(atTokens, t)
-		}
-	}
-
-	if len(atTokens) == 0 {
+	tokens := importTokensFromTextFiles(files, func(token string) importToken {
+		return importToken{accessToken: token}
+	})
+	if len(tokens) == 0 {
 		writeError(c, http.StatusBadRequest, "文件中未找到有效的 Access Token")
 		return
 	}
 
-	// 数据库去重
-	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer dedupeCancel()
-	existingATs, err := h.db.GetAllAccessTokens(dedupeCtx)
-	if err != nil {
-		log.Printf("查询已有 AT 失败: %v", err)
-		existingATs = make(map[string]bool)
-	}
-
-	var newTokens []string
-	duplicateCount := 0
-	for _, at := range atTokens {
-		if existingATs[at] {
-			duplicateCount++
-		} else {
-			newTokens = append(newTokens, at)
-		}
-	}
-
-	total := len(atTokens)
-
-	if len(newTokens) == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"message":   fmt.Sprintf("所有 %d 个 AT 已存在，无需导入", total),
-			"success":   0,
-			"duplicate": duplicateCount,
-			"failed":    0,
-			"total":     total,
-		})
-		return
-	}
-
-	// SSE 流式响应
-	setupSSE(c)
-
-	var successCount int64
-	var failCount int64
-	var current int64
-	sem := make(chan struct{}, 20)
-	var wg sync.WaitGroup
-
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cur := int(atomic.LoadInt64(&current))
-				suc := int(atomic.LoadInt64(&successCount))
-				fai := int(atomic.LoadInt64(&failCount))
-				sendImportEvent(c, importEvent{
-					Type: "progress", Current: cur + duplicateCount, Total: total,
-					Success: suc, Duplicate: duplicateCount, Failed: fai,
-				})
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	for i, at := range newTokens {
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(idx int, accessToken string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			name := fmt.Sprintf("at-import-%d", idx+1)
-
-			insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			id, err := h.db.InsertATAccount(insertCtx, name, accessToken, proxyURL)
-			insertCancel()
-
-			if err != nil {
-				log.Printf("导入 AT 账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
-				atomic.AddInt64(&failCount, 1)
-				atomic.AddInt64(&current, 1)
-				return
-			}
-
-			atomic.AddInt64(&successCount, 1)
-			atomic.AddInt64(&current, 1)
-			h.db.InsertAccountEventAsync(id, "added", "import_at")
-
-			// 解析 AT JWT 提取账号信息
-			atInfo := auth.ParseAccessToken(accessToken)
-
-			newAcc := &auth.Account{
-				DBID:        id,
-				AccessToken: accessToken,
-				ExpiresAt:   time.Now().Add(1 * time.Hour),
-				ProxyURL:    proxyURL,
-			}
-			if atInfo != nil {
-				newAcc.Email = atInfo.Email
-				newAcc.AccountID = atInfo.ChatGPTAccountID
-				newAcc.PlanType = atInfo.PlanType
-				if !atInfo.ExpiresAt.IsZero() {
-					newAcc.ExpiresAt = atInfo.ExpiresAt
-				}
-				// 持久化解析到的账号信息
-				credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
-				_ = h.db.UpdateCredentials(credCtx, id, map[string]interface{}{
-					"email":      atInfo.Email,
-					"account_id": atInfo.ChatGPTAccountID,
-					"plan_type":  atInfo.PlanType,
-					"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
-				})
-				credCancel()
-
-				// 如果解析到邮箱，用邮箱替换默认名称
-				if atInfo.Email != "" {
-					name = atInfo.Email
-				}
-			}
-			h.store.AddAccount(newAcc)
-		}(i, at)
-	}
-
-	wg.Wait()
-	close(done)
-
-	suc := int(atomic.LoadInt64(&successCount))
-	fai := int(atomic.LoadInt64(&failCount))
-	sendImportEvent(c, importEvent{
-		Type: "complete", Current: total, Total: total,
-		Success: suc, Duplicate: duplicateCount, Failed: fai,
-	})
-
-	log.Printf("AT 导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
+	h.importAccountsCommon(c, tokens, proxyURL)
 }
 
 // GetAccountUsage 查询单个账号的用量统计
@@ -1685,8 +1848,8 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	// 标记为 deleted 而非物理删除
-	if err := h.db.SetError(ctx, id, "deleted"); err != nil {
+	// 软删除：保留账号数据与事件记录，但从运行时池和 active 列表中移除。
+	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
@@ -1724,6 +1887,44 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	}
 
 	writeMessage(c, http.StatusOK, "账号刷新成功")
+}
+
+// ToggleAccountEnabled 切换账号是否参与调度选择
+func (h *Handler) ToggleAccountEnabled(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		Enabled *bool `json:"enabled" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Enabled == nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.db.SetAccountEnabled(ctx, id, *req.Enabled); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新启用状态失败: "+err.Error())
+		return
+	}
+
+	h.store.ApplyAccountEnabled(id, *req.Enabled)
+
+	if *req.Enabled {
+		writeMessage(c, http.StatusOK, "账号已启用")
+	} else {
+		writeMessage(c, http.StatusOK, "账号已禁用")
+	}
 }
 
 // ToggleAccountLock 切换账号的锁定状态
@@ -2148,6 +2349,15 @@ type settingsResponse struct {
 	ModelMapping                     string `json:"model_mapping"`
 	ResinURL                         string `json:"resin_url"`
 	ResinPlatformName                string `json:"resin_platform_name"`
+	PromptFilterEnabled              bool   `json:"prompt_filter_enabled"`
+	PromptFilterMode                 string `json:"prompt_filter_mode"`
+	PromptFilterThreshold            int    `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold      int    `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches           bool   `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength        int    `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords       string `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns       string `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns     string `json:"prompt_filter_disabled_patterns"`
 }
 
 type updateSettingsReq struct {
@@ -2174,6 +2384,15 @@ type updateSettingsReq struct {
 	ModelMapping                     *string `json:"model_mapping"`
 	ResinURL                         *string `json:"resin_url"`
 	ResinPlatformName                *string `json:"resin_platform_name"`
+	PromptFilterEnabled              *bool   `json:"prompt_filter_enabled"`
+	PromptFilterMode                 *string `json:"prompt_filter_mode"`
+	PromptFilterThreshold            *int    `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold      *int    `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches           *bool   `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength        *int    `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords       *string `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns       *string `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns     *string `json:"prompt_filter_disabled_patterns"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2191,6 +2410,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 	}
+	promptFilterCfg := h.store.GetPromptFilterConfig()
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
@@ -2220,6 +2440,15 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ModelMapping:                     h.store.GetModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		PromptFilterEnabled:              promptFilterCfg.Enabled,
+		PromptFilterMode:                 promptFilterCfg.Mode,
+		PromptFilterThreshold:            promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:      promptFilterCfg.StrictThreshold,
+		PromptFilterLogMatches:           promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:        promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 	})
 }
 
@@ -2424,6 +2653,64 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: model_mapping")
 	}
 
+	promptFilterCfg := h.store.GetPromptFilterConfig()
+	promptFilterChanged := false
+	if req.PromptFilterEnabled != nil {
+		promptFilterCfg.Enabled = *req.PromptFilterEnabled
+		promptFilterChanged = true
+	}
+	if req.PromptFilterMode != nil {
+		promptFilterCfg.Mode = *req.PromptFilterMode
+		promptFilterChanged = true
+	}
+	if req.PromptFilterThreshold != nil {
+		promptFilterCfg.Threshold = *req.PromptFilterThreshold
+		promptFilterChanged = true
+	}
+	if req.PromptFilterStrictThreshold != nil {
+		promptFilterCfg.StrictThreshold = *req.PromptFilterStrictThreshold
+		promptFilterChanged = true
+	}
+	if req.PromptFilterLogMatches != nil {
+		promptFilterCfg.LogMatches = *req.PromptFilterLogMatches
+		promptFilterChanged = true
+	}
+	if req.PromptFilterMaxTextLength != nil {
+		promptFilterCfg.MaxTextLength = *req.PromptFilterMaxTextLength
+		promptFilterChanged = true
+	}
+	if req.PromptFilterSensitiveWords != nil {
+		promptFilterCfg.SensitiveWords = *req.PromptFilterSensitiveWords
+		promptFilterChanged = true
+	}
+	if req.PromptFilterCustomPatterns != nil {
+		patterns, err := promptfilter.ParseCustomPatterns(*req.PromptFilterCustomPatterns)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "Prompt 检查自定义规则 JSON 无效: "+err.Error())
+			return
+		}
+		promptFilterCfg.CustomPatterns = patterns
+		promptFilterChanged = true
+	}
+	if req.PromptFilterDisabledPatterns != nil {
+		disabled, err := promptfilter.ParseDisabledPatterns(*req.PromptFilterDisabledPatterns)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "Prompt 检查禁用规则 JSON 无效: "+err.Error())
+			return
+		}
+		promptFilterCfg.DisabledPatterns = disabled
+		promptFilterChanged = true
+	}
+	if promptFilterChanged {
+		promptFilterCfg = promptfilter.NormalizeConfig(promptFilterCfg)
+		if _, err := promptfilter.NewEngine(promptFilterCfg); err != nil {
+			writeError(c, http.StatusBadRequest, "Prompt 检查规则无效: "+err.Error())
+			return
+		}
+		h.store.SetPromptFilterConfig(promptFilterCfg)
+		log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
+	}
+
 	// Resin 粘性代理池配置
 	resinURL := ""
 	resinPlatformName := ""
@@ -2444,6 +2731,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			BaseURL:      resinURL,
 			PlatformName: resinPlatformName,
 		})
+		if strings.TrimSpace(resinURL) != "" && strings.TrimSpace(resinPlatformName) != "" {
+			auth.ResinRequestDecorator = func(targetURL, accountID string) string {
+				return proxy.BuildReverseProxyURL(targetURL)
+			}
+		} else {
+			auth.ResinRequestDecorator = nil
+		}
 	}
 
 	// 持久化保存到数据库
@@ -2471,6 +2765,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ModelMapping:                     h.store.GetModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		PromptFilterEnabled:              promptFilterCfg.Enabled,
+		PromptFilterMode:                 promptFilterCfg.Mode,
+		PromptFilterThreshold:            promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:      promptFilterCfg.StrictThreshold,
+		PromptFilterLogMatches:           promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:        promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2522,6 +2825,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ModelMapping:                     h.store.GetModelMapping(),
 		ResinURL:                         resinURL,
 		ResinPlatformName:                resinPlatformName,
+		PromptFilterEnabled:              promptFilterCfg.Enabled,
+		PromptFilterMode:                 promptFilterCfg.Mode,
+		PromptFilterThreshold:            promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:      promptFilterCfg.StrictThreshold,
+		PromptFilterLogMatches:           promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:        promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 	})
 }
 
@@ -2536,6 +2848,82 @@ type cpaExportEntry struct {
 	AccessToken  string `json:"access_token"`
 	LastRefresh  string `json:"last_refresh"`
 	RefreshToken string `json:"refresh_token"`
+}
+
+type accountAuthJSONTokens struct {
+	IDToken      string `json:"id_token"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	AccountID    string `json:"account_id"`
+}
+
+type accountAuthJSON struct {
+	AuthMode     string                `json:"auth_mode"`
+	OpenAIAPIKey *string               `json:"OPENAI_API_KEY"`
+	Tokens       accountAuthJSONTokens `json:"tokens"`
+	LastRefresh  string                `json:"last_refresh"`
+}
+
+// GetAccountAuthJSON 生成单账号可用于 Codex CLI 的 auth.json。
+func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+		return
+	}
+
+	refreshToken := row.GetCredential("refresh_token")
+	accessToken := row.GetCredential("access_token")
+	idToken := row.GetCredential("id_token")
+	accountID := row.GetCredential("account_id")
+	if refreshToken == "" {
+		writeError(c, http.StatusBadRequest, "该账号没有 refresh_token，无法生成 auth.json")
+		return
+	}
+	if accessToken == "" || idToken == "" {
+		writeError(c, http.StatusBadRequest, "账号缺少 access_token 或 id_token，请先刷新账号后再生成 auth.json")
+		return
+	}
+	if accountID == "" {
+		if info := auth.ParseIDToken(idToken); info != nil {
+			accountID = info.ChatGPTAccountID
+		}
+	}
+	if accountID == "" {
+		if info := auth.ParseAccessToken(accessToken); info != nil {
+			accountID = info.ChatGPTAccountID
+		}
+	}
+	if accountID == "" {
+		writeError(c, http.StatusBadRequest, "账号缺少 account_id，请先刷新账号后再生成 auth.json")
+		return
+	}
+
+	c.Header("Content-Disposition", `attachment; filename="auth.json"`)
+	c.JSON(http.StatusOK, accountAuthJSON{
+		AuthMode:     "chatgpt",
+		OpenAIAPIKey: nil,
+		Tokens: accountAuthJSONTokens{
+			IDToken:      idToken,
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			AccountID:    accountID,
+		},
+		LastRefresh: row.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	})
 }
 
 // ExportAccounts 导出账号（CPA JSON 格式）
@@ -2687,7 +3075,15 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 		if name == "" {
 			name = "migrate"
 		}
-		tokens = append(tokens, importToken{refreshToken: rt, name: name})
+		tokens = append(tokens, importToken{
+			refreshToken: rt,
+			accessToken:  strings.TrimSpace(entry.AccessToken),
+			name:         name,
+			email:        strings.TrimSpace(entry.Email),
+			idToken:      strings.TrimSpace(entry.IDToken),
+			accountID:    strings.TrimSpace(entry.AccountID),
+			expiresAt:    strings.TrimSpace(entry.Expired),
+		})
 	}
 
 	log.Printf("远程迁移: 从 %s 拉取到 %d 个账号，开始导入", remoteURL, len(tokens))
@@ -2698,7 +3094,21 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"models": proxy.SupportedModels})
+	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
+	c.JSON(http.StatusOK, catalog)
+}
+
+// SyncModels 从官方 Codex 模型页同步模型注册表。
+func (h *Handler) SyncModels(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	result, err := proxy.SyncOfficialCodexModels(ctx, h.db)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 // ==================== 账号趋势 ====================

@@ -5,7 +5,51 @@ import { ADMIN_AUTH_REQUIRED_EVENT, api, clearAdminKey, resetAdminAuthState } fr
 import logoImg from '../assets/logo.png'
 import { getErrorMessage } from '../utils/error'
 
-type AuthStatus = 'checking' | 'authenticated' | 'need_login'
+type AuthStatus = 'checking' | 'need_bootstrap' | 'need_login' | 'authenticated'
+
+const MIN_SECRET_LEN = 8
+const MAX_SECRET_LEN = 256
+
+const COPY = {
+  zh: {
+    bootstrapTitle: '首次使用：设置管理密钥',
+    bootstrapSubtitle: '该密钥用于登录管理后台与调用 /api/admin/* 接口，请妥善保管。',
+    bootstrapHint: `至少 ${MIN_SECRET_LEN} 位`,
+    secretLabel: '管理密钥',
+    confirmLabel: '再次输入确认',
+    submit: '完成初始化并登录',
+    submitting: '正在保存…',
+    errEmpty: '管理密钥不能为空',
+    errTooShort: `管理密钥至少 ${MIN_SECRET_LEN} 位`,
+    errTooLong: `管理密钥不可超过 ${MAX_SECRET_LEN} 个字符`,
+    errMismatch: '两次输入不一致',
+    errServer: '初始化失败，请稍后再试',
+    loginSubtitle: '请输入管理密钥登录',
+    loginPlaceholder: '请输入 ADMIN_SECRET',
+    loginError: '密钥错误，请重新输入',
+    loginButton: '登录',
+    loadingText: '加载中…',
+  },
+  en: {
+    bootstrapTitle: 'First-run setup: choose an admin secret',
+    bootstrapSubtitle: 'This secret is required for both web login and /api/admin/* API calls. Store it safely.',
+    bootstrapHint: `At least ${MIN_SECRET_LEN} characters.`,
+    secretLabel: 'Admin secret',
+    confirmLabel: 'Confirm secret',
+    submit: 'Initialize and sign in',
+    submitting: 'Saving…',
+    errEmpty: 'Admin secret cannot be empty',
+    errTooShort: `Admin secret must be at least ${MIN_SECRET_LEN} characters`,
+    errTooLong: `Admin secret must not exceed ${MAX_SECRET_LEN} characters`,
+    errMismatch: 'The two entries do not match',
+    errServer: 'Initialization failed, please retry',
+    loginSubtitle: 'Enter your admin secret to sign in',
+    loginPlaceholder: 'Enter ADMIN_SECRET',
+    loginError: 'Invalid secret, please try again',
+    loginButton: 'Sign in',
+    loadingText: 'Loading…',
+  },
+} as const
 
 type AdminAuthContextValue = {
   authRequired: boolean
@@ -24,15 +68,33 @@ export function useAdminAuth() {
 }
 
 export default function AuthGate({ children }: PropsWithChildren) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const lang = (i18n.language || 'zh').startsWith('zh') ? 'zh' : 'en'
+  const copy = COPY[lang]
+
   const [status, setStatus] = useState<AuthStatus>('checking')
   const [authRequired, setAuthRequired] = useState(false)
   const [inputKey, setInputKey] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
+  const [bsSecret, setBsSecret] = useState('')
+  const [bsConfirm, setBsConfirm] = useState('')
+  const [bsError, setBsError] = useState('')
+  const [bsSubmitting, setBsSubmitting] = useState(false)
+
   const checkAuth = useCallback(async () => {
     try {
+      const bsRes = await fetch('/api/admin/bootstrap-status')
+      if (bsRes.ok) {
+        const bs = (await bsRes.json()) as { needs_bootstrap?: boolean }
+        if (bs.needs_bootstrap) {
+          setAuthRequired(true)
+          setStatus('need_bootstrap')
+          return
+        }
+      }
+
       const session = await api.getAdminSessionStatus()
       setAuthRequired(session.auth_required)
       setStatus(session.authenticated ? 'authenticated' : 'need_login')
@@ -109,12 +171,116 @@ export default function AuthGate({ children }: PropsWithChildren) {
     }
   }, [])
 
+  const handleBootstrap = async () => {
+    setBsError('')
+    const secret = bsSecret.trim()
+    const confirm = bsConfirm.trim()
+    if (!secret) {
+      setBsError(copy.errEmpty)
+      return
+    }
+    if (secret.length < MIN_SECRET_LEN) {
+      setBsError(copy.errTooShort)
+      return
+    }
+    if (secret.length > MAX_SECRET_LEN) {
+      setBsError(copy.errTooLong)
+      return
+    }
+    if (secret !== confirm) {
+      setBsError(copy.errMismatch)
+      return
+    }
+    setBsSubmitting(true)
+    try {
+      const res = await fetch('/api/admin/bootstrap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ admin_secret: secret }),
+      })
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string }
+        setBsError(body.error || copy.errServer)
+        return
+      }
+      try {
+        await api.loginAdminSession(secret)
+      } catch {
+        // 如果会话登录失败，退化到旧 header 模式，避免初始化后卡死
+        resetAdminAuthState()
+      }
+      setBsSecret('')
+      setBsConfirm('')
+      setAuthRequired(true)
+      setStatus('authenticated')
+    } catch {
+      setBsError(copy.errServer)
+    } finally {
+      setBsSubmitting(false)
+    }
+  }
+
   if (status === 'checking') {
     return (
       <div className="flex items-center justify-center min-h-dvh">
         <div className="text-center">
           <div className="size-8 mx-auto mb-3 rounded-full border-3 border-primary/30 border-t-primary animate-spin" />
-          <p className="text-sm text-muted-foreground">{t('common.loading')}</p>
+          <p className="text-sm text-muted-foreground">{copy.loadingText}</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (status === 'need_bootstrap') {
+    return (
+      <div className="flex items-center justify-center min-h-dvh bg-background">
+        <div className="w-full max-w-[460px] mx-4">
+          <div className="text-center mb-6">
+            <img src={logoImg} alt="Codex2API" className="size-14 rounded-lg object-cover shadow-sm mx-auto mb-4" />
+            <h1 className="text-[26px] font-bold text-foreground">Codex2API</h1>
+            <p className="mt-1 text-sm text-muted-foreground">{copy.bootstrapSubtitle}</p>
+          </div>
+
+          <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
+            <h2 className="text-base font-bold text-foreground">{copy.bootstrapTitle}</h2>
+            <p className="mt-1 text-xs text-muted-foreground">{copy.bootstrapHint}</p>
+
+            <div className="mt-4 space-y-4">
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{copy.secretLabel}</label>
+                <input
+                  type="password"
+                  value={bsSecret}
+                  onChange={(e) => { setBsSecret(e.target.value); setBsError('') }}
+                  className="w-full h-10 px-3.5 rounded-md border border-input bg-background text-[15px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
+                  autoFocus
+                />
+              </div>
+
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{copy.confirmLabel}</label>
+                <input
+                  type="password"
+                  value={bsConfirm}
+                  onChange={(e) => { setBsConfirm(e.target.value); setBsError('') }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void handleBootstrap() }}
+                  className="w-full h-10 px-3.5 rounded-md border border-input bg-background text-[15px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
+                />
+              </div>
+
+              {bsError && (
+                <div className="text-sm text-red-500 font-medium px-1">{bsError}</div>
+              )}
+
+              <button
+                onClick={() => void handleBootstrap()}
+                disabled={bsSubmitting}
+                className="w-full h-10 rounded-md bg-primary text-primary-foreground font-semibold text-[15px] shadow-sm transition-colors hover:bg-primary/90 disabled:opacity-50"
+              >
+                {bsSubmitting ? copy.submitting : copy.submit}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     )
@@ -122,17 +288,15 @@ export default function AuthGate({ children }: PropsWithChildren) {
 
   if (status === 'need_login') {
     return (
-      <div className="flex items-center justify-center min-h-dvh bg-gradient-to-br from-slate-50 via-white to-blue-50/30">
+      <div className="flex items-center justify-center min-h-dvh bg-background">
         <div className="w-full max-w-[400px] mx-4">
-          <div className="text-center mb-8">
-            <img src={logoImg} alt="Codex2API" className="w-16 h-16 rounded-2xl object-cover shadow-[0_4px_20px_hsl(258_60%_63%/0.2)] mx-auto mb-4" />
-            <h1 className="text-[28px] font-bold bg-gradient-to-br from-[hsl(258,60%,63%)] to-[hsl(210,80%,60%)] bg-clip-text text-transparent">
-              Codex2API
-            </h1>
-            <p className="text-sm text-muted-foreground mt-1">{t('auth.subtitle')}</p>
+          <div className="text-center mb-6">
+            <img src={logoImg} alt="Codex2API" className="size-14 rounded-lg object-cover shadow-sm mx-auto mb-4" />
+            <h1 className="text-[26px] font-bold text-foreground">Codex2API</h1>
+            <p className="text-sm text-muted-foreground mt-1">{copy.loginSubtitle}</p>
           </div>
 
-          <div className="rounded-3xl border border-border bg-white/80 shadow-xl shadow-black/[0.03] p-6 backdrop-blur-sm">
+          <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
             <div className="space-y-4">
               <div>
                 <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.adminSecret')}</label>
@@ -141,9 +305,9 @@ export default function AuthGate({ children }: PropsWithChildren) {
                   value={inputKey}
                   onChange={(e) => { setInputKey(e.target.value); setError('') }}
                   onKeyDown={(e) => { if (e.key === 'Enter') void handleLogin() }}
-                  placeholder={t('auth.placeholder')}
+                  placeholder={copy.loginPlaceholder}
                   autoFocus
-                  className="w-full h-11 px-4 rounded-xl border border-border bg-white text-[15px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
+                  className="w-full h-10 px-3.5 rounded-md border border-input bg-background text-[15px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
                 />
               </div>
 
@@ -154,9 +318,9 @@ export default function AuthGate({ children }: PropsWithChildren) {
               <button
                 onClick={() => void handleLogin()}
                 disabled={submitting}
-                className="w-full h-11 rounded-xl bg-gradient-to-r from-[hsl(258,60%,63%)] to-[hsl(210,80%,60%)] text-white font-semibold text-[15px] shadow-lg shadow-primary/20 transition-all hover:opacity-90 disabled:opacity-50"
+                className="w-full h-10 rounded-md bg-primary text-primary-foreground font-semibold text-[15px] shadow-sm transition-colors hover:bg-primary/90 disabled:opacity-50"
               >
-                {submitting ? t('common.loading') : t('auth.login')}
+                {submitting ? copy.loadingText : copy.loginButton}
               </button>
             </div>
           </div>
