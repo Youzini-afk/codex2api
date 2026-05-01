@@ -34,6 +34,14 @@ type AccountRow struct {
 	UpdatedAt               time.Time
 }
 
+type AccountModelCooldownRow struct {
+	AccountID int64
+	Model     string
+	Reason    string
+	ResetAt   time.Time
+	UpdatedAt time.Time
+}
+
 type OptionalInt64Slice struct {
 	Set    bool
 	Values []int64
@@ -85,36 +93,39 @@ type DB struct {
 
 // usageLogEntry 日志缓冲条目
 type usageLogEntry struct {
-	AccountID        int64
-	Endpoint         string
-	Model            string
-	EffectiveModel   string
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	StatusCode       int
-	DurationMs       int
-	InputTokens      int
-	OutputTokens     int
-	ReasoningTokens  int
-	FirstTokenMs     int
-	ReasoningEffort  string
-	InboundEndpoint  string
-	UpstreamEndpoint string
-	Stream           bool
-	CachedTokens     int
-	ServiceTier      string
-	APIKeyID         int64
-	APIKeyName       string
-	APIKeyMasked     string
-	ImageCount       int
-	ImageWidth       int
-	ImageHeight      int
-	ImageBytes       int
-	ImageFormat      string
-	ImageSize        string
-	AccountBilled    float64
-	UserBilled       float64
+	AccountID         int64
+	Endpoint          string
+	Model             string
+	EffectiveModel    string
+	PromptTokens      int
+	CompletionTokens  int
+	TotalTokens       int
+	StatusCode        int
+	DurationMs        int
+	InputTokens       int
+	OutputTokens      int
+	ReasoningTokens   int
+	FirstTokenMs      int
+	ReasoningEffort   string
+	InboundEndpoint   string
+	UpstreamEndpoint  string
+	Stream            bool
+	CachedTokens      int
+	ServiceTier       string
+	APIKeyID          int64
+	APIKeyName        string
+	APIKeyMasked      string
+	ImageCount        int
+	ImageWidth        int
+	ImageHeight       int
+	ImageBytes        int
+	ImageFormat       string
+	ImageSize         string
+	AccountBilled     float64
+	UserBilled        float64
+	IsRetryAttempt    bool
+	AttemptIndex      int
+	UpstreamErrorKind string
 }
 
 // New 创建数据库连接并自动建表。
@@ -332,6 +343,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_size VARCHAR(32) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS account_billed DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS user_billed DOUBLE PRECISION DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS is_retry_attempt BOOLEAN DEFAULT FALSE;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS attempt_index INT DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_error_kind VARCHAR(64) DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
 
@@ -357,6 +371,15 @@ func (db *DB) migrate(ctx context.Context) error {
 			usage_probe_max_age_minutes INT DEFAULT 10,
 			recovery_probe_interval_minutes INT DEFAULT 30
 		);
+	CREATE TABLE IF NOT EXISTS account_model_cooldowns (
+		account_id BIGINT NOT NULL,
+		model VARCHAR(100) NOT NULL,
+		reason VARCHAR(64) DEFAULT '',
+		reset_at TIMESTAMPTZ NOT NULL,
+		updated_at TIMESTAMPTZ DEFAULT NOW(),
+		PRIMARY KEY (account_id, model)
+	);
+	CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -367,23 +390,24 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
-		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
-		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
-		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
-		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
-		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
-		ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_mode VARCHAR(20) DEFAULT 'monitor';
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_threshold INT DEFAULT 50;
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_strict_threshold INT DEFAULT 90;
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_log_matches BOOLEAN DEFAULT TRUE;
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_max_text_length INT DEFAULT 81920;
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_sensitive_words TEXT DEFAULT '';
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_custom_patterns TEXT DEFAULT '[]';
-			ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_disabled_patterns TEXT DEFAULT '[]';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_rate_limit_retries INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_mode VARCHAR(20) DEFAULT 'monitor';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_threshold INT DEFAULT 50;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_strict_threshold INT DEFAULT 90;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_log_matches BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_max_text_length INT DEFAULT 81920;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_sensitive_words TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_custom_patterns TEXT DEFAULT '[]';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_disabled_patterns TEXT DEFAULT '[]';
 
 			CREATE TABLE IF NOT EXISTS prompt_filter_logs (
 				id               SERIAL PRIMARY KEY,
@@ -598,6 +622,7 @@ type SystemSettings struct {
 	ProxyPoolEnabled                 bool
 	FastSchedulerEnabled             bool
 	MaxRetries                       int
+	MaxRateLimitRetries              int
 	AllowRemoteMigration             bool
 	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
 	BackgroundRefreshIntervalMinutes int
@@ -625,6 +650,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(proxy_pool_enabled, false),
 		       COALESCE(fast_scheduler_enabled, false),
 		       COALESCE(max_retries, 2),
+		       COALESCE(max_rate_limit_retries, 1),
 		       COALESCE(allow_remote_migration, false),
 		       COALESCE(auto_clean_error, false),
 		       COALESCE(auto_clean_expired, false),
@@ -647,7 +673,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
-		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
+		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
 		&s.ResinURL, &s.ResinPlatformName,
@@ -667,13 +693,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			INSERT INTO system_settings (
 				id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
-				fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
+				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
 				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
 			ON CONFLICT (id) DO UPDATE SET
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
@@ -689,6 +715,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled,
 				fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
 				max_retries             = EXCLUDED.max_retries,
+				max_rate_limit_retries  = EXCLUDED.max_rate_limit_retries,
 				allow_remote_migration  = EXCLUDED.allow_remote_migration,
 				auto_clean_error        = EXCLUDED.auto_clean_error,
 				auto_clean_expired      = EXCLUDED.auto_clean_expired,
@@ -709,7 +736,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns
 		`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
+		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
@@ -956,36 +983,39 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 
 	db.logMu.Lock()
 	db.logBuf = append(db.logBuf, usageLogEntry{
-		AccountID:        log.AccountID,
-		Endpoint:         log.Endpoint,
-		Model:            log.Model,
-		EffectiveModel:   log.EffectiveModel,
-		PromptTokens:     log.PromptTokens,
-		CompletionTokens: log.CompletionTokens,
-		TotalTokens:      log.TotalTokens,
-		StatusCode:       log.StatusCode,
-		DurationMs:       log.DurationMs,
-		InputTokens:      log.InputTokens,
-		OutputTokens:     log.OutputTokens,
-		ReasoningTokens:  log.ReasoningTokens,
-		FirstTokenMs:     log.FirstTokenMs,
-		ReasoningEffort:  log.ReasoningEffort,
-		InboundEndpoint:  log.InboundEndpoint,
-		UpstreamEndpoint: log.UpstreamEndpoint,
-		Stream:           log.Stream,
-		CachedTokens:     log.CachedTokens,
-		ServiceTier:      log.ServiceTier,
-		APIKeyID:         log.APIKeyID,
-		APIKeyName:       log.APIKeyName,
-		APIKeyMasked:     log.APIKeyMasked,
-		ImageCount:       log.ImageCount,
-		ImageWidth:       log.ImageWidth,
-		ImageHeight:      log.ImageHeight,
-		ImageBytes:       log.ImageBytes,
-		ImageFormat:      log.ImageFormat,
-		ImageSize:        log.ImageSize,
-		AccountBilled:    accountBilled,
-		UserBilled:       userBilled,
+		AccountID:         log.AccountID,
+		Endpoint:          log.Endpoint,
+		Model:             log.Model,
+		EffectiveModel:    log.EffectiveModel,
+		PromptTokens:      log.PromptTokens,
+		CompletionTokens:  log.CompletionTokens,
+		TotalTokens:       log.TotalTokens,
+		StatusCode:        log.StatusCode,
+		DurationMs:        log.DurationMs,
+		InputTokens:       log.InputTokens,
+		OutputTokens:      log.OutputTokens,
+		ReasoningTokens:   log.ReasoningTokens,
+		FirstTokenMs:      log.FirstTokenMs,
+		ReasoningEffort:   log.ReasoningEffort,
+		InboundEndpoint:   log.InboundEndpoint,
+		UpstreamEndpoint:  log.UpstreamEndpoint,
+		Stream:            log.Stream,
+		CachedTokens:      log.CachedTokens,
+		ServiceTier:       log.ServiceTier,
+		APIKeyID:          log.APIKeyID,
+		APIKeyName:        log.APIKeyName,
+		APIKeyMasked:      log.APIKeyMasked,
+		ImageCount:        log.ImageCount,
+		ImageWidth:        log.ImageWidth,
+		ImageHeight:       log.ImageHeight,
+		ImageBytes:        log.ImageBytes,
+		ImageFormat:       log.ImageFormat,
+		ImageSize:         log.ImageSize,
+		AccountBilled:     accountBilled,
+		UserBilled:        userBilled,
+		IsRetryAttempt:    log.IsRetryAttempt,
+		AttemptIndex:      log.AttemptIndex,
+		UpstreamErrorKind: log.UpstreamErrorKind,
 	})
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
@@ -999,34 +1029,37 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 
 // UsageLogInput 日志写入参数
 type UsageLogInput struct {
-	AccountID        int64
-	Endpoint         string
-	Model            string
-	EffectiveModel   string
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	StatusCode       int
-	DurationMs       int
-	InputTokens      int
-	OutputTokens     int
-	ReasoningTokens  int
-	FirstTokenMs     int
-	ReasoningEffort  string
-	InboundEndpoint  string
-	UpstreamEndpoint string
-	Stream           bool
-	CachedTokens     int
-	ServiceTier      string
-	APIKeyID         int64
-	APIKeyName       string
-	APIKeyMasked     string
-	ImageCount       int
-	ImageWidth       int
-	ImageHeight      int
-	ImageBytes       int
-	ImageFormat      string
-	ImageSize        string
+	AccountID         int64
+	Endpoint          string
+	Model             string
+	EffectiveModel    string
+	PromptTokens      int
+	CompletionTokens  int
+	TotalTokens       int
+	StatusCode        int
+	DurationMs        int
+	InputTokens       int
+	OutputTokens      int
+	ReasoningTokens   int
+	FirstTokenMs      int
+	ReasoningEffort   string
+	InboundEndpoint   string
+	UpstreamEndpoint  string
+	Stream            bool
+	CachedTokens      int
+	ServiceTier       string
+	APIKeyID          int64
+	APIKeyName        string
+	APIKeyMasked      string
+	ImageCount        int
+	ImageWidth        int
+	ImageHeight       int
+	ImageBytes        int
+	ImageFormat       string
+	ImageSize         string
+	IsRetryAttempt    bool
+	AttemptIndex      int
+	UpstreamErrorKind string
 }
 
 func (l *UsageLog) populateBillingBreakdown() {
@@ -1111,8 +1144,9 @@ func (db *DB) flushLogs() {
 	stmt, err := tx.PrepareContext(ctx,
 		`INSERT INTO usage_logs (account_id, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
-		  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)`)
+		  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
+		  is_retry_attempt, attempt_index, upstream_error_kind)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)`)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("批量写入日志失败（准备语句）: %v", err)
@@ -1123,7 +1157,8 @@ func (db *DB) flushLogs() {
 	for _, e := range batch {
 		if _, err := stmt.ExecContext(ctx, e.AccountID, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
-			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled); err != nil {
+			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
+			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind); err != nil {
 			tx.Rollback()
 			log.Printf("批量写入日志失败（执行）: %v", err)
 			return
@@ -1141,13 +1176,13 @@ func (db *DB) flushLogs() {
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行 28 个参数，每批最多 2340 行）
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行 33 个参数，每批最多 1900 行）
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
-	const maxRowsPerBatch = 2300
+	const maxRowsPerBatch = 1900
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -1172,23 +1207,26 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) e
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
 	valueStrings := make([]string, 0, len(batch))
-	valueArgs := make([]interface{}, 0, len(batch)*30)
+	valueArgs := make([]interface{}, 0, len(batch)*33)
 	argIdx := 1
 
 	for _, e := range batch {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
 			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
 			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19,
-			argIdx+20, argIdx+21, argIdx+22, argIdx+23, argIdx+24, argIdx+25, argIdx+26, argIdx+27, argIdx+28, argIdx+29))
+			argIdx+20, argIdx+21, argIdx+22, argIdx+23, argIdx+24, argIdx+25, argIdx+26, argIdx+27, argIdx+28, argIdx+29,
+			argIdx+30, argIdx+31, argIdx+32))
 		valueArgs = append(valueArgs, e.AccountID, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier,
-			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled)
-		argIdx += 30
+			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
+			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind)
+		argIdx += 33
 	}
 
 	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier,
-		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed)
+		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
+		is_retry_attempt, attempt_index, upstream_error_kind)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
@@ -1775,9 +1813,11 @@ func (db *DB) Stats() sql.DBStats {
 
 // AccountRequestCount 每个账号的请求统计
 type AccountRequestCount struct {
-	AccountID    int64
-	SuccessCount int64
-	ErrorCount   int64
+	AccountID             int64
+	SuccessCount          int64
+	ErrorCount            int64
+	RetryErrorCount       int64
+	RateLimitAttemptCount int64
 }
 
 // AccountTimeRangeUsage 每个账号在指定时间窗口内的真实请求/token 统计。
@@ -1792,14 +1832,22 @@ type AccountTimeRangeUsage struct {
 // GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
 	since := time.Now().AddDate(0, 0, -7)
-	query := `
+	retryFalse := "COALESCE(is_retry_attempt, false) = false"
+	retryTrue := "COALESCE(is_retry_attempt, false) = true"
+	if db.isSQLite() {
+		retryFalse = "COALESCE(is_retry_attempt, 0) = 0"
+		retryTrue = "COALESCE(is_retry_attempt, 0) = 1"
+	}
+	query := fmt.Sprintf(`
 	SELECT account_id,
-		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
-		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
+		COALESCE(SUM(CASE WHEN status_code < 400 AND %s THEN 1 ELSE 0 END), 0) AS success_count,
+		COALESCE(SUM(CASE WHEN status_code >= 400 AND %s THEN 1 ELSE 0 END), 0) AS error_count,
+		COALESCE(SUM(CASE WHEN status_code >= 400 AND %s THEN 1 ELSE 0 END), 0) AS retry_error_count,
+		COALESCE(SUM(CASE WHEN status_code = 429 THEN 1 ELSE 0 END), 0) AS rate_limit_attempt_count
 	FROM usage_logs
 	WHERE created_at >= $1
 	GROUP BY account_id
-	`
+	`, retryFalse, retryFalse, retryTrue)
 	rows, err := db.conn.QueryContext(ctx, query, db.timeArg(since))
 	if err != nil {
 		return nil, err
@@ -1809,7 +1857,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 	result := make(map[int64]*AccountRequestCount)
 	for rows.Next() {
 		rc := &AccountRequestCount{}
-		if err := rows.Scan(&rc.AccountID, &rc.SuccessCount, &rc.ErrorCount); err != nil {
+		if err := rows.Scan(&rc.AccountID, &rc.SuccessCount, &rc.ErrorCount, &rc.RetryErrorCount, &rc.RateLimitAttemptCount); err != nil {
 			return nil, err
 		}
 		result[rc.AccountID] = rc
@@ -1905,6 +1953,85 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+func (db *DB) ListActiveModelCooldowns(ctx context.Context) ([]*AccountModelCooldownRow, error) {
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT account_id, model, COALESCE(reason, ''), reset_at, updated_at
+		FROM account_model_cooldowns
+		WHERE reset_at > $1
+		ORDER BY account_id, model
+	`, db.timeArg(time.Now()))
+	if err != nil {
+		return nil, fmt.Errorf("查询模型冷却失败: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*AccountModelCooldownRow
+	for rows.Next() {
+		row := &AccountModelCooldownRow{}
+		var resetRaw interface{}
+		var updatedRaw interface{}
+		if err := rows.Scan(&row.AccountID, &row.Model, &row.Reason, &resetRaw, &updatedRaw); err != nil {
+			return nil, err
+		}
+		var parseErr error
+		row.ResetAt, parseErr = parseDBTimeValue(resetRaw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析模型冷却 reset_at 失败: %w", parseErr)
+		}
+		row.UpdatedAt, parseErr = parseDBTimeValue(updatedRaw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析模型冷却 updated_at 失败: %w", parseErr)
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (db *DB) SetModelCooldown(ctx context.Context, accountID int64, model, reason string, resetAt time.Time) error {
+	model = strings.TrimSpace(model)
+	if accountID == 0 || model == "" || resetAt.IsZero() {
+		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	if db.isSQLite() {
+		_, err := db.conn.ExecContext(ctx, `
+			INSERT INTO account_model_cooldowns (account_id, model, reason, reset_at, updated_at)
+			VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+			ON CONFLICT(account_id, model) DO UPDATE SET
+				reason = excluded.reason,
+				reset_at = excluded.reset_at,
+				updated_at = CURRENT_TIMESTAMP
+		`, accountID, model, reason, db.timeArg(resetAt))
+		return err
+	}
+	_, err := db.conn.ExecContext(ctx, `
+		INSERT INTO account_model_cooldowns (account_id, model, reason, reset_at, updated_at)
+		VALUES ($1, $2, $3, $4, NOW())
+		ON CONFLICT(account_id, model) DO UPDATE SET
+			reason = EXCLUDED.reason,
+			reset_at = EXCLUDED.reset_at,
+			updated_at = NOW()
+	`, accountID, model, reason, db.timeArg(resetAt))
+	return err
+}
+
+func (db *DB) ClearModelCooldown(ctx context.Context, accountID int64, model string) error {
+	model = strings.TrimSpace(model)
+	if accountID == 0 || model == "" {
+		return nil
+	}
+	_, err := db.conn.ExecContext(ctx, `DELETE FROM account_model_cooldowns WHERE account_id = $1 AND model = $2`, accountID, model)
+	return err
+}
+
+func (db *DB) ClearExpiredModelCooldowns(ctx context.Context) error {
+	_, err := db.conn.ExecContext(ctx, `DELETE FROM account_model_cooldowns WHERE reset_at <= $1`, db.timeArg(time.Now()))
+	return err
 }
 
 // GetAccountByID 获取未删除账号的完整数据库行。

@@ -1271,6 +1271,12 @@ export default function Accounts() {
                             {account.cooldown_until && (account.status === 'rate_limited' || account.status === 'error') && (
                               <CooldownTimer until={account.cooldown_until} />
                             )}
+                            {(account.model_cooldowns?.length ?? 0) > 0 && (
+                              <div className="text-[11px] leading-tight text-amber-600">
+                                model {account.model_cooldowns?.[0]?.model}
+                                {(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ''}
+                              </div>
+                            )}
                             <div className="text-[11px] text-muted-foreground">
                               {t('accounts.healthSummary', {
                                 health: formatHealthTier(account.health_tier, t),
@@ -1281,10 +1287,17 @@ export default function Accounts() {
                           </div>
                         </TableCell>
                         <TableCell>
-                          <div className="flex items-center gap-2 text-[13px]">
-                            <span className="text-emerald-600 font-medium">{account.success_requests ?? 0}</span>
-                            <span className="text-muted-foreground">/</span>
-                            <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
+                          <div className="space-y-0.5 text-[13px]">
+                            <div className="flex items-center gap-2">
+                              <span className="text-emerald-600 font-medium">{account.success_requests ?? 0}</span>
+                              <span className="text-muted-foreground">/</span>
+                              <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
+                            </div>
+                            {((account.retry_error_requests ?? 0) > 0 || (account.rate_limit_attempts ?? 0) > 0) && (
+                              <div className="text-[11px] text-muted-foreground">
+                                retry {account.retry_error_requests ?? 0} · 429 {account.rate_limit_attempts ?? 0}
+                              </div>
+                            )}
                           </div>
                         </TableCell>
                         <TableCell>

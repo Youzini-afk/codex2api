@@ -124,12 +124,15 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
+	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	generalRetries := 0
+	rateLimitRetries := 0
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
@@ -185,7 +188,11 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d, /v1/messages): %v", attempt+1, reqErr)
 			lastErr = reqErr
-			continue
+			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				continue
+			}
+			sendAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream request failed")
+			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -204,21 +211,25 @@ func (h *Handler) Messages(c *gin.Context) {
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:        account.ID(),
-				Endpoint:         "/v1/messages",
-				Model:            model,
-				EffectiveModel:   effectiveModel,
-				StatusCode:       resp.StatusCode,
-				DurationMs:       durationMs,
-				ReasoningEffort:  reasoningEffort,
-				InboundEndpoint:  "/v1/messages",
-				UpstreamEndpoint: "/v1/responses",
-				Stream:           isStream,
+				AccountID:         account.ID(),
+				Endpoint:          "/v1/messages",
+				Model:             model,
+				EffectiveModel:    effectiveModel,
+				StatusCode:        resp.StatusCode,
+				DurationMs:        durationMs,
+				ReasoningEffort:   reasoningEffort,
+				InboundEndpoint:   "/v1/messages",
+				UpstreamEndpoint:  "/v1/responses",
+				Stream:            isStream,
+				IsRetryAttempt:    shouldRetry,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
 			})
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -432,6 +443,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
+			h.store.ClearModelCooldown(account, effectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)

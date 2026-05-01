@@ -104,6 +104,15 @@ type Account struct {
 	BaseConcurrencyOverride *int64
 	AllowedAPIKeyIDs        []int64
 	allowedAPIKeySet        map[int64]struct{}
+	ModelCooldowns          map[string]ModelCooldown
+}
+
+type ModelCooldown struct {
+	Model        string
+	Reason       string
+	ResetAt      time.Time
+	UpdatedAt    time.Time
+	BackoffLevel int
 }
 
 // AccountFilter 用于请求级调度约束，例如按模型限制账号套餐。
@@ -579,10 +588,10 @@ func (a *Account) IsAvailable() bool {
 	if a.usageExhaustedLocked() {
 		return false
 	}
-	if a.premium5hRateLimitedLocked(time.Now()) {
-		return a.AccessToken != ""
-	}
 	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
+		return false
+	}
+	if a.premium5hRateLimitedLocked(time.Now()) {
 		return false
 	}
 	// 冷却期过了自动恢复
@@ -642,6 +651,12 @@ func (a *Account) GetCooldownReason() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.CooldownReason
+}
+
+func (a *Account) GetCooldownSnapshot() (string, time.Time) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.CooldownReason, a.CooldownUtil
 }
 
 // HasActiveCooldown 检查账号是否仍处于冷却期
@@ -873,6 +888,132 @@ func (a *Account) AllowsAPIKey(apiKeyID int64) bool {
 	return ok
 }
 
+func normalizeModelCooldownKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
+func (a *Account) SetModelCooldownUntil(model, reason string, resetAt time.Time) ModelCooldown {
+	key := normalizeModelCooldownKey(model)
+	if key == "" || resetAt.IsZero() {
+		return ModelCooldown{}
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	now := time.Now()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ModelCooldowns == nil {
+		a.ModelCooldowns = make(map[string]ModelCooldown)
+	}
+	current := a.ModelCooldowns[key]
+	level := current.BackoffLevel
+	if current.ResetAt.After(now) {
+		level++
+	}
+	if level < 0 {
+		level = 0
+	}
+	cooldown := ModelCooldown{
+		Model:        key,
+		Reason:       reason,
+		ResetAt:      resetAt,
+		UpdatedAt:    now,
+		BackoffLevel: level,
+	}
+	a.ModelCooldowns[key] = cooldown
+	return cooldown
+}
+
+func (a *Account) RestoreModelCooldown(model, reason string, resetAt, updatedAt time.Time) {
+	key := normalizeModelCooldownKey(model)
+	if key == "" || resetAt.IsZero() || !resetAt.After(time.Now()) {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ModelCooldowns == nil {
+		a.ModelCooldowns = make(map[string]ModelCooldown)
+	}
+	a.ModelCooldowns[key] = ModelCooldown{
+		Model:     key,
+		Reason:    reason,
+		ResetAt:   resetAt,
+		UpdatedAt: updatedAt,
+	}
+}
+
+func (a *Account) IsModelRateLimited(model string) bool {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cooldown, ok := a.ModelCooldowns[key]
+	return ok && cooldown.ResetAt.After(time.Now())
+}
+
+func (a *Account) ModelCooldownRemaining(model string) time.Duration {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return 0
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cooldown, ok := a.ModelCooldowns[key]
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(cooldown.ResetAt)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (a *Account) ActiveModelCooldowns() []ModelCooldown {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.ModelCooldowns) == 0 {
+		return nil
+	}
+	now := time.Now()
+	result := make([]ModelCooldown, 0, len(a.ModelCooldowns))
+	for _, cooldown := range a.ModelCooldowns {
+		if cooldown.ResetAt.After(now) {
+			result = append(result, cooldown)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Model < result[j].Model
+	})
+	return result
+}
+
+func (a *Account) ClearModelCooldown(model string) bool {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.ModelCooldowns) == 0 {
+		return false
+	}
+	if _, ok := a.ModelCooldowns[key]; !ok {
+		return false
+	}
+	delete(a.ModelCooldowns, key)
+	return true
+}
+
 // GetDynamicConcurrencyLimit 获取当前动态并发上限
 func (a *Account) GetDynamicConcurrencyLimit() int64 {
 	a.mu.RLock()
@@ -912,13 +1053,13 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
 		return false
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" {
+	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false
 	}
 	if a.premium5hRateLimitedLocked(now) {
 		return false
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" {
+	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false // 429 冷却期间不探活，避免加重限流
 	}
 	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() {
@@ -1024,6 +1165,7 @@ type Store struct {
 	autoCleanExpired          atomic.Bool
 	autoCleanupBatch          atomic.Bool
 	maxRetries                int64 // 请求失败最大重试次数（换号重试）
+	maxRateLimitRetries       int64 // 429 最大换号重试次数
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
 	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
@@ -1102,6 +1244,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			UsageProbeMaxAgeMinutes:          10,
 			RecoveryProbeIntervalMinutes:     30,
 			ProxyURL:                         "",
+			MaxRateLimitRetries:              1,
 		}
 	}
 	s := &Store{
@@ -1129,6 +1272,11 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		retries = 2 // 默认重试 2 次
 	}
 	atomic.StoreInt64(&s.maxRetries, retries)
+	rateLimitRetries := int64(settings.MaxRateLimitRetries)
+	if rateLimitRetries < 0 {
+		rateLimitRetries = 0
+	}
+	atomic.StoreInt64(&s.maxRateLimitRetries, rateLimitRetries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
@@ -1481,6 +1629,17 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("从数据库加载账号失败: %w", err)
 	}
+	modelCooldowns := make(map[int64][]*database.AccountModelCooldownRow)
+	if cooldownRows, err := s.db.ListActiveModelCooldowns(ctx); err == nil {
+		for _, row := range cooldownRows {
+			modelCooldowns[row.AccountID] = append(modelCooldowns[row.AccountID], row)
+		}
+	} else {
+		log.Printf("加载模型冷却状态失败: %v", err)
+	}
+	if err := s.db.ClearExpiredModelCooldowns(ctx); err != nil {
+		log.Printf("清理过期模型冷却状态失败: %v", err)
+	}
 
 	for _, row := range rows {
 		rt := row.GetCredential("refresh_token")
@@ -1573,17 +1732,8 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				account.SetUsageSnapshot5h(parsed, resetAt)
 			}
 		}
-		account.mu.Lock()
-		if account.premium5hCooldownSuppressedLocked(time.Now()) {
-			account.Status = StatusReady
-			account.CooldownUtil = time.Time{}
-			account.CooldownReason = ""
-		}
-		account.mu.Unlock()
-		if row.CooldownUntil.Valid && row.CooldownReason == "rate_limited" && account.IsPremium5hRateLimited() && s.db != nil {
-			if err := s.db.ClearCooldown(ctx, row.ID); err != nil {
-				log.Printf("[账号 %d] 清理 premium 5h 冷却状态失败: %v", row.ID, err)
-			}
+		for _, cooldown := range modelCooldowns[row.ID] {
+			account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 		}
 		account.mu.Lock()
 		account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -1967,6 +2117,17 @@ func (s *Store) GetMaxRetries() int {
 	return int(atomic.LoadInt64(&s.maxRetries))
 }
 
+func (s *Store) SetMaxRateLimitRetries(n int) {
+	if n < 0 {
+		n = 0
+	}
+	atomic.StoreInt64(&s.maxRateLimitRetries, int64(n))
+}
+
+func (s *Store) GetMaxRateLimitRetries() int {
+	return int(atomic.LoadInt64(&s.maxRateLimitRetries))
+}
+
 // GetAllowRemoteMigration 获取是否允许远程迁移
 func (s *Store) GetAllowRemoteMigration() bool {
 	return s.allowRemoteMigration.Load()
@@ -2197,6 +2358,87 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 	defer cancel()
 	if err := s.db.SetCooldown(ctx, acc.DBID, reason, until); err != nil {
 		log.Printf("[账号 %d] 持久化冷却状态失败: %v", acc.DBID, err)
+	}
+}
+
+func (s *Store) MarkModelCooldown(acc *Account, model string, duration time.Duration, reason string) ModelCooldown {
+	if acc == nil {
+		return ModelCooldown{}
+	}
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return ModelCooldown{}
+	}
+	if duration <= 0 {
+		duration = 5 * time.Minute
+	}
+	if duration > 30*time.Minute {
+		duration = 30 * time.Minute
+	}
+
+	now := time.Now()
+	acc.mu.Lock()
+	if acc.ModelCooldowns == nil {
+		acc.ModelCooldowns = make(map[string]ModelCooldown)
+	}
+	current := acc.ModelCooldowns[key]
+	level := current.BackoffLevel
+	if current.ResetAt.After(now) {
+		level++
+		duration *= 2
+		for i := 0; i < level-1; i++ {
+			duration *= 2
+		}
+		if duration > 30*time.Minute {
+			duration = 30 * time.Minute
+		}
+	}
+	resetAt := now.Add(duration)
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	cooldown := ModelCooldown{
+		Model:        key,
+		Reason:       reason,
+		ResetAt:      resetAt,
+		UpdatedAt:    now,
+		BackoffLevel: level,
+	}
+	acc.ModelCooldowns[key] = cooldown
+	acc.LastRateLimitedAt = now
+	acc.LastFailureAt = now
+	acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
+	acc.SuccessStreak = 0
+	if acc.healthTierLocked() == HealthTierHealthy {
+		acc.HealthTier = HealthTierWarm
+	} else if acc.HealthTier != HealthTierBanned {
+		acc.HealthTier = HealthTierRisky
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.db.SetModelCooldown(ctx, acc.DBID, key, reason, resetAt); err != nil {
+			log.Printf("[账号 %d] 持久化模型冷却失败 model=%s: %v", acc.DBID, key, err)
+		}
+	}
+	return cooldown
+}
+
+func (s *Store) ClearModelCooldown(acc *Account, model string) {
+	if acc == nil || !acc.ClearModelCooldown(model) {
+		return
+	}
+	if s.db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.ClearModelCooldown(ctx, acc.DBID, normalizeModelCooldownKey(model)); err != nil {
+		log.Printf("[账号 %d] 清理模型冷却失败 model=%s: %v", acc.DBID, model, err)
 	}
 }
 
@@ -2836,8 +3078,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	cooldownUntil := acc.CooldownUtil
 	cooldownReason := acc.CooldownReason
 	now := time.Now()
-	premiumCooldownSuppressed := acc.premium5hCooldownSuppressedLocked(now)
-	activeCooldown := acc.Status == StatusCooldown && now.Before(acc.CooldownUtil) && !premiumCooldownSuppressed
+	activeCooldown := acc.Status == StatusCooldown && now.Before(acc.CooldownUtil)
 	expiredCooldown := acc.Status == StatusCooldown && !now.Before(acc.CooldownUtil)
 	acc.mu.RUnlock()
 

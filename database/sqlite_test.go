@@ -81,10 +81,83 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "account_billed", "user_billed"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
+	}
+}
+
+func TestSQLiteModelCooldownPersistence(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	resetAt := time.Now().Add(15 * time.Minute).Truncate(time.Second)
+	if err := db.SetModelCooldown(ctx, 42, "gpt-5.4", "model_capacity", resetAt); err != nil {
+		t.Fatalf("SetModelCooldown 返回错误: %v", err)
+	}
+
+	rows, err := db.ListActiveModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("ListActiveModelCooldowns 返回错误: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListActiveModelCooldowns 返回 %d 条，want 1", len(rows))
+	}
+	if rows[0].AccountID != 42 || rows[0].Model != "gpt-5.4" || rows[0].Reason != "model_capacity" {
+		t.Fatalf("cooldown row = %#v", rows[0])
+	}
+
+	if err := db.ClearModelCooldown(ctx, 42, "gpt-5.4"); err != nil {
+		t.Fatalf("ClearModelCooldown 返回错误: %v", err)
+	}
+	rows, err = db.ListActiveModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("ListActiveModelCooldowns 返回错误: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("ListActiveModelCooldowns 返回 %d 条，want 0", len(rows))
+	}
+}
+
+func TestAccountRequestCountsSeparateRetryAttempts(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	logs := []*UsageLogInput{
+		{AccountID: 7, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 200},
+		{AccountID: 7, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 429, IsRetryAttempt: true, AttemptIndex: 1, UpstreamErrorKind: "model_capacity"},
+		{AccountID: 7, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 500, IsRetryAttempt: false, AttemptIndex: 2, UpstreamErrorKind: "server"},
+	}
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	counts, err := db.GetAccountRequestCounts(ctx)
+	if err != nil {
+		t.Fatalf("GetAccountRequestCounts 返回错误: %v", err)
+	}
+	got := counts[7]
+	if got == nil {
+		t.Fatal("account 7 counts missing")
+	}
+	if got.SuccessCount != 1 || got.ErrorCount != 1 || got.RetryErrorCount != 1 || got.RateLimitAttemptCount != 1 {
+		t.Fatalf("counts = %#v, want success=1 error=1 retry=1 rateLimit=1", got)
 	}
 }
 

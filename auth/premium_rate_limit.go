@@ -63,21 +63,6 @@ func (a *Account) premium5hRateLimitedLocked(now time.Time) bool {
 	return a.Reset5hAt.After(now)
 }
 
-func (a *Account) premium5hRateLimitWindowLocked(now time.Time) (bool, time.Time) {
-	if !a.premium5hRateLimitedLocked(now) {
-		return false, time.Time{}
-	}
-	return true, a.Reset5hAt
-}
-
-func (a *Account) premium5hCooldownSuppressedLocked(now time.Time) bool {
-	if a.Status != StatusCooldown || a.CooldownReason != "rate_limited" {
-		return false
-	}
-	active, _ := a.premium5hRateLimitWindowLocked(now)
-	return active
-}
-
 // IsPremium5hRateLimited 判断账号当前是否处于 premium 5h 限流态。
 func (a *Account) IsPremium5hRateLimited() bool {
 	a.mu.RLock()
@@ -135,11 +120,9 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	acc.Reset5hAt = resetAt
 	acc.UsageUpdatedAt = now
 	acc.LastRateLimitedAt = now
-	if acc.Status == StatusCooldown && acc.CooldownReason == "rate_limited" {
-		acc.Status = StatusReady
-		acc.CooldownUtil = time.Time{}
-		acc.CooldownReason = ""
-	}
+	acc.Status = StatusCooldown
+	acc.CooldownUtil = resetAt
+	acc.CooldownReason = "rate_limited"
 	if acc.HealthTier != HealthTierBanned {
 		acc.HealthTier = HealthTierRisky
 	}
@@ -154,8 +137,8 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.ClearCooldown(ctx, acc.DBID); err != nil {
-		log.Printf("[账号 %d] 清理 premium 5h 限流冷却状态失败: %v", acc.DBID, err)
+	if err := s.db.SetCooldown(ctx, acc.DBID, "rate_limited", resetAt); err != nil {
+		log.Printf("[账号 %d] 持久化 premium 5h 限流冷却状态失败: %v", acc.DBID, err)
 	}
 	if err := s.db.UpdateUsageSnapshot5h(ctx, acc.DBID, 100, resetAt, now); err != nil {
 		log.Printf("[账号 %d] 持久化 premium 5h 限流快照失败: %v", acc.DBID, err)

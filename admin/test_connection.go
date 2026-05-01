@@ -93,7 +93,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		case http.StatusUnauthorized:
 			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
 		case http.StatusTooManyRequests:
-			proxy.Apply429Cooldown(h.store, account, errBody, resp)
+			proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
 		}
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
@@ -443,7 +443,7 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				atomic.AddInt64(&bannedCount, 1)
 			case http.StatusTooManyRequests:
 				proxy.SyncCodexUsageState(h.store, acc, resp)
-				proxy.Apply429Cooldown(h.store, acc, body, resp)
+				proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
 				atomic.AddInt64(&rateLimitCount, 1)
 			default:
 				if shouldMarkBatchTestAccountError(resp.StatusCode, body) {

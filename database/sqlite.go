@@ -79,6 +79,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			key TEXT NOT NULL UNIQUE,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS account_model_cooldowns (
+			account_id INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			reason TEXT DEFAULT '',
+			reset_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (account_id, model)
+		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
 					id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 					max_concurrency INTEGER DEFAULT 2,
@@ -100,6 +108,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				proxy_pool_enabled INTEGER DEFAULT 0,
 			fast_scheduler_enabled INTEGER DEFAULT 0,
 				max_retries INTEGER DEFAULT 2,
+				max_rate_limit_retries INTEGER DEFAULT 1,
 				allow_remote_migration INTEGER DEFAULT 0
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
@@ -240,6 +249,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "image_size", "TEXT DEFAULT ''"},
 		{"usage_logs", "account_billed", "REAL DEFAULT 0"},
 		{"usage_logs", "user_billed", "REAL DEFAULT 0"},
+		{"usage_logs", "is_retry_attempt", "INTEGER DEFAULT 0"},
+		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
+		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
@@ -254,6 +266,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "proxy_pool_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
+		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
 		{"system_settings", "resin_url", "TEXT DEFAULT ''"},
@@ -292,6 +305,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_image_prompt_templates_updated ON image_prompt_templates(updated_at);`,

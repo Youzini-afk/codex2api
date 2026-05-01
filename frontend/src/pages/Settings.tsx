@@ -231,6 +231,7 @@ export default function Settings() {
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
     max_retries: 2,
+    max_rate_limit_retries: 1,
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -429,6 +430,15 @@ export default function Settings() {
                     max={10}
                     value={settingsForm.max_retries}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_retries: parseInt(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.maxRateLimitRetries')} description={t('settings.maxRateLimitRetriesRange')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={settingsForm.max_rate_limit_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_rate_limit_retries: parseInt(e.target.value) || 0 }))}
                   />
                 </SettingField>
               </div>

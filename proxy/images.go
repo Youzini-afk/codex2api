@@ -867,12 +867,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 
 	apiKeyID := requestAPIKeyID(c)
 	maxRetries := h.getMaxRetries()
+	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	generalRetries := 0
+	rateLimitRetries := 0
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts)
@@ -907,7 +910,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				return
 			}
 			lastErr = reqErr
-			continue
+			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				continue
+			}
+			ErrorToGinResponse(c, reqErr)
+			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -923,8 +930,22 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			excludeAccounts[account.ID()] = true
 			logUpstreamError(inboundEndpoint, resp.StatusCode, requestModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			h.logUsageForRequest(c, &database.UsageLogInput{
+				AccountID:         account.ID(),
+				Endpoint:          inboundEndpoint,
+				Model:             requestModel,
+				StatusCode:        resp.StatusCode,
+				DurationMs:        durationMs,
+				InboundEndpoint:   inboundEndpoint,
+				UpstreamEndpoint:  "/v1/responses",
+				Stream:            stream,
+				IsRetryAttempt:    shouldRetry,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
+			})
+			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -993,6 +1014,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if readErr != nil {
 			h.store.ReportRequestFailure(account, "transport", time.Duration(logInput.DurationMs)*time.Millisecond)
 		} else {
+			h.store.ClearModelCooldown(account, requestModel)
 			h.store.ReportRequestSuccess(account, time.Duration(logInput.DurationMs)*time.Millisecond)
 		}
 		h.store.Release(account)
