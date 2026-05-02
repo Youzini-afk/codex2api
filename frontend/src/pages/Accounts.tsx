@@ -119,7 +119,7 @@ export default function Accounts() {
         return false
       }
 
-      const plan = (account.plan_type || '').toLowerCase()
+      const plan = normalizePlanType(account.plan_type)
       const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
       const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
 
@@ -191,7 +191,7 @@ export default function Accounts() {
     }
     // 套餐过滤
     if (planFilter !== 'all') {
-      const plan = (account.plan_type || '').toLowerCase()
+      const plan = normalizePlanType(account.plan_type)
       if (plan !== planFilter) return false
     }
     // 搜索过滤
@@ -2243,8 +2243,17 @@ function getDispatchScore(account: AccountRow): number {
   return account.dispatch_score ?? account.scheduler_score ?? 0
 }
 
+// OpenAI reports the $100 Pro tier as "prolite" — functionally a Pro plan with
+// a smaller usage cap. Keep behavioral comparisons (usage windows, plan filter,
+// scheduler bias) aligned with the Go side by folding it into "pro".
+function normalizePlanType(planType?: string): string {
+  const raw = (planType || '').toLowerCase().trim()
+  if (raw === 'prolite' || raw === 'pro_lite' || raw === 'pro-lite') return 'pro'
+  return raw
+}
+
 function getDefaultScoreBias(planType?: string): number {
-  switch ((planType || '').toLowerCase()) {
+  switch (normalizePlanType(planType)) {
     case 'pro':
     case 'plus':
     case 'team':
@@ -2817,7 +2826,7 @@ function UsageWindowStat({ label, detail }: { label: string; detail?: AccountRow
 
 // 用量列组件
 function UsageCell({ account }: { account: AccountRow }) {
-  const plan = (account.plan_type || '').toLowerCase()
+  const plan = normalizePlanType(account.plan_type)
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail)

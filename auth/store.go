@@ -308,7 +308,7 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 }
 
 func defaultScoreBiasForPlan(planType string) int64 {
-	switch strings.ToLower(strings.TrimSpace(planType)) {
+	switch NormalizePlanType(planType) {
 	case "pro", "plus", "team":
 		return 50
 	default:

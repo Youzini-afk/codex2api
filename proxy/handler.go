@@ -158,7 +158,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 			return false
 		}
 		if isProOnlyModel(model) {
-			return strings.EqualFold(strings.TrimSpace(account.GetPlanType()), "pro")
+			return auth.NormalizePlanType(account.GetPlanType()) == "pro"
 		}
 		return true
 	}
@@ -2194,7 +2194,7 @@ func compute429Cooldown(account *auth.Account, body []byte, resp *http.Response)
 	}
 
 	// 2. 没有精确重置时间，根据套餐类型 + 用量窗口推断
-	planType := strings.ToLower(account.GetPlanType())
+	planType := auth.NormalizePlanType(account.GetPlanType())
 
 	switch planType {
 	case "free":

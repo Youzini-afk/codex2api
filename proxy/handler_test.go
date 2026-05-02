@@ -349,6 +349,9 @@ func TestAccountFilterForSparkRequiresPro(t *testing.T) {
 	if !filter(&auth.Account{PlanType: "pro"}) {
 		t.Fatal("spark filter should allow pro accounts")
 	}
+	if !filter(&auth.Account{PlanType: "prolite"}) {
+		t.Fatal("spark filter should treat prolite as pro")
+	}
 	if filter(&auth.Account{PlanType: "plus"}) {
 		t.Fatal("spark filter should reject non-pro accounts")
 	}
