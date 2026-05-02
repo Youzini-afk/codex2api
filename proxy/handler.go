@@ -179,6 +179,82 @@ func noAvailableAccountMessage(model string) string {
 	return "无可用账号，请稍后重试"
 }
 
+func noAvailableAccountError(model string) gin.H {
+	return gin.H{
+		"error": gin.H{
+			"message": noAvailableAccountMessage(model),
+			"type":    ErrorTypeServerError,
+			"code":    ErrorCodeNoAvailableAccount,
+		},
+	}
+}
+
+func usageLogErrorMessage(statusCode int, body []byte) string {
+	if statusCode < 400 {
+		return ""
+	}
+
+	candidates := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "response.error.message").String(),
+		gjson.GetBytes(body, "response.status_details.error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+	}
+	message := ""
+	for _, candidate := range candidates {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			message = candidate
+			break
+		}
+	}
+
+	codeCandidates := []string{
+		gjson.GetBytes(body, "error.code").String(),
+		gjson.GetBytes(body, "response.error.code").String(),
+		gjson.GetBytes(body, "response.status_details.error.code").String(),
+		gjson.GetBytes(body, "detail.code").String(),
+		gjson.GetBytes(body, "code").String(),
+	}
+	code := ""
+	for _, candidate := range codeCandidates {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			code = candidate
+			break
+		}
+	}
+
+	typeCandidates := []string{
+		gjson.GetBytes(body, "error.type").String(),
+		gjson.GetBytes(body, "response.error.type").String(),
+		gjson.GetBytes(body, "type").String(),
+	}
+	errType := ""
+	for _, candidate := range typeCandidates {
+		if candidate = strings.TrimSpace(candidate); candidate != "" && candidate != "error" {
+			errType = candidate
+			break
+		}
+	}
+
+	if message == "" {
+		raw := strings.TrimSpace(string(body))
+		if raw == "" {
+			return fmt.Sprintf("HTTP %d", statusCode)
+		}
+		message = raw
+	}
+
+	parts := make([]string, 0, 3)
+	if code != "" {
+		parts = append(parts, code)
+	}
+	if errType != "" && errType != code {
+		parts = append(parts, errType)
+	}
+	parts = append(parts, message)
+	return security.SafeTruncate(security.SanitizeLog(strings.Join(parts, " · ")), 600)
+}
+
 func noAvailableAnthropicAccountMessage(model string) string {
 	if isProOnlyModel(model) {
 		return "No available Pro account for gpt-5.3-codex-spark"
@@ -836,9 +912,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
-				})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
@@ -919,6 +993,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
 				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -1111,6 +1186,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			Stream:           isStream,
 			ServiceTier:      resolvedServiceTier,
 		}
+		if logStatusCode != http.StatusOK {
+			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
 			logInput.CompletionTokens = usage.CompletionTokens
@@ -1223,9 +1301,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
-				})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
@@ -1295,6 +1371,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
 				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -1435,9 +1512,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
-				})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
@@ -1518,6 +1593,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
 				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -1703,6 +1779,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           isStream,
 			ServiceTier:      resolvedServiceTier,
+		}
+		if logStatusCode != http.StatusOK {
+			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -2030,6 +2109,9 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 	decision := classify429RateLimit(account, body, resp, time.Now(), model)
 	if store == nil || account == nil {
 		return decision
+	}
+	if details, ok := parseUsageLimitDetails(body); ok {
+		store.ApplyUsageLimitMetadata(account, details.planType, decision.ResetAt)
 	}
 	if decision.Scope == rateLimitScopeModel {
 		cooldown := store.MarkModelCooldown(account, decision.Model, decision.Cooldown, decision.Reason)

@@ -70,6 +70,8 @@ components:
                 - rate_limit_reached
                 - server_error
                 - service_unavailable
+                - no_available_account
+                - account_pool_usage_limit_reached
                 - upstream_error
                 - upstream_timeout
                 - resource_not_found

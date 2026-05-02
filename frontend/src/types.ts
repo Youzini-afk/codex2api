@@ -413,6 +413,7 @@ export interface UsageLog {
   output_price_per_mtoken: number
   cache_read_price_per_mtoken: number
   rate_multiplier: number
+  error_message: string
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>

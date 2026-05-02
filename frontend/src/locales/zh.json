@@ -560,6 +560,8 @@
     "inputUnitPrice": "输入单价",
     "outputUnitPrice": "输出单价",
     "cacheReadUnitPrice": "缓存读取单价",
+    "statusErrorDetails": "错误详情",
+    "statusErrorEmpty": "未记录具体错误信息",
     "clearFilters": "清除筛选"
   },
   "promptFilter": {

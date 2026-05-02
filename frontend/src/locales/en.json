@@ -560,6 +560,8 @@
     "inputUnitPrice": "Input Unit Price",
     "outputUnitPrice": "Output Unit Price",
     "cacheReadUnitPrice": "Cache Read Unit Price",
+    "statusErrorDetails": "Error Details",
+    "statusErrorEmpty": "No detailed error message recorded",
     "clearFilters": "Clear Filters"
   },
   "promptFilter": {

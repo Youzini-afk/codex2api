@@ -122,6 +122,40 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	}
 }
 
+func assertNoAvailableAccountResponse(t *testing.T, body []byte) {
+	t.Helper()
+
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, string(body))
+	}
+	if payload.Error.Message == "" {
+		t.Fatalf("message is empty; body=%s", string(body))
+	}
+	if payload.Error.Type != ErrorTypeServerError {
+		t.Fatalf("type = %q, want %q", payload.Error.Type, ErrorTypeServerError)
+	}
+	if payload.Error.Code != ErrorCodeNoAvailableAccount {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, ErrorCodeNoAvailableAccount)
+	}
+}
+
+func TestUsageLogErrorMessageExtractsStructuredError(t *testing.T) {
+	body := []byte(`{"error":{"code":"rate_limit_exceeded","type":"server_error","message":"Too many requests"}}`)
+
+	got := usageLogErrorMessage(http.StatusTooManyRequests, body)
+
+	if got != "rate_limit_exceeded · server_error · Too many requests" {
+		t.Fatalf("usageLogErrorMessage() = %q", got)
+	}
+}
+
 func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -161,6 +195,7 @@ func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 			if recorder.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status = %d, want %d after validation passes; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
 			}
+			assertNoAvailableAccountResponse(t, recorder.Body.Bytes())
 		})
 	}
 }
@@ -198,7 +233,34 @@ func TestResponsesEndpointsAllowGPT55MaxOutputTokens128K(t *testing.T) {
 			if recorder.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status = %d, want %d after validation passes; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
 			}
+			assertNoAvailableAccountResponse(t, recorder.Body.Bytes())
 		})
+	}
+}
+
+func TestResponsesNoAvailableAccountFailsFastWithoutCancelledContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(auth.NewStore(nil, nil, nil), nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = req
+
+	start := time.Now()
+	handler.Responses(ginCtx)
+	elapsed := time.Since(start)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+	}
+	assertNoAvailableAccountResponse(t, recorder.Body.Bytes())
+	if elapsed > 150*time.Millisecond {
+		t.Fatalf("Responses took %s with no dispatch candidates; want fast failure", elapsed)
 	}
 }
 
@@ -565,6 +627,62 @@ func TestApply429CooldownPremiumMarks5hRateLimitFromWindow(t *testing.T) {
 	}
 	if got := resetAt.Sub(time.Now()); got < 14*time.Minute || got > 16*time.Minute {
 		t.Fatalf("resetAt delta = %v, want about 15m", got)
+	}
+}
+
+func TestApply429CooldownUsageLimitUpdatesFreePlanMetadata(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "usage-limit-account", map[string]interface{}{
+		"plan_type": "pro",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "pro"}
+	body := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_in_seconds":3600}}`)
+
+	decision := Apply429Cooldown(store, account, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "usage_limit" {
+		t.Fatalf("decision = %#v, want account usage_limit", decision)
+	}
+	if got := account.GetPlanType(); got != "free" {
+		t.Fatalf("account plan_type = %q, want free", got)
+	}
+	pct, ok := account.GetUsagePercent7d()
+	if !ok || pct != 100 {
+		t.Fatalf("usage_percent_7d = %v ok=%v, want 100 true", pct, ok)
+	}
+	if got := account.RuntimeStatus(); got != "usage_exhausted" {
+		t.Fatalf("RuntimeStatus() = %q, want usage_exhausted", got)
+	}
+
+	resetDelta := time.Until(account.GetReset7dAt())
+	if resetDelta < 59*time.Minute || resetDelta > 61*time.Minute {
+		t.Fatalf("reset_7d_at delta = %v, want about 1h", resetDelta)
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID 返回错误: %v", err)
+	}
+	if got := row.GetCredential("plan_type"); got != "free" {
+		t.Fatalf("persisted plan_type = %q, want free", got)
+	}
+	if got := row.GetCredential("codex_7d_used_percent"); got != "100" {
+		t.Fatalf("persisted codex_7d_used_percent = %q, want 100", got)
+	}
+	if got := row.GetCredential("codex_7d_reset_at"); got == "" {
+		t.Fatal("persisted codex_7d_reset_at is empty")
 	}
 }
 

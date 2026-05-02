@@ -224,6 +224,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
 				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -415,6 +416,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			InboundEndpoint:  "/v1/messages",
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           isStream,
+		}
+		if logStatusCode != http.StatusOK {
+			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens

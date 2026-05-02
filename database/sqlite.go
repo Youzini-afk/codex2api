@@ -71,7 +71,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			image_height INTEGER DEFAULT 0,
 			image_bytes INTEGER DEFAULT 0,
 			image_format TEXT DEFAULT '',
-			image_size TEXT DEFAULT ''
+			image_size TEXT DEFAULT '',
+			error_message TEXT DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -252,6 +253,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "is_retry_attempt", "INTEGER DEFAULT 0"},
 		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
+		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},

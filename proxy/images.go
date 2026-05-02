@@ -883,7 +883,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"}})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
 				return
 			}
 		}
@@ -942,6 +942,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
 				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
@@ -989,6 +990,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			InboundEndpoint:  inboundEndpoint,
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           stream,
+		}
+		if readErr != nil {
+			logInput.ErrorMessage = usageLogErrorMessage(statusCode, []byte(readErr.Error()))
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
