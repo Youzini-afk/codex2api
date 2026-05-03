@@ -1,4 +1,4 @@
-import type { ChangeEvent, DragEvent } from 'react'
+import type { ChangeEvent, DragEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
 import { api, getAdminKey } from '../api'
 import Modal from '../components/Modal'
@@ -51,7 +51,9 @@ export default function Accounts() {
   const [authJsonExportingIds, setAuthJsonExportingIds] = useState<Set<number>>(new Set())
   const [authJsonModal, setAuthJsonModal] = useState<{ account: AccountRow; json: string } | null>(null)
   const [batchLoading, setBatchLoading] = useState(false)
+  const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchTesting, setBatchTesting] = useState(false)
+  const [lockingSubscriptionAccounts, setLockingSubscriptionAccounts] = useState(false)
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
   const [cleaningError, setCleaningError] = useState(false)
@@ -163,6 +165,7 @@ export default function Accounts() {
   const errorAccounts = accounts.filter((account) => account.status === 'error').length
   const disabledAccounts = accounts.filter((account) => account.enabled === false).length
   const lockedAccounts = accounts.filter((account) => account.locked).length
+  const subscriptionAccountsToLock = accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked)
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
   const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
@@ -719,6 +722,34 @@ export default function Accounts() {
     }
   }
 
+  const handleLockSubscriptionAccounts = async () => {
+    const candidates = accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked)
+    if (candidates.length === 0) {
+      showToast(t('accounts.noSubscriptionAccountsToLock'))
+      return
+    }
+
+    setBatchLoading(true)
+    setLockingSubscriptionAccounts(true)
+    let success = 0
+    let fail = 0
+    try {
+      for (const account of candidates) {
+        try {
+          await api.toggleAccountLock(account.id, true)
+          success++
+        } catch {
+          fail++
+        }
+      }
+      showToast(t('accounts.lockSubscriptionAccountsDone', { success, fail }))
+      void reload()
+    } finally {
+      setBatchLoading(false)
+      setLockingSubscriptionAccounts(false)
+    }
+  }
+
   const handleToggleEnabled = async (account: AccountRow) => {
     const nextEnabled = account.enabled === false
     try {
@@ -757,22 +788,27 @@ export default function Accounts() {
     void reload()
   }
 
-  const handleBatchRefresh = async () => {
-    if (selected.size === 0) return
+  const handleBatchRefresh = async (ids = Array.from(selected)) => {
+    if (ids.length === 0) return
     setBatchLoading(true)
+    setBatchRefreshing(true)
     let success = 0
     let fail = 0
-    for (const id of selected) {
-      try {
-        await api.refreshAccount(id)
-        success++
-      } catch {
-        fail++
+    try {
+      for (const id of ids) {
+        try {
+          await api.refreshAccount(id)
+          success++
+        } catch {
+          fail++
+        }
       }
+      showToast(t('accounts.batchRefreshDone', { success, fail }))
+      void reload()
+    } finally {
+      setBatchLoading(false)
+      setBatchRefreshing(false)
     }
-    showToast(t('accounts.batchRefreshDone', { success, fail }))
-    setBatchLoading(false)
-    void reload()
   }
 
   const handleBatchLock = async (locked: boolean) => {
@@ -841,10 +877,11 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchTest = async () => {
+  const handleBatchTest = async (ids?: number[]) => {
+    if (ids && ids.length === 0) return
     setBatchTesting(true)
     try {
-      const result = await api.batchTestAccounts()
+      const result = await api.batchTestAccounts(ids)
       showToast(t('accounts.batchTestDone', {
         success: result.success,
         banned: result.banned,
@@ -1022,37 +1059,91 @@ export default function Accounts() {
           onRefresh={() => void reload()}
           actions={(
             <div className="flex flex-wrap items-center justify-end gap-1.5">
-              <Button variant="outline" size="sm" disabled={batchTesting} onClick={() => void handleBatchTest()}>
-                <FlaskConical className="size-3" />
-                {batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
-              </Button>
-              <Button variant="outline" size="sm" disabled={cleaningBanned} onClick={() => void handleCleanBanned()}>
-                <Ban className="size-3" />
-                {cleaningBanned ? t('accounts.cleaning') : t('accounts.cleanBanned')}
-              </Button>
-              <Button variant="outline" size="sm" disabled={cleaningRateLimited} onClick={() => void handleCleanRateLimited()}>
-                <Timer className="size-3" />
-                {cleaningRateLimited ? t('accounts.cleaning') : t('accounts.cleanRateLimited')}
-              </Button>
-              <Button variant="outline" size="sm" disabled={cleaningError} onClick={() => void handleCleanError()}>
-                <AlertTriangle className="size-3" />
-                {cleaningError ? t('accounts.cleaning') : t('accounts.cleanError')}
-              </Button>
+              <HeaderActionMenu
+                label={t('accounts.maintenanceActions')}
+                icon={<Zap className="size-3.5" />}
+                items={[
+                  {
+                    key: 'refresh-tokens',
+                    label: t('accounts.refreshTokens'),
+                    icon: <RefreshCw className={`size-3.5 ${batchRefreshing ? 'animate-spin' : ''}`} />,
+                    disabled: batchLoading || batchTesting || accounts.length === 0,
+                    onSelect: () => void handleBatchRefresh(accounts.map((account) => account.id)),
+                  },
+                  {
+                    key: 'test-connection',
+                    label: batchTesting ? t('accounts.batchTesting') : t('accounts.testConnection'),
+                    icon: <FlaskConical className="size-3.5" />,
+                    disabled: batchLoading || batchTesting || accounts.length === 0,
+                    onSelect: () => void handleBatchTest(),
+                  },
+                  {
+                    key: 'lock-subscription',
+                    label: lockingSubscriptionAccounts ? t('accounts.lockingSubscriptionAccounts') : t('accounts.lockSubscriptionAccounts'),
+                    icon: <Lock className="size-3.5" />,
+                    disabled: batchLoading || batchTesting || lockingSubscriptionAccounts || accounts.length === 0,
+                    title: t('accounts.lockSubscriptionAccountsHint', { count: subscriptionAccountsToLock.length }),
+                    onSelect: () => void handleLockSubscriptionAccounts(),
+                  },
+                ]}
+              />
+              <HeaderActionMenu
+                label={t('accounts.cleanupActions')}
+                icon={<Trash2 className="size-3.5" />}
+                items={[
+                  {
+                    key: 'clean-banned',
+                    label: cleaningBanned ? t('accounts.cleaning') : t('accounts.cleanBanned'),
+                    icon: <Ban className="size-3.5" />,
+                    disabled: cleaningBanned,
+                    onSelect: () => void handleCleanBanned(),
+                  },
+                  {
+                    key: 'clean-rate-limited',
+                    label: cleaningRateLimited ? t('accounts.cleaning') : t('accounts.cleanRateLimited'),
+                    icon: <Timer className="size-3.5" />,
+                    disabled: cleaningRateLimited,
+                    onSelect: () => void handleCleanRateLimited(),
+                  },
+                  {
+                    key: 'clean-error',
+                    label: cleaningError ? t('accounts.cleaning') : t('accounts.cleanError'),
+                    icon: <AlertTriangle className="size-3.5" />,
+                    disabled: cleaningError,
+                    onSelect: () => void handleCleanError(),
+                  },
+                ]}
+              />
+              <HeaderActionMenu
+                label={t('accounts.dataActions')}
+                icon={<FolderOpen className="size-3.5" />}
+                items={[
+                  {
+                    key: 'import',
+                    label: importing ? t('accounts.importing') : t('accounts.importFile'),
+                    icon: <Upload className="size-3.5" />,
+                    disabled: importing,
+                    onSelect: () => setShowImportPicker(true),
+                  },
+                  {
+                    key: 'export',
+                    label: exporting ? t('accounts.exporting') : t('accounts.export'),
+                    icon: <Download className="size-3.5" />,
+                    disabled: exporting,
+                    onSelect: () => setShowExportPicker(true),
+                  },
+                  {
+                    key: 'migrate',
+                    label: migrating ? t('accounts.migrating') : t('accounts.migrateImport'),
+                    icon: <ArrowDownToLine className="size-3.5" />,
+                    disabled: migrating,
+                    onSelect: () => setShowMigrate(true),
+                  },
+                ]}
+              />
               <Button onClick={() => setShowAdd(true)}>
                 <Plus className="size-3.5" />
                 {t('accounts.addAccount')}
-              </Button>
-              <Button variant="outline" disabled={importing} onClick={() => setShowImportPicker(true)}>
-                <Upload className="size-3.5" />
-                {importing ? t('accounts.importing') : t('accounts.importFile')}
-              </Button>
-              <Button variant="outline" disabled={exporting} onClick={() => setShowExportPicker(true)}>
-                <Download className="size-3.5" />
-                {exporting ? t('accounts.exporting') : t('accounts.export')}
-              </Button>
-              <Button variant="outline" disabled={migrating} onClick={() => setShowMigrate(true)}>
-                <ArrowDownToLine className="size-3.5" />
-                {migrating ? t('accounts.migrating') : t('accounts.migrateImport')}
               </Button>
               <input
                 ref={fileInputRef}
@@ -1157,25 +1248,28 @@ export default function Accounts() {
           <div className="sticky top-2 z-20 mb-4 flex items-center justify-between gap-3 rounded-lg border border-primary/20 bg-card/95 px-3 py-2.5 text-sm font-semibold text-primary shadow-lg backdrop-blur-sm max-lg:flex-col max-lg:items-stretch">
             <span>{t('common.selected', { count: selected.size })}</span>
             <div className="flex flex-wrap items-center justify-end gap-1.5 max-lg:justify-start">
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
-                {t('accounts.batchRefresh')}
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchRefresh()}>
+                <RefreshCw className={`size-3 mr-1 ${batchRefreshing ? 'animate-spin' : ''}`} />{t('accounts.batchRefresh')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchEnabled(true)}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchTest(Array.from(selected))}>
+                <FlaskConical className="size-3 mr-1" />{batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchEnabled(true)}>
                 <Power className="size-3 mr-1" />{t('accounts.enable')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchEnabled(false)}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchEnabled(false)}>
                 <PowerOff className="size-3 mr-1" />{t('accounts.disable')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(true)}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchLock(true)}>
                 <Lock className="size-3 mr-1" />{t('accounts.lock')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(false)}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchLock(false)}>
                 <Unlock className="size-3 mr-1" />{t('accounts.unlock')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchResetStatus()}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchResetStatus()}>
                 <RotateCcw className="size-3 mr-1" />{t('accounts.batchResetStatus')}
               </Button>
-              <Button variant="destructive" size="sm" disabled={batchLoading} onClick={() => void handleBatchDelete()}>
+              <Button variant="destructive" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchDelete()}>
                 {t('accounts.batchDelete')}
               </Button>
               <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>
@@ -2254,6 +2348,107 @@ function normalizePlanType(planType?: string): string {
   const raw = (planType || '').toLowerCase().trim()
   if (raw === 'prolite' || raw === 'pro_lite' || raw === 'pro-lite') return 'pro'
   return raw
+}
+
+function isSubscriptionPlan(planType?: string): boolean {
+  const normalized = normalizePlanType(planType)
+  if (!normalized || normalized === 'free') return false
+  if (['plus', 'pro', 'team', 'teamplus', 'enterprise', 'business', 'edu', 'education'].includes(normalized)) {
+    return true
+  }
+  return normalized.includes('plus') ||
+    normalized.startsWith('pro') ||
+    normalized.startsWith('team') ||
+    normalized.includes('enterprise') ||
+    normalized.includes('business')
+}
+
+interface HeaderActionMenuItem {
+  key: string
+  label: string
+  icon: ReactNode
+  disabled?: boolean
+  title?: string
+  onSelect: () => void
+}
+
+function HeaderActionMenu({
+  label,
+  icon,
+  items,
+}: {
+  label: string
+  icon: ReactNode
+  items: HeaderActionMenuItem[]
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleEscape)
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [open])
+
+  return (
+    <div ref={rootRef} className="relative">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {icon}
+        {label}
+        <ChevronDown className={`size-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </Button>
+
+      {open ? (
+        <div className="absolute right-0 top-[calc(100%+0.5rem)] z-50 w-56 overflow-hidden rounded-lg border border-border bg-popover p-1.5 shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm">
+          <div role="menu" className="space-y-0.5">
+            {items.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                role="menuitem"
+                disabled={item.disabled}
+                title={item.title}
+                className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm text-foreground transition-colors hover:bg-accent/70 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => {
+                  if (item.disabled) return
+                  setOpen(false)
+                  item.onSelect()
+                }}
+              >
+                <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground">{item.icon}</span>
+                <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
 }
 
 function formatPlanLabel(planType?: string): string {

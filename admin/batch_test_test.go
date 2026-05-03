@@ -3,6 +3,8 @@ package admin
 import (
 	"net/http"
 	"testing"
+
+	"github.com/codex2api/auth"
 )
 
 func TestShouldMarkBatchTestAccountError(t *testing.T) {
@@ -50,5 +52,37 @@ func TestShouldMarkBatchTestAccountError(t *testing.T) {
 				t.Fatalf("shouldMarkBatchTestAccountError() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveBatchTestAccountsDefaultsToAllAccounts(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token-1", Status: auth.StatusReady})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "token-2", Status: auth.StatusReady})
+
+	accounts, missing := resolveBatchTestAccounts(store, nil)
+	if missing != 0 {
+		t.Fatalf("missing = %d, want 0", missing)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("len(accounts) = %d, want 2", len(accounts))
+	}
+}
+
+func TestResolveBatchTestAccountsUsesSelectedIDs(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token-1", Status: auth.StatusReady})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "token-2", Status: auth.StatusReady})
+
+	ids := []int64{2, 99, 2, 1}
+	accounts, missing := resolveBatchTestAccounts(store, &ids)
+	if missing != 1 {
+		t.Fatalf("missing = %d, want 1", missing)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("len(accounts) = %d, want 2", len(accounts))
+	}
+	if accounts[0].DBID != 2 || accounts[1].DBID != 1 {
+		t.Fatalf("account order = [%d, %d], want [2, 1]", accounts[0].DBID, accounts[1].DBID)
 	}
 }

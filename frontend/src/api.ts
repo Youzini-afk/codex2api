@@ -274,8 +274,11 @@ export const api = {
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
   getModels: () => request<ModelsResponse>('/models'),
   syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
-  batchTestAccounts: () =>
-    request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', { method: 'POST' }),
+  batchTestAccounts: (ids?: number[]) =>
+    request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', {
+      method: 'POST',
+      body: ids ? JSON.stringify({ ids }) : undefined,
+    }),
   cleanBanned: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-banned', { method: 'POST' }),
   cleanRateLimited: () =>
