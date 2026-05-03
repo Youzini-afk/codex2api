@@ -14,7 +14,6 @@ It exposes OpenAI-style API endpoints and manages a long-running account pool ba
 ## Live Demo
 
 - Demo URL: [https://codex2api-latest-vu8j.onrender.com](https://codex2api-latest-vu8j.onrender.com)
-- Admin dashboard: [https://codex2api-latest-vu8j.onrender.com/admin/](https://codex2api-latest-vu8j.onrender.com/admin/)
 - Demo password: `codex2api`
 
 > The demo is only for trying the admin dashboard and basic UI flows. Do not upload real Refresh Tokens, Access Tokens, API keys, or any other sensitive data.

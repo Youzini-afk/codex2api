@@ -14,7 +14,6 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 ## 在线 Demo
 
 - Demo 地址：[https://codex2api-latest-vu8j.onrender.com](https://codex2api-latest-vu8j.onrender.com)
-- 管理后台：[https://codex2api-latest-vu8j.onrender.com/admin/](https://codex2api-latest-vu8j.onrender.com/admin/)
 - Demo 密码：`codex2api`
 
 > Demo 环境仅用于体验管理后台界面和基础功能，请勿上传真实 Refresh Token、Access Token、API Key 或其他敏感信息。
