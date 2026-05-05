@@ -57,6 +57,25 @@ func TestFastSchedulerSkipsDispatchPausedAccount(t *testing.T) {
 	}
 }
 
+func TestFastSchedulerSkipsErrorAccount(t *testing.T) {
+	errored := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	errored.Status = StatusError
+	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
+
+	scheduler := NewFastScheduler(2)
+	scheduler.Rebuild([]*Account{errored, fallback})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != fallback.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want %d", got.DBID, fallback.DBID)
+	}
+}
+
 func TestFastSchedulerRespectsConcurrencyLimit(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
 
@@ -434,7 +453,7 @@ func TestStoreFastSchedulerTracksCooldownTransition(t *testing.T) {
 	store.Release(got)
 }
 
-func TestFastSchedulerPremium5hRateLimitUsesSingleConcurrencyAndRecoversAfterReset(t *testing.T) {
+func TestFastSchedulerPremium5hRateLimitIsFencedAndRecoversAfterReset(t *testing.T) {
 	acc := &Account{
 		DBID:                1,
 		AccessToken:         "token",
@@ -450,24 +469,19 @@ func TestFastSchedulerPremium5hRateLimitUsesSingleConcurrencyAndRecoversAfterRes
 	scheduler.Rebuild([]*Account{acc})
 
 	sizes := scheduler.BucketSizes()
-	if sizes[HealthTierRisky] != 1 {
-		t.Fatalf("risky bucket size = %d, want 1", sizes[HealthTierRisky])
+	if sizes[HealthTierRisky] != 0 {
+		t.Fatalf("risky bucket size = %d, want 0 while premium 5h rate limit is active", sizes[HealthTierRisky])
 	}
 
 	first := scheduler.Acquire()
-	if first == nil {
-		t.Fatal("first Acquire() returned nil")
-	}
-
-	second := scheduler.Acquire()
-	if second != nil {
-		t.Fatal("second Acquire() should be nil while premium 5h rate limit is active")
+	if first != nil {
+		t.Fatal("Acquire() should be nil while premium 5h rate limit is active")
 	}
 
 	acc.mu.Lock()
 	acc.Reset5hAt = time.Now().Add(-time.Minute)
 	acc.mu.Unlock()
-	scheduler.Release(first)
+	scheduler.Rebuild([]*Account{acc})
 
 	third := scheduler.Acquire()
 	if third == nil {

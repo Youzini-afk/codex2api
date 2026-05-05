@@ -28,6 +28,7 @@ export interface AccountRow {
   email: string
   plan_type: string
   status: AccountStatus
+  error_message?: string
   at_only?: boolean
   health_tier?: string
   scheduler_score?: number
@@ -60,6 +61,8 @@ export interface AccountRow {
   last_used_at?: ISODateString
   success_requests?: number
   error_requests?: number
+  retry_error_requests?: number
+  rate_limit_attempts?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   usage_5h_detail?: AccountUsageWindow
@@ -67,6 +70,13 @@ export interface AccountRow {
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
   cooldown_until?: ISODateString
+  cooldown_reason?: string
+  model_cooldowns?: Array<{
+    model: string
+    reason: string
+    reset_at: ISODateString
+    remaining_seconds: number
+  }>
   enabled?: boolean
   locked?: boolean
   // 图片配额信息
@@ -222,6 +232,7 @@ export interface SystemSettings {
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   max_retries: number
+  max_rate_limit_retries: number
   allow_remote_migration: boolean
   database_driver: string
   database_label: string
@@ -410,6 +421,7 @@ export interface UsageLog {
   output_price_per_mtoken: number
   cache_read_price_per_mtoken: number
   rate_multiplier: number
+  error_message: string
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>

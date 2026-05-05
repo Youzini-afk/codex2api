@@ -1,5 +1,7 @@
 # Codex2API
 
+[中文](README.md) | [English](README_EN.md)
+
 Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管理后台项目，支持：
 
 - 标准模式：**PostgreSQL + Redis**
@@ -9,10 +11,51 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 
 ---
 
+## 在线 Demo
+
+- Demo 地址：[https://codex2api-latest-vu8j.onrender.com](https://codex2api-latest-vu8j.onrender.com)
+- Demo 密码：`codex2api`
+
+> Demo 环境仅用于体验管理后台界面和基础功能，请勿上传真实 Refresh Token、Access Token、API Key 或其他敏感信息。
+
+---
+
+## 界面预览
+
+> 以下截图使用演示数据，实际页面会随账号池、请求日志和运行环境变化。
+
+![CodexProxy 仪表盘](docs/screenshots/dashboard.png)
+
+<details>
+<summary>查看更多后台界面</summary>
+
+| 账号管理 | 仪表盘趋势 |
+| --- | --- |
+| ![账号管理](docs/screenshots/accounts.png) | ![仪表盘趋势](docs/screenshots/dashboard-trends.png) |
+
+| 生图工作台 | Prompt 检查 |
+| --- | --- |
+| ![生图工作台](docs/screenshots/image-studio.png) | ![Prompt 检查](docs/screenshots/prompt-filter.png) |
+
+| 系统运维 | 使用统计 |
+| --- | --- |
+| ![系统运维](docs/screenshots/operations.png) | ![使用统计](docs/screenshots/usage.png) |
+
+| 使用文档 | API 文档 |
+| --- | --- |
+| ![使用文档](docs/screenshots/guide.png) | ![API 文档](docs/screenshots/api-reference.png) |
+
+</details>
+
+---
+
 ## 目录
 
+- [在线 Demo](#在线-demo)
+- [界面预览](#界面预览)
 - [快速部署](#快速部署)
 - [完整文档](#完整文档)
+- [升级与本地开发](#升级与本地开发)
 - [环境配置](#环境配置)
 - [对外接口](#对外接口)
   - [Token 上传与账号管理](#token-上传与账号管理)
@@ -22,6 +65,7 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 - [常见注意事项](#常见注意事项)
 - [免责声明](#免责声明与开源协议)
 - [Star History](#star-history)
+- [友情链接](#友情链接)
 
 ---
 
@@ -120,10 +164,11 @@ docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
 | [架构文档](docs/ARCHITECTURE.md) | 系统架构、调度算法、存储设计 | `docs/ARCHITECTURE.md` |
 | [故障排查](docs/TROUBLESHOOTING.md) | 常见问题排查、诊断脚本、解决方案 | `docs/TROUBLESHOOTING.md` |
 | [贡献指南](docs/CONTRIBUTING.md) | 开发规范、PR 流程、代码标准 | `docs/CONTRIBUTING.md` |
+| [English README](README_EN.md) | 英文项目介绍、部署和后台功能概览 | `README_EN.md` |
 
 ---
 
-## 环境配置
+## 升级与本地开发
 
 ```bash
 git pull && docker compose pull && docker compose up -d && docker compose logs -f codex2api
@@ -298,10 +343,16 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 | --- | --- | --- |
 | Dashboard | `/admin/` | 总览指标、请求趋势、延迟趋势、Token 分布、模型排行 |
 | 账号管理 | `/admin/accounts` | 导入、测试、批量处理、调度信息查看 |
+| API 密钥 | `/admin/api-keys` | API Key 创建、查看、删除与调用凭据管理 |
+| 代理管理 | `/admin/proxies` | 代理池维护、账号代理分配与连通性管理 |
+| 生图工作台 | `/admin/images/studio` | 文生图、提示词模板、任务历史和服务器图库 |
+| Prompt 检查 | `/admin/prompt-filter/overview` | Prompt 规则、触发日志、测试和处理模式配置 |
 | 使用统计 | `/admin/usage` | 请求日志、统计卡片、图表、日志清空 |
 | 运维概览 | `/admin/ops` | 运行态监控与系统概览 |
 | 调度看板 | `/admin/ops/scheduler` | 调度健康度、惩罚项和评分拆解 |
 | 系统设置 | `/admin/settings` | 业务运行参数与后台密钥配置 |
+| 使用文档 | `/admin/docs` | Codex CLI / Claude Code 接入示例 |
+| API 文档 | `/admin/api-reference` | OpenAI 风格接口与管理接口参考 |
 
 ---
 
@@ -392,10 +443,10 @@ codex2api/
 ├─ auth/                        # 账号池、调度与 token 管理
 ├─ cache/                       # Redis 缓存封装
 ├─ config/                      # 环境变量加载
-├─ database/                    # PostgreSQL 访问层
+├─ database/                    # 数据库访问层
 ├─ proxy/                       # 对外代理、转发与限流
 └─ frontend/                    # React + Vite 管理后台
-   ├─ src/pages/                # Dashboard / Accounts / Usage / Ops / Settings
+   ├─ src/pages/                # Dashboard / Accounts / API Keys / Proxies / Images / Prompt Filter / Ops / Usage / Settings / Docs
    ├─ src/components/           # UI 组件
    ├─ src/locales/              # 国际化语言文件 (zh/en)
    └─ vite.config.js            # Vite 配置

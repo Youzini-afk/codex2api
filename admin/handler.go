@@ -281,6 +281,7 @@ type accountResponse struct {
 	Email                    string                     `json:"email"`
 	PlanType                 string                     `json:"plan_type"`
 	Status                   string                     `json:"status"`
+	ErrorMessage             string                     `json:"error_message,omitempty"`
 	ATOnly                   bool                       `json:"at_only"`
 	HealthTier               string                     `json:"health_tier"`
 	SchedulerScore           float64                    `json:"scheduler_score"`
@@ -298,6 +299,8 @@ type accountResponse struct {
 	LastUsedAt               string                     `json:"last_used_at"`
 	SuccessRequests          int64                      `json:"success_requests"`
 	ErrorRequests            int64                      `json:"error_requests"`
+	RetryErrorRequests       int64                      `json:"retry_error_requests"`
+	RateLimitAttempts        int64                      `json:"rate_limit_attempts"`
 	UsagePercent7d           *float64                   `json:"usage_percent_7d"`
 	UsagePercent5h           *float64                   `json:"usage_percent_5h"`
 	Usage5hDetail            *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
@@ -309,6 +312,9 @@ type accountResponse struct {
 	LastRateLimitedAt        string                     `json:"last_rate_limited_at,omitempty"`
 	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
 	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
+	CooldownReason           string                     `json:"cooldown_reason,omitempty"`
+	CooldownUntil            string                     `json:"cooldown_until,omitempty"`
+	ModelCooldowns           []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
 	Enabled                  bool                       `json:"enabled"`
 	Locked                   bool                       `json:"locked"`
 	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
@@ -317,6 +323,13 @@ type accountResponse struct {
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
 	TodayUsedCount      *int   `json:"today_used_count,omitempty"`
 	ImageQuotaResetAt   string `json:"image_quota_reset_at,omitempty"`
+}
+
+type modelCooldownResponse struct {
+	Model     string `json:"model"`
+	Reason    string `json:"reason"`
+	ResetAt   string `json:"reset_at"`
+	Remaining int64  `json:"remaining_seconds"`
 }
 
 type accountUsageWindow struct {
@@ -370,6 +383,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Email:                    row.GetCredential("email"),
 			PlanType:                 row.GetCredential("plan_type"),
 			Status:                   row.Status,
+			ErrorMessage:             row.ErrorMessage,
 			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			ProxyURL:                 row.ProxyURL,
 			Enabled:                  row.Enabled,
@@ -436,8 +450,26 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			if !debug.LastServerErrorAt.IsZero() {
 				resp.LastServerErrorAt = debug.LastServerErrorAt.Format(time.RFC3339)
 			}
+			if reason, until := acc.GetCooldownSnapshot(); !until.IsZero() && until.After(time.Now()) {
+				resp.CooldownReason = reason
+				resp.CooldownUntil = until.Format(time.RFC3339)
+			}
+			for _, cooldown := range acc.ActiveModelCooldowns() {
+				resp.ModelCooldowns = append(resp.ModelCooldowns, modelCooldownResponse{
+					Model:     cooldown.Model,
+					Reason:    cooldown.Reason,
+					ResetAt:   cooldown.ResetAt.Format(time.RFC3339),
+					Remaining: int64(time.Until(cooldown.ResetAt).Seconds()),
+				})
+			}
 			// 使用运行时状态（优先于 DB 状态）
 			resp.Status = acc.RuntimeStatus()
+			acc.Mu().RLock()
+			resp.ErrorMessage = acc.ErrorMsg
+			acc.Mu().RUnlock()
+		} else if row.CooldownUntil.Valid && row.CooldownUntil.Time.After(time.Now()) {
+			resp.CooldownReason = row.CooldownReason
+			resp.CooldownUntil = row.CooldownUntil.Time.Format(time.RFC3339)
 		}
 		if resp.DispatchScore == 0 {
 			resp.DispatchScore = dispatchScoreFallback(resp.SchedulerScore, resp.ScoreBiasEffective, resp.HealthTier, resp.Status)
@@ -445,6 +477,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if rc, ok := reqCounts[row.ID]; ok {
 			resp.SuccessRequests = rc.SuccessCount
 			resp.ErrorRequests = rc.ErrorCount
+			resp.RetryErrorRequests = rc.RetryErrorCount
+			resp.RateLimitAttempts = rc.RateLimitAttemptCount
 		}
 		if usage, ok := usage5h[row.ID]; ok {
 			resp.Usage5hDetail = &accountUsageWindow{
@@ -2340,6 +2374,7 @@ type settingsResponse struct {
 	ProxyPoolEnabled                 bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             bool   `json:"fast_scheduler_enabled"`
 	MaxRetries                       int    `json:"max_retries"`
+	MaxRateLimitRetries              int    `json:"max_rate_limit_retries"`
 	AllowRemoteMigration             bool   `json:"allow_remote_migration"`
 	DatabaseDriver                   string `json:"database_driver"`
 	DatabaseLabel                    string `json:"database_label"`
@@ -2380,6 +2415,7 @@ type updateSettingsReq struct {
 	ProxyPoolEnabled                 *bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             *bool   `json:"fast_scheduler_enabled"`
 	MaxRetries                       *int    `json:"max_retries"`
+	MaxRateLimitRetries              *int    `json:"max_rate_limit_retries"`
 	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
 	ModelMapping                     *string `json:"model_mapping"`
 	ResinURL                         *string `json:"resin_url"`
@@ -2432,6 +2468,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
+		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                   h.databaseDriver,
 		DatabaseLabel:                    h.databaseLabel,
@@ -2637,6 +2674,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: max_retries = %d", v)
 	}
 
+	if req.MaxRateLimitRetries != nil {
+		v := *req.MaxRateLimitRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
+		h.store.SetMaxRateLimitRetries(v)
+		log.Printf("设置已更新: max_rate_limit_retries = %d", v)
+	}
+
 	if req.AllowRemoteMigration != nil {
 		if *req.AllowRemoteMigration && !hasAdminSecret {
 			writeError(c, http.StatusBadRequest, "请先设置管理密钥，再启用远程迁移")
@@ -2761,6 +2810,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
+		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                     h.store.GetModelMapping(),
 		ResinURL:                         resinURL,
@@ -2816,6 +2866,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
+		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                   h.databaseDriver,
 		DatabaseLabel:                    h.databaseLabel,
