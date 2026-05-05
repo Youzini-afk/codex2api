@@ -362,6 +362,16 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 			body:    `{"base_concurrency_override":0}`,
 			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
 		},
+		{
+			name:    "5h reserve out of range",
+			body:    `{"usage_reserve_percent_5h":100}`,
+			message: "usage_reserve_percent_5h 超出范围，必须在 1..99 之间",
+		},
+		{
+			name:    "7d reserve out of range",
+			body:    `{"usage_reserve_percent_7d":0}`,
+			message: "usage_reserve_percent_7d 超出范围，必须在 1..99 之间",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -416,6 +426,37 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	}
 }
 
+func TestUpdateAccountSchedulerPersistsUsageReserveThresholds(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":12,"base_concurrency_override":3,"usage_reserve_percent_5h":10,"usage_reserve_percent_7d":20}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if !rows[0].UsageReservePercent5h.Valid || rows[0].UsageReservePercent5h.Int64 != 10 {
+		t.Fatalf("usage_reserve_percent_5h = %+v, want 10", rows[0].UsageReservePercent5h)
+	}
+	if !rows[0].UsageReservePercent7d.Valid || rows[0].UsageReservePercent7d.Int64 != 20 {
+		t.Fatalf("usage_reserve_percent_7d = %+v, want 20", rows[0].UsageReservePercent7d)
+	}
+}
+
 func TestUpdateAccountSchedulerPersistsAllowedAPIKeyIDs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -452,7 +493,7 @@ func TestUpdateAccountSchedulerResetsToAutoOnNull(t *testing.T) {
 	db := newTestAdminDB(t)
 	accountID := insertTestAccount(t, db)
 	ctx := context.Background()
-	if err := db.UpdateAccountSchedulerConfig(ctx, accountID, sql.NullInt64{Int64: 20, Valid: true}, sql.NullInt64{Int64: 4, Valid: true}, database.OptionalInt64Slice{}); err != nil {
+	if err := db.UpdateAccountSchedulerConfig(ctx, accountID, sql.NullInt64{Int64: 20, Valid: true}, sql.NullInt64{Int64: 4, Valid: true}, database.OptionalNullInt64{}, database.OptionalNullInt64{}, database.OptionalInt64Slice{}); err != nil {
 		t.Fatalf("seed scheduler config: %v", err)
 	}
 
@@ -481,6 +522,76 @@ func TestUpdateAccountSchedulerResetsToAutoOnNull(t *testing.T) {
 	}
 	if rows[0].BaseConcurrencyOverride.Valid {
 		t.Fatalf("base_concurrency_override = %+v, want null", rows[0].BaseConcurrencyOverride)
+	}
+}
+
+func TestUpdateAccountSchedulerClearsUsageReserveOnNull(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	if err := db.UpdateAccountSchedulerConfig(ctx, accountID, sql.NullInt64{}, sql.NullInt64{}, database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 10, Valid: true}}, database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 20, Valid: true}}, database.OptionalInt64Slice{}); err != nil {
+		t.Fatalf("seed usage reserve config: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":null,"base_concurrency_override":null,"usage_reserve_percent_5h":null,"usage_reserve_percent_7d":null}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if rows[0].UsageReservePercent5h.Valid {
+		t.Fatalf("usage_reserve_percent_5h = %+v, want null", rows[0].UsageReservePercent5h)
+	}
+	if rows[0].UsageReservePercent7d.Valid {
+		t.Fatalf("usage_reserve_percent_7d = %+v, want null", rows[0].UsageReservePercent7d)
+	}
+}
+
+func TestUpdateAccountSchedulerKeepsUsageReserveWhenFieldOmitted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	if err := db.UpdateAccountSchedulerConfig(ctx, accountID, sql.NullInt64{}, sql.NullInt64{}, database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 10, Valid: true}}, database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 20, Valid: true}}, database.OptionalInt64Slice{}); err != nil {
+		t.Fatalf("seed usage reserve config: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":11,"base_concurrency_override":2}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if !rows[0].UsageReservePercent5h.Valid || rows[0].UsageReservePercent5h.Int64 != 10 {
+		t.Fatalf("usage_reserve_percent_5h = %+v, want 10", rows[0].UsageReservePercent5h)
+	}
+	if !rows[0].UsageReservePercent7d.Valid || rows[0].UsageReservePercent7d.Int64 != 20 {
+		t.Fatalf("usage_reserve_percent_7d = %+v, want 20", rows[0].UsageReservePercent7d)
 	}
 }
 
@@ -593,7 +704,7 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"allowed_api_key_ids":[%d,%d]}`, keyID2, keyID1)))
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"usage_reserve_percent_5h":9,"usage_reserve_percent_7d":18,"allowed_api_key_ids":[%d,%d]}`, keyID2, keyID1)))
 	ginCtx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ginCtx)
@@ -612,6 +723,12 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	}
 	if got := runtimeAccount.GetAllowedAPIKeyIDs(); len(got) != 2 || got[0] != keyID1 || got[1] != keyID2 {
 		t.Fatalf("runtime allowed_api_key_ids = %v, want [%d %d]", got, keyID1, keyID2)
+	}
+	if reserve5h, ok := runtimeAccount.GetUsageReservePercent5h(); !ok || reserve5h != 9 {
+		t.Fatalf("runtime usage_reserve_percent_5h = (%d, %t), want (9, true)", reserve5h, ok)
+	}
+	if reserve7d, ok := runtimeAccount.GetUsageReservePercent7d(); !ok || reserve7d != 18 {
+		t.Fatalf("runtime usage_reserve_percent_7d = (%d, %t), want (18, true)", reserve7d, ok)
 	}
 }
 

@@ -154,6 +154,141 @@ func TestNeedsUsageProbeAllowsReadyAccount(t *testing.T) {
 	}
 }
 
+func TestUsageReserveThresholdStopsAvailability(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		AccessToken:            "token",
+		Status:                 StatusReady,
+		UsageReservePercent5h:  int64Ptr(10),
+		UsagePercent5h:         91,
+		UsagePercent5hValid:    true,
+		Reset5hAt:              now.Add(time.Hour),
+		UsageUpdatedAt:         now,
+	}
+
+	if acc.IsAvailableWithUsageProbeMaxAge(10 * time.Minute) {
+		t.Fatal("IsAvailableWithUsageProbeMaxAge() = true, want false when 5h reserve is active")
+	}
+	if got := acc.RuntimeStatusWithUsageProbeMaxAge(10 * time.Minute); got != "usage_reserved" {
+		t.Fatalf("RuntimeStatusWithUsageProbeMaxAge() = %q, want usage_reserved", got)
+	}
+	windows := acc.GetUsageReserveActiveWindows(10 * time.Minute)
+	if len(windows) != 1 || windows[0] != "5h" {
+		t.Fatalf("active reserve windows = %v, want [5h]", windows)
+	}
+}
+
+func TestUsageReserveThresholdsAreIndependent(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		AccessToken:            "token",
+		Status:                 StatusReady,
+		UsageReservePercent5h:  int64Ptr(5),
+		UsageReservePercent7d:  int64Ptr(20),
+		UsagePercent5h:         90,
+		UsagePercent5hValid:    true,
+		Reset5hAt:              now.Add(time.Hour),
+		UsagePercent7d:         81,
+		UsagePercent7dValid:    true,
+		Reset7dAt:              now.Add(24 * time.Hour),
+		UsageUpdatedAt:         now,
+	}
+
+	windows := acc.GetUsageReserveActiveWindows(10 * time.Minute)
+	if len(windows) != 1 || windows[0] != "7d" {
+		t.Fatalf("active reserve windows = %v, want [7d]", windows)
+	}
+}
+
+func TestUsageReserveUnknownOrStaleSnapshotAllowsAndNeedsProbe(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		AccessToken:           "token",
+		Status:                StatusReady,
+		UsageReservePercent5h: int64Ptr(10),
+		UsagePercent5h:        95,
+		UsagePercent5hValid:   true,
+		Reset5hAt:             now.Add(time.Hour),
+		UsageUpdatedAt:        now.Add(-30 * time.Minute),
+	}
+
+	if !acc.IsAvailableWithUsageProbeMaxAge(10 * time.Minute) {
+		t.Fatal("stale reserve snapshot should not block dispatch")
+	}
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("stale reserve snapshot should request a usage probe")
+	}
+
+	acc.UsagePercent5hValid = false
+	acc.UsageUpdatedAt = now
+	if !acc.IsAvailableWithUsageProbeMaxAge(10 * time.Minute) {
+		t.Fatal("missing reserve snapshot should not block dispatch")
+	}
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("missing reserve snapshot should request a usage probe")
+	}
+}
+
+func TestUsageReserveUsesPerWindowSnapshotFreshness(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		AccessToken:            "token",
+		Status:                 StatusReady,
+		UsageReservePercent7d:  int64Ptr(10),
+		UsagePercent7d:         95,
+		UsagePercent7dValid:    true,
+		Reset7dAt:              now.Add(24 * time.Hour),
+		UsageUpdated7dAt:       now.Add(-30 * time.Minute),
+		UsageUpdated5hAt:       now,
+		UsageUpdatedAt:         now,
+	}
+
+	if !acc.IsAvailableWithUsageProbeMaxAge(10 * time.Minute) {
+		t.Fatal("fresh 5h-only update should not make stale 7d reserve snapshot block dispatch")
+	}
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("stale 7d reserve snapshot should request a usage probe")
+	}
+}
+
+func TestStoreNextSkipsUsageReservedAccount(t *testing.T) {
+	now := time.Now()
+	reserved := &Account{
+		DBID:                  1,
+		AccessToken:           "token",
+		Status:                StatusReady,
+		HealthTier:            HealthTierHealthy,
+		DispatchScore:         200,
+		DynamicConcurrencyLimit: 1,
+		UsageReservePercent5h: int64Ptr(10),
+		UsagePercent5h:        95,
+		UsagePercent5hValid:   true,
+		Reset5hAt:             now.Add(time.Hour),
+		UsageUpdatedAt:        now,
+	}
+	fallback := &Account{
+		DBID:                    2,
+		AccessToken:             "token",
+		Status:                  StatusReady,
+		HealthTier:              HealthTierHealthy,
+		DispatchScore:           100,
+		DynamicConcurrencyLimit: 1,
+	}
+	store := &Store{
+		accounts:       []*Account{reserved, fallback},
+		maxConcurrency: 1,
+	}
+
+	got := store.Next()
+	if got == nil {
+		t.Fatal("Next() returned nil")
+	}
+	defer store.Release(got)
+	if got.DBID != fallback.DBID {
+		t.Fatalf("Next() picked dbID=%d, want %d", got.DBID, fallback.DBID)
+	}
+}
+
 func TestRefreshSingleBypassesCachedAccessToken(t *testing.T) {
 	ctx := context.Background()
 	tokenCache := cache.NewMemory(1)

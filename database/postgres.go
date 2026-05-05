@@ -30,6 +30,8 @@ type AccountRow struct {
 	Locked                  bool
 	ScoreBiasOverride       sql.NullInt64
 	BaseConcurrencyOverride sql.NullInt64
+	UsageReservePercent5h   sql.NullInt64
+	UsageReservePercent7d   sql.NullInt64
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -45,6 +47,11 @@ type AccountModelCooldownRow struct {
 type OptionalInt64Slice struct {
 	Set    bool
 	Values []int64
+}
+
+type OptionalNullInt64 struct {
+	Set   bool
+	Value sql.NullInt64
 }
 
 // GetCredential 从 credentials JSONB 获取字符串字段
@@ -287,6 +294,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS score_bias_override INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS base_concurrency_override INT NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS usage_reserve_percent_5h INT NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS usage_reserve_percent_7d INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_remaining INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_total INT NULL;
@@ -1907,7 +1916,7 @@ func (db *DB) GetAccountTimeRangeUsage(ctx context.Context, since time.Time) (ma
 // ListActive 获取所有未删除账号。
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, usage_reserve_percent_5h, usage_reserve_percent_7d, created_at, updated_at
 		FROM accounts
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		ORDER BY id
@@ -1940,6 +1949,8 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.Locked,
 			&a.ScoreBiasOverride,
 			&a.BaseConcurrencyOverride,
+			&a.UsageReservePercent5h,
+			&a.UsageReservePercent7d,
 			&createdAtRaw,
 			&updatedAtRaw,
 		); err != nil {
@@ -2045,7 +2056,7 @@ func (db *DB) ClearExpiredModelCooldowns(ctx context.Context) error {
 // GetAccountByID 获取未删除账号的完整数据库行。
 func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, usage_reserve_percent_5h, usage_reserve_percent_7d, created_at, updated_at
 		FROM accounts
 		WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		LIMIT 1
@@ -2070,6 +2081,8 @@ func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error)
 		&a.Locked,
 		&a.ScoreBiasOverride,
 		&a.BaseConcurrencyOverride,
+		&a.UsageReservePercent5h,
+		&a.UsageReservePercent7d,
 		&createdAtRaw,
 		&updatedAtRaw,
 	)
@@ -2096,20 +2109,35 @@ func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error)
 }
 
 // UpdateAccountSchedulerConfig 更新账号调度配置。
-func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreBiasOverride sql.NullInt64, baseConcurrencyOverride sql.NullInt64, allowedAPIKeyIDs OptionalInt64Slice) error {
+func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreBiasOverride sql.NullInt64, baseConcurrencyOverride sql.NullInt64, usageReserve5h OptionalNullInt64, usageReserve7d OptionalNullInt64, allowedAPIKeyIDs OptionalInt64Slice) error {
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `
+	setClauses := []string{
+		"score_bias_override = $1",
+		"base_concurrency_override = $2",
+	}
+	args := []interface{}{nullableInt64Value(scoreBiasOverride), nullableInt64Value(baseConcurrencyOverride)}
+	if usageReserve5h.Set {
+		args = append(args, nullableInt64Value(usageReserve5h.Value))
+		setClauses = append(setClauses, fmt.Sprintf("usage_reserve_percent_5h = $%d", len(args)))
+	}
+	if usageReserve7d.Set {
+		args = append(args, nullableInt64Value(usageReserve7d.Value))
+		setClauses = append(setClauses, fmt.Sprintf("usage_reserve_percent_7d = $%d", len(args)))
+	}
+	setClauses = append(setClauses, "updated_at = CURRENT_TIMESTAMP")
+	args = append(args, id)
+	query := fmt.Sprintf(`
 		UPDATE accounts
-		SET score_bias_override = $1,
-		    base_concurrency_override = $2,
-		    updated_at = CURRENT_TIMESTAMP
-		WHERE id = $3
-	`, nullableInt64Value(scoreBiasOverride), nullableInt64Value(baseConcurrencyOverride), id)
+		SET %s
+		WHERE id = $%d
+	`, strings.Join(setClauses, ", "), len(args))
+
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -2221,19 +2249,22 @@ func (db *DB) UpdateCredentials(ctx context.Context, id int64, credentials map[s
 // UpdateUsageSnapshot 持久化账号用量快照（7d + 5h）
 func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, updatedAt time.Time) error {
 	return db.UpdateCredentials(ctx, id, map[string]interface{}{
-		"codex_7d_used_percent":  pct7d,
-		"codex_usage_updated_at": updatedAt.Format(time.RFC3339),
+		"codex_7d_used_percent":     pct7d,
+		"codex_7d_usage_updated_at": updatedAt.Format(time.RFC3339),
+		"codex_usage_updated_at":    updatedAt.Format(time.RFC3339),
 	})
 }
 
 // UpdateUsageSnapshotFull 持久化完整用量快照（5h + 7d + 重置时间）
 func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float64, reset7dAt time.Time, pct5h float64, reset5hAt time.Time, updatedAt time.Time) error {
 	fields := map[string]interface{}{
-		"codex_7d_used_percent":  pct7d,
-		"codex_7d_reset_at":      reset7dAt.Format(time.RFC3339),
-		"codex_5h_used_percent":  pct5h,
-		"codex_5h_reset_at":      reset5hAt.Format(time.RFC3339),
-		"codex_usage_updated_at": updatedAt.Format(time.RFC3339),
+		"codex_7d_used_percent":     pct7d,
+		"codex_7d_reset_at":         reset7dAt.Format(time.RFC3339),
+		"codex_7d_usage_updated_at": updatedAt.Format(time.RFC3339),
+		"codex_5h_used_percent":     pct5h,
+		"codex_5h_reset_at":         reset5hAt.Format(time.RFC3339),
+		"codex_5h_usage_updated_at": updatedAt.Format(time.RFC3339),
+		"codex_usage_updated_at":    updatedAt.Format(time.RFC3339),
 	}
 	return db.UpdateCredentials(ctx, id, fields)
 }

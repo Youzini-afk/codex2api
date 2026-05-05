@@ -57,6 +57,30 @@ func TestFastSchedulerSkipsDispatchPausedAccount(t *testing.T) {
 	}
 }
 
+func TestFastSchedulerSkipsUsageReservedAccount(t *testing.T) {
+	now := time.Now()
+	reserved := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	reserved.UsageReservePercent7d = int64Ptr(15)
+	reserved.UsagePercent7d = 90
+	reserved.UsagePercent7dValid = true
+	reserved.Reset7dAt = now.Add(24 * time.Hour)
+	reserved.UsageUpdatedAt = now
+	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
+
+	scheduler := NewFastScheduler(2, 10*time.Minute)
+	scheduler.Rebuild([]*Account{reserved, fallback})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != fallback.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want %d", got.DBID, fallback.DBID)
+	}
+}
+
 func TestFastSchedulerSkipsErrorAccount(t *testing.T) {
 	errored := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
 	errored.Status = StatusError

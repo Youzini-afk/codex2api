@@ -290,6 +290,9 @@ type accountResponse struct {
 	ScoreBiasEffective       int64                      `json:"score_bias_effective"`
 	BaseConcurrencyOverride  *int64                     `json:"base_concurrency_override"`
 	BaseConcurrencyEffective int64                      `json:"base_concurrency_effective"`
+	UsageReservePercent5h    *int64                     `json:"usage_reserve_percent_5h"`
+	UsageReservePercent7d    *int64                     `json:"usage_reserve_percent_7d"`
+	UsageReserveActiveWindows []string                  `json:"usage_reserve_active_windows"`
 	ConcurrencyCap           int64                      `json:"dynamic_concurrency_limit"`
 	ProxyURL                 string                     `json:"proxy_url"`
 	CreatedAt                string                     `json:"created_at"`
@@ -393,6 +396,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			ScoreBiasEffective:       effectiveScoreBias(row.GetCredential("plan_type"), row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
 			BaseConcurrencyEffective: effectiveBaseConcurrency(row.BaseConcurrencyOverride, int64(h.store.GetMaxConcurrency())),
+			UsageReservePercent5h:    nullableInt64Pointer(row.UsageReservePercent5h),
+			UsageReservePercent7d:    nullableInt64Pointer(row.UsageReservePercent7d),
+			UsageReserveActiveWindows: []string{},
 			CreatedAt:                row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:                row.UpdatedAt.Format(time.RFC3339),
 		}
@@ -454,6 +460,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				resp.CooldownReason = reason
 				resp.CooldownUntil = until.Format(time.RFC3339)
 			}
+			resp.UsageReserveActiveWindows = acc.GetUsageReserveActiveWindows(h.store.GetUsageProbeMaxAge())
 			for _, cooldown := range acc.ActiveModelCooldowns() {
 				resp.ModelCooldowns = append(resp.ModelCooldowns, modelCooldownResponse{
 					Model:     cooldown.Model,
@@ -463,7 +470,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				})
 			}
 			// 使用运行时状态（优先于 DB 状态）
-			resp.Status = acc.RuntimeStatus()
+			resp.Status = acc.RuntimeStatusWithUsageProbeMaxAge(h.store.GetUsageProbeMaxAge())
 			acc.Mu().RLock()
 			resp.ErrorMessage = acc.ErrorMsg
 			acc.Mu().RUnlock()
@@ -505,6 +512,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+	UsageReservePercent5h   json.RawMessage `json:"usage_reserve_percent_5h"`
+	UsageReservePercent7d   json.RawMessage `json:"usage_reserve_percent_7d"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 }
 
@@ -534,6 +543,16 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	usageReserve5h, err := parseOptionalIntegerPatchField(req.UsageReservePercent5h, "usage_reserve_percent_5h", 1, 99)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	usageReserve7d, err := parseOptionalIntegerPatchField(req.UsageReservePercent7d, "usage_reserve_percent_7d", 1, 99)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -559,7 +578,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		}
 	}
 
-	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs); err != nil {
+	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride, usageReserve5h, usageReserve7d, allowedAPIKeyIDs); err != nil {
 		if err == sql.ErrNoRows {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -569,6 +588,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	}
 	if h.store != nil {
 		h.store.ApplyAccountSchedulerOverrides(id, nullableInt64Pointer(scoreBiasOverride), nullableInt64Pointer(baseConcurrencyOverride))
+		if usageReserve5h.Set || usageReserve7d.Set {
+			if row, err := h.db.GetAccountByID(ctx, id); err == nil {
+				h.store.ApplyAccountUsageReserveOverrides(id, nullableInt64Pointer(row.UsageReservePercent5h), nullableInt64Pointer(row.UsageReservePercent7d))
+			}
+		}
 		if allowedAPIKeyIDs.Set {
 			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
 		}
@@ -594,6 +618,20 @@ func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxV
 		return sql.NullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
 	return sql.NullInt64{Int64: value, Valid: true}, nil
+}
+
+func parseOptionalIntegerPatchField(raw json.RawMessage, field string, minValue, maxValue int64) (database.OptionalNullInt64, error) {
+	if len(raw) == 0 {
+		return database.OptionalNullInt64{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalNullInt64{Set: true}, nil
+	}
+	value, err := parseOptionalIntegerField(raw, field, minValue, maxValue)
+	if err != nil {
+		return database.OptionalNullInt64{}, err
+	}
+	return database.OptionalNullInt64{Set: true, Value: value}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {

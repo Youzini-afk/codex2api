@@ -38,6 +38,9 @@ export interface AccountRow {
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
   dynamic_concurrency_limit?: number
+  usage_reserve_percent_5h?: number | null
+  usage_reserve_percent_7d?: number | null
+  usage_reserve_active_windows?: string[]
   allowed_api_key_ids?: number[]
   scheduler_breakdown?: {
     unauthorized_penalty: number
@@ -103,6 +106,8 @@ export interface AddATAccountRequest {
 export interface UpdateAccountSchedulerRequest {
   score_bias_override: number | null
   base_concurrency_override: number | null
+  usage_reserve_percent_5h?: number | null
+  usage_reserve_percent_7d?: number | null
   allowed_api_key_ids?: number[] | null
 }
 

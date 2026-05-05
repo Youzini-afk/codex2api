@@ -33,10 +33,11 @@ import AccountUsageModal from '../components/AccountUsageModal'
 export default function Accounts() {
   const { t } = useTranslation()
   const pageSizeOptions = [10, 20, 50, 100]
+  type ReserveMode = 'off' | 'custom'
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'usage_reserved' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'prolite' | 'plus' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
@@ -65,6 +66,10 @@ export default function Accounts() {
   const [scoreInput, setScoreInput] = useState('')
   const [concurrencyMode, setConcurrencyMode] = useState<'default' | 'custom'>('default')
   const [concurrencyInput, setConcurrencyInput] = useState('')
+  const [reserve5hMode, setReserve5hMode] = useState<ReserveMode>('off')
+  const [reserve5hInput, setReserve5hInput] = useState('')
+  const [reserve7dMode, setReserve7dMode] = useState<ReserveMode>('off')
+  const [reserve7dInput, setReserve7dInput] = useState('')
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<number[]>([])
   const [importing, setImporting] = useState(false)
   const [showImportPicker, setShowImportPicker] = useState(false)
@@ -161,6 +166,7 @@ export default function Accounts() {
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
+  const usageReservedAccounts = accounts.filter((account) => account.status === 'usage_reserved').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
   const errorAccounts = accounts.filter((account) => account.status === 'error').length
   const disabledAccounts = accounts.filter((account) => account.enabled === false).length
@@ -178,6 +184,9 @@ export default function Accounts() {
         break
       case 'rate_limited':
         if (account.status !== 'rate_limited' && account.status !== 'usage_exhausted') return false
+        break
+      case 'usage_reserved':
+        if (account.status !== 'usage_reserved') return false
         break
       case 'banned':
         if (account.status !== 'unauthorized') return false
@@ -962,6 +971,10 @@ export default function Accounts() {
     setScoreInput(account.score_bias_override === null || account.score_bias_override === undefined ? '' : String(account.score_bias_override))
     setConcurrencyMode(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? 'default' : 'custom')
     setConcurrencyInput(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? '' : String(account.base_concurrency_override))
+    setReserve5hMode(account.usage_reserve_percent_5h === null || account.usage_reserve_percent_5h === undefined ? 'off' : 'custom')
+    setReserve5hInput(account.usage_reserve_percent_5h === null || account.usage_reserve_percent_5h === undefined ? '' : String(account.usage_reserve_percent_5h))
+    setReserve7dMode(account.usage_reserve_percent_7d === null || account.usage_reserve_percent_7d === undefined ? 'off' : 'custom')
+    setReserve7dInput(account.usage_reserve_percent_7d === null || account.usage_reserve_percent_7d === undefined ? '' : String(account.usage_reserve_percent_7d))
     setAllowedAPIKeySelection(filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys))
   }
 
@@ -972,13 +985,21 @@ export default function Accounts() {
     setScoreInput('')
     setConcurrencyMode('default')
     setConcurrencyInput('')
+    setReserve5hMode('off')
+    setReserve5hInput('')
+    setReserve7dMode('off')
+    setReserve7dInput('')
     setAllowedAPIKeySelection([])
   }
 
   const parsedScoreBias = scoreMode === 'custom' ? parseIntegerInput(scoreInput) : null
   const parsedBaseConcurrency = concurrencyMode === 'custom' ? parseIntegerInput(concurrencyInput) : null
+  const parsedReserve5h = reserve5hMode === 'custom' ? parseIntegerInput(reserve5hInput) : null
+  const parsedReserve7d = reserve7dMode === 'custom' ? parseIntegerInput(reserve7dInput) : null
   const scoreInputInvalid = scoreMode === 'custom' && (parsedScoreBias === null || parsedScoreBias < -200 || parsedScoreBias > 200)
   const concurrencyInputInvalid = concurrencyMode === 'custom' && (parsedBaseConcurrency === null || parsedBaseConcurrency < 1 || parsedBaseConcurrency > 50)
+  const reserve5hInputInvalid = reserve5hMode === 'custom' && (parsedReserve5h === null || parsedReserve5h < 1 || parsedReserve5h > 99)
+  const reserve7dInputInvalid = reserve7dMode === 'custom' && (parsedReserve7d === null || parsedReserve7d < 1 || parsedReserve7d > 99)
 
   const editPreview = useMemo(() => {
     if (!editingAccount) return null
@@ -990,6 +1011,8 @@ export default function Accounts() {
     const baseConcurrency = concurrencyMode === 'custom'
       ? (parsedBaseConcurrency ?? getEffectiveBaseConcurrency(editingAccount))
       : getEffectiveBaseConcurrency(editingAccount)
+    const reserve5h = reserve5hMode === 'custom' ? parsedReserve5h : null
+    const reserve7d = reserve7dMode === 'custom' ? parsedReserve7d : null
 
     return {
       rawScore,
@@ -998,12 +1021,18 @@ export default function Accounts() {
       dynamicConcurrency: computePreviewDynamicConcurrency(editingAccount, baseConcurrency),
       appliedBias,
       baseConcurrency,
+      reserve5h,
+      reserve7d,
+      reserve5hRemaining: getUsageRemaining(editingAccount.usage_percent_5h),
+      reserve7dRemaining: getUsageRemaining(editingAccount.usage_percent_7d),
+      reserve5hActive: isReservePreviewActive(editingAccount.usage_percent_5h, reserve5h),
+      reserve7dActive: isReservePreviewActive(editingAccount.usage_percent_7d, reserve7d),
     }
-  }, [editingAccount, scoreMode, parsedScoreBias, concurrencyMode, parsedBaseConcurrency])
+  }, [editingAccount, scoreMode, parsedScoreBias, concurrencyMode, parsedBaseConcurrency, reserve5hMode, parsedReserve5h, reserve7dMode, parsedReserve7d])
 
   const handleSaveScheduler = async () => {
     if (!editingAccount) return
-    if (scoreInputInvalid || concurrencyInputInvalid) {
+    if (scoreInputInvalid || concurrencyInputInvalid || reserve5hInputInvalid || reserve7dInputInvalid) {
       showToast(t('accounts.schedulerInvalidInput'), 'error')
       return
     }
@@ -1013,6 +1042,8 @@ export default function Accounts() {
       const payload = {
         score_bias_override: scoreMode === 'custom' ? parsedScoreBias : null,
         base_concurrency_override: concurrencyMode === 'custom' ? parsedBaseConcurrency : null,
+        usage_reserve_percent_5h: reserve5hMode === 'custom' ? parsedReserve5h : null,
+        usage_reserve_percent_7d: reserve7dMode === 'custom' ? parsedReserve7d : null,
         allowed_api_key_ids: allowedAPIKeySelection,
       }
       await api.updateAccountScheduler(editingAccount.id, payload)
@@ -1190,7 +1221,7 @@ export default function Accounts() {
 
         <div className="toolbar-surface mb-3 flex flex-wrap items-center gap-2">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['error', t('accounts.filterError')], ['disabled', t('accounts.filterDisabled')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['usage_reserved', t('accounts.filterUsageReserved')], ['banned', t('accounts.filterBanned')], ['error', t('accounts.filterError')], ['disabled', t('accounts.filterDisabled')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
@@ -1200,7 +1231,7 @@ export default function Accounts() {
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : key === 'error' ? errorAccounts : key === 'disabled' ? disabledAccounts : lockedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'usage_reserved' ? usageReservedAccounts : key === 'banned' ? bannedAccounts : key === 'error' ? errorAccounts : key === 'disabled' ? disabledAccounts : lockedAccounts}
             </button>
           ))}
         </div>
@@ -1960,7 +1991,7 @@ export default function Accounts() {
               <Button variant="outline" onClick={() => closeSchedulerEditor()} disabled={editSubmitting}>
                 {t('common.cancel')}
               </Button>
-              <Button onClick={() => void handleSaveScheduler()} disabled={editSubmitting || scoreInputInvalid || concurrencyInputInvalid}>
+              <Button onClick={() => void handleSaveScheduler()} disabled={editSubmitting || scoreInputInvalid || concurrencyInputInvalid || reserve5hInputInvalid || reserve7dInputInvalid}>
                 {editSubmitting ? t('common.saving') : t('common.save')}
               </Button>
             </>
@@ -2040,6 +2071,94 @@ export default function Accounts() {
                       </div>
                     </div>
                   )}
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-border p-4">
+                <div className="text-sm font-semibold text-foreground">{t('accounts.usageReserveLabel')}</div>
+                <div className="mt-1 text-xs text-muted-foreground">{t('accounts.usageReserveHint')}</div>
+                <div className="mt-4 grid gap-4 md:grid-cols-2">
+                  <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-foreground">{t('accounts.usageReserve5hLabel')}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {formatRemainingPreview(editPreview.reserve5hRemaining, t)}
+                        </div>
+                      </div>
+                      {editPreview.reserve5hActive && (
+                        <span className="rounded-full bg-cyan-500/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-600 dark:text-cyan-300">
+                          {t('accounts.usageReserveActive')}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-3 flex gap-2">
+                      <TogglePill
+                        active={reserve5hMode === 'off'}
+                        onClick={() => setReserve5hMode('off')}
+                        label={t('accounts.usageReserveOff')}
+                      />
+                      <TogglePill
+                        active={reserve5hMode === 'custom'}
+                        onClick={() => setReserve5hMode('custom')}
+                        label={t('accounts.schedulerCustom')}
+                      />
+                    </div>
+                    {reserve5hMode === 'custom' && (
+                      <div className="mt-3 space-y-2">
+                        <Input
+                          inputMode="numeric"
+                          value={reserve5hInput}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => setReserve5hInput(event.target.value)}
+                          placeholder={t('accounts.usageReservePlaceholder')}
+                        />
+                        <div className={`text-xs ${reserve5hInputInvalid ? 'text-red-500' : 'text-muted-foreground'}`}>
+                          {reserve5hInputInvalid ? t('accounts.usageReserveRange') : t('accounts.usageReserveCustomValuePreview', { value: parsedReserve5h ?? 0 })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-foreground">{t('accounts.usageReserve7dLabel')}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {formatRemainingPreview(editPreview.reserve7dRemaining, t)}
+                        </div>
+                      </div>
+                      {editPreview.reserve7dActive && (
+                        <span className="rounded-full bg-cyan-500/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-600 dark:text-cyan-300">
+                          {t('accounts.usageReserveActive')}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-3 flex gap-2">
+                      <TogglePill
+                        active={reserve7dMode === 'off'}
+                        onClick={() => setReserve7dMode('off')}
+                        label={t('accounts.usageReserveOff')}
+                      />
+                      <TogglePill
+                        active={reserve7dMode === 'custom'}
+                        onClick={() => setReserve7dMode('custom')}
+                        label={t('accounts.schedulerCustom')}
+                      />
+                    </div>
+                    {reserve7dMode === 'custom' && (
+                      <div className="mt-3 space-y-2">
+                        <Input
+                          inputMode="numeric"
+                          value={reserve7dInput}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) => setReserve7dInput(event.target.value)}
+                          placeholder={t('accounts.usageReservePlaceholder')}
+                        />
+                        <div className={`text-xs ${reserve7dInputInvalid ? 'text-red-500' : 'text-muted-foreground'}`}>
+                          {reserve7dInputInvalid ? t('accounts.usageReserveRange') : t('accounts.usageReserveCustomValuePreview', { value: parsedReserve7d ?? 0 })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -2516,6 +2635,21 @@ function computePreviewDynamicConcurrency(account: AccountRow, baseConcurrency: 
     default:
       return account.dynamic_concurrency_limit ?? baseConcurrency
   }
+}
+
+function getUsageRemaining(usedPct?: number | null): number | null {
+  if (typeof usedPct !== 'number') return null
+  return Math.max(0, 100 - usedPct)
+}
+
+function isReservePreviewActive(usedPct: number | null | undefined, reservePercent: number | null): boolean {
+  const remaining = getUsageRemaining(usedPct)
+  return remaining !== null && reservePercent !== null && remaining <= reservePercent
+}
+
+function formatRemainingPreview(remaining: number | null, t: (key: string, options?: Record<string, unknown>) => string): string {
+  if (remaining === null) return t('accounts.usageReserveRemainingUnknown')
+  return t('accounts.usageReserveRemaining', { value: remaining.toFixed(1) })
 }
 
 function formatSignedNumber(value: number): string {
@@ -3033,21 +3167,29 @@ function UsageWindowStat({ label, detail }: { label: string; detail?: AccountRow
 
 // 用量列组件
 function UsageCell({ account }: { account: AccountRow }) {
+  const { t } = useTranslation()
   const plan = normalizePlanType(account.plan_type)
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail)
   const has5hDetail = hasUsageWindowDetail(account.usage_5h_detail)
+  const reserveWindows = account.usage_reserve_active_windows ?? []
+  const reserveHint = reserveWindows.length > 0 ? (
+    <div className="text-[11px] font-semibold text-cyan-600 dark:text-cyan-300">
+      {t('accounts.usageReserveWindowActive', { windows: reserveWindows.join(' / ') })}
+    </div>
+  ) : null
 
   if (plan === 'free') {
     if (!has7d && !has7dDetail) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
-      <div className="w-48">
+      <div className="w-48 space-y-1">
         {has7d ? (
           <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} detail={account.usage_7d_detail} />
         ) : (
           <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
         )}
+        {reserveHint}
       </div>
     )
   }
@@ -3066,18 +3208,20 @@ function UsageCell({ account }: { account: AccountRow }) {
         ) : (
           <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
         )}
+        {reserveHint}
       </div>
     )
   }
 
   if (has7d || has7dDetail) {
     return (
-      <div className="w-48">
+      <div className="w-48 space-y-1">
         {has7d ? (
           <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} detail={account.usage_7d_detail} />
         ) : (
           <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
         )}
+        {reserveHint}
       </div>
     )
   }
@@ -3091,6 +3235,17 @@ function getAccountStatusCountdownUntil(account: AccountRow): string | undefined
   }
   if (status === 'usage_exhausted') {
     return account.reset_7d_at
+  }
+  if (status === 'usage_reserved') {
+    const windows = account.usage_reserve_active_windows ?? []
+    const resets = [
+      windows.includes('5h') ? account.reset_5h_at : undefined,
+      windows.includes('7d') ? account.reset_7d_at : undefined,
+    ].filter((value): value is string => Boolean(value))
+    return resets.reduce<string | undefined>((latest, value) => {
+      if (!latest) return value
+      return new Date(value).getTime() > new Date(latest).getTime() ? value : latest
+    }, undefined)
   }
   return undefined
 }

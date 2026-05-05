@@ -35,6 +35,7 @@ type fastSchedulerPosition struct {
 type FastScheduler struct {
 	mu           sync.RWMutex
 	baseLimit    int64
+	usageMaxAge  time.Duration
 	buckets      map[AccountHealthTier][]fastSchedulerEntry
 	positions    map[int64]fastSchedulerPosition
 	cursors      [3]atomic.Uint64
@@ -42,12 +43,17 @@ type FastScheduler struct {
 	provenCurs   [3]atomic.Uint64 // 验证账号专用 round-robin 游标
 }
 
-func NewFastScheduler(baseLimit int64) *FastScheduler {
+func NewFastScheduler(baseLimit int64, usageMaxAge ...time.Duration) *FastScheduler {
 	if baseLimit <= 0 {
 		baseLimit = 1
 	}
+	maxAge := defaultUsageProbeMaxAge
+	if len(usageMaxAge) > 0 && usageMaxAge[0] > 0 {
+		maxAge = usageMaxAge[0]
+	}
 	return &FastScheduler{
-		baseLimit: baseLimit,
+		baseLimit:   baseLimit,
+		usageMaxAge: maxAge,
 		buckets: map[AccountHealthTier][]fastSchedulerEntry{
 			HealthTierHealthy: nil,
 			HealthTierWarm:    nil,
@@ -63,7 +69,7 @@ func (s *Store) BuildFastScheduler() *FastScheduler {
 	if s == nil {
 		return NewFastScheduler(1)
 	}
-	scheduler := NewFastScheduler(atomic.LoadInt64(&s.maxConcurrency))
+	scheduler := NewFastScheduler(atomic.LoadInt64(&s.maxConcurrency), s.GetUsageProbeMaxAge())
 
 	s.mu.RLock()
 	accounts := make([]*Account, len(s.accounts))
@@ -95,7 +101,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		if acc == nil || acc.DBID == 0 {
 			continue
 		}
-		tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
+		tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, s.usageMaxAge, now)
 		if !available || limit <= 0 {
 			continue
 		}
@@ -188,6 +194,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 	defer s.mu.Unlock()
 
 	baseLimit := s.baseLimit
+	usageMaxAge := s.usageMaxAge
 	for {
 		changed := false
 		for tierIdx, tier := range fastSchedulerTierOrder {
@@ -199,7 +206,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 			// 阶段 1：优先在验证过的账号（桶前部 provenBound 个）中 round-robin
 			provenBound := s.provenBounds[tierIdx]
 			if provenBound > 0 {
-				acc, stale := s.scanRangeLocked(tier, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, now, apiKeyID, exclude, filter)
+				acc, stale := s.scanRangeLocked(tier, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, usageMaxAge, now, apiKeyID, exclude, filter)
 				if acc != nil {
 					return acc
 				}
@@ -210,7 +217,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 			}
 
 			// 阶段 2：回退到全量 round-robin
-			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, apiKeyID, exclude, filter)
+			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), &s.cursors[tierIdx], baseLimit, usageMaxAge, now, apiKeyID, exclude, filter)
 			if acc != nil {
 				return acc
 			}
@@ -227,7 +234,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 
 // scanRangeLocked 在 bucket[start:end) 范围内 round-robin 扫描可用账号。
 // 返回 stale=true 表示桶内缓存已过期，调用方应重新开始扫描。
-func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, bool) {
+func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, usageMaxAge time.Duration, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, bool) {
 	bucket := s.buckets[expectedTier]
 	rangeLen := rangeEnd - rangeStart
 	if rangeLen <= 0 {
@@ -248,7 +255,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		if filter != nil && !filter(entry.acc) {
 			continue
 		}
-		tier, _, limit, _, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+		tier, _, limit, _, available := entry.acc.fastSchedulerSnapshot(baseLimit, usageMaxAge, now)
 		if tier != expectedTier {
 			s.removeLocked(entry.dbID)
 			if available && limit > 0 {
@@ -293,7 +300,7 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		return
 	}
 
-	tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
+	tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, s.usageMaxAge, now)
 	if !available || limit <= 0 {
 		return
 	}
@@ -372,7 +379,7 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 	}
 }
 
-func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
+func (a *Account) fastSchedulerSnapshot(baseLimit int64, usageMaxAge time.Duration, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -412,7 +419,10 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		available = false
 	}
 	// Free 账号 7d 用量耗尽，不参与调度
-	if a.usageExhaustedLocked() {
+	if a.usageExhaustedLockedAt(now) {
+		available = false
+	}
+	if a.usageReserveActiveLocked(now, usageMaxAge) {
 		available = false
 	}
 

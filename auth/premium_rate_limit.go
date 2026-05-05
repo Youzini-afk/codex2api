@@ -98,7 +98,7 @@ func (a *Account) GetUsageSnapshot5h() (pct float64, resetAt time.Time, ok bool)
 
 // PersistUsageSnapshot5hOnly 持久化仅包含 5h 数据的用量快照。
 func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
-	if acc == nil || s == nil || s.db == nil {
+	if acc == nil || s == nil {
 		return
 	}
 
@@ -109,8 +109,14 @@ func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
 
 	updatedAt := time.Now()
 	acc.mu.Lock()
+	acc.UsageUpdated5hAt = updatedAt
 	acc.UsageUpdatedAt = updatedAt
 	acc.mu.Unlock()
+	s.refreshUsageSchedulerState(acc)
+
+	if s.db == nil {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -134,6 +140,7 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	acc.UsagePercent5h = 100
 	acc.UsagePercent5hValid = true
 	acc.Reset5hAt = resetAt
+	acc.UsageUpdated5hAt = now
 	acc.UsageUpdatedAt = now
 	acc.LastRateLimitedAt = now
 	acc.Status = StatusCooldown

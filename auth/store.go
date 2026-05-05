@@ -60,9 +60,11 @@ type Account struct {
 	UsagePercent7d        float64 // 7d 窗口使用率 0-100+
 	UsagePercent7dValid   bool
 	Reset7dAt             time.Time // 7d 窗口重置时间
+	UsageUpdated7dAt      time.Time
 	UsagePercent5h        float64   // 5h 窗口使用率 0-100+
 	UsagePercent5hValid   bool
 	Reset5hAt             time.Time // 5h 窗口重置时间
+	UsageUpdated5hAt      time.Time
 	UsageUpdatedAt        time.Time
 	usageProbeInFlight    bool
 	recoveryProbeInFlight bool
@@ -102,6 +104,8 @@ type Account struct {
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
 	BaseConcurrencyOverride *int64
+	UsageReservePercent5h   *int64
+	UsageReservePercent7d   *int64
 	AllowedAPIKeyIDs        []int64
 	allowedAPIKeySet        map[int64]struct{}
 	ModelCooldowns          map[string]ModelCooldown
@@ -483,6 +487,9 @@ func (a *Account) dispatchBonusEligibleLocked(now time.Time, tier AccountHealthT
 	if a.usageExhaustedLocked() {
 		return false
 	}
+	if a.usageReserveActiveLocked(now, defaultUsageProbeMaxAge) {
+		return false
+	}
 	if a.AccessToken == "" {
 		return false
 	}
@@ -542,6 +549,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	if a.premium5hRateLimitedLocked(now) && tier != HealthTierBanned {
 		tier = HealthTierRisky
 	}
+	if a.usageReserveActiveLocked(now, defaultUsageProbeMaxAge) && tier != HealthTierBanned {
+		tier = HealthTierRisky
+	}
 
 	baseConcurrencyEffective := a.effectiveBaseConcurrencyLocked(baseLimit)
 	scoreBiasEffective := a.effectiveScoreBiasLocked(now, tier)
@@ -565,8 +575,90 @@ func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64
 	return a.HealthTier, a.SchedulerScore, a.DispatchScore, a.DynamicConcurrencyLimit
 }
 
+func usageReserveWindowActive(usedPct float64, valid bool, resetAt, updatedAt time.Time, threshold *int64, now time.Time, maxAge time.Duration) bool {
+	if threshold == nil || *threshold <= 0 {
+		return false
+	}
+	if !valid || updatedAt.IsZero() {
+		return false
+	}
+	if maxAge <= 0 {
+		maxAge = defaultUsageProbeMaxAge
+	}
+	if now.Sub(updatedAt) > maxAge {
+		return false
+	}
+	if resetAt.IsZero() || !resetAt.After(now) {
+		return false
+	}
+	remaining := 100 - usedPct
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining <= float64(*threshold)
+}
+
+func usageReserveWindowNeedsProbe(valid bool, resetAt, updatedAt time.Time, threshold *int64, now time.Time, maxAge time.Duration) bool {
+	if threshold == nil || *threshold <= 0 {
+		return false
+	}
+	if !valid || updatedAt.IsZero() {
+		return true
+	}
+	if maxAge <= 0 {
+		maxAge = defaultUsageProbeMaxAge
+	}
+	if now.Sub(updatedAt) > maxAge {
+		return true
+	}
+	return resetAt.IsZero() || !resetAt.After(now)
+}
+
+func usageWindowUpdatedAt(windowUpdatedAt, fallback time.Time) time.Time {
+	if !windowUpdatedAt.IsZero() {
+		return windowUpdatedAt
+	}
+	return fallback
+}
+
+func (a *Account) usageReserveActiveWindowsLocked(now time.Time, maxAge time.Duration) []string {
+	windows := []string{}
+	if usageReserveWindowActive(
+		a.UsagePercent5h,
+		a.UsagePercent5hValid,
+		a.Reset5hAt,
+		usageWindowUpdatedAt(a.UsageUpdated5hAt, a.UsageUpdatedAt),
+		a.UsageReservePercent5h,
+		now,
+		maxAge,
+	) {
+		windows = append(windows, "5h")
+	}
+	if usageReserveWindowActive(
+		a.UsagePercent7d,
+		a.UsagePercent7dValid,
+		a.Reset7dAt,
+		usageWindowUpdatedAt(a.UsageUpdated7dAt, a.UsageUpdatedAt),
+		a.UsageReservePercent7d,
+		now,
+		maxAge,
+	) {
+		windows = append(windows, "7d")
+	}
+	return windows
+}
+
+func (a *Account) usageReserveActiveLocked(now time.Time, maxAge time.Duration) bool {
+	return len(a.usageReserveActiveWindowsLocked(now, maxAge)) > 0
+}
+
 // IsAvailable 检查账号是否可用
 func (a *Account) IsAvailable() bool {
+	return a.IsAvailableWithUsageProbeMaxAge(defaultUsageProbeMaxAge)
+}
+
+// IsAvailableWithUsageProbeMaxAge checks availability using the same usage snapshot freshness policy as usage probes.
+func (a *Account) IsAvailableWithUsageProbeMaxAge(maxAge time.Duration) bool {
 	// 原子标志优先：401 时瞬间置位，无需等锁即可拦截并发请求
 	if atomic.LoadInt32(&a.Disabled) != 0 {
 		return false
@@ -578,6 +670,7 @@ func (a *Account) IsAvailable() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
+	now := time.Now()
 	if a.Status == StatusError {
 		return false
 	}
@@ -585,17 +678,20 @@ func (a *Account) IsAvailable() bool {
 		return false
 	}
 	// Free 账号 7d 用量 >= 100%，视为不可用
-	if a.usageExhaustedLocked() {
+	if a.usageExhaustedLockedAt(now) {
 		return false
 	}
-	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
 		return false
 	}
-	if a.premium5hRateLimitedLocked(time.Now()) {
+	if a.premium5hRateLimitedLocked(now) {
+		return false
+	}
+	if a.usageReserveActiveLocked(now, maxAge) {
 		return false
 	}
 	// 冷却期过了自动恢复
-	if a.Status == StatusCooldown && !time.Now().Before(a.CooldownUtil) {
+	if a.Status == StatusCooldown && !now.Before(a.CooldownUtil) {
 		return a.AccessToken != ""
 	}
 	return a.AccessToken != ""
@@ -603,7 +699,14 @@ func (a *Account) IsAvailable() bool {
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
 func (a *Account) usageExhaustedLocked() bool {
-	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
+	return a.usageExhaustedLockedAt(time.Now())
+}
+
+func (a *Account) usageExhaustedLockedAt(now time.Time) bool {
+	if !a.UsagePercent7dValid || !strings.EqualFold(a.PlanType, "free") || a.UsagePercent7d < 100 {
+		return false
+	}
+	return a.Reset7dAt.IsZero() || a.Reset7dAt.After(now)
 }
 
 // NeedsRefresh 检查 AT 是否需要刷新（过期前 5 分钟刷新）
@@ -675,6 +778,10 @@ func (a *Account) IsBanned() bool {
 
 // RuntimeStatus 返回运行时状态字符串（供 admin API 使用）
 func (a *Account) RuntimeStatus() string {
+	return a.RuntimeStatusWithUsageProbeMaxAge(defaultUsageProbeMaxAge)
+}
+
+func (a *Account) RuntimeStatusWithUsageProbeMaxAge(maxAge time.Duration) string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	now := time.Now()
@@ -687,6 +794,9 @@ func (a *Account) RuntimeStatus() string {
 	}
 	if a.premium5hRateLimitedLocked(now) {
 		return "rate_limited"
+	}
+	if a.usageReserveActiveLocked(now, maxAge) {
+		return "usage_reserved"
 	}
 	switch a.Status {
 	case StatusError:
@@ -727,7 +837,10 @@ func (a *Account) SetUsageSnapshot(pct float64, updatedAt time.Time) {
 	defer a.mu.Unlock()
 	a.UsagePercent7d = pct
 	a.UsagePercent7dValid = true
-	a.UsageUpdatedAt = updatedAt
+	a.UsageUpdated7dAt = updatedAt
+	if !updatedAt.IsZero() && (a.UsageUpdatedAt.IsZero() || updatedAt.After(a.UsageUpdatedAt)) {
+		a.UsageUpdatedAt = updatedAt
+	}
 }
 
 // GetUsagePercent7d 获取 7d 用量百分比
@@ -739,11 +852,19 @@ func (a *Account) GetUsagePercent7d() (float64, bool) {
 
 // SetUsageSnapshot5h 更新 5h 用量快照
 func (a *Account) SetUsageSnapshot5h(pct float64, resetAt time.Time) {
+	a.SetUsageSnapshot5hAt(pct, resetAt, time.Now())
+}
+
+func (a *Account) SetUsageSnapshot5hAt(pct float64, resetAt time.Time, updatedAt time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.UsagePercent5h = pct
 	a.UsagePercent5hValid = true
 	a.Reset5hAt = resetAt
+	a.UsageUpdated5hAt = updatedAt
+	if !updatedAt.IsZero() && (a.UsageUpdatedAt.IsZero() || updatedAt.After(a.UsageUpdatedAt)) {
+		a.UsageUpdatedAt = updatedAt
+	}
 }
 
 // GetUsagePercent5h 获取 5h 用量百分比
@@ -760,9 +881,11 @@ func (a *Account) ClearUsageCache() {
 	a.UsagePercent7d = 0
 	a.UsagePercent7dValid = false
 	a.Reset7dAt = time.Time{}
+	a.UsageUpdated7dAt = time.Time{}
 	a.UsagePercent5h = 0
 	a.UsagePercent5hValid = false
 	a.Reset5hAt = time.Time{}
+	a.UsageUpdated5hAt = time.Time{}
 	a.UsageUpdatedAt = time.Time{}
 }
 
@@ -865,6 +988,30 @@ func (a *Account) GetBaseConcurrencyEffective() int64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.BaseConcurrencyEffective
+}
+
+func (a *Account) GetUsageReservePercent5h() (int64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.UsageReservePercent5h == nil {
+		return 0, false
+	}
+	return *a.UsageReservePercent5h, true
+}
+
+func (a *Account) GetUsageReservePercent7d() (int64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.UsageReservePercent7d == nil {
+		return 0, false
+	}
+	return *a.UsageReservePercent7d, true
+}
+
+func (a *Account) GetUsageReserveActiveWindows(maxAge time.Duration) []string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.usageReserveActiveWindowsLocked(time.Now(), maxAge)
 }
 
 func (a *Account) setAllowedAPIKeyIDsLocked(values []int64) {
@@ -1079,6 +1226,23 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	}
 	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false // 429 冷却期间不探活，避免加重限流
+	}
+	if usageReserveWindowNeedsProbe(
+		a.UsagePercent5hValid,
+		a.Reset5hAt,
+		usageWindowUpdatedAt(a.UsageUpdated5hAt, a.UsageUpdatedAt),
+		a.UsageReservePercent5h,
+		now,
+		maxAge,
+	) || usageReserveWindowNeedsProbe(
+		a.UsagePercent7dValid,
+		a.Reset7dAt,
+		usageWindowUpdatedAt(a.UsageUpdated7dAt, a.UsageUpdatedAt),
+		a.UsageReservePercent7d,
+		now,
+		maxAge,
+	) {
+		return true
 	}
 	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() {
 		return true
@@ -1304,7 +1468,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
 	if fastEnabled {
-		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency)))
+		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency), s.GetUsageProbeMaxAge()))
 		log.Printf("快速调度器已启用（请求热路径将优先走本地内存调度器）")
 	}
 
@@ -1583,6 +1747,7 @@ func (s *Store) SetUsageProbeMaxAge(d time.Duration) {
 		d = defaultUsageProbeMaxAge
 	}
 	atomic.StoreInt64(&s.usageProbeMaxAge, int64(d))
+	s.rebuildFastScheduler()
 }
 
 // GetUsageProbeMaxAge 获取用量探针最大缓存时长。
@@ -1632,8 +1797,9 @@ func (s *Store) Init(ctx context.Context) error {
 
 	// 2. 统计可用账号，RT 账号的刷新交给 StartBackgroundRefresh 处理
 	available := 0
+	usageProbeMaxAge := s.GetUsageProbeMaxAge()
 	for _, acc := range s.accounts {
-		if acc.IsAvailable() {
+		if acc.IsAvailableWithUsageProbeMaxAge(usageProbeMaxAge) {
 			available++
 		}
 	}
@@ -1678,6 +1844,8 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		}
 		account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
 		account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
+		account.UsageReservePercent5h = reflectOptionalInt64Field(row, "UsageReservePercent5h")
+		account.UsageReservePercent7d = reflectOptionalInt64Field(row, "UsageReservePercent7d")
 		account.setAllowedAPIKeyIDsLocked(row.GetCredentialInt64Slice("allowed_api_key_ids"))
 		if row.Locked {
 			atomic.StoreInt32(&account.Locked, 1)
@@ -1717,17 +1885,33 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				}
 			}
 		}
+		usageUpdatedAt := time.Time{}
+		if raw := row.GetCredential("codex_usage_updated_at"); raw != "" {
+			if parsedTime, err := time.Parse(time.RFC3339, raw); err == nil {
+				usageUpdatedAt = parsedTime
+			} else {
+				log.Printf("[账号 %d] 解析 codex_usage_updated_at 失败: %v", row.ID, err)
+			}
+		}
+		usageUpdated7dAt := usageUpdatedAt
+		if raw := row.GetCredential("codex_7d_usage_updated_at"); raw != "" {
+			if parsedTime, err := time.Parse(time.RFC3339, raw); err == nil {
+				usageUpdated7dAt = parsedTime
+			} else {
+				log.Printf("[账号 %d] 解析 codex_7d_usage_updated_at 失败: %v", row.ID, err)
+			}
+		}
+		usageUpdated5hAt := usageUpdatedAt
+		if raw := row.GetCredential("codex_5h_usage_updated_at"); raw != "" {
+			if parsedTime, err := time.Parse(time.RFC3339, raw); err == nil {
+				usageUpdated5hAt = parsedTime
+			} else {
+				log.Printf("[账号 %d] 解析 codex_5h_usage_updated_at 失败: %v", row.ID, err)
+			}
+		}
 		if usagePct := row.GetCredential("codex_7d_used_percent"); usagePct != "" {
 			if parsed, err := strconv.ParseFloat(usagePct, 64); err == nil {
-				updatedAt := time.Time{}
-				if usageUpdatedAt := row.GetCredential("codex_usage_updated_at"); usageUpdatedAt != "" {
-					if parsedTime, err := time.Parse(time.RFC3339, usageUpdatedAt); err == nil {
-						updatedAt = parsedTime
-					} else {
-						log.Printf("[账号 %d] 解析 codex_usage_updated_at 失败: %v", row.ID, err)
-					}
-				}
-				account.SetUsageSnapshot(parsed, updatedAt)
+				account.SetUsageSnapshot(parsed, usageUpdated7dAt)
 				// 恢复 7d 重置时间
 				if resetAt := row.GetCredential("codex_7d_reset_at"); resetAt != "" {
 					if t, err := time.Parse(time.RFC3339, resetAt); err == nil {
@@ -1747,7 +1931,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 						resetAt = t
 					}
 				}
-				account.SetUsageSnapshot5h(parsed, resetAt)
+				account.SetUsageSnapshot5hAt(parsed, resetAt, usageUpdated5hAt)
 			}
 		}
 		for _, cooldown := range modelCooldowns[row.ID] {
@@ -1898,7 +2082,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		if exclude != nil && exclude[acc.DBID] {
 			continue
 		}
-		if !acc.IsAvailable() {
+		if !acc.IsAvailableWithUsageProbeMaxAge(s.GetUsageProbeMaxAge()) {
 			continue
 		}
 		if !acc.AllowsAPIKey(apiKeyID) {
@@ -2029,7 +2213,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 		}
 	}
 	s.mu.RUnlock()
-	if target == nil || !target.IsAvailable() {
+	if target == nil || !target.IsAvailableWithUsageProbeMaxAge(s.GetUsageProbeMaxAge()) {
 		return nil
 	}
 	if !target.AllowsAPIKey(apiKeyID) {
@@ -2041,7 +2225,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	now := time.Now()
-	_, _, limit, _, available := target.fastSchedulerSnapshot(maxConcurrency, now)
+	_, _, limit, _, available := target.fastSchedulerSnapshot(maxConcurrency, s.GetUsageProbeMaxAge(), now)
 	if !available || limit <= 0 {
 		return nil
 	}
@@ -2078,7 +2262,7 @@ func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64
 		if exclude != nil && exclude[acc.DBID] {
 			continue
 		}
-		if !acc.IsAvailable() {
+		if !acc.IsAvailableWithUsageProbeMaxAge(s.GetUsageProbeMaxAge()) {
 			continue
 		}
 		if !acc.AllowsAPIKey(apiKeyID) {
@@ -2353,6 +2537,21 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	return true
 }
 
+func (s *Store) ApplyAccountUsageReserveOverrides(dbID int64, usageReserve5h, usageReserve7d *int64) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	acc.UsageReservePercent5h = cloneInt64Ptr(usageReserve5h)
+	acc.UsageReservePercent7d = cloneInt64Ptr(usageReserve7d)
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
 func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
@@ -2378,6 +2577,16 @@ func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
 	}
 	s.fastSchedulerUpdate(acc)
 	return true
+}
+
+func (s *Store) refreshUsageSchedulerState(acc *Account) {
+	if acc == nil || s == nil {
+		return
+	}
+	acc.mu.Lock()
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
 }
 
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
@@ -2665,6 +2874,7 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 
 	now := time.Now()
 	acc.SetUsageSnapshot(pct7d, now)
+	s.refreshUsageSchedulerState(acc)
 
 	if s.db == nil {
 		return
@@ -2708,9 +2918,11 @@ func (s *Store) ApplyUsageLimitMetadata(acc *Account, planType string, resetAt t
 		acc.UsagePercent7d = 100
 		acc.UsagePercent7dValid = true
 		acc.Reset7dAt = resetAt
+		acc.UsageUpdated7dAt = now
 		acc.UsageUpdatedAt = now
 		fields["codex_7d_used_percent"] = float64(100)
 		fields["codex_7d_reset_at"] = resetAt.Format(time.RFC3339)
+		fields["codex_7d_usage_updated_at"] = now.Format(time.RFC3339)
 		fields["codex_usage_updated_at"] = now.Format(time.RFC3339)
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -3110,8 +3322,9 @@ func (s *Store) AvailableCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	count := 0
+	usageProbeMaxAge := s.GetUsageProbeMaxAge()
 	for _, acc := range s.accounts {
-		if acc.IsAvailable() {
+		if acc.IsAvailableWithUsageProbeMaxAge(usageProbeMaxAge) {
 			count++
 		}
 	}
