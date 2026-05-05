@@ -279,7 +279,7 @@ export default function Usage() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [clearing, setClearing] = useState(false)
-  const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
+  const [timeRange, setTimeRange] = useState<TimeRangeKey>('24h')
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
@@ -415,6 +415,15 @@ export default function Usage() {
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
   const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
+  const usageEmptyDescription =
+    !hasActiveFilters && timeRange === '1h' && todayRequests > 0
+      ? t('usage.emptyRecentDesc', {
+          range: t('dashboard.timeRange1H'),
+          count: todayRequests.toLocaleString(),
+        })
+      : hasActiveFilters
+        ? t('usage.emptyFilteredDesc')
+        : t('usage.emptyDesc')
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -705,7 +714,7 @@ export default function Usage() {
               variant="section"
               isEmpty={logs.length === 0}
               emptyTitle={t('usage.emptyTitle')}
-              emptyDescription={hasActiveFilters ? t('usage.emptyFilteredDesc') : t('usage.emptyDesc')}
+              emptyDescription={usageEmptyDescription}
             >
               <div className="data-table-shell">
                 <TooltipProvider>

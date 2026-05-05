@@ -112,6 +112,13 @@ export default function Dashboard() {
   const available = stats?.available ?? 0
   const errorCount = stats?.error ?? 0
   const todayRequests = stats?.today_requests ?? 0
+  const chartEmptyDescription =
+    timeRange === '1h' && todayRequests > 0
+      ? t('dashboard.chartsEmptyTodayHint', {
+          range: t('dashboard.timeRange1H'),
+          count: todayRequests.toLocaleString(),
+        })
+      : t('dashboard.chartsEmptyDesc')
 
   const icons: Record<string, ReactNode> = {
     total: <Users className="size-[22px]" />,
@@ -180,6 +187,7 @@ export default function Dashboard() {
                 refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
                 timeRange={timeRange}
                 onTimeRangeChange={setTimeRange}
+                emptyDescription={chartEmptyDescription}
                 loading={chartLoading}
               />
             </Suspense>

@@ -26,6 +26,7 @@ interface DashboardUsageChartsProps {
   refreshIntervalMs: number
   timeRange: TimeRangeKey
   onTimeRangeChange: (range: TimeRangeKey) => void
+  emptyDescription?: string
   loading?: boolean
 }
 
@@ -70,6 +71,7 @@ export default function DashboardUsageCharts({
   refreshIntervalMs,
   timeRange,
   onTimeRangeChange,
+  emptyDescription,
   loading = false,
 }: DashboardUsageChartsProps) {
   const { t } = useTranslation()
@@ -184,7 +186,7 @@ export default function DashboardUsageCharts({
               variant="section"
               isEmpty
               emptyTitle={t('dashboard.chartsEmptyTitle')}
-              emptyDescription={t('dashboard.chartsEmptyDesc')}
+              emptyDescription={emptyDescription || t('dashboard.chartsEmptyDesc')}
             >
               <></>
             </StateShell>
