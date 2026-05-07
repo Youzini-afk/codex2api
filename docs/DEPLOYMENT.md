@@ -65,6 +65,12 @@ docker compose -f docker-compose.sqlite.yml up -d
 3. 至少设置 `ADMIN_SECRET`
 4. 将健康检查路径指向 `/health`
 
+**二改 fork 注意事项：**
+
+- 推荐在 Zeabur 选择“从 Git 仓库部署”，仓库指向你的 fork，并使用根目录 `Dockerfile` 构建。
+- 如果 Zeabur 服务使用“Docker Image”部署，镜像地址必须指向你的 fork 镜像，例如 `ghcr.io/<your-github-user>/codex2api:latest`；继续使用上游 `ghcr.io/james-6-23/codex2api:latest` 会看不到 fork 中的新功能。
+- 本仓库的镜像构建工作流会在 `main` 分支推送后自动发布 `latest` 镜像，适合 Zeabur 镜像部署模式。
+
 **默认行为：**
 
 - 检测到 Zeabur 环境且未配置 PostgreSQL / Redis 时，服务会自动回退到 `SQLite + Memory`

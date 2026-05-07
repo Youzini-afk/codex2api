@@ -90,6 +90,7 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 - 建议在 Zeabur 中挂载持久化目录到 `/data`，SQLite 默认会写入 `/data/codex2api.db`
 - 如需托管版 PostgreSQL / Redis，可直接绑定 `DATABASE_URL=${POSTGRES_CONNECTION_STRING}` 与 `REDIS_URL=${REDIS_CONNECTION_STRING}`
 - 可参考示例文件 `.env.zeabur.example`
+- 二改 fork 建议在 Zeabur 选择“从 Git 仓库部署”并使用本仓库 `Dockerfile`；如果使用“Docker Image”部署，请把镜像地址指向当前 fork 的 GHCR 镜像，例如 `ghcr.io/<your-github-user>/codex2api:latest`，不要继续使用上游 `ghcr.io/james-6-23/codex2api:latest`。
 
 ### 部署命令速查
 
