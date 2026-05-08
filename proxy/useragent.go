@@ -36,11 +36,16 @@ var codexOfficialClientUserAgentPrefixes = []string{
 	"codex_exec/",
 	"codex_sdk_ts/",
 	"codex ",
+	"opencode/",
 }
 
+// Third-party CLIs that ChatGPT-backend Codex accepts as first-party originators.
+// opencode advertises itself via Originator: "opencode" and reaching upstream with
+// that identity is required for features like reasoning_effort=xhigh to take effect.
 var codexOfficialClientOriginatorPrefixes = []string{
 	"codex_",
 	"codex ",
+	"opencode",
 }
 
 func IsCodexOfficialClientByHeaders(userAgent, originator string) bool {

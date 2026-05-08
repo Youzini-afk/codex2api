@@ -290,7 +290,7 @@ func TestApplyCodexRequestHeadersFallsBackForNonOfficialClient(t *testing.T) {
 	acc := &auth.Account{DBID: 42}
 	downstreamHeaders := http.Header{
 		"User-Agent": []string{"curl/8.0"},
-		"Originator": []string{"opencode"},
+		"Originator": []string{"random-client"},
 	}
 
 	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
@@ -303,6 +303,31 @@ func TestApplyCodexRequestHeadersFallsBackForNonOfficialClient(t *testing.T) {
 	}
 	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
 		t.Fatalf("Version = %q, want %q", got, latestCodexCLIVersion)
+	}
+}
+
+func TestApplyCodexRequestHeadersPreservesOpenCodeClient(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	ApplyRuntimeSettings(RuntimeSettings{ClientCompatMode: ClientCompatModePreserve})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	acc := &auth.Account{DBID: 42, AccountID: "acct-42"}
+	downstreamHeaders := http.Header{
+		"User-Agent": []string{"opencode/0.5.0"},
+		"Originator": []string{"opencode"},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+	if got := req.Header.Get("User-Agent"); got != "opencode/0.5.0" {
+		t.Fatalf("User-Agent = %q, want %q", got, "opencode/0.5.0")
+	}
+	if got := req.Header.Get("Originator"); got != "opencode" {
+		t.Fatalf("Originator = %q, want %q", got, "opencode")
 	}
 }
 
