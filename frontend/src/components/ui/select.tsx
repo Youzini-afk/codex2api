@@ -71,8 +71,13 @@ export function Select({
   useEffect(() => {
     if (!open) return
 
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as Node
+    // 关闭仅在「点击 trigger 与 dropdown 之外」触发。注意 dropdown 通过 createPortal
+    // 渲染在 document.body 下，与 trigger 不在同一 DOM 子树，必须按 ref 直接判断。
+    // 用 pointerdown 而非 mousedown，能同时覆盖鼠标 / 触屏 / 笔，且对路径上的 React
+    // 合成事件 stopPropagation 不敏感（native 监听拿到的总是真实 target）。
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null
+      if (!target) return
       if (triggerRef.current?.contains(target)) return
       if (dropdownRef.current?.contains(target)) return
       setOpen(false)
@@ -86,18 +91,26 @@ export function Select({
 
     const handleReposition = () => computePosition()
 
-    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('pointerdown', handlePointerDown)
     document.addEventListener('keydown', handleEscape)
     window.addEventListener('resize', handleReposition)
     window.addEventListener('scroll', handleReposition, true)
 
     return () => {
-      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('pointerdown', handlePointerDown)
       document.removeEventListener('keydown', handleEscape)
       window.removeEventListener('resize', handleReposition)
       window.removeEventListener('scroll', handleReposition, true)
     }
   }, [open, computePosition])
+
+  const handleSelect = useCallback(
+    (next: string) => {
+      onValueChange(next)
+      setOpen(false)
+    },
+    [onValueChange]
+  )
 
   return (
     <div className={cn('relative w-full', className)}>
@@ -163,10 +176,17 @@ export function Select({
                             ? 'bg-primary/10 text-primary'
                             : 'text-foreground hover:bg-accent/70 hover:text-accent-foreground'
                         )}
-                        onClick={() => {
-                          onValueChange(option.value)
-                          setOpen(false)
+                        // 用 onPointerDown 在 target 阶段直接 commit 选择：
+                        //  1. 早于 document 的 outside-pointerdown handler，避免 portal 边界
+                        //     场景下 dropdown 被先关掉、click 永远收不到的竞态；
+                        //  2. preventDefault 阻止 button 的默认 focus 转移，下拉关闭时焦点自然
+                        //     回到 trigger，不会跳到无关元素。
+                        onPointerDown={(event) => {
+                          event.preventDefault()
+                          handleSelect(option.value)
                         }}
+                        // onClick 兜底：键盘 Enter / Space 触发的合成 click 没有 pointerdown。
+                        onClick={() => handleSelect(option.value)}
                       >
                         <span className="truncate">{option.label}</span>
                         <Check className={cn('size-4 shrink-0', isSelected ? 'opacity-100' : 'opacity-0')} />
