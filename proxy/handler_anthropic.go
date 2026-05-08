@@ -283,9 +283,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				eventType := parsed.Get("type").String()
 
 				// TTFT 跟踪
-				if !ttftRecorded && (eventType == "response.output_text.delta" ||
-					eventType == "response.reasoning_summary_text.delta" ||
-					eventType == "response.reasoning_text.delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -346,7 +344,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
