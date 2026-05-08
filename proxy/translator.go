@@ -1106,11 +1106,16 @@ func sanitizeServiceTierForUpstream(body []byte) []byte {
 // resolveServiceTier 从实际 tier 和请求 tier 中选择最终值。
 // 入库时把 "priority" 归一化为 "fast"：两者在 OpenAI Responses API 是同义词
 // （codex2api 把 fast → priority 后透传上游），codex2api 的 UI/筛选/徽章统一以
-// "fast" 为规范名。这样 sub2api 等中间层透传 service_tier="priority" 时，仍能
-// 在管理台正确显示 Fast 徽章和参与 fast 维度的统计/筛选。
+// "fast" 为规范名。
+//
+// 两个真实场景都需要识别为 fast：
+//  1. 客户端发 fast（codex2api 自己的 UI/SDK），上游透传后回 priority/降级 default；
+//  2. codex CLI 0.129+ 等订阅客户端直接发 service_tier="priority"，上游降级时回 default。
+//
+// 因此只要客户端**意图**是 fast/priority，就锁定为 fast，不被上游降级值掩盖。
 func resolveServiceTier(actualTier, requestedTier string) string {
 	requestedTier = strings.TrimSpace(requestedTier)
-	if requestedTier == "fast" {
+	if requestedTier == "fast" || requestedTier == "priority" {
 		return "fast"
 	}
 	actualTier = strings.TrimSpace(actualTier)
