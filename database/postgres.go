@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
 
@@ -181,11 +181,17 @@ type usageLogEntry struct {
 }
 
 // New 创建数据库连接并自动建表。
-func New(driver string, dsn string) (*DB, error) {
+// schema 仅对 PostgreSQL 生效；为空时保持数据库默认 search_path。
+func New(driver string, dsn string, schema ...string) (*DB, error) {
 	driver = normalizeDriver(driver)
 	driverName := driver
 	if driver == "sqlite" {
 		driverName = "sqlite"
+	}
+
+	pgSchema := ""
+	if len(schema) > 0 {
+		pgSchema = strings.TrimSpace(schema[0])
 	}
 
 	conn, err := sql.Open(driverName, dsn)
@@ -227,6 +233,18 @@ func New(driver string, dsn string) (*DB, error) {
 		// PostgreSQL: 统一会话时区为 UTC，确保 NOW() 和时间字面量一致
 		if _, err := conn.ExecContext(ctx, "SET timezone = 'UTC'"); err != nil {
 			return nil, fmt.Errorf("设置数据库时区失败: %w", err)
+		}
+		// 自定义 schema：确保 schema 存在并确认当前会话 search_path 已生效。
+		// search_path 已通过 DSN 的 options=-c search_path=... 在所有连接启动时设置；
+		// 这里仅做一次幂等的 CREATE SCHEMA + SET 兜底，便于首次部署时自动建好 schema。
+		if pgSchema != "" {
+			quoted := pq.QuoteIdentifier(pgSchema)
+			if _, err := conn.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
+				return nil, fmt.Errorf("创建数据库 schema 失败: %w", err)
+			}
+			if _, err := conn.ExecContext(ctx, "SET search_path TO "+quoted+", public"); err != nil {
+				return nil, fmt.Errorf("设置 search_path 失败: %w", err)
+			}
 		}
 	}
 	if err := db.migrate(ctx); err != nil {

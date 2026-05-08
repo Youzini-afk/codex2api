@@ -41,7 +41,7 @@ func main() {
 	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label())
 
 	// 2. 初始化数据库
-	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN())
+	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN(), cfg.Database.Schema)
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
@@ -50,7 +50,11 @@ func main() {
 	case "sqlite":
 		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)
 	default:
-		log.Printf("%s 连接成功: %s:%d/%s", cfg.Database.Label(), cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
+		if cfg.Database.Schema != "" {
+			log.Printf("%s 连接成功: %s:%d/%s (schema=%s)", cfg.Database.Label(), cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName, cfg.Database.Schema)
+		} else {
+			log.Printf("%s 连接成功: %s:%d/%s", cfg.Database.Label(), cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
+		}
 	}
 
 	// 3. 读取运行时的系统逻辑设置（需在缓存初始化之前，以获取连接池大小）
