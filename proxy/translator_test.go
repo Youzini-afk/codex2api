@@ -32,6 +32,20 @@ func TestResolveServiceTier(t *testing.T) {
 	if got := resolveServiceTier("default", "fast"); got != "fast" {
 		t.Fatalf("expected requested fast to win for logging, got %q", got)
 	}
+	// priority 是 fast 的同义词，入库归一化为 fast，便于 UI 徽章/筛选统一识别
+	if got := resolveServiceTier("priority", ""); got != "fast" {
+		t.Fatalf("expected priority to normalize to fast, got %q", got)
+	}
+	if got := resolveServiceTier("", "priority"); got != "fast" {
+		t.Fatalf("expected requested priority to normalize to fast, got %q", got)
+	}
+	if got := resolveServiceTier("priority", "default"); got != "fast" {
+		t.Fatalf("expected actual priority to normalize to fast, got %q", got)
+	}
+	// flex / default 等其它 tier 保持原值
+	if got := resolveServiceTier("flex", ""); got != "flex" {
+		t.Fatalf("expected flex tier to be preserved, got %q", got)
+	}
 }
 
 func TestSanitizeServiceTierForUpstream_FastToPriority(t *testing.T) {

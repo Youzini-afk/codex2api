@@ -1918,10 +1918,12 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		paramIdx++
 	}
 	if f.FastOnly != nil {
+		// priority 是 fast 的同义词；新数据已在 resolveServiceTier 处归一化为 fast，
+		// 这里同时识别 priority 以兼容历史日志（issue #119 之前的 priority 透传记录）。
 		if *f.FastOnly {
-			where += ` AND COALESCE(u.service_tier, '') = 'fast'`
+			where += ` AND COALESCE(u.service_tier, '') IN ('fast', 'priority')`
 		} else {
-			where += ` AND COALESCE(u.service_tier, '') <> 'fast'`
+			where += ` AND COALESCE(u.service_tier, '') NOT IN ('fast', 'priority')`
 		}
 	}
 	if f.StreamOnly != nil {

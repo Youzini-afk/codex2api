@@ -293,7 +293,7 @@ export default function Usage() {
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
-  const showFastFilter = false
+  const showFastFilter = true
   const pageSizeOptions = [10, 20, 50, 100]
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
 
@@ -760,7 +760,7 @@ export default function Usage() {
                             {isImageUsageLog(log) && (
                               <ImageUsageBadge log={log} />
                             )}
-                            {log.service_tier === 'fast' && (
+                            {(log.service_tier === 'fast' || log.service_tier === 'priority') && (
                               <Badge
                                 variant="outline"
                                 className="text-[11px] font-semibold gap-0.5 border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"
