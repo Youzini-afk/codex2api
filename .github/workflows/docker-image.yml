@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      build_version:
+        description: 'Version label shown in the admin UI, e.g. 2.0.6'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -58,7 +63,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BUILD_VERSION=${{ github.ref_name }}
+            BUILD_VERSION=${{ inputs.build_version || github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
