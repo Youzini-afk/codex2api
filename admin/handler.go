@@ -1063,17 +1063,17 @@ type importToken struct {
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken      string `json:"refresh_token"`
-	SessionToken      string `json:"session_token"`
-	SessionTokenCamel string `json:"sessionToken"`
-	AccessToken       string `json:"access_token"`
-	IDToken           string `json:"id_token"`
-	AccountID         string `json:"account_id"`
-	Email             string `json:"email"`
-	Name              string `json:"name"`
-	PlanType          string `json:"plan_type"`
-	Expired           string `json:"expired"`
-	ExpiresAt         string `json:"expires_at"`
+	RefreshToken      string                 `json:"refresh_token"`
+	SessionToken      string                 `json:"session_token"`
+	SessionTokenCamel string                 `json:"sessionToken"`
+	AccessToken       string                 `json:"access_token"`
+	IDToken           string                 `json:"id_token"`
+	AccountID         string                 `json:"account_id"`
+	Email             string                 `json:"email"`
+	Name              string                 `json:"name"`
+	PlanType          string                 `json:"plan_type"`
+	Expired           importJSONScalarString `json:"expired"`
+	ExpiresAt         importJSONScalarString `json:"expires_at"`
 }
 
 type sub2apiImportPayload struct {
@@ -1086,16 +1086,45 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
-	RefreshToken      string `json:"refresh_token"`
-	SessionToken      string `json:"session_token"`
-	SessionTokenCamel string `json:"sessionToken"`
-	AccessToken       string `json:"access_token"`
-	IDToken           string `json:"id_token"`
-	AccountID         string `json:"account_id"`
-	Email             string `json:"email"`
-	PlanType          string `json:"plan_type"`
-	ExpiresAt         string `json:"expires_at"`
-	Expired           string `json:"expired"`
+	RefreshToken      string                 `json:"refresh_token"`
+	SessionToken      string                 `json:"session_token"`
+	SessionTokenCamel string                 `json:"sessionToken"`
+	AccessToken       string                 `json:"access_token"`
+	IDToken           string                 `json:"id_token"`
+	AccountID         string                 `json:"account_id"`
+	Email             string                 `json:"email"`
+	PlanType          string                 `json:"plan_type"`
+	ExpiresAt         importJSONScalarString `json:"expires_at"`
+	Expired           importJSONScalarString `json:"expired"`
+}
+
+type importJSONScalarString string
+
+func (v *importJSONScalarString) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var raw interface{}
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+
+	switch value := raw.(type) {
+	case string:
+		*v = importJSONScalarString(strings.TrimSpace(value))
+	case json.Number:
+		*v = importJSONScalarString(value.String())
+	case bool:
+		*v = importJSONScalarString(strconv.FormatBool(value))
+	default:
+		*v = ""
+	}
+
+	return nil
+}
+
+func (v importJSONScalarString) String() string {
+	return strings.TrimSpace(string(v))
 }
 
 var utf8BOM = []byte{0xef, 0xbb, 0xbf}
@@ -1155,7 +1184,7 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 				idToken:      strings.TrimSpace(entry.IDToken),
 				accountID:    strings.TrimSpace(entry.AccountID),
 				planType:     strings.TrimSpace(entry.PlanType),
-				expiresAt:    firstNonEmpty(entry.ExpiresAt, entry.Expired),
+				expiresAt:    firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
 			})
 		}
 	}
@@ -1190,7 +1219,7 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 				idToken:      strings.TrimSpace(account.Credentials.IDToken),
 				accountID:    strings.TrimSpace(account.Credentials.AccountID),
 				planType:     strings.TrimSpace(account.Credentials.PlanType),
-				expiresAt:    firstNonEmpty(account.Credentials.ExpiresAt, account.Credentials.Expired),
+				expiresAt:    firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
 			})
 		}
 	}
