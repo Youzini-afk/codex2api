@@ -24,6 +24,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -140,6 +141,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
@@ -2202,6 +2204,14 @@ type settingsResponse struct {
 	UsageLogFlushIntervalSeconds     int    `json:"usage_log_flush_interval_seconds"`
 	StreamFlushPolicy                string `json:"stream_flush_policy"`
 	StreamFlushIntervalMS            int    `json:"stream_flush_interval_ms"`
+	ImageStorageBackend              string `json:"image_storage_backend"`
+	ImageS3Endpoint                  string `json:"image_s3_endpoint"`
+	ImageS3Region                    string `json:"image_s3_region"`
+	ImageS3Bucket                    string `json:"image_s3_bucket"`
+	ImageS3AccessKey                 string `json:"image_s3_access_key"`
+	ImageS3SecretKey                 string `json:"image_s3_secret_key"`
+	ImageS3Prefix                    string `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle            bool   `json:"image_s3_force_path_style"`
 }
 
 type updateSettingsReq struct {
@@ -2245,6 +2255,14 @@ type updateSettingsReq struct {
 	UsageLogFlushIntervalSeconds     *int    `json:"usage_log_flush_interval_seconds"`
 	StreamFlushPolicy                *string `json:"stream_flush_policy"`
 	StreamFlushIntervalMS            *int    `json:"stream_flush_interval_ms"`
+	ImageStorageBackend              *string `json:"image_storage_backend"`
+	ImageS3Endpoint                  *string `json:"image_s3_endpoint"`
+	ImageS3Region                    *string `json:"image_s3_region"`
+	ImageS3Bucket                    *string `json:"image_s3_bucket"`
+	ImageS3AccessKey                 *string `json:"image_s3_access_key"`
+	ImageS3SecretKey                 *string `json:"image_s3_secret_key"`
+	ImageS3Prefix                    *string `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle            *bool   `json:"image_s3_force_path_style"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2264,6 +2282,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
+	imgCfg := imagestore.CurrentConfig()
+	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
@@ -2310,6 +2330,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     h.db.GetUsageLogFlushIntervalSeconds(),
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		ImageStorageBackend:              imgCfg.Backend,
+		ImageS3Endpoint:                  imgCfg.Endpoint,
+		ImageS3Region:                    imgCfg.Region,
+		ImageS3Bucket:                    imgCfg.Bucket,
+		ImageS3AccessKey:                 imgCfg.AccessKey,
+		ImageS3SecretKey:                 imgCfg.SecretKey,
+		ImageS3Prefix:                    imgPrefix,
+		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
 	})
 }
 
@@ -2655,6 +2683,57 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
+	// 图片存储后端配置
+	imgCfg := imagestore.CurrentConfig()
+	imgChanged := false
+	if req.ImageStorageBackend != nil {
+		imgCfg.Backend = *req.ImageStorageBackend
+		imgChanged = true
+	}
+	if req.ImageS3Endpoint != nil {
+		imgCfg.Endpoint = *req.ImageS3Endpoint
+		imgChanged = true
+	}
+	if req.ImageS3Region != nil {
+		imgCfg.Region = *req.ImageS3Region
+		imgChanged = true
+	}
+	if req.ImageS3Bucket != nil {
+		imgCfg.Bucket = *req.ImageS3Bucket
+		imgChanged = true
+	}
+	if req.ImageS3AccessKey != nil {
+		imgCfg.AccessKey = *req.ImageS3AccessKey
+		imgChanged = true
+	}
+	if req.ImageS3SecretKey != nil {
+		imgCfg.SecretKey = *req.ImageS3SecretKey
+		imgChanged = true
+	}
+	if req.ImageS3Prefix != nil {
+		imgCfg.Prefix = *req.ImageS3Prefix
+		imgChanged = true
+	}
+	if req.ImageS3ForcePathStyle != nil {
+		imgCfg.ForcePathStyle = *req.ImageS3ForcePathStyle
+		imgChanged = true
+	}
+	imgCfg.LocalDir = imageAssetDir()
+	if imgChanged {
+		if err := imagestore.Configure(imgCfg); err != nil {
+			writeError(c, http.StatusBadRequest, "图片存储配置无效: "+err.Error())
+			return
+		}
+		// Configure 内部 Normalize 过，重新读出来用于持久化
+		imgCfg = imagestore.CurrentConfig()
+		log.Printf("设置已更新: image_storage_backend = %s", imgCfg.Backend)
+	}
+	imgConfigJSON, encodeErr := imagestore.EncodeConfigJSON(imgCfg)
+	if encodeErr != nil {
+		log.Printf("图片存储配置序列化失败: %v", encodeErr)
+		imgConfigJSON = "{}"
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2697,6 +2776,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		ImageStorageConfig:               imgConfigJSON,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2762,7 +2842,61 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		ImageStorageBackend:              imgCfg.Backend,
+		ImageS3Endpoint:                  imgCfg.Endpoint,
+		ImageS3Region:                    imgCfg.Region,
+		ImageS3Bucket:                    imgCfg.Bucket,
+		ImageS3AccessKey:                 imgCfg.AccessKey,
+		ImageS3SecretKey:                 imgCfg.SecretKey,
+		ImageS3Prefix:                    strings.TrimSuffix(imgCfg.Prefix, "/"),
+		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
 	})
+}
+
+type testImageStorageReq struct {
+	Endpoint       string `json:"endpoint"`
+	Region         string `json:"region"`
+	Bucket         string `json:"bucket"`
+	AccessKey      string `json:"access_key"`
+	SecretKey      string `json:"secret_key"`
+	Prefix         string `json:"prefix"`
+	ForcePathStyle bool   `json:"force_path_style"`
+}
+
+// TestImageStorageConnection 用提交的字段临时构造一次 S3Backend，调用 HeadBucket 验证可达性。
+// 不修改任何持久化状态，便于"保存前先点测试连接"。
+func (h *Handler) TestImageStorageConnection(c *gin.Context) {
+	var req testImageStorageReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	cfg := imagestore.Config{
+		Backend:        imagestore.BackendS3,
+		Endpoint:       req.Endpoint,
+		Region:         req.Region,
+		Bucket:         req.Bucket,
+		AccessKey:      req.AccessKey,
+		SecretKey:      req.SecretKey,
+		Prefix:         req.Prefix,
+		ForcePathStyle: req.ForcePathStyle,
+	}.Normalize()
+	if err := cfg.Validate(); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	backend, err := imagestore.NewS3Backend(cfg)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := backend.HeadBucket(ctx); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "bucket": cfg.Bucket})
 }
 
 // ==================== 导出 & 迁移 ====================

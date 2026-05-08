@@ -249,6 +249,19 @@ export const api = {
   getSettings: () => request<SystemSettings>('/settings'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  testImageStorageConnection: (data: {
+    endpoint: string
+    region: string
+    bucket: string
+    access_key: string
+    secret_key: string
+    prefix: string
+    force_path_style: boolean
+  }) =>
+    request<{ ok: boolean; bucket: string }>('/settings/image-storage/test', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getPromptFilterLogs: (params: number | { page?: number; pageSize?: number; limit?: number; source?: string; action?: string; endpoint?: string; model?: string; apiKeyId?: string; q?: string } = 100) => {
     const search = new URLSearchParams()
     if (typeof params === 'number') {

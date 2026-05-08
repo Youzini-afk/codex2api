@@ -225,6 +225,10 @@ export default function Settings() {
     { label: t('settings.streamFlushImmediate'), value: 'immediate' },
     { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
   ]
+  const imageStorageBackendOptions = [
+    { label: t('settings.imageStorageLocal'), value: 'local' },
+    { label: t('settings.imageStorageS3'), value: 's3' },
+  ]
   const [settingsForm, setSettingsForm] = useState<SystemSettings>({
     max_concurrency: 2,
     global_rpm: 0,
@@ -270,8 +274,17 @@ export default function Settings() {
     usage_log_flush_interval_seconds: 5,
     stream_flush_policy: 'immediate',
     stream_flush_interval_ms: 20,
+    image_storage_backend: 'local',
+    image_s3_endpoint: '',
+    image_s3_region: '',
+    image_s3_bucket: '',
+    image_s3_access_key: '',
+    image_s3_secret_key: '',
+    image_s3_prefix: '',
+    image_s3_force_path_style: false,
   })
   const [savingSettings, setSavingSettings] = useState(false)
+  const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
   const [modelItems, setModelItems] = useState<ModelInfo[]>([])
@@ -325,6 +338,26 @@ export default function Settings() {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSavingSettings(false)
+    }
+  }
+
+  const handleTestImageStorage = async () => {
+    setTestingImageStorage(true)
+    try {
+      const result = await api.testImageStorageConnection({
+        endpoint: settingsForm.image_s3_endpoint,
+        region: settingsForm.image_s3_region,
+        bucket: settingsForm.image_s3_bucket,
+        access_key: settingsForm.image_s3_access_key,
+        secret_key: settingsForm.image_s3_secret_key,
+        prefix: settingsForm.image_s3_prefix,
+        force_path_style: settingsForm.image_s3_force_path_style,
+      })
+      showToast(t('settings.imageS3TestSuccess', { bucket: result.bucket }))
+    } catch (error) {
+      showToast(`${t('settings.imageS3TestFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setTestingImageStorage(false)
     }
   }
 
@@ -578,6 +611,84 @@ export default function Settings() {
                 />
               </SettingField>
             </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.imageStorage')} description={t('settings.imageStorageDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-4">
+              <SettingField label={t('settings.imageStorageBackend')} description={t('settings.imageStorageBackendDesc')}>
+                <Select
+                  value={settingsForm.image_storage_backend}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, image_storage_backend: value }))}
+                  options={imageStorageBackendOptions}
+                />
+              </SettingField>
+              {settingsForm.image_storage_backend === 's3' ? (
+                <>
+                  <SettingField label={t('settings.imageS3Endpoint')} description={t('settings.imageS3EndpointDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_endpoint}
+                      placeholder="https://..."
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_endpoint: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3Region')} description={t('settings.imageS3RegionDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_region}
+                      placeholder="auto"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_region: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3Bucket')} description={t('settings.imageS3BucketDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_bucket}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_bucket: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3AccessKey')} description={t('settings.imageS3AccessKeyDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_access_key}
+                      autoComplete="off"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_access_key: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3SecretKey')} description={t('settings.imageS3SecretKeyDesc')}>
+                    <Input
+                      type="password"
+                      value={settingsForm.image_s3_secret_key}
+                      autoComplete="new-password"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_secret_key: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3Prefix')} description={t('settings.imageS3PrefixDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_prefix}
+                      placeholder="codex/images"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_prefix: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3ForcePathStyle')} description={t('settings.imageS3ForcePathStyleDesc')}>
+                    <Select
+                      value={settingsForm.image_s3_force_path_style ? 'true' : 'false'}
+                      onValueChange={(value) => setSettingsForm((f) => ({ ...f, image_s3_force_path_style: value === 'true' }))}
+                      options={booleanOptions}
+                    />
+                  </SettingField>
+                </>
+              ) : null}
+            </div>
+            {settingsForm.image_storage_backend === 's3' ? (
+              <div className="mt-4">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleTestImageStorage()}
+                  disabled={testingImageStorage || !settingsForm.image_s3_bucket || !settingsForm.image_s3_access_key || !settingsForm.image_s3_secret_key}
+                >
+                  {testingImageStorage ? t('settings.imageS3Testing') : t('settings.imageS3Test')}
+                </Button>
+              </div>
+            ) : null}
           </SettingsCard>
 
           <SettingsCard title={t('settings.autoCleanup')}>

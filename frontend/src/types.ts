@@ -250,6 +250,14 @@ export interface SystemSettings {
   usage_log_flush_interval_seconds: number
   stream_flush_policy: 'immediate' | 'coalesce' | string
   stream_flush_interval_ms: number
+  image_storage_backend: 'local' | 's3' | string
+  image_s3_endpoint: string
+  image_s3_region: string
+  image_s3_bucket: string
+  image_s3_access_key: string
+  image_s3_secret_key: string
+  image_s3_prefix: string
+  image_s3_force_path_style: boolean
 }
 
 export interface PromptFilterMatch {
