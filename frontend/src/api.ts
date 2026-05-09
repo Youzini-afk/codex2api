@@ -22,6 +22,7 @@ import type {
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
+  OpsErrorSummary,
   OpsOverviewResponse,
   PromptFilterLogsResponse,
   PromptFilterRulesResponse,
@@ -130,6 +131,30 @@ async function requestBlob(path: string, options: RequestInit = {}): Promise<Blo
   return res.blob()
 }
 
+function buildOpsErrorSearchParams(params: {
+  start: string
+  end: string
+  status?: string
+  errorKind?: string
+  endpoint?: string
+  apiKeyId?: string
+  stream?: string
+  fast?: string
+  q?: string
+}) {
+  const search = new URLSearchParams()
+  search.set('start', params.start)
+  search.set('end', params.end)
+  if (params.status) search.set('status', params.status)
+  if (params.errorKind) search.set('error_kind', params.errorKind)
+  if (params.endpoint) search.set('endpoint', params.endpoint)
+  if (params.apiKeyId) search.set('api_key_id', params.apiKeyId)
+  if (params.stream) search.set('stream', params.stream)
+  if (params.fast) search.set('fast', params.fast)
+  if (params.q) search.set('q', params.q)
+  return search
+}
+
 export const api = {
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
@@ -155,6 +180,38 @@ export const api = {
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
   getHealth: () => request<HealthResponse>('/health'),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
+  getOpsErrorSummary: (params: {
+    start: string
+    end: string
+    status?: string
+    errorKind?: string
+    endpoint?: string
+    apiKeyId?: string
+    stream?: string
+    fast?: string
+    q?: string
+  }) => {
+    const search = buildOpsErrorSearchParams(params)
+    return request<OpsErrorSummary>(`/ops/errors/summary?${search.toString()}`)
+  },
+  getOpsErrors: (params: {
+    start: string
+    end: string
+    page: number
+    pageSize?: number
+    status?: string
+    errorKind?: string
+    endpoint?: string
+    apiKeyId?: string
+    stream?: string
+    fast?: string
+    q?: string
+  }) => {
+    const search = buildOpsErrorSearchParams(params)
+    search.set('page', String(params.page))
+    if (params.pageSize) search.set('page_size', String(params.pageSize))
+    return request<UsageLogsPagedResponse>(`/ops/errors?${search.toString()}`)
+  },
   getUsageStats: () => request<UsageStats>('/usage/stats'),
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()

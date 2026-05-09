@@ -428,6 +428,9 @@ export interface UsageLog {
   output_price_per_mtoken: number
   cache_read_price_per_mtoken: number
   rate_multiplier: number
+  is_retry_attempt: boolean
+  attempt_index: number
+  upstream_error_kind: string
   error_message: string
 }
 
@@ -438,6 +441,18 @@ export interface UsageLogsPagedResponse {
   total: number
 }
 
+export interface OpsErrorSummary {
+  total_errors: number
+  status_4xx: number
+  status_5xx: number
+  unauthorized: number
+  rate_limited: number
+  canceled: number
+  timeouts: number
+  retry_attempts: number
+  avg_duration_ms: number
+}
+
 export interface ChartTimelinePoint {
   bucket: string
   requests: number
@@ -446,7 +461,8 @@ export interface ChartTimelinePoint {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
-  errors_401: number
+  errors_4xx: number
+  errors_5xx: number
 }
 
 export interface ChartModelPoint {

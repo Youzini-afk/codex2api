@@ -144,6 +144,7 @@ export function Select({
         ? createPortal(
             <div
               ref={dropdownRef}
+              data-select-dropdown="true"
               style={{
                 position: 'fixed',
                 top: position.openUp ? undefined : position.top,
@@ -152,7 +153,7 @@ export function Select({
                 width: position.width,
               }}
               className={cn(
-                'z-[1000] overflow-hidden border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm rounded-lg'
+                'pointer-events-auto z-[1000] overflow-hidden border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm rounded-lg'
               )}
             >
               <div

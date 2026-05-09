@@ -130,6 +130,129 @@ func TestUsageLogModeErrorsSkipsSuccessfulLogs(t *testing.T) {
 	}
 }
 
+func TestUsageErrorSummaryAndFilters(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	for _, usageLog := range []*UsageLogInput{
+		{
+			AccountID:         1,
+			Endpoint:          "/v1/responses",
+			InboundEndpoint:   "/v1/responses",
+			UpstreamEndpoint:  "/backend-api/codex/responses",
+			Model:             "gpt-5.4",
+			StatusCode:        500,
+			DurationMs:        1200,
+			IsRetryAttempt:    true,
+			AttemptIndex:      1,
+			UpstreamErrorKind: "upstream_timeout",
+			ErrorMessage:      "upstream timeout",
+		},
+		{
+			AccountID:         2,
+			Endpoint:          "/v1/messages",
+			InboundEndpoint:   "/v1/messages",
+			Model:             "claude-sonnet-4.5",
+			StatusCode:        401,
+			DurationMs:        80,
+			UpstreamErrorKind: "unauthorized",
+			ErrorMessage:      "invalid access token",
+		},
+		{
+			AccountID:    3,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   499,
+			DurationMs:   30,
+			ErrorMessage: "client canceled",
+		},
+		{
+			AccountID:  4,
+			Endpoint:   "/v1/responses",
+			Model:      "gpt-5.4",
+			StatusCode: 200,
+			DurationMs: 90,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	now := time.Now()
+	filter := UsageLogFilter{
+		Start:           now.Add(-1 * time.Hour),
+		End:             now.Add(1 * time.Hour),
+		Page:            1,
+		PageSize:        10,
+		ErrorOnly:       true,
+		IncludeCanceled: true,
+	}
+	page, err := db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
+	}
+	if page.Total != 3 {
+		t.Fatalf("page.Total = %d, want 3", page.Total)
+	}
+
+	foundRetry := false
+	for _, usageLog := range page.Logs {
+		if usageLog.UpstreamErrorKind == "upstream_timeout" {
+			foundRetry = true
+			if !usageLog.IsRetryAttempt {
+				t.Fatal("IsRetryAttempt = false, want true")
+			}
+			if usageLog.AttemptIndex != 1 {
+				t.Fatalf("AttemptIndex = %d, want 1", usageLog.AttemptIndex)
+			}
+		}
+	}
+	if !foundRetry {
+		t.Fatal("未找到 upstream_timeout 错误日志")
+	}
+
+	summary, err := db.GetUsageErrorSummary(ctx, filter)
+	if err != nil {
+		t.Fatalf("GetUsageErrorSummary 返回错误: %v", err)
+	}
+	if summary.TotalErrors != 3 {
+		t.Fatalf("TotalErrors = %d, want 3", summary.TotalErrors)
+	}
+	if summary.Status5xx != 1 || summary.Unauthorized != 1 || summary.Canceled != 1 || summary.Timeouts != 1 || summary.RetryAttempts != 1 {
+		t.Fatalf("summary = %+v, want one 5xx/401/499/timeout/retry", summary)
+	}
+
+	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5)
+	if err != nil {
+		t.Fatalf("GetChartAggregation 返回错误: %v", err)
+	}
+	var chart4xx, chart5xx int64
+	for _, point := range charts.Timeline {
+		chart4xx += point.Errors4xx
+		chart5xx += point.Errors5xx
+	}
+	if chart4xx != 1 || chart5xx != 1 {
+		t.Fatalf("chart errors = 4xx:%d 5xx:%d, want 1/1", chart4xx, chart5xx)
+	}
+
+	filter.StatusFamily = "5xx"
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged status family 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 500 {
+		t.Fatalf("5xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+}
+
 func TestUsageLogModeOffSkipsAllLogs(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

@@ -8,6 +8,7 @@ import Dashboard from './pages/Dashboard'
 
 const Accounts = lazy(() => import('./pages/Accounts'))
 const Operations = lazy(() => import('./pages/Operations'))
+const OperationsErrors = lazy(() => import('./pages/OperationsErrors'))
 const Proxies = lazy(() => import('./pages/Proxies'))
 const SchedulerBoard = lazy(() => import('./pages/SchedulerBoard'))
 const Settings = lazy(() => import('./pages/Settings'))
@@ -33,7 +34,9 @@ export default function App() {
               <Route path="/images/:view" element={<ImageStudio />} />
               <Route path="/prompt-filter" element={<Navigate to="/prompt-filter/overview" replace />} />
               <Route path="/prompt-filter/:view" element={<PromptFilter />} />
-              <Route path="/ops" element={<Operations />} />
+              <Route path="/ops" element={<Navigate to="/ops/overview" replace />} />
+              <Route path="/ops/overview" element={<Operations />} />
+              <Route path="/ops/errors" element={<OperationsErrors />} />
               <Route path="/ops/scheduler" element={<SchedulerBoard />} />
               <Route path="/usage" element={<Usage />} />
               <Route path="/settings" element={<Settings />} />

@@ -473,7 +473,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		outputTokens    int64
 		reasoningTokens int64
 		cachedTokens    int64
-		errors401       int64
+		errors4xx       int64
+		errors5xx       int64
 	}
 
 	result := &ChartAggregation{}
@@ -509,8 +510,11 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		agg.outputTokens += outputTokens
 		agg.reasoningTokens += reasoningTokens
 		agg.cachedTokens += cachedTokens
-		if statusCode == 401 {
-			agg.errors401++
+		if statusCode >= 400 && statusCode < 500 {
+			agg.errors4xx++
+		}
+		if statusCode >= 500 && statusCode < 600 {
+			agg.errors5xx++
 		}
 
 		modelName := "unknown"
@@ -542,7 +546,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 			OutputTokens:    agg.outputTokens,
 			ReasoningTokens: agg.reasoningTokens,
 			CachedTokens:    agg.cachedTokens,
-			Errors401:       agg.errors401,
+			Errors4xx:       agg.errors4xx,
+			Errors5xx:       agg.errors5xx,
 		})
 	}
 	if result.Timeline == nil {

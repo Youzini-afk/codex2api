@@ -1109,48 +1109,51 @@ func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location 
 
 // UsageLog 请求日志行
 type UsageLog struct {
-	ID               int64     `json:"id"`
-	AccountID        int64     `json:"account_id"`
-	Endpoint         string    `json:"endpoint"`
-	Model            string    `json:"model"`
-	EffectiveModel   string    `json:"effective_model"`
-	PromptTokens     int       `json:"prompt_tokens"`
-	CompletionTokens int       `json:"completion_tokens"`
-	TotalTokens      int       `json:"total_tokens"`
-	StatusCode       int       `json:"status_code"`
-	DurationMs       int       `json:"duration_ms"`
-	InputTokens      int       `json:"input_tokens"`
-	OutputTokens     int       `json:"output_tokens"`
-	ReasoningTokens  int       `json:"reasoning_tokens"`
-	FirstTokenMs     int       `json:"first_token_ms"`
-	ReasoningEffort  string    `json:"reasoning_effort"`
-	InboundEndpoint  string    `json:"inbound_endpoint"`
-	UpstreamEndpoint string    `json:"upstream_endpoint"`
-	Stream           bool      `json:"stream"`
-	CachedTokens     int       `json:"cached_tokens"`
-	ServiceTier      string    `json:"service_tier"`
-	APIKeyID         int64     `json:"api_key_id"`
-	APIKeyName       string    `json:"api_key_name"`
-	APIKeyMasked     string    `json:"api_key_masked"`
-	ImageCount       int       `json:"image_count"`
-	ImageWidth       int       `json:"image_width"`
-	ImageHeight      int       `json:"image_height"`
-	ImageBytes       int       `json:"image_bytes"`
-	ImageFormat      string    `json:"image_format"`
-	ImageSize        string    `json:"image_size"`
-	AccountEmail     string    `json:"account_email"`
-	CreatedAt        time.Time `json:"created_at"`
-	AccountBilled    float64   `json:"account_billed"`
-	UserBilled       float64   `json:"user_billed"`
-	InputCost        float64   `json:"input_cost"`
-	OutputCost       float64   `json:"output_cost"`
-	CacheReadCost    float64   `json:"cache_read_cost"`
-	TotalCost        float64   `json:"total_cost"`
-	InputPrice       float64   `json:"input_price_per_mtoken"`
-	OutputPrice      float64   `json:"output_price_per_mtoken"`
-	CacheReadPrice   float64   `json:"cache_read_price_per_mtoken"`
-	RateMultiplier   float64   `json:"rate_multiplier"`
-	ErrorMessage     string    `json:"error_message"`
+	ID                int64     `json:"id"`
+	AccountID         int64     `json:"account_id"`
+	Endpoint          string    `json:"endpoint"`
+	Model             string    `json:"model"`
+	EffectiveModel    string    `json:"effective_model"`
+	PromptTokens      int       `json:"prompt_tokens"`
+	CompletionTokens  int       `json:"completion_tokens"`
+	TotalTokens       int       `json:"total_tokens"`
+	StatusCode        int       `json:"status_code"`
+	DurationMs        int       `json:"duration_ms"`
+	InputTokens       int       `json:"input_tokens"`
+	OutputTokens      int       `json:"output_tokens"`
+	ReasoningTokens   int       `json:"reasoning_tokens"`
+	FirstTokenMs      int       `json:"first_token_ms"`
+	ReasoningEffort   string    `json:"reasoning_effort"`
+	InboundEndpoint   string    `json:"inbound_endpoint"`
+	UpstreamEndpoint  string    `json:"upstream_endpoint"`
+	Stream            bool      `json:"stream"`
+	CachedTokens      int       `json:"cached_tokens"`
+	ServiceTier       string    `json:"service_tier"`
+	APIKeyID          int64     `json:"api_key_id"`
+	APIKeyName        string    `json:"api_key_name"`
+	APIKeyMasked      string    `json:"api_key_masked"`
+	ImageCount        int       `json:"image_count"`
+	ImageWidth        int       `json:"image_width"`
+	ImageHeight       int       `json:"image_height"`
+	ImageBytes        int       `json:"image_bytes"`
+	ImageFormat       string    `json:"image_format"`
+	ImageSize         string    `json:"image_size"`
+	AccountEmail      string    `json:"account_email"`
+	CreatedAt         time.Time `json:"created_at"`
+	AccountBilled     float64   `json:"account_billed"`
+	UserBilled        float64   `json:"user_billed"`
+	InputCost         float64   `json:"input_cost"`
+	OutputCost        float64   `json:"output_cost"`
+	CacheReadCost     float64   `json:"cache_read_cost"`
+	TotalCost         float64   `json:"total_cost"`
+	InputPrice        float64   `json:"input_price_per_mtoken"`
+	OutputPrice       float64   `json:"output_price_per_mtoken"`
+	CacheReadPrice    float64   `json:"cache_read_price_per_mtoken"`
+	RateMultiplier    float64   `json:"rate_multiplier"`
+	IsRetryAttempt    bool      `json:"is_retry_attempt"`
+	AttemptIndex      int       `json:"attempt_index"`
+	UpstreamErrorKind string    `json:"upstream_error_kind"`
+	ErrorMessage      string    `json:"error_message"`
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
@@ -1598,7 +1601,8 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
-		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0), COALESCE(u.error_message, ''),
+		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
+		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
 		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1618,7 +1622,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
-			&l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
+			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1643,7 +1647,8 @@ type ChartTimelinePoint struct {
 	OutputTokens    int64   `json:"output_tokens"`
 	ReasoningTokens int64   `json:"reasoning_tokens"`
 	CachedTokens    int64   `json:"cached_tokens"`
-	Errors401       int64   `json:"errors_401"`
+	Errors4xx       int64   `json:"errors_4xx"`
+	Errors5xx       int64   `json:"errors_5xx"`
 }
 
 // ChartModelPoint 模型排行聚合点
@@ -1708,7 +1713,8 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 		COALESCE(SUM(output_tokens), 0)       AS output_tokens,
 		COALESCE(SUM(reasoning_tokens), 0)    AS reasoning_tokens,
 		COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
-		COALESCE(SUM(CASE WHEN status_code = 401 THEN 1 ELSE 0 END), 0) AS errors_401
+		COALESCE(SUM(CASE WHEN status_code >= 400 AND status_code < 500 THEN 1 ELSE 0 END), 0) AS errors_4xx,
+		COALESCE(SUM(CASE WHEN status_code >= 500 AND status_code < 600 THEN 1 ELSE 0 END), 0) AS errors_5xx
 	FROM usage_logs
 	WHERE created_at >= $1 AND created_at <= $2
 	  AND status_code <> 499
@@ -1723,7 +1729,7 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 
 	for rows.Next() {
 		var p ChartTimelinePoint
-		if err := rows.Scan(&p.Bucket, &p.Requests, &p.AvgLatency, &p.InputTokens, &p.OutputTokens, &p.ReasoningTokens, &p.CachedTokens, &p.Errors401); err != nil {
+		if err := rows.Scan(&p.Bucket, &p.Requests, &p.AvgLatency, &p.InputTokens, &p.OutputTokens, &p.ReasoningTokens, &p.CachedTokens, &p.Errors4xx, &p.Errors5xx); err != nil {
 			return nil, err
 		}
 		result.Timeline = append(result.Timeline, p)
@@ -1827,7 +1833,8 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
-		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0), COALESCE(u.error_message, ''),
+		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
+		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
 		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1848,7 +1855,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens, &l.ServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
-			&l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
+			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -1870,16 +1877,157 @@ type UsageLogPage struct {
 
 // UsageLogFilter 日志查询过滤条件
 type UsageLogFilter struct {
-	Start      time.Time
-	End        time.Time
-	Page       int
-	PageSize   int
-	Email      string // LIKE 模糊匹配
-	Model      string // 精确匹配
-	Endpoint   string // 精确匹配 inbound_endpoint
-	APIKeyID   *int64 // nil=全部
-	FastOnly   *bool  // nil=全部, true=仅fast, false=仅非fast
-	StreamOnly *bool  // nil=全部, true=仅stream, false=仅sync
+	Start           time.Time
+	End             time.Time
+	Page            int
+	PageSize        int
+	Email           string // LIKE 模糊匹配
+	Model           string // 精确匹配
+	Endpoint        string // 精确匹配 inbound_endpoint
+	APIKeyID        *int64 // nil=全部
+	AccountID       *int64 // nil=全部
+	FastOnly        *bool  // nil=全部, true=仅fast, false=仅非fast
+	StreamOnly      *bool  // nil=全部, true=仅stream, false=仅sync
+	ErrorOnly       bool
+	IncludeCanceled bool
+	StatusCode      int
+	StatusFamily    string
+	ErrorKind       string
+	Query           string
+}
+
+func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
+	startArg, endArg := db.timeRangeArgs(f.Start, f.End)
+	parts := []string{`u.created_at >= $1 AND u.created_at <= $2`}
+	args := []interface{}{startArg, endArg}
+	paramIdx := 3
+	addArg := func(value interface{}) string {
+		placeholder := fmt.Sprintf("$%d", paramIdx)
+		args = append(args, value)
+		paramIdx++
+		return placeholder
+	}
+
+	if !f.IncludeCanceled {
+		parts = append(parts, `u.status_code <> 499`)
+	}
+	if f.ErrorOnly {
+		parts = append(parts, `(u.status_code >= 400 OR COALESCE(u.error_message, '') <> '' OR COALESCE(u.upstream_error_kind, '') <> '')`)
+	}
+	if f.Email != "" {
+		p := addArg("%" + f.Email + "%")
+		parts = append(parts, fmt.Sprintf(`LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%s)`, p))
+	}
+	if f.Model != "" {
+		p := addArg(f.Model)
+		parts = append(parts, fmt.Sprintf(`(u.model = %s OR COALESCE(u.effective_model, '') = %s)`, p, p))
+	}
+	if f.Endpoint != "" {
+		p := addArg(f.Endpoint)
+		parts = append(parts, fmt.Sprintf(`u.inbound_endpoint = %s`, p))
+	}
+	if f.APIKeyID != nil {
+		p := addArg(*f.APIKeyID)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.api_key_id, 0) = %s`, p))
+	}
+	if f.AccountID != nil {
+		p := addArg(*f.AccountID)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.account_id, 0) = %s`, p))
+	}
+	if f.FastOnly != nil {
+		// priority 是 fast 的同义词；新数据已在 resolveServiceTier 处归一化为 fast，
+		// 这里同时识别 priority 以兼容历史日志（issue #119 之前的 priority 透传记录）。
+		if *f.FastOnly {
+			parts = append(parts, `COALESCE(u.service_tier, '') IN ('fast', 'priority')`)
+		} else {
+			parts = append(parts, `COALESCE(u.service_tier, '') NOT IN ('fast', 'priority')`)
+		}
+	}
+	if f.StreamOnly != nil {
+		p := addArg(*f.StreamOnly)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.stream, false) = %s`, p))
+	}
+	if f.StatusCode > 0 {
+		p := addArg(f.StatusCode)
+		parts = append(parts, fmt.Sprintf(`u.status_code = %s`, p))
+	}
+	switch strings.ToLower(strings.TrimSpace(f.StatusFamily)) {
+	case "4xx":
+		parts = append(parts, `u.status_code >= 400 AND u.status_code < 500`)
+	case "5xx":
+		parts = append(parts, `u.status_code >= 500 AND u.status_code < 600`)
+	}
+	if f.ErrorKind != "" {
+		p := addArg(f.ErrorKind)
+		parts = append(parts, fmt.Sprintf(`COALESCE(u.upstream_error_kind, '') = %s`, p))
+	}
+	if f.Query != "" {
+		p := addArg("%" + f.Query + "%")
+		parts = append(parts, fmt.Sprintf(`(
+			LOWER(COALESCE(u.error_message, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.upstream_error_kind, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.model, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.effective_model, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.inbound_endpoint, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.upstream_endpoint, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.api_key_name, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.api_key_masked, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
+		)`, p))
+	}
+
+	return strings.Join(parts, " AND "), args
+}
+
+type UsageErrorSummary struct {
+	TotalErrors   int64   `json:"total_errors"`
+	Status4xx     int64   `json:"status_4xx"`
+	Status5xx     int64   `json:"status_5xx"`
+	Unauthorized  int64   `json:"unauthorized"`
+	RateLimited   int64   `json:"rate_limited"`
+	Canceled      int64   `json:"canceled"`
+	Timeouts      int64   `json:"timeouts"`
+	RetryAttempts int64   `json:"retry_attempts"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
+}
+
+func (db *DB) GetUsageErrorSummary(ctx context.Context, f UsageLogFilter) (*UsageErrorSummary, error) {
+	f.ErrorOnly = true
+	f.IncludeCanceled = true
+	where, args := db.buildUsageLogWhere(f)
+	query := `SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN u.status_code >= 400 AND u.status_code < 500 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN u.status_code >= 500 AND u.status_code < 600 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN u.status_code = 401 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN u.status_code = 429 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN u.status_code = 499 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN
+			LOWER(COALESCE(u.upstream_error_kind, '')) LIKE '%timeout%'
+			OR LOWER(COALESCE(u.error_message, '')) LIKE '%timeout%'
+			OR LOWER(COALESCE(u.error_message, '')) LIKE '%deadline%'
+		THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN COALESCE(u.is_retry_attempt, false) THEN 1 ELSE 0 END), 0),
+		COALESCE(AVG(u.duration_ms), 0)
+		FROM usage_logs u
+		LEFT JOIN accounts a ON u.account_id = a.id
+		WHERE ` + where
+
+	result := &UsageErrorSummary{}
+	if err := db.conn.QueryRowContext(ctx, query, args...).Scan(
+		&result.TotalErrors,
+		&result.Status4xx,
+		&result.Status5xx,
+		&result.Unauthorized,
+		&result.RateLimited,
+		&result.Canceled,
+		&result.Timeouts,
+		&result.RetryAttempts,
+		&result.AvgDurationMs,
+	); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ListUsageLogsByTimeRangePaged 按时间范围分页查询请求日志（支持筛选）
@@ -1891,48 +2039,9 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		f.PageSize = 20
 	}
 
-	// 动态拼接 WHERE 条件
-	where := `u.created_at >= $1 AND u.created_at <= $2 AND u.status_code <> 499`
-	startArg, endArg := db.timeRangeArgs(f.Start, f.End)
-	args := []interface{}{startArg, endArg}
-	paramIdx := 3
-
-	if f.Email != "" {
-		where += fmt.Sprintf(` AND LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER($%d)`, paramIdx)
-		args = append(args, "%"+f.Email+"%")
-		paramIdx++
-	}
-	if f.Model != "" {
-		where += fmt.Sprintf(` AND (u.model = $%d OR COALESCE(u.effective_model, '') = $%d)`, paramIdx, paramIdx)
-		args = append(args, f.Model)
-		paramIdx++
-	}
-	if f.Endpoint != "" {
-		where += fmt.Sprintf(` AND u.inbound_endpoint = $%d`, paramIdx)
-		args = append(args, f.Endpoint)
-		paramIdx++
-	}
-	if f.APIKeyID != nil {
-		where += fmt.Sprintf(` AND COALESCE(u.api_key_id, 0) = $%d`, paramIdx)
-		args = append(args, *f.APIKeyID)
-		paramIdx++
-	}
-	if f.FastOnly != nil {
-		// priority 是 fast 的同义词；新数据已在 resolveServiceTier 处归一化为 fast，
-		// 这里同时识别 priority 以兼容历史日志（issue #119 之前的 priority 透传记录）。
-		if *f.FastOnly {
-			where += ` AND COALESCE(u.service_tier, '') IN ('fast', 'priority')`
-		} else {
-			where += ` AND COALESCE(u.service_tier, '') NOT IN ('fast', 'priority')`
-		}
-	}
-	if f.StreamOnly != nil {
-		where += fmt.Sprintf(` AND COALESCE(u.stream, false) = $%d`, paramIdx)
-		args = append(args, *f.StreamOnly)
-		paramIdx++
-	}
-
+	where, args := db.buildUsageLogWhere(f)
 	offset := (f.Page - 1) * f.PageSize
+	paramIdx := len(args) + 1
 	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)
 	args = append(args, f.PageSize, offset)
 
@@ -1943,8 +2052,9 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
-		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0), COALESCE(u.error_message, ''),
-		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
+			            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
+			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+			            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -1964,7 +2074,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens,
 			&l.ServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.ErrorMessage, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)

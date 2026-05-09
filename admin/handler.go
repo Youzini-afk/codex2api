@@ -139,6 +139,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/health", h.GetHealth)
 	api.GET("/ops/overview", h.GetOpsOverview)
+	api.GET("/ops/errors", h.GetOpsErrorLogs)
+	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
@@ -1967,6 +1969,140 @@ func (h *Handler) GetChartData(c *gin.Context) {
 	}
 	h.chartCacheMu.Unlock()
 
+	c.JSON(http.StatusOK, result)
+}
+
+func parseOpsErrorPositiveInt64(c *gin.Context, name string) (*int64, bool) {
+	raw := strings.TrimSpace(c.Query(name))
+	if raw == "" {
+		return nil, true
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed <= 0 {
+		writeError(c, http.StatusBadRequest, fmt.Sprintf("%s 参数无效，需要正整数", name))
+		return nil, false
+	}
+	return &parsed, true
+}
+
+func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogFilter, bool) {
+	endTime := time.Now()
+	startTime := endTime.Add(-1 * time.Hour)
+	startStr := strings.TrimSpace(c.Query("start"))
+	endStr := strings.TrimSpace(c.Query("end"))
+	if startStr != "" || endStr != "" {
+		if startStr == "" || endStr == "" {
+			writeError(c, http.StatusBadRequest, "start/end 参数需要同时提供")
+			return database.UsageLogFilter{}, false
+		}
+		parsedStart, e1 := time.Parse(time.RFC3339, startStr)
+		parsedEnd, e2 := time.Parse(time.RFC3339, endStr)
+		if e1 != nil || e2 != nil {
+			writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+			return database.UsageLogFilter{}, false
+		}
+		startTime = parsedStart
+		endTime = parsedEnd
+	}
+
+	apiKeyID, ok := parseOpsErrorPositiveInt64(c, "api_key_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	accountID, ok := parseOpsErrorPositiveInt64(c, "account_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	filter := database.UsageLogFilter{
+		Start:           startTime,
+		End:             endTime,
+		Page:            1,
+		PageSize:        20,
+		Email:           strings.TrimSpace(c.Query("email")),
+		Model:           strings.TrimSpace(c.Query("model")),
+		Endpoint:        strings.TrimSpace(c.Query("endpoint")),
+		APIKeyID:        apiKeyID,
+		AccountID:       accountID,
+		ErrorOnly:       true,
+		IncludeCanceled: true,
+		ErrorKind:       strings.TrimSpace(c.Query("error_kind")),
+		Query:           strings.TrimSpace(c.Query("q")),
+	}
+
+	status := strings.TrimSpace(c.Query("status"))
+	if status == "" {
+		status = strings.TrimSpace(c.Query("status_code"))
+	}
+	switch strings.ToLower(status) {
+	case "", "all":
+	case "4xx", "5xx":
+		filter.StatusFamily = strings.ToLower(status)
+	default:
+		statusCode, err := strconv.Atoi(status)
+		if err != nil || statusCode < 100 || statusCode > 599 {
+			writeError(c, http.StatusBadRequest, "status/status_code 参数无效")
+			return database.UsageLogFilter{}, false
+		}
+		filter.StatusCode = statusCode
+	}
+
+	if fastStr := c.Query("fast"); fastStr != "" {
+		v := fastStr == "true"
+		filter.FastOnly = &v
+	}
+	if streamStr := c.Query("stream"); streamStr != "" {
+		v := streamStr == "true"
+		filter.StreamOnly = &v
+	}
+
+	if withPaging {
+		if pageStr := c.Query("page"); pageStr != "" {
+			if page, err := strconv.Atoi(pageStr); err == nil && page > 0 {
+				filter.Page = page
+			}
+		}
+		if ps := c.Query("page_size"); ps != "" {
+			if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 200 {
+				filter.PageSize = n
+			}
+		}
+	}
+
+	return filter, true
+}
+
+// GetOpsErrorLogs 获取运维错误日志
+func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, true)
+	if !ok {
+		return
+	}
+	result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetOpsErrorSummary 获取运维错误日志概览
+func (h *Handler) GetOpsErrorSummary(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	result, err := h.db.GetUsageErrorSummary(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, result)
 }
 
