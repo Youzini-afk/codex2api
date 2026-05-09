@@ -160,9 +160,8 @@ export default function Accounts() {
 
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
-  const rateLimitedAccountRows = accounts.filter(isRateLimitedAccount)
-  const rateLimitedWindowStats = getRateLimitedWindowStats(rateLimitedAccountRows)
-  const rateLimitedAccounts = rateLimitedAccountRows.length
+  const rateLimitedWindowStats = getRateLimitedWindowStats(accounts)
+  const rateLimitedAccounts = rateLimitedWindowStats.total
   const rateLimited5hAccounts = rateLimitedWindowStats.fiveHour
   const rateLimited7dAccounts = rateLimitedWindowStats.sevenDay
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
@@ -1379,7 +1378,7 @@ export default function Accounts() {
                         <TableCell>
                           <div className="space-y-1.5">
                             <div className="flex min-h-6 items-center gap-2 whitespace-nowrap">
-                              <StatusBadge status={account.status} />
+                              <StatusBadge status={account.status} detail={getAccountRateLimitWindow(account) ?? undefined} />
                               <AccountStatusCountdown account={account} />
                             </div>
                             {account.status === 'error' && account.error_message && (
@@ -2373,31 +2372,41 @@ function isUsageWindowExhausted(value?: number | null): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value >= 100
 }
 
+function isActiveUsageWindowExhausted(value?: number | null, resetAt?: string): boolean {
+  return isUsageWindowExhausted(value) && (!resetAt || isFutureTime(resetAt))
+}
+
 function isPremiumUsagePlan(planType?: string): boolean {
   return ['plus', 'pro', 'team', 'teamplus'].includes(normalizePlanType(planType))
 }
 
+type RateLimitWindow = '5h' | '7d'
+
 function isRateLimitedAccount(account: AccountRow): boolean {
+  return getAccountRateLimitWindow(account) !== null
+}
+
+function getAccountRateLimitWindow(account: AccountRow): RateLimitWindow | null {
   const status = (account.status || '').toLowerCase()
   const reason = (account.cooldown_reason || '').toLowerCase()
-
-  return status === 'rate_limited' ||
+  const explicitlyRateLimited = status === 'rate_limited' ||
     status === 'usage_exhausted' ||
     status === 'rate_limited_5h' ||
     status === 'rate_limited_7d' ||
+    reason === 'rate_limited' ||
     reason === 'rate_limited_5h' ||
     reason === 'rate_limited_7d'
-}
+  const has7dLimit = isActiveUsageWindowExhausted(account.usage_percent_7d, account.reset_7d_at)
+  const has5hLimit = isPremiumUsagePlan(account.plan_type) &&
+    isActiveUsageWindowExhausted(account.usage_percent_5h, account.reset_5h_at)
 
-function getAccountRateLimitWindow(account: AccountRow): '5h' | '7d' {
-  const status = (account.status || '').toLowerCase()
-  const reason = (account.cooldown_reason || '').toLowerCase()
-
+  // Prefer the longer 7d window when both windows are exhausted so each account
+  // belongs to exactly one bucket and 5h + 7d stays equal to total limited.
   if (
     status === 'usage_exhausted' ||
     status === 'rate_limited_7d' ||
     reason === 'rate_limited_7d' ||
-    (isUsageWindowExhausted(account.usage_percent_7d) && (!account.reset_7d_at || isFutureTime(account.reset_7d_at)))
+    has7dLimit
   ) {
     return '7d'
   }
@@ -2405,27 +2414,32 @@ function getAccountRateLimitWindow(account: AccountRow): '5h' | '7d' {
   if (
     status === 'rate_limited_5h' ||
     reason === 'rate_limited_5h' ||
-    (
-      isPremiumUsagePlan(account.plan_type) &&
-      isUsageWindowExhausted(account.usage_percent_5h) &&
-      (!account.reset_5h_at || isFutureTime(account.reset_5h_at))
-    )
+    has5hLimit
   ) {
     return '5h'
   }
 
-  return '5h'
+  return explicitlyRateLimited ? '5h' : null
 }
 
-function getRateLimitedWindowStats(accounts: AccountRow[]): { fiveHour: number; sevenDay: number } {
-  return accounts.reduce((stats, account) => {
-    if (getAccountRateLimitWindow(account) === '7d') {
+function getRateLimitedWindowStats(accounts: AccountRow[]): { total: number; fiveHour: number; sevenDay: number } {
+  const stats = accounts.reduce((stats, account) => {
+    const window = getAccountRateLimitWindow(account)
+    if (!window) {
+      return stats
+    }
+    if (window === '7d') {
       stats.sevenDay += 1
     } else {
       stats.fiveHour += 1
     }
     return stats
   }, { fiveHour: 0, sevenDay: 0 })
+
+  return {
+    ...stats,
+    total: stats.fiveHour + stats.sevenDay,
+  }
 }
 
 function isSubscriptionPlan(planType?: string): boolean {
@@ -2645,12 +2659,12 @@ function CompactStat({
           {chipLabel ?? label}
         </div>
         {details && details.length > 0 && (
-          <div className="flex flex-col items-end gap-0.5 text-[11px] font-semibold leading-4 text-muted-foreground">
+          <div className="flex w-[4.75rem] flex-col gap-0.5 text-[11px] font-semibold leading-4 text-muted-foreground">
             {details.map((item) => (
-              <div key={item.label} className="tabular-nums">
-                <span>{item.label}</span>
-                <span className="mx-0.5">：</span>
-                <span className="text-foreground">{item.value}</span>
+              <div key={item.label} className="grid grid-cols-[2ch_auto_1fr] items-center gap-x-1 tabular-nums">
+                <span className="justify-self-start">{item.label}</span>
+                <span className="justify-self-center">：</span>
+                <span className="justify-self-end text-foreground">{item.value}</span>
               </div>
             ))}
           </div>

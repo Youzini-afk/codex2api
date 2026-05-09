@@ -74,6 +74,11 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	// 发送 test_start
 	sendTestEvent(c, testEvent{Type: "test_start", Model: testModel})
 
+	if resetAt, ok := activeLocalRateLimitReset(account); ok && !forceConnectionTest(c) {
+		sendTestEvent(c, testEvent{Type: "error", Error: formatLocalRateLimitTestError(resetAt)})
+		return
+	}
+
 	// 构建最小测试请求体（参考 sub2api createOpenAITestPayload）
 	payload := buildTestPayload(testModel)
 
@@ -100,6 +105,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 
 	usageState := proxy.SyncCodexUsageState(h.store, account, resp)
+	if msg, limited := formatUsageLimitedTestError(usageState); limited {
+		sendTestEvent(c, testEvent{Type: "error", Error: msg})
+		return
+	}
 
 	// 解析 SSE 流
 	hasContent := false
@@ -218,6 +227,58 @@ func buildTestPayload(model string) []byte {
 	payload, _ = sjson.SetBytes(payload, "store", false)
 	payload, _ = sjson.SetBytes(payload, "instructions", "You are a helpful assistant. Reply briefly.")
 	return payload
+}
+
+func forceConnectionTest(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Query("force"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func activeLocalRateLimitReset(account *auth.Account) (time.Time, bool) {
+	if account == nil {
+		return time.Time{}, false
+	}
+	now := time.Now()
+	if account.IsPremium5hRateLimited() {
+		_, resetAt, ok := account.GetUsageSnapshot5h()
+		if ok && resetAt.After(now) {
+			return resetAt, true
+		}
+	}
+	reason, until := account.GetCooldownSnapshot()
+	if reason == "rate_limited" && until.After(now) {
+		return until, true
+	}
+	return time.Time{}, false
+}
+
+func formatLocalRateLimitTestError(resetAt time.Time) string {
+	remaining := time.Until(resetAt).Round(time.Second)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return fmt.Sprintf("账号当前处于本地限流状态，预计 %s 后恢复；本次未发送上游探针。需要强制探针时可添加 force=1。", remaining)
+}
+
+func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool) {
+	if state.Premium5hRateLimited {
+		remaining := time.Until(state.Reset5hAt).Round(time.Second)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return fmt.Sprintf("上游探针返回 200，但 Codex 5h 用量头已达 %.0f%%，账号已保持限流状态，预计 %s 后恢复。", state.UsagePct5h, remaining), true
+	}
+	if state.HasUsage7d && state.UsagePct7d >= 100 {
+		return fmt.Sprintf("上游探针返回 200，但 Codex 7d 用量头已达 %.0f%%，账号已保持用量耗尽状态。", state.UsagePct7d), true
+	}
+	return "", false
 }
 
 // sendTestEvent 发送 SSE 事件
@@ -462,6 +523,11 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			if _, ok := activeLocalRateLimitReset(acc); ok {
+				atomic.AddInt64(&rateLimitCount, 1)
+				return
+			}
+
 			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 			if err != nil {
 				h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
@@ -474,10 +540,12 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			switch resp.StatusCode {
 			case http.StatusOK:
 				usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
-				// 测试成功即重置冷却状态，用量限制由调度器自行判断
-				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
-					h.store.ClearCooldown(acc)
+				if _, limited := formatUsageLimitedTestError(usageState); limited {
+					atomic.AddInt64(&rateLimitCount, 1)
+					return
 				}
+				// 测试成功即重置冷却状态，用量限制由调度器自行判断
+				h.store.ClearCooldown(acc)
 				atomic.AddInt64(&successCount, 1)
 			case http.StatusUnauthorized:
 				proxy.SyncCodexUsageState(h.store, acc, resp)
