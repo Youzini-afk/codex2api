@@ -167,6 +167,155 @@ func TestPrepareResponsesBody_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_DefaultsNullFunctionToolParameters(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"tools":[
+			{
+				"type":"function",
+				"name":"Agent",
+				"parameters":null
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "tools.0.parameters.type").String(); typ != "object" {
+		t.Fatalf("expected default function schema type object, got %q; body=%s", typ, got)
+	}
+	if props := gjson.GetBytes(got, "tools.0.parameters.properties"); !props.Exists() || props.Type != gjson.JSON {
+		t.Fatalf("expected default function schema properties object, got %s; body=%s", props.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_DefaultsMissingFunctionToolParameters(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"tools":[
+			{
+				"type":"function",
+				"name":"Agent"
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "tools.0.parameters.type").String(); typ != "object" {
+		t.Fatalf("expected default function schema type object, got %q; body=%s", typ, got)
+	}
+}
+
+func TestTranslateRequest_DefaultsNullFunctionToolParameters(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"test"}],
+		"tools":[
+			{
+				"type":"function",
+				"function":{
+					"name":"Agent",
+					"parameters":null
+				}
+			}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if typ := gjson.GetBytes(got, "tools.0.parameters.type").String(); typ != "object" {
+		t.Fatalf("expected default function schema type object, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesLegacyFileContentPart(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"text","text":"read this"},
+					{"type":"file","file":{"file_id":"file_abc","filename":"notes.pdf"}}
+				]
+			}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_text" {
+		t.Fatalf("expected legacy text part to normalize to input_text, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.content.1.type").String(); typ != "input_file" {
+		t.Fatalf("expected legacy file part to normalize to input_file, got %q; body=%s", typ, got)
+	}
+	if fileID := gjson.GetBytes(got, "input.0.content.1.file_id").String(); fileID != "file_abc" {
+		t.Fatalf("expected file_id to be flattened, got %q; body=%s", fileID, got)
+	}
+	if filename := gjson.GetBytes(got, "input.0.content.1.filename").String(); filename != "notes.pdf" {
+		t.Fatalf("expected filename to be preserved, got %q; body=%s", filename, got)
+	}
+	if gjson.GetBytes(got, "input.0.content.1.file").Exists() {
+		t.Fatalf("legacy file wrapper should be removed; body=%s", got)
+	}
+	if typ := gjson.Get(expandedInputRaw, "0.content.1.type").String(); typ != "input_file" {
+		t.Fatalf("expanded input should contain normalized input_file, got %q; expanded=%s", typ, expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesLegacyTopLevelFileInput(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"file","file":"file_top"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "input_file" {
+		t.Fatalf("expected top-level legacy file input to normalize to input_file, got %q; body=%s", typ, got)
+	}
+	if fileID := gjson.GetBytes(got, "input.0.file_id").String(); fileID != "file_top" {
+		t.Fatalf("expected top-level file shorthand to become file_id, got %q; body=%s", fileID, got)
+	}
+	if gjson.GetBytes(got, "input.0.file").Exists() {
+		t.Fatalf("legacy file wrapper should be removed; body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesLegacyImageContentPart(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+				]
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_image" {
+		t.Fatalf("expected legacy image_url part to normalize to input_image, got %q; body=%s", typ, got)
+	}
+	if imageURL := gjson.GetBytes(got, "input.0.content.0.image_url").String(); imageURL != "https://example.com/cat.png" {
+		t.Fatalf("expected image_url object to be flattened, got %q; body=%s", imageURL, got)
+	}
+}
+
 func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -605,6 +754,75 @@ func TestPrepareCompactResponsesBody_ConvertsPlaintextCompactionToDeveloperMessa
 	}
 	if gotText := input.Get("1.content.0.text").String(); !strings.Contains(gotText, "previous context was compacted") {
 		t.Fatalf("converted compaction text = %q, want summary; input=%s", gotText, input.Raw)
+	}
+}
+
+func TestPrepareResponsesBody_DefaultsMissingMessageContent(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"function_call","call_id":"call_abc","name":"lookup","arguments":"{}"},
+			{"type":"message","role":"user"}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	if content := gjson.GetBytes(got, "input.2.content"); !content.Exists() || content.String() != "" {
+		t.Fatalf("missing message content should be defaulted to empty string, got %s; body=%s", content.Raw, got)
+	}
+	if gjson.GetBytes(got, "input.1.content").Exists() {
+		t.Fatalf("non-message tool context item should not receive content, got %s", got)
+	}
+	if content := gjson.Get(expandedInputRaw, "2.content"); !content.Exists() || content.String() != "" {
+		t.Fatalf("expanded input should include normalized empty content, got %s; expanded=%s", content.Raw, expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBody_DefaultsNullMessageContent(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"role":"developer","content":null},
+			{"type":"message","role":"assistant","content":null}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	for i := 0; i < 2; i++ {
+		if content := gjson.GetBytes(got, fmt.Sprintf("input.%d.content", i)); !content.Exists() || content.String() != "" {
+			t.Fatalf("null message content at input[%d] should be defaulted, got %s; body=%s", i, content.Raw, got)
+		}
+	}
+}
+
+func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"reasoning","id":"rs_123","encrypted_content":"opaque"},
+			{"type":"message","id":"msg_123","role":"user","content":"continue"},
+			{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":"{}"}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	for i := 0; i < 3; i++ {
+		if id := gjson.GetBytes(got, fmt.Sprintf("input.%d.id", i)); id.Exists() {
+			t.Fatalf("input[%d].id should be stripped for store=false, got %s; body=%s", i, id.Raw, got)
+		}
+		if id := gjson.Get(expandedInputRaw, fmt.Sprintf("%d.id", i)); id.Exists() {
+			t.Fatalf("expanded input[%d].id should be stripped for cache replay, got %s; expanded=%s", i, id.Raw, expandedInputRaw)
+		}
+	}
+	if encrypted := gjson.GetBytes(got, "input.0.encrypted_content").String(); encrypted != "opaque" {
+		t.Fatalf("reasoning encrypted_content should be preserved, got %q; body=%s", encrypted, got)
+	}
+	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_123" {
+		t.Fatalf("function_call call_id should be preserved, got %q; body=%s", callID, got)
 	}
 }
 

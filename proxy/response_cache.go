@@ -227,20 +227,52 @@ func cacheCompletedResponse(expandedInputRaw []byte, completedData []byte) {
 	inputItems := gjson.ParseBytes(expandedInputRaw)
 	if inputItems.IsArray() {
 		inputItems.ForEach(func(_, v gjson.Result) bool {
-			items = append(items, json.RawMessage(v.Raw))
+			if item, ok := replayableCachedInputItem(v); ok {
+				items = append(items, item)
+			}
 			return true
 		})
 	}
 
-	// 添加响应 output items
+	// 添加响应 output 中真正需要续链的工具上下文；reasoning/message 等
+	// 服务端输出 item 带有 rs_/msg_ id，store=false 时回灌会触发 item not found。
 	output.ForEach(func(_, v gjson.Result) bool {
-		items = append(items, json.RawMessage(v.Raw))
+		if item, ok := replayableCachedOutputItem(v); ok {
+			items = append(items, item)
+		}
 		return true
 	})
 
 	if len(items) > 0 {
 		setResponseCache(respID, items)
 	}
+}
+
+func replayableCachedInputItem(item gjson.Result) (json.RawMessage, bool) {
+	return stripResponseItemID(json.RawMessage(item.Raw))
+}
+
+func replayableCachedOutputItem(item gjson.Result) (json.RawMessage, bool) {
+	if !isCodexToolCallContextType(item.Get("type").String()) {
+		return nil, false
+	}
+	return stripResponseItemID(json.RawMessage(item.Raw))
+}
+
+func stripResponseItemID(raw json.RawMessage) (json.RawMessage, bool) {
+	var item map[string]any
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return raw, true
+	}
+	if _, exists := item["id"]; !exists {
+		return raw, true
+	}
+	delete(item, "id")
+	stripped, err := json.Marshal(item)
+	if err != nil {
+		return nil, false
+	}
+	return stripped, true
 }
 
 func isCodexToolCallContextType(typ string) bool {

@@ -16,7 +16,7 @@ func TestCacheCompletedResponseCachesCodexNativeToolCalls(t *testing.T) {
 	resetResponseCacheForTest()
 
 	expandedInput := []byte(`[{"type":"message","role":"user","content":"find a tool"}]`)
-	completed := []byte(`{"type":"response.completed","response":{"id":"resp_native","output":[{"type":"tool_search_call","call_id":"call_search","status":"completed"}]}}`)
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_native","output":[{"type":"tool_search_call","id":"ts_123","call_id":"call_search","status":"completed"}]}}`)
 
 	cacheCompletedResponse(expandedInput, completed)
 
@@ -26,6 +26,9 @@ func TestCacheCompletedResponseCachesCodexNativeToolCalls(t *testing.T) {
 	}
 	if got := gjson.GetBytes(cached[1], "call_id").String(); got != "call_search" {
 		t.Fatalf("cached call_id = %q, want call_search", got)
+	}
+	if got := gjson.GetBytes(cached[1], "id"); got.Exists() {
+		t.Fatalf("cached output item id should be stripped for store=false replay, got %s", got.Raw)
 	}
 }
 
@@ -127,5 +130,35 @@ func TestCacheCompletedResponseDoesNotCacheNonCallIDToolCalls(t *testing.T) {
 				t.Fatalf("expected no cache for %s, got %d items", test.name, len(cached))
 			}
 		})
+	}
+}
+
+func TestCacheCompletedResponseSkipsReasoningAndMessageOutputItems(t *testing.T) {
+	resetResponseCacheForTest()
+
+	cacheCompletedResponse(
+		[]byte(`[{"type":"message","id":"msg_input","role":"user","content":"call a tool"}]`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_reasoning","output":[`+
+			`{"type":"reasoning","id":"rs_0609","encrypted_content":"opaque"},`+
+			`{"type":"message","id":"msg_output","role":"assistant","content":[{"type":"output_text","text":"thinking"}]},`+
+			`{"type":"function_call","id":"fc_123","call_id":"call_abc","name":"lookup","arguments":"{}"}`+
+			`]}}`),
+	)
+
+	cached := getResponseCache("resp_reasoning")
+	if len(cached) != 2 {
+		t.Fatalf("cached items = %d, want input message + function_call only", len(cached))
+	}
+	if typ := gjson.GetBytes(cached[0], "type").String(); typ != "message" {
+		t.Fatalf("cached[0].type = %q, want message", typ)
+	}
+	if id := gjson.GetBytes(cached[0], "id"); id.Exists() {
+		t.Fatalf("cached input id should be stripped, got %s", id.Raw)
+	}
+	if typ := gjson.GetBytes(cached[1], "type").String(); typ != "function_call" {
+		t.Fatalf("cached[1].type = %q, want function_call", typ)
+	}
+	if id := gjson.GetBytes(cached[1], "id"); id.Exists() {
+		t.Fatalf("cached function_call id should be stripped, got %s", id.Raw)
 	}
 }
