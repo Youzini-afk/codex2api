@@ -122,6 +122,10 @@ const (
 	defaultBackgroundRefreshInterval = 2 * time.Minute
 	defaultUsageProbeMaxAge          = 10 * time.Minute
 	defaultRecoveryProbeInterval     = 30 * time.Minute
+	premium5hUrgencyWindow           = 4 * time.Hour
+	premium5hUrgencyMaxBonus         = 25.0
+	premium5hUrgencyMinRemainingPct  = 5.0
+	premium5hUrgencyFullRemainingPct = 50.0
 )
 
 // SchedulerBreakdown 调度评分拆解
@@ -134,6 +138,7 @@ type SchedulerBreakdown struct {
 	SuccessBonus        float64
 	ProvenBonus         float64 // 经过验证的账号（TotalRequests > 10）加分
 	UsagePenalty7d      float64
+	UsageUrgencyBonus5h float64
 	LatencyPenalty      float64
 	SuccessRatePenalty  float64 // 滑动窗口成功率惩罚
 }
@@ -388,8 +393,7 @@ func linearDecay(base float64, elapsed, window time.Duration) float64 {
 	return base * (1.0 - float64(elapsed)/float64(window))
 }
 
-func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
-	now := time.Now()
+func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
 	breakdown := SchedulerBreakdown{}
 	premium5hLimited := a.premium5hRateLimitedLocked(now)
 
@@ -457,6 +461,51 @@ func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
 	return breakdown
 }
 
+func (a *Account) premium5hUsageUrgencyBonusLocked(now time.Time) float64 {
+	if !isPremium5hPlan(a.PlanType) {
+		return 0
+	}
+	if !a.UsagePercent5hValid || a.Reset5hAt.IsZero() {
+		return 0
+	}
+	if a.UsagePercent5h >= 100 || a.premium5hRateLimitedLocked(now) {
+		return 0
+	}
+	if a.AccessToken == "" || a.Status == StatusError || a.HealthTier == HealthTierBanned {
+		return 0
+	}
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		return 0
+	}
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+		return 0
+	}
+	if a.usageExhaustedLocked() {
+		return 0
+	}
+
+	timeRemaining := a.Reset5hAt.Sub(now)
+	if timeRemaining <= 0 || timeRemaining > premium5hUrgencyWindow {
+		return 0
+	}
+
+	quotaRemaining := 100 - a.UsagePercent5h
+	if quotaRemaining <= premium5hUrgencyMinRemainingPct {
+		return 0
+	}
+
+	timeFactor := 1 - float64(timeRemaining)/float64(premium5hUrgencyWindow)
+	quotaFactor := quotaRemaining / premium5hUrgencyFullRemainingPct
+	if quotaFactor > 1 {
+		quotaFactor = 1
+	}
+	if quotaFactor < 0 {
+		quotaFactor = 0
+	}
+
+	return premium5hUrgencyMaxBonus * timeFactor * quotaFactor
+}
+
 func (a *Account) effectiveBaseConcurrencyLocked(storeBaseLimit int64) int64 {
 	if a.BaseConcurrencyOverride != nil && *a.BaseConcurrencyOverride > 0 {
 		return *a.BaseConcurrencyOverride
@@ -501,7 +550,7 @@ func (a *Account) effectiveScoreBiasLocked(now time.Time, tier AccountHealthTier
 
 func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	now := time.Now()
-	breakdown := a.schedulerBreakdownLocked()
+	breakdown := a.schedulerBreakdownLocked(now)
 	score := 100.0 -
 		breakdown.UnauthorizedPenalty -
 		breakdown.RateLimitPenalty -
@@ -545,7 +594,10 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 
 	baseConcurrencyEffective := a.effectiveBaseConcurrencyLocked(baseLimit)
 	scoreBiasEffective := a.effectiveScoreBiasLocked(now, tier)
-	dispatchScore := score + float64(scoreBiasEffective)
+	if a.dispatchBonusEligibleLocked(now, tier) {
+		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
+	}
+	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h
 
 	a.HealthTier = tier
 	a.SchedulerScore = score
@@ -1045,6 +1097,11 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 	defer a.mu.Unlock()
 
 	a.recomputeSchedulerLocked(baseLimit)
+	now := time.Now()
+	breakdown := a.schedulerBreakdownLocked(now)
+	if a.dispatchBonusEligibleLocked(now, a.HealthTier) {
+		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
+	}
 	return SchedulerDebugSnapshot{
 		HealthTier:               string(a.HealthTier),
 		SchedulerScore:           a.SchedulerScore,
@@ -1054,7 +1111,7 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 		BaseConcurrencyOverride:  cloneInt64Ptr(a.BaseConcurrencyOverride),
 		BaseConcurrencyEffective: a.BaseConcurrencyEffective,
 		DynamicConcurrencyLimit:  a.DynamicConcurrencyLimit,
-		Breakdown:                a.schedulerBreakdownLocked(),
+		Breakdown:                breakdown,
 		LastUnauthorizedAt:       a.LastUnauthorizedAt,
 		LastRateLimitedAt:        a.LastRateLimitedAt,
 		LastTimeoutAt:            a.LastTimeoutAt,
@@ -2665,6 +2722,7 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 
 	now := time.Now()
 	acc.SetUsageSnapshot(pct7d, now)
+	s.fastSchedulerUpdate(acc)
 
 	if s.db == nil {
 		return
