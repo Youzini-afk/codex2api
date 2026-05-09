@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
 	"github.com/tidwall/gjson"
 )
@@ -29,24 +28,6 @@ func TestBuildTestPayloadUsesSelectedModel(t *testing.T) {
 	}
 	if !gjson.GetBytes(payload, "stream").Bool() {
 		t.Fatal("stream should be true")
-	}
-}
-
-func TestActiveLocalRateLimitResetDetectsPremium5h(t *testing.T) {
-	resetAt := time.Now().Add(30 * time.Minute)
-	acc := &auth.Account{
-		PlanType:            "plus",
-		UsagePercent5h:      100,
-		UsagePercent5hValid: true,
-		Reset5hAt:           resetAt,
-	}
-
-	got, ok := activeLocalRateLimitReset(acc)
-	if !ok {
-		t.Fatal("activeLocalRateLimitReset() ok = false, want true")
-	}
-	if !got.Equal(resetAt) {
-		t.Fatalf("resetAt = %v, want %v", got, resetAt)
 	}
 }
 

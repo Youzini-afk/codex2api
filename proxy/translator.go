@@ -18,6 +18,7 @@ type openAIRequest struct {
 	Model           string            `json:"model"`
 	Messages        []openAIMessage   `json:"messages"`
 	Tools           []json.RawMessage `json:"tools"`
+	ResponseFormat  json.RawMessage   `json:"response_format,omitempty"`
 	ReasoningEffort string            `json:"reasoning_effort"`
 	ServiceTier     string            `json:"service_tier"`
 	ServiceTierAlt  string            `json:"serviceTier"` // 兼容驼峰命名
@@ -879,6 +880,16 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		}
 	}
 
+	// 5. response_format → Responses text.format，并清理结构化输出 schema
+	if len(req.ResponseFormat) > 0 && string(req.ResponseFormat) != "null" {
+		var responseFormat map[string]any
+		if json.Unmarshal(req.ResponseFormat, &responseFormat) == nil && responseFormat != nil {
+			out["response_format"] = responseFormat
+			normalizeResponsesStructuredOutputFormat(out)
+			delete(out, "response_format")
+		}
+	}
+
 	return json.Marshal(out)
 }
 
@@ -942,6 +953,7 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 			body["service_tier"] = upstreamServiceTier(tier)
 		}
 	}
+	normalizeResponsesStructuredOutputFormat(body)
 
 	// 5. 工具描述补充 + schema 清理 + 上游数量限制
 	if tools, ok := body["tools"].([]any); ok {
@@ -1360,6 +1372,86 @@ func stripUnsupportedSchemaKeys(schema map[string]interface{}) {
 func sanitizeSchemaForUpstream(schema map[string]interface{}) {
 	stripUnsupportedSchemaKeys(schema)
 	ensureArrayItems(schema)
+}
+
+func normalizeResponsesStructuredOutputFormat(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	modified := false
+	if responseFormat, ok := body["response_format"].(map[string]any); ok {
+		if textFormat := responsesTextFormatFromResponseFormat(responseFormat); textFormat != nil {
+			text, _ := body["text"].(map[string]any)
+			if text == nil {
+				text = map[string]any{}
+				body["text"] = text
+			}
+			if _, hasFormat := text["format"]; !hasFormat {
+				text["format"] = textFormat
+				modified = true
+			}
+		}
+		if sanitizeStructuredOutputSchema(responseFormat) {
+			modified = true
+		}
+	}
+
+	text, ok := body["text"].(map[string]any)
+	if !ok {
+		return modified
+	}
+	format, ok := text["format"].(map[string]any)
+	if !ok {
+		return modified
+	}
+	if sanitizeStructuredOutputSchema(format) {
+		modified = true
+	}
+	return modified
+}
+
+func responsesTextFormatFromResponseFormat(responseFormat map[string]any) map[string]any {
+	formatType := strings.TrimSpace(firstNonEmptyAnyString(responseFormat["type"]))
+	switch formatType {
+	case "json_schema":
+		if jsonSchema, ok := responseFormat["json_schema"].(map[string]any); ok && jsonSchema != nil {
+			out := make(map[string]any, len(jsonSchema)+1)
+			for key, value := range jsonSchema {
+				out[key] = value
+			}
+			out["type"] = "json_schema"
+			return out
+		}
+		out := make(map[string]any, len(responseFormat))
+		for key, value := range responseFormat {
+			if key == "json_schema" {
+				continue
+			}
+			out[key] = value
+		}
+		out["type"] = "json_schema"
+		return out
+	case "json_object", "text":
+		return map[string]any{"type": formatType}
+	default:
+		return nil
+	}
+}
+
+func sanitizeStructuredOutputSchema(format map[string]any) bool {
+	modified := false
+	if schema, ok := format["schema"].(map[string]any); ok && schema != nil {
+		sanitizeSchemaForUpstream(schema)
+		modified = true
+	}
+	if jsonSchema, ok := format["json_schema"].(map[string]any); ok && jsonSchema != nil {
+		if schema, ok := jsonSchema["schema"].(map[string]any); ok && schema != nil {
+			sanitizeSchemaForUpstream(schema)
+			modified = true
+		}
+	}
+	return modified
 }
 
 func isFunctionTool(tool map[string]any) bool {

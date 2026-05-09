@@ -316,6 +316,129 @@ func TestPrepareResponsesBody_NormalizesLegacyImageContentPart(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_SanitizesTextFormatJSONSchema(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"name":"codex_output_schema",
+				"schema":{
+					"type":"object",
+					"properties":{
+						"testEnvironmentContract":{
+							"type":"object",
+							"minProperties":1,
+							"maxProperties":2,
+							"properties":{
+								"runtime":{"type":"string","minLength":1}
+							}
+						},
+						"steps":{"type":"array"}
+					}
+				},
+				"strict":true
+			}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if name := gjson.GetBytes(got, "text.format.name").String(); name != "codex_output_schema" {
+		t.Fatalf("expected text.format.name to be preserved, got %q; body=%s", name, got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
+		t.Fatalf("minProperties should be stripped from structured output schema; body=%s", got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.maxProperties").Exists() {
+		t.Fatalf("maxProperties should be stripped from structured output schema; body=%s", got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.properties.runtime.minLength").Exists() {
+		t.Fatalf("nested minLength should be stripped from structured output schema; body=%s", got)
+	}
+	if items := gjson.GetBytes(got, "text.format.schema.properties.steps.items"); !items.Exists() || items.Type != gjson.JSON {
+		t.Fatalf("array items should be injected in structured output schema, got %s; body=%s", items.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_ConvertsAndSanitizesLegacyResponseFormat(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"response_format":{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"codex_output_schema",
+				"schema":{
+					"type":"object",
+					"properties":{
+						"testEnvironmentContract":{
+							"type":"object",
+							"minProperties":1,
+							"properties":{}
+						}
+					}
+				},
+				"strict":true
+			}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if gjson.GetBytes(got, "response_format").Exists() {
+		t.Fatalf("legacy response_format should be removed after conversion; body=%s", got)
+	}
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_schema" {
+		t.Fatalf("expected response_format to convert to text.format json_schema, got %q; body=%s", typ, got)
+	}
+	if name := gjson.GetBytes(got, "text.format.name").String(); name != "codex_output_schema" {
+		t.Fatalf("expected json_schema name to be preserved, got %q; body=%s", name, got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
+		t.Fatalf("minProperties should be stripped after response_format conversion; body=%s", got)
+	}
+}
+
+func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"test"}],
+		"response_format":{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"codex_output_schema",
+				"schema":{
+					"type":"object",
+					"properties":{
+						"testEnvironmentContract":{
+							"type":"object",
+							"minProperties":1,
+							"properties":{}
+						}
+					}
+				}
+			}
+		}
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if gjson.GetBytes(got, "response_format").Exists() {
+		t.Fatalf("legacy response_format should not be forwarded, got %s", got)
+	}
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_schema" {
+		t.Fatalf("expected text.format json_schema, got %q; body=%s", typ, got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
+		t.Fatalf("minProperties should be stripped in translated response_format schema; body=%s", got)
+	}
+}
+
 func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

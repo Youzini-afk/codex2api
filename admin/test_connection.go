@@ -74,11 +74,6 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	// 发送 test_start
 	sendTestEvent(c, testEvent{Type: "test_start", Model: testModel})
 
-	if resetAt, ok := activeLocalRateLimitReset(account); ok && !forceConnectionTest(c) {
-		sendTestEvent(c, testEvent{Type: "error", Error: formatLocalRateLimitTestError(resetAt)})
-		return
-	}
-
 	// 构建最小测试请求体（参考 sub2api createOpenAITestPayload）
 	payload := buildTestPayload(testModel)
 
@@ -227,44 +222,6 @@ func buildTestPayload(model string) []byte {
 	payload, _ = sjson.SetBytes(payload, "store", false)
 	payload, _ = sjson.SetBytes(payload, "instructions", "You are a helpful assistant. Reply briefly.")
 	return payload
-}
-
-func forceConnectionTest(c *gin.Context) bool {
-	if c == nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(c.Query("force"))) {
-	case "1", "true", "yes":
-		return true
-	default:
-		return false
-	}
-}
-
-func activeLocalRateLimitReset(account *auth.Account) (time.Time, bool) {
-	if account == nil {
-		return time.Time{}, false
-	}
-	now := time.Now()
-	if account.IsPremium5hRateLimited() {
-		_, resetAt, ok := account.GetUsageSnapshot5h()
-		if ok && resetAt.After(now) {
-			return resetAt, true
-		}
-	}
-	reason, until := account.GetCooldownSnapshot()
-	if reason == "rate_limited" && until.After(now) {
-		return until, true
-	}
-	return time.Time{}, false
-}
-
-func formatLocalRateLimitTestError(resetAt time.Time) string {
-	remaining := time.Until(resetAt).Round(time.Second)
-	if remaining < 0 {
-		remaining = 0
-	}
-	return fmt.Sprintf("账号当前处于本地限流状态，预计 %s 后恢复；本次未发送上游探针。需要强制探针时可添加 force=1。", remaining)
 }
 
 func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool) {
@@ -522,11 +479,6 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-
-			if _, ok := activeLocalRateLimitReset(acc); ok {
-				atomic.AddInt64(&rateLimitCount, 1)
-				return
-			}
 
 			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 			if err != nil {
