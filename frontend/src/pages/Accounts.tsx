@@ -160,9 +160,11 @@ export default function Accounts() {
 
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
-  const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
-  const rateLimited5hAccounts = accounts.filter(isAccountRateLimited5h).length
-  const rateLimited7dAccounts = accounts.filter(isAccountRateLimited7d).length
+  const rateLimitedAccountRows = accounts.filter(isRateLimitedAccount)
+  const rateLimitedWindowStats = getRateLimitedWindowStats(rateLimitedAccountRows)
+  const rateLimitedAccounts = rateLimitedAccountRows.length
+  const rateLimited5hAccounts = rateLimitedWindowStats.fiveHour
+  const rateLimited7dAccounts = rateLimitedWindowStats.sevenDay
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
   const errorAccounts = accounts.filter((account) => account.status === 'error').length
   const disabledAccounts = accounts.filter((account) => account.enabled === false).length
@@ -179,7 +181,7 @@ export default function Accounts() {
         if (account.status !== 'active' && account.status !== 'ready') return false
         break
       case 'rate_limited':
-        if (account.status !== 'rate_limited' && account.status !== 'usage_exhausted') return false
+        if (!isRateLimitedAccount(account)) return false
         break
       case 'banned':
         if (account.status !== 'unauthorized') return false
@@ -2375,23 +2377,55 @@ function isPremiumUsagePlan(planType?: string): boolean {
   return ['plus', 'pro', 'team', 'teamplus'].includes(normalizePlanType(planType))
 }
 
-function isAccountRateLimited5h(account: AccountRow): boolean {
+function isRateLimitedAccount(account: AccountRow): boolean {
   const status = (account.status || '').toLowerCase()
   const reason = (account.cooldown_reason || '').toLowerCase()
-  if (status === 'rate_limited_5h' || reason === 'rate_limited_5h') return true
 
-  return isPremiumUsagePlan(account.plan_type) &&
-    isUsageWindowExhausted(account.usage_percent_5h) &&
-    isFutureTime(account.reset_5h_at || account.cooldown_until)
+  return status === 'rate_limited' ||
+    status === 'usage_exhausted' ||
+    status === 'rate_limited_5h' ||
+    status === 'rate_limited_7d' ||
+    reason === 'rate_limited_5h' ||
+    reason === 'rate_limited_7d'
 }
 
-function isAccountRateLimited7d(account: AccountRow): boolean {
+function getAccountRateLimitWindow(account: AccountRow): '5h' | '7d' {
   const status = (account.status || '').toLowerCase()
   const reason = (account.cooldown_reason || '').toLowerCase()
-  if (status === 'usage_exhausted' || status === 'rate_limited_7d' || reason === 'rate_limited_7d') return true
 
-  return isUsageWindowExhausted(account.usage_percent_7d) &&
-    isFutureTime(account.reset_7d_at || account.cooldown_until)
+  if (
+    status === 'usage_exhausted' ||
+    status === 'rate_limited_7d' ||
+    reason === 'rate_limited_7d' ||
+    (isUsageWindowExhausted(account.usage_percent_7d) && (!account.reset_7d_at || isFutureTime(account.reset_7d_at)))
+  ) {
+    return '7d'
+  }
+
+  if (
+    status === 'rate_limited_5h' ||
+    reason === 'rate_limited_5h' ||
+    (
+      isPremiumUsagePlan(account.plan_type) &&
+      isUsageWindowExhausted(account.usage_percent_5h) &&
+      (!account.reset_5h_at || isFutureTime(account.reset_5h_at))
+    )
+  ) {
+    return '5h'
+  }
+
+  return '5h'
+}
+
+function getRateLimitedWindowStats(accounts: AccountRow[]): { fiveHour: number; sevenDay: number } {
+  return accounts.reduce((stats, account) => {
+    if (getAccountRateLimitWindow(account) === '7d') {
+      stats.sevenDay += 1
+    } else {
+      stats.fiveHour += 1
+    }
+    return stats
+  }, { fiveHour: 0, sevenDay: 0 })
 }
 
 function isSubscriptionPlan(planType?: string): boolean {
