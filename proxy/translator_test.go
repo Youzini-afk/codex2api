@@ -141,6 +141,46 @@ func TestTranslateRequest_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_DropsInvalidRequiredInToolSchema(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"test"}],
+		"tools":[
+			{
+				"type":"function",
+				"function":{
+					"name":"session_status",
+					"parameters":{
+						"type":"object",
+						"required":null,
+						"properties":{
+							"session_id":{"type":"string"},
+							"metadata":{
+								"type":"object",
+								"required":[null, "", "kind"],
+								"properties":{"kind":{"type":"string"}}
+							}
+						}
+					}
+				}
+			}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if required := gjson.GetBytes(got, "tools.0.parameters.required"); required.Exists() {
+		t.Fatalf("null required should be removed from tool schema, got %s; body=%s", required.Raw, got)
+	}
+	nestedRequired := gjson.GetBytes(got, "tools.0.parameters.properties.metadata.required")
+	if nestedRequired.Raw != `["kind"]` {
+		t.Fatalf("nested required should keep only string entries, got %s; body=%s", nestedRequired.Raw, got)
+	}
+}
+
 func TestPrepareResponsesBody_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -164,6 +204,41 @@ func TestPrepareResponsesBody_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	items := gjson.GetBytes(got, "tools.0.parameters.properties.args.items")
 	if !items.Exists() || items.Type != gjson.JSON {
 		t.Fatalf("expected array schema items object to be injected, got %s", items.Raw)
+	}
+}
+
+func TestPrepareResponsesBody_DropsInvalidRequiredInToolSchema(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"tools":[
+			{
+				"type":"function",
+				"name":"session_status",
+				"parameters":{
+					"type":"object",
+					"required":null,
+					"properties":{
+						"session_id":{"type":"string"},
+						"metadata":{
+							"type":"object",
+							"required":[null, "", "kind"],
+							"properties":{"kind":{"type":"string"}}
+						}
+					}
+				}
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if required := gjson.GetBytes(got, "tools.0.parameters.required"); required.Exists() {
+		t.Fatalf("null required should be removed from tool schema, got %s; body=%s", required.Raw, got)
+	}
+	nestedRequired := gjson.GetBytes(got, "tools.0.parameters.properties.metadata.required")
+	if nestedRequired.Raw != `["kind"]` {
+		t.Fatalf("nested required should keep only string entries, got %s; body=%s", nestedRequired.Raw, got)
 	}
 }
 

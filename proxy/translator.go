@@ -1371,6 +1371,7 @@ func stripUnsupportedSchemaKeys(schema map[string]interface{}) {
 
 func sanitizeSchemaForUpstream(schema map[string]interface{}) {
 	stripUnsupportedSchemaKeys(schema)
+	normalizeSchemaRequiredFields(schema)
 	ensureArrayItems(schema)
 }
 
@@ -1482,6 +1483,56 @@ func ensureFunctionParametersRootObject(schema map[string]any) {
 	}
 	if props, ok := schema["properties"].(map[string]any); !ok || props == nil {
 		schema["properties"] = map[string]any{}
+	}
+}
+
+func normalizeSchemaRequiredFields(schema map[string]interface{}) {
+	if rawRequired, exists := schema["required"]; exists {
+		required, ok := rawRequired.([]interface{})
+		if !ok {
+			delete(schema, "required")
+		} else {
+			cleaned := make([]interface{}, 0, len(required))
+			for _, item := range required {
+				if name, ok := item.(string); ok && strings.TrimSpace(name) != "" {
+					cleaned = append(cleaned, name)
+				}
+			}
+			if len(cleaned) == 0 {
+				delete(schema, "required")
+			} else {
+				schema["required"] = cleaned
+			}
+		}
+	}
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				normalizeSchemaRequiredFields(sub)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		normalizeSchemaRequiredFields(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					normalizeSchemaRequiredFields(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		normalizeSchemaRequiredFields(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, v := range defs {
+			if sub, ok := v.(map[string]interface{}); ok {
+				normalizeSchemaRequiredFields(sub)
+			}
+		}
 	}
 }
 
