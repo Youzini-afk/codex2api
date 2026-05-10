@@ -35,8 +35,11 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 			t.Errorf("Header %s = %q, expected %q", header, value, expected)
 		}
 	}
-	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "img-src 'self' data: blob:") {
-		t.Errorf("Content-Security-Policy = %q, expected blob: image previews to be allowed", csp)
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "img-src 'self' data: blob: https: http:") {
+		t.Errorf("Content-Security-Policy = %q, expected local, inline, and remote images to be allowed", csp)
+	}
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'self' https://api.github.com") {
+		t.Errorf("Content-Security-Policy = %q, expected GitHub release API to be allowed for update checks", csp)
 	}
 }
 
@@ -151,6 +154,7 @@ func TestIsSensitiveEndpoint(t *testing.T) {
 		{"/api/admin/keys", true},
 		{"/api/admin/settings", true},
 		{"/api/admin/proxies", true},
+		{"/api/admin/system/update", true},
 		{"/api/admin/stats", false},
 		{"/health", false},
 		{"/v1/chat/completions", false},

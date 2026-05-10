@@ -154,6 +154,9 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account == nil {
 			return false
 		}
+		if account.IsOpenAIResponsesAPI() {
+			return false
+		}
 		if model != "" && account.IsModelRateLimited(model) {
 			return false
 		}
@@ -162,6 +165,36 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		}
 		return true
 	}
+}
+
+func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	codexFilter := accountFilterForModel(model)
+	return func(account *auth.Account) bool {
+		if account == nil {
+			return false
+		}
+		if account.IsOpenAIResponsesAPI() {
+			return account.SupportsOpenAIResponsesModel(model) && (model == "" || !account.IsModelRateLimited(model))
+		}
+		if !allowCodexAccounts {
+			return false
+		}
+		return codexFilter(account)
+	}
+}
+
+func modelIDInList(model string, models []string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	for _, candidate := range models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
 }
 
 func effectiveRequestModel(body []byte, fallback string) string {
@@ -891,7 +924,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
-	accountFilter := accountFilterForModel(effectiveModel)
+	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -945,6 +978,239 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
+
+		if account.IsOpenAIResponsesAPI() {
+			if lastUpstreamCancel != nil {
+				lastUpstreamCancel()
+			}
+			upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+			lastUpstreamCancel = upstreamCancel
+			baseURL, _ := account.OpenAIResponsesCredentials()
+			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, rawBody, proxyURL, downstreamHeaders)
+			durationMs := int(time.Since(start).Milliseconds())
+
+			if reqErr != nil {
+				if kind := classifyTransportFailure(reqErr); kind != "" {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				excludeAccounts[account.ID()] = true
+
+				if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+					ErrorToGinResponse(c, reqErr)
+					return
+				}
+
+				log.Printf("OpenAI Responses 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
+				if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+					continue
+				}
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				errBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				excludeAccounts[account.ID()] = true
+
+				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+				logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
+				h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				h.logUsageForRequest(c, &database.UsageLogInput{
+					AccountID:         account.ID(),
+					Endpoint:          "/v1/responses",
+					Model:             model,
+					StatusCode:        resp.StatusCode,
+					DurationMs:        durationMs,
+					ReasoningEffort:   reasoningEffort,
+					InboundEndpoint:   "/v1/responses",
+					UpstreamEndpoint:  upstreamEndpoint,
+					Stream:            isStream,
+					ServiceTier:       serviceTier,
+					IsRetryAttempt:    shouldRetry,
+					AttemptIndex:      attempt + 1,
+					UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				})
+
+				if shouldRetry {
+					lastStatusCode = resp.StatusCode
+					lastBody = errBody
+					continue
+				}
+
+				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+				return
+			}
+
+			c.Set("x-account-email", baseURL)
+			c.Set("x-account-proxy", proxyURL)
+			c.Set("x-model", model)
+			c.Set("x-reasoning-effort", reasoningEffort)
+
+			var firstTokenMs int
+			var usage *UsageInfo
+			var actualServiceTier string
+			ttftRecorded := false
+			gotTerminal := false
+			deltaCharCount := 0
+			var readErr error
+			var writeErr error
+			wroteAnyBody := false
+			var imageLogInfo imageUsageLogInfo
+
+			if isStream {
+				c.Header("Content-Type", "text/event-stream")
+				c.Header("Cache-Control", "no-cache")
+				c.Header("Connection", "keep-alive")
+				c.Header("X-Accel-Buffering", "no")
+
+				flusher, ok := c.Writer.(http.Flusher)
+				if !ok {
+					c.JSON(http.StatusInternalServerError, gin.H{
+						"error": gin.H{"message": "streaming not supported", "type": "server_error"},
+					})
+					resp.Body.Close()
+					h.store.Release(account)
+					return
+				}
+				streamWriter := newStreamFlushWriter(c.Writer, flusher)
+				clientGone := false
+				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+					parsed := gjson.ParseBytes(data)
+					eventType := parsed.Get("type").String()
+					if !ttftRecorded && isFirstTokenEvent(eventType) {
+						firstTokenMs = int(time.Since(start).Milliseconds())
+						ttftRecorded = true
+					}
+					if eventType == "response.output_text.delta" {
+						deltaCharCount += len(parsed.Get("delta").String())
+					}
+					if eventType == "response.completed" {
+						usage = extractUsageFromResult(parsed.Get("response.usage"))
+						if tier := parsed.Get("response.service_tier").String(); tier != "" {
+							actualServiceTier = tier
+						}
+						gotTerminal = true
+					}
+					if eventType == "response.failed" {
+						gotTerminal = true
+					}
+					if image, ok := extractImageFromOutputItemDone(data, model); ok {
+						imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
+					}
+					if !clientGone {
+						if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", data)); err != nil {
+							writeErr = err
+							clientGone = true
+						} else {
+							wroteAnyBody = true
+						}
+					}
+					return eventType != "response.completed" && eventType != "response.failed"
+				})
+				if writeErr == nil {
+					writeErr = streamWriter.Flush()
+				}
+			} else {
+				var respBody []byte
+				respBody, readErr = io.ReadAll(resp.Body)
+				if readErr == nil {
+					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
+					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
+					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
+					gotTerminal = true
+					contentType := resp.Header.Get("Content-Type")
+					if contentType == "" {
+						contentType = "application/json"
+					}
+					c.Data(http.StatusOK, contentType, respBody)
+				}
+			}
+
+			totalDuration := int(time.Since(start).Milliseconds())
+			outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+				recyclePooledClient(account, proxyURL)
+				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				resp.Body.Close()
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				continue
+			}
+			if !isStream && readErr != nil {
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error": gin.H{"message": "读取 OpenAI Responses 响应失败", "type": "upstream_error"},
+				})
+			}
+			if outcome.logStatusCode != http.StatusOK {
+				log.Printf("OpenAI Responses 流异常结束 (account %d, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+				if deltaCharCount > 0 {
+					estOutputTokens := deltaCharCount / 3
+					if estOutputTokens < 1 {
+						estOutputTokens = 1
+					}
+					usage = &UsageInfo{
+						OutputTokens:     estOutputTokens,
+						CompletionTokens: estOutputTokens,
+						TotalTokens:      estOutputTokens,
+					}
+				}
+			}
+
+			resolvedServiceTier := resolveServiceTier(actualServiceTier, serviceTier)
+			c.Set("x-service-tier", resolvedServiceTier)
+			logInput := &database.UsageLogInput{
+				AccountID:        account.ID(),
+				Endpoint:         "/v1/responses",
+				Model:            model,
+				StatusCode:       outcome.logStatusCode,
+				DurationMs:       totalDuration,
+				FirstTokenMs:     firstTokenMs,
+				ReasoningEffort:  reasoningEffort,
+				InboundEndpoint:  "/v1/responses",
+				UpstreamEndpoint: upstreamEndpoint,
+				Stream:           isStream,
+				ServiceTier:      resolvedServiceTier,
+			}
+			if outcome.logStatusCode != http.StatusOK {
+				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+			}
+			if usage != nil {
+				logInput.PromptTokens = usage.PromptTokens
+				logInput.CompletionTokens = usage.CompletionTokens
+				logInput.TotalTokens = usage.TotalTokens
+				logInput.InputTokens = usage.InputTokens
+				logInput.OutputTokens = usage.OutputTokens
+				logInput.ReasoningTokens = usage.ReasoningTokens
+				logInput.CachedTokens = usage.CachedTokens
+			}
+			applyImageUsageLogInfo(logInput, imageLogInfo)
+			h.logUsageForRequest(c, logInput)
+
+			resp.Body.Close()
+			if outcome.penalize {
+				recyclePooledClient(account, proxyURL)
+				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			} else if outcome.logStatusCode == http.StatusOK {
+				h.store.ClearModelCooldown(account, effectiveModel)
+				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+			}
+			h.store.Release(account)
+			return
+		}
 
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
@@ -2501,5 +2767,25 @@ func (h *Handler) ListModels(c *gin.Context) {
 }
 
 func (h *Handler) supportedModelIDs(ctx context.Context) []string {
-	return SupportedModelIDs(ctx, h.db)
+	models := SupportedModelIDs(ctx, h.db)
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		seen[strings.ToLower(strings.TrimSpace(model))] = struct{}{}
+	}
+	if h != nil && h.store != nil {
+		for _, account := range h.store.Accounts() {
+			for _, model := range account.OpenAIResponsesModels() {
+				key := strings.ToLower(strings.TrimSpace(model))
+				if key == "" {
+					continue
+				}
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				models = append(models, model)
+			}
+		}
+	}
+	return models
 }

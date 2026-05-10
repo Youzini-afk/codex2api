@@ -3,12 +3,15 @@ import type {
   AccountUsageDetail,
   AddAccountRequest,
   AddATAccountRequest,
+  AddOpenAIResponsesAccountRequest,
   AdminErrorResponse,
   APIKeysResponse,
   AccountsResponse,
   ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
+  FetchOpenAIResponsesModelsRequest,
+  FetchOpenAIResponsesModelsResponse,
   CreateImageJobPayload,
   HealthResponse,
   ImageAssetsResponse,
@@ -27,10 +30,14 @@ import type {
   PromptFilterLogsResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
+  SelfUpdateStartResponse,
+  SelfUpdateStatusResponse,
+  SiteBranding,
   StatsResponse,
   CPAExportEntry,
   SystemSettings,
   UpdateAccountSchedulerRequest,
+  UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
@@ -106,6 +113,20 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return (await res.json()) as T
 }
 
+async function requestPublic<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await fetch(path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return (await res.json()) as T
+}
+
 async function requestBlob(path: string, options: RequestInit = {}): Promise<Blob> {
   const headers = new Headers(options.headers)
 
@@ -156,12 +177,19 @@ function buildOpsErrorSearchParams(params: {
 }
 
 export const api = {
+  getBranding: () => requestPublic<SiteBranding>('/api/branding'),
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
+  addOpenAIResponsesAccount: (data: AddOpenAIResponsesAccountRequest) =>
+    request<CreateAccountResponse>('/accounts/openai-responses', { method: 'POST', body: JSON.stringify(data) }),
+  fetchOpenAIResponsesModels: (data: FetchOpenAIResponsesModelsRequest) =>
+    request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
+  updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
+    request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
@@ -179,6 +207,9 @@ export const api = {
   getAccountUsage: (id: number) =>
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
   getHealth: () => request<HealthResponse>('/health'),
+  getSelfUpdateStatus: () => request<SelfUpdateStatusResponse>('/system/update'),
+  startSelfUpdate: (data: { version?: string } = {}) =>
+    request<SelfUpdateStartResponse>('/system/update', { method: 'POST', body: JSON.stringify(data) }),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getOpsErrorSummary: (params: {
     start: string

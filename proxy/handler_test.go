@@ -359,11 +359,53 @@ func TestAccountFilterForSparkRequiresPro(t *testing.T) {
 	if normalFilter == nil || !normalFilter(&auth.Account{PlanType: "plus"}) {
 		t.Fatal("non-spark model filter should allow available accounts")
 	}
+	directOpenAIAccount := &auth.Account{
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.openai.com",
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4.1"},
+	}
+	if normalFilter(directOpenAIAccount) {
+		t.Fatal("codex account filter should reject direct OpenAI Responses accounts")
+	}
+	responsesFilter := accountFilterForResponsesModel("gpt-4.1", false)
+	if !responsesFilter(directOpenAIAccount) {
+		t.Fatal("responses filter should allow direct OpenAI account for configured model")
+	}
+	if responsesFilter(&auth.Account{AccessToken: "codex-at", PlanType: "plus"}) {
+		t.Fatal("responses filter should reject codex accounts for direct-only models")
+	}
+	if !accountFilterForResponsesModel("gpt-4.1", true)(&auth.Account{AccessToken: "codex-at", PlanType: "plus"}) {
+		t.Fatal("responses filter should allow codex accounts when model is in Codex catalog")
+	}
+	if accountFilterForResponsesModel("gpt-4.2", false)(directOpenAIAccount) {
+		t.Fatal("responses filter should reject direct OpenAI account for unconfigured model")
+	}
 	cooled := &auth.Account{PlanType: "pro"}
 	cooled.SetModelCooldownUntil("gpt-5.3-codex-spark", "model_capacity", time.Now().Add(time.Minute))
 	if filter(cooled) {
 		t.Fatal("filter should reject model-cooled accounts")
 	}
+}
+
+func TestSupportedModelIDsIncludesOpenAIResponsesAccountModels(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.openai.com",
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4.1-direct"},
+	})
+
+	handler := &Handler{store: store}
+	models := handler.supportedModelIDs(context.Background())
+	for _, model := range models {
+		if model == "gpt-4.1-direct" {
+			return
+		}
+	}
+	t.Fatalf("supported models missing direct OpenAI model: %v", models)
 }
 
 func TestClassify429UsageLimitExactResetUsesAccountCooldown(t *testing.T) {

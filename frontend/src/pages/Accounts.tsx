@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest, APIKeyRow } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest, AddOpenAIResponsesAccountRequest, UpdateOpenAIResponsesAccountRequest, APIKeyRow } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatCompactEmail } from '../lib/utils'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
@@ -26,12 +26,47 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff, Hourglass } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff, Hourglass, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
 const ACCOUNT_BATCH_CONCURRENCY = 6
 const ACCOUNT_REFRESH_BATCH_CONCURRENCY = 4
+
+function parseModelTokens(value: string): string[] {
+  const seen = new Set<string>()
+  return value
+    .split(/[\n,\t ]+/)
+    .map(item => item.trim())
+    .filter(item => {
+      if (!item) return false
+      const key = item.toLowerCase()
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
+function mergeModelLists(current: string[], incoming: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const item of [...current, ...incoming]) {
+    const value = item.trim()
+    if (!value) continue
+    const key = value.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(value)
+  }
+  return result
+}
+
+function formatAccountName(account: AccountRow): string {
+  if (account.openai_responses_api) {
+    return account.name?.trim() || `ID ${account.id}`
+  }
+  return account.email || account.name || `ID ${account.id}`
+}
 
 async function runAccountBatch(ids: number[], action: (id: number) => Promise<unknown>, concurrency = ACCOUNT_BATCH_CONCURRENCY) {
   let success = 0
@@ -86,11 +121,22 @@ export default function Accounts() {
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null)
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null)
   const [editSubmitting, setEditSubmitting] = useState(false)
+  const [editTab, setEditTab] = useState<'scheduler' | 'account'>('scheduler')
   const [scoreMode, setScoreMode] = useState<'default' | 'custom'>('default')
   const [scoreInput, setScoreInput] = useState('')
   const [concurrencyMode, setConcurrencyMode] = useState<'default' | 'custom'>('default')
   const [concurrencyInput, setConcurrencyInput] = useState('')
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<number[]>([])
+  const [editOpenAIForm, setEditOpenAIForm] = useState<UpdateOpenAIResponsesAccountRequest>({
+    name: '',
+    base_url: 'https://api.openai.com',
+    api_key: '',
+    models: [],
+    proxy_url: '',
+  })
+  const [openAIModelDraft, setOpenAIModelDraft] = useState('')
+  const [editOpenAIModelDraft, setEditOpenAIModelDraft] = useState('')
+  const [editOpenAIModelsLoading, setEditOpenAIModelsLoading] = useState(false)
   const [importing, setImporting] = useState(false)
   const [showImportPicker, setShowImportPicker] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -102,11 +148,18 @@ export default function Accounts() {
   const [migrateKey, setMigrateKey] = useState('')
   const [migrating, setMigrating] = useState(false)
   const [importProgress, setImportProgress] = useState<{ show: boolean; current: number; total: number; success: number; duplicate: number; failed: number; done: boolean }>({ show: false, current: 0, total: 0, success: 0, duplicate: 0, failed: 0, done: false })
-  const [addMethod, setAddMethod] = useState<'rt' | 'at' | 'oauth'>('rt')
+  const [addMethod, setAddMethod] = useState<'rt' | 'at' | 'openai' | 'oauth'>('rt')
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: '',
     proxy_url: '',
   })
+  const [openAIForm, setOpenAIForm] = useState<AddOpenAIResponsesAccountRequest>({
+    base_url: 'https://api.openai.com',
+    api_key: '',
+    models: [],
+    proxy_url: '',
+  })
+  const [openAIModelsLoading, setOpenAIModelsLoading] = useState(false)
   const [oauthStep, setOauthStep] = useState<'generate' | 'exchange'>('generate')
   const [oauthSession, setOauthSession] = useState<{ session_id: string; auth_url: string } | null>(null)
   const [oauthProxyUrl, setOauthProxyUrl] = useState('')
@@ -361,6 +414,107 @@ export default function Accounts() {
       showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const addOpenAIModelValues = useCallback((raw: string) => {
+    const nextModels = parseModelTokens(raw)
+    if (nextModels.length === 0) return
+    setOpenAIForm((form) => ({ ...form, models: mergeModelLists(form.models, nextModels) }))
+    setOpenAIModelDraft('')
+  }, [])
+
+  const removeOpenAIModel = useCallback((model: string) => {
+    setOpenAIForm((form) => ({ ...form, models: form.models.filter(item => item !== model) }))
+  }, [])
+
+  const addEditOpenAIModelValues = useCallback((raw: string) => {
+    const nextModels = parseModelTokens(raw)
+    if (nextModels.length === 0) return
+    setEditOpenAIForm((form) => ({ ...form, models: mergeModelLists(form.models, nextModels) }))
+    setEditOpenAIModelDraft('')
+  }, [])
+
+  const removeEditOpenAIModel = useCallback((model: string) => {
+    setEditOpenAIForm((form) => ({ ...form, models: form.models.filter(item => item !== model) }))
+  }, [])
+
+  const handleFetchOpenAIModels = async () => {
+    if (!openAIForm.api_key.trim()) return
+    setOpenAIModelsLoading(true)
+    try {
+      const result = await api.fetchOpenAIResponsesModels({
+        base_url: openAIForm.base_url,
+        api_key: openAIForm.api_key,
+        proxy_url: openAIForm.proxy_url,
+      })
+      const models = result.models ?? []
+      setOpenAIForm((form) => ({ ...form, base_url: result.base_url || form.base_url, models }))
+      showToast(t('accounts.openaiModelsFetchSuccess', { count: models.length }))
+    } catch (error) {
+      showToast(t('accounts.openaiModelsFetchFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setOpenAIModelsLoading(false)
+    }
+  }
+
+  const handleAddOpenAIResponses = async () => {
+    const models = openAIForm.models
+    if (!openAIForm.api_key.trim() || models.length === 0) return
+    setSubmitting(true)
+    try {
+      await api.addOpenAIResponsesAccount({ ...openAIForm, models })
+      showToast(t('accounts.addSuccess'))
+      setShowAdd(false)
+      setOpenAIForm({ base_url: 'https://api.openai.com', api_key: '', models: [], proxy_url: '' })
+      setOpenAIModelDraft('')
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleFetchEditOpenAIModels = async () => {
+    if (!editingAccount?.openai_responses_api) return
+    setEditOpenAIModelsLoading(true)
+    try {
+      const result = await api.fetchOpenAIResponsesModels({
+        account_id: editingAccount.id,
+        base_url: editOpenAIForm.base_url,
+        api_key: editOpenAIForm.api_key ?? '',
+        proxy_url: editOpenAIForm.proxy_url,
+      })
+      const models = result.models ?? []
+      setEditOpenAIForm((form) => ({ ...form, base_url: result.base_url || form.base_url, models }))
+      showToast(t('accounts.openaiModelsFetchSuccess', { count: models.length }))
+    } catch (error) {
+      showToast(t('accounts.openaiModelsFetchFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setEditOpenAIModelsLoading(false)
+    }
+  }
+
+  const handleSaveOpenAIAccountSettings = async () => {
+    if (!editingAccount?.openai_responses_api) return
+    if (!editOpenAIForm.base_url.trim() || editOpenAIForm.models.length === 0) {
+      showToast(t('accounts.openaiAccountInvalid'), 'error')
+      return
+    }
+    setEditSubmitting(true)
+    try {
+      await api.updateOpenAIResponsesAccount(editingAccount.id, {
+        ...editOpenAIForm,
+        api_key: editOpenAIForm.api_key?.trim() || undefined,
+      })
+      showToast(t('accounts.openaiAccountSaveSuccess'))
+      await reload()
+      closeSchedulerEditor(true)
+    } catch (error) {
+      showToast(t('accounts.openaiAccountSaveFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setEditSubmitting(false)
     }
   }
 
@@ -991,27 +1145,44 @@ export default function Accounts() {
 
   const openSchedulerEditor = (account: AccountRow) => {
     setEditingAccount(account)
+    setEditTab('scheduler')
     setScoreMode(account.score_bias_override === null || account.score_bias_override === undefined ? 'default' : 'custom')
     setScoreInput(account.score_bias_override === null || account.score_bias_override === undefined ? '' : String(account.score_bias_override))
     setConcurrencyMode(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? 'default' : 'custom')
     setConcurrencyInput(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? '' : String(account.base_concurrency_override))
     setAllowedAPIKeySelection(filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys))
+    setEditOpenAIForm({
+      name: account.name ?? '',
+      base_url: account.base_url || 'https://api.openai.com',
+      api_key: '',
+      models: account.models ?? [],
+      proxy_url: account.proxy_url ?? '',
+    })
+    setEditOpenAIModelDraft('')
   }
 
   const closeSchedulerEditor = (force = false) => {
     if (editSubmitting && !force) return
     setEditingAccount(null)
+    setEditTab('scheduler')
     setScoreMode('default')
     setScoreInput('')
     setConcurrencyMode('default')
     setConcurrencyInput('')
     setAllowedAPIKeySelection([])
+    setEditOpenAIForm({ name: '', base_url: 'https://api.openai.com', api_key: '', models: [], proxy_url: '' })
+    setEditOpenAIModelDraft('')
   }
 
   const parsedScoreBias = scoreMode === 'custom' ? parseIntegerInput(scoreInput) : null
   const parsedBaseConcurrency = concurrencyMode === 'custom' ? parseIntegerInput(concurrencyInput) : null
   const scoreInputInvalid = scoreMode === 'custom' && (parsedScoreBias === null || parsedScoreBias < -200 || parsedScoreBias > 200)
   const concurrencyInputInvalid = concurrencyMode === 'custom' && (parsedBaseConcurrency === null || parsedBaseConcurrency < 1 || parsedBaseConcurrency > 50)
+  const openAIAccountInputInvalid = Boolean(
+    editingAccount?.openai_responses_api &&
+    editTab === 'account' &&
+    (!editOpenAIForm.base_url.trim() || editOpenAIForm.models.length === 0)
+  )
 
   const editPreview = useMemo(() => {
     if (!editingAccount) return null
@@ -1057,6 +1228,14 @@ export default function Accounts() {
     } finally {
       setEditSubmitting(false)
     }
+  }
+
+  const handleSaveAccountEditor = async () => {
+    if (editingAccount?.openai_responses_api && editTab === 'account') {
+      await handleSaveOpenAIAccountSettings()
+      return
+    }
+    await handleSaveScheduler()
   }
 
   return (
@@ -1386,10 +1565,15 @@ export default function Accounts() {
                             {(currentPage - 1) * pageSize + index + 1}
                           </TableCell>
                           <TableCell className="text-[14px] text-muted-foreground">
-                            {formatCompactEmail(account.email)}
+                            <span>{account.openai_responses_api ? formatAccountName(account) : formatCompactEmail(account.email)}</span>
                             {account.at_only && (
                               <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                                 AT
+                              </span>
+                            )}
+                            {account.openai_responses_api && (
+                              <span className="ml-1.5 inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
+                                Responses API
                               </span>
                             )}
                             {account.enabled === false && (
@@ -1484,9 +1668,9 @@ export default function Accounts() {
                               variant="outline"
                               size="icon"
                               className="h-7 w-8 px-0"
-                              disabled={refreshingIds.has(account.id) || account.at_only}
+                              disabled={refreshingIds.has(account.id) || account.at_only || account.openai_responses_api}
                               onClick={() => void handleRefresh(account)}
-                              title={account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
+                              title={(account.at_only || account.openai_responses_api) ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
                             >
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
                             </Button>
@@ -1494,9 +1678,9 @@ export default function Accounts() {
                               variant="outline"
                               size="icon"
                               className="h-7 w-8 px-0"
-                              disabled={authJsonExportingIds.has(account.id) || account.at_only}
+                              disabled={authJsonExportingIds.has(account.id) || account.at_only || account.openai_responses_api}
                               onClick={() => void handleGenerateAuthJSON(account)}
-                              title={account.at_only ? t('accounts.authJsonDisabled') : t('accounts.generateAuthJson')}
+                              title={(account.at_only || account.openai_responses_api) ? t('accounts.authJsonDisabled') : t('accounts.generateAuthJson')}
                             >
                               <FileJson className="size-3.5" />
                             </Button>
@@ -1571,6 +1755,8 @@ export default function Accounts() {
             setOauthSession(null)
             setOauthCallbackUrl('')
             setOauthName('')
+            setOpenAIForm({ base_url: 'https://api.openai.com', api_key: '', models: [], proxy_url: '' })
+            setOpenAIModelDraft('')
           }}
           footer={(
             <>
@@ -1583,6 +1769,8 @@ export default function Accounts() {
                   setOauthSession(null)
                   setOauthCallbackUrl('')
                   setOauthName('')
+                  setOpenAIForm({ base_url: 'https://api.openai.com', api_key: '', models: [], proxy_url: '' })
+                  setOpenAIModelDraft('')
                 }}
               >
                 {t('common.cancel')}
@@ -1593,6 +1781,13 @@ export default function Accounts() {
                 </Button>
               ) : addMethod === 'at' ? (
                 <Button onClick={() => void handleAddAT()} disabled={submitting || !atForm.access_token.trim()}>
+                  {submitting ? t('accounts.adding') : t('accounts.submit')}
+                </Button>
+              ) : addMethod === 'openai' ? (
+                <Button
+                  onClick={() => void handleAddOpenAIResponses()}
+                  disabled={submitting || !openAIForm.api_key.trim() || openAIForm.models.length === 0}
+                >
                   {submitting ? t('accounts.adding') : t('accounts.submit')}
                 </Button>
               ) : oauthStep === 'generate' ? (
@@ -1633,6 +1828,17 @@ export default function Accounts() {
             >
               <Fingerprint className="size-3.5" />
               {t('accounts.addMethodAT')}
+            </button>
+            <button
+              onClick={() => setAddMethod('openai')}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                addMethod === 'openai'
+                  ? 'bg-background shadow-sm text-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <KeyRound className="size-3.5" />
+              {t('accounts.addMethodOpenAI')}
             </button>
             <button
               onClick={() => { setAddMethod('oauth'); setOauthStep('generate'); setOauthSession(null); setOauthCallbackUrl('') }}
@@ -1696,6 +1902,101 @@ export default function Accounts() {
                   value={atForm.proxy_url}
                   onChange={(event: ChangeEvent<HTMLInputElement>) =>
                     setAtForm((form) => ({ ...form, proxy_url: event.target.value }))
+                  }
+                />
+              </div>
+            </div>
+          ) : addMethod === 'openai' ? (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                <p className="font-semibold text-foreground mb-1">{t('accounts.openaiResponsesTitle')}</p>
+                <p>{t('accounts.openaiResponsesDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.openaiNameLabel')}</label>
+                <Input
+                  placeholder={t('accounts.openaiNamePlaceholder')}
+                  value={openAIForm.name ?? ''}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setOpenAIForm((form) => ({ ...form, name: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.openaiBaseUrl')} *</label>
+                <Input
+                  placeholder="https://api.openai.com"
+                  value={openAIForm.base_url}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setOpenAIForm((form) => ({ ...form, base_url: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.openaiApiKey')} *</label>
+                <Input
+                  type="password"
+                  placeholder="sk-proj-..."
+                  value={openAIForm.api_key}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setOpenAIForm((form) => ({ ...form, api_key: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <label className="text-sm font-semibold text-muted-foreground">{t('accounts.openaiModels')} *</label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleFetchOpenAIModels()}
+                    disabled={openAIModelsLoading || !openAIForm.api_key.trim()}
+                  >
+                    <RefreshCw className={`size-3.5 ${openAIModelsLoading ? 'animate-spin' : ''}`} />
+                    {openAIModelsLoading ? t('accounts.openaiModelsFetching') : t('accounts.openaiModelsFetch')}
+                  </Button>
+                </div>
+                <div className="mb-3 flex gap-2">
+                  <Input
+                    placeholder={t('accounts.openaiModelsPlaceholder')}
+                    value={openAIModelDraft}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setOpenAIModelDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        addOpenAIModelValues(openAIModelDraft)
+                      }
+                    }}
+                    onPaste={(event) => {
+                      const pasted = event.clipboardData.getData('text')
+                      if (parseModelTokens(pasted).length > 1) {
+                        event.preventDefault()
+                        addOpenAIModelValues(pasted)
+                      }
+                    }}
+                  />
+                  <Button type="button" variant="outline" onClick={() => addOpenAIModelValues(openAIModelDraft)} disabled={!openAIModelDraft.trim()}>
+                    <Plus className="size-3.5" />
+                    {t('accounts.openaiModelsAdd')}
+                  </Button>
+                </div>
+                <ModelChipGrid
+                  models={openAIForm.models}
+                  onRemove={removeOpenAIModel}
+                  emptyLabel={t('accounts.openaiModelsEmpty')}
+                />
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  {t('accounts.openaiModelsHint', { count: openAIForm.models.length })}
+                </p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyUrl')}</label>
+                <Input
+                  placeholder={t('accounts.proxyUrlPlaceholder')}
+                  value={openAIForm.proxy_url}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setOpenAIForm((form) => ({ ...form, proxy_url: event.target.value }))
                   }
                 />
               </div>
@@ -2004,7 +2305,10 @@ export default function Accounts() {
               <Button variant="outline" onClick={() => closeSchedulerEditor()} disabled={editSubmitting}>
                 {t('common.cancel')}
               </Button>
-              <Button onClick={() => void handleSaveScheduler()} disabled={editSubmitting || scoreInputInvalid || concurrencyInputInvalid}>
+              <Button
+                onClick={() => void handleSaveAccountEditor()}
+                disabled={editSubmitting || (editTab === 'scheduler' && (scoreInputInvalid || concurrencyInputInvalid)) || openAIAccountInputInvalid}
+              >
                 {editSubmitting ? t('common.saving') : t('common.save')}
               </Button>
             </>
@@ -2013,10 +2317,130 @@ export default function Accounts() {
           {editingAccount && editPreview ? (
             <div className="space-y-5">
               <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
-                <div className="font-semibold text-foreground">{editingAccount.email || `ID ${editingAccount.id}`}</div>
+                <div className="font-semibold text-foreground">{formatAccountName(editingAccount)}</div>
                 <div className="mt-1">{t('accounts.schedulerEditDesc', { plan: editingAccount.plan_type || '-' })}</div>
               </div>
 
+              {editingAccount.openai_responses_api && (
+                <div className="flex gap-1 rounded-xl border border-border bg-muted/50 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setEditTab('scheduler')}
+                    className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
+                      editTab === 'scheduler'
+                        ? 'bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {t('accounts.editTabScheduler')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditTab('account')}
+                    className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
+                      editTab === 'account'
+                        ? 'bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {t('accounts.editTabAccount')}
+                  </button>
+                </div>
+              )}
+
+              {editTab === 'account' && editingAccount.openai_responses_api ? (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.openaiNameLabel')}</label>
+                    <Input
+                      placeholder={t('accounts.openaiNamePlaceholder')}
+                      value={editOpenAIForm.name ?? ''}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setEditOpenAIForm((form) => ({ ...form, name: event.target.value }))
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.openaiBaseUrl')} *</label>
+                    <Input
+                      placeholder="https://api.openai.com"
+                      value={editOpenAIForm.base_url}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setEditOpenAIForm((form) => ({ ...form, base_url: event.target.value }))
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.openaiApiKey')}</label>
+                    <Input
+                      type="password"
+                      placeholder={t('accounts.openaiApiKeyKeepPlaceholder')}
+                      value={editOpenAIForm.api_key ?? ''}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setEditOpenAIForm((form) => ({ ...form, api_key: event.target.value }))
+                      }
+                    />
+                  </div>
+                  <div>
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <label className="text-sm font-semibold text-muted-foreground">{t('accounts.openaiModels')} *</label>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void handleFetchEditOpenAIModels()}
+                        disabled={editOpenAIModelsLoading}
+                      >
+                        <RefreshCw className={`size-3.5 ${editOpenAIModelsLoading ? 'animate-spin' : ''}`} />
+                        {editOpenAIModelsLoading ? t('accounts.openaiModelsFetching') : t('accounts.openaiModelsFetch')}
+                      </Button>
+                    </div>
+                    <div className="mb-3 flex gap-2">
+                      <Input
+                        placeholder={t('accounts.openaiModelsPlaceholder')}
+                        value={editOpenAIModelDraft}
+                        onChange={(event: ChangeEvent<HTMLInputElement>) => setEditOpenAIModelDraft(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            addEditOpenAIModelValues(editOpenAIModelDraft)
+                          }
+                        }}
+                        onPaste={(event) => {
+                          const pasted = event.clipboardData.getData('text')
+                          if (parseModelTokens(pasted).length > 1) {
+                            event.preventDefault()
+                            addEditOpenAIModelValues(pasted)
+                          }
+                        }}
+                      />
+                      <Button type="button" variant="outline" onClick={() => addEditOpenAIModelValues(editOpenAIModelDraft)} disabled={!editOpenAIModelDraft.trim()}>
+                        <Plus className="size-3.5" />
+                        {t('accounts.openaiModelsAdd')}
+                      </Button>
+                    </div>
+                    <ModelChipGrid
+                      models={editOpenAIForm.models}
+                      onRemove={removeEditOpenAIModel}
+                      emptyLabel={t('accounts.openaiModelsEmpty')}
+                    />
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {t('accounts.openaiModelsHint', { count: editOpenAIForm.models.length })}
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyUrl')}</label>
+                    <Input
+                      placeholder={t('accounts.proxyUrlPlaceholder')}
+                      value={editOpenAIForm.proxy_url}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setEditOpenAIForm((form) => ({ ...form, proxy_url: event.target.value }))
+                      }
+                    />
+                  </div>
+                </div>
+              ) : (
+                <>
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="rounded-xl border border-border p-4">
                   <div className="text-sm font-semibold text-foreground">{t('accounts.schedulerScoreLabel')}</div>
@@ -2114,6 +2538,8 @@ export default function Accounts() {
                   <PreviewItem label={t('accounts.schedulerPreviewDynamicConcurrency')} value={String(editPreview.dynamicConcurrency)} />
                 </div>
               </div>
+                </>
+              )}
             </div>
           ) : null}
         </Modal>
@@ -2329,6 +2755,45 @@ function APIKeyMultiSelect({
           )}
         </div>
       ) : null}
+    </div>
+  )
+}
+
+function ModelChipGrid({
+  models,
+  onRemove,
+  emptyLabel,
+}: {
+  models: string[]
+  onRemove: (model: string) => void
+  emptyLabel: string
+}) {
+  if (models.length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed border-border bg-muted/20 px-3 py-3 text-sm text-muted-foreground">
+        {emptyLabel}
+      </div>
+    )
+  }
+  return (
+    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+      {models.map((model) => (
+        <div
+          key={model}
+          className="flex min-h-10 items-center justify-between gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm"
+          title={model}
+        >
+          <span className="min-w-0 truncate font-mono text-[12px] text-foreground">{model}</span>
+          <button
+            type="button"
+            className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            onClick={() => onRemove(model)}
+            aria-label={`Remove ${model}`}
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
+      ))}
     </div>
   )
 }
@@ -2824,13 +3289,13 @@ function extractTextModels(modelsResp: Awaited<ReturnType<typeof api.getModels>>
   return (modelsResp.models ?? []).filter(isConnectionTestModel)
 }
 
-function uniqueTestModels(models: string[], preferredModel?: string) {
+function uniqueTestModels(models: string[], preferredModel?: string, includeDefault = true) {
   const seen = new Set<string>()
   const result: string[] = []
   const candidates = [
     preferredModel ?? '',
     ...models,
-    DEFAULT_TEST_MODEL,
+    ...(includeDefault ? [DEFAULT_TEST_MODEL] : []),
   ]
 
   for (const model of candidates) {
@@ -2871,9 +3336,11 @@ function TestConnectionModal({
     onSettledRef.current()
   }, [])
 
+  const isOpenAIResponsesAccount = Boolean(account.openai_responses_api)
+
   const modelSelectOptions = useMemo(
-    () => uniqueTestModels(modelOptions, selectedModel).map((item) => ({ label: item, value: item })),
-    [modelOptions, selectedModel]
+    () => uniqueTestModels(modelOptions, selectedModel, !isOpenAIResponsesAccount).map((item) => ({ label: item, value: item })),
+    [isOpenAIResponsesAccount, modelOptions, selectedModel]
   )
 
   useEffect(() => {
@@ -2881,19 +3348,36 @@ function TestConnectionModal({
 
     const loadModels = async () => {
       try {
-        const [modelsResp, settings] = await Promise.all([api.getModels(), api.getSettings()])
+        const settings = await api.getSettings()
         if (!active) return
 
-	        const upstreamModels = extractTextModels(modelsResp)
-	        const preferredModel = isConnectionTestModel(settings.test_model) ? settings.test_model : DEFAULT_TEST_MODEL
-	        const nextModels = uniqueTestModels(upstreamModels, preferredModel)
-	        setModelOptions(nextModels)
-	        setSelectedModel((current) => current || nextModels[0] || DEFAULT_TEST_MODEL)
-	      } catch {
-	        if (!active) return
-	        const fallbackModels = uniqueTestModels([], DEFAULT_TEST_MODEL)
-	        setModelOptions(fallbackModels)
-	        setSelectedModel((current) => current || fallbackModels[0])
+        if (isOpenAIResponsesAccount) {
+          const accountModels = (account.models ?? []).filter(isConnectionTestModel)
+          const preferredModel = accountModels.find(item => item.toLowerCase() === settings.test_model.toLowerCase()) ?? accountModels[0]
+          const nextModels = uniqueTestModels(accountModels, preferredModel, false)
+          setModelOptions(nextModels)
+          setSelectedModel((current) => current || nextModels[0] || '')
+          return
+        }
+
+        const modelsResp = await api.getModels()
+        if (!active) return
+        const upstreamModels = extractTextModels(modelsResp)
+        const preferredModel = isConnectionTestModel(settings.test_model) ? settings.test_model : DEFAULT_TEST_MODEL
+        const nextModels = uniqueTestModels(upstreamModels, preferredModel)
+        setModelOptions(nextModels)
+        setSelectedModel((current) => current || nextModels[0] || DEFAULT_TEST_MODEL)
+      } catch {
+        if (!active) return
+        if (isOpenAIResponsesAccount) {
+          const fallbackModels = uniqueTestModels((account.models ?? []).filter(isConnectionTestModel), undefined, false)
+          setModelOptions(fallbackModels)
+          setSelectedModel((current) => current || fallbackModels[0] || '')
+        } else {
+          const fallbackModels = uniqueTestModels([], DEFAULT_TEST_MODEL)
+          setModelOptions(fallbackModels)
+          setSelectedModel((current) => current || fallbackModels[0])
+        }
       } finally {
         if (active) {
           setModelOptionsReady(true)
@@ -2906,7 +3390,7 @@ function TestConnectionModal({
     return () => {
       active = false
     }
-  }, [])
+  }, [account.models, isOpenAIResponsesAccount])
 
   useEffect(() => {
     if (!modelOptionsReady || !selectedModel) return
@@ -3053,7 +3537,7 @@ function TestConnectionModal({
   return (
     <Modal
       show={true}
-      title={t('accounts.testConnectionTitle', { account: account.email || `ID ${account.id}` })}
+      title={t('accounts.testConnectionTitle', { account: formatAccountName(account) })}
       onClose={() => {
         abortRef.current?.abort()
         onClose()

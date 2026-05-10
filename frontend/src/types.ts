@@ -30,6 +30,10 @@ export interface AccountRow {
   status: AccountStatus
   error_message?: string
   at_only?: boolean
+  account_type?: string
+  openai_responses_api?: boolean
+  base_url?: string
+  models?: string[]
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -102,6 +106,34 @@ export interface AddATAccountRequest {
   proxy_url: string
 }
 
+export interface AddOpenAIResponsesAccountRequest {
+  name?: string
+  base_url: string
+  api_key: string
+  models: string[]
+  proxy_url: string
+}
+
+export interface UpdateOpenAIResponsesAccountRequest {
+  name?: string
+  base_url: string
+  api_key?: string
+  models: string[]
+  proxy_url: string
+}
+
+export interface FetchOpenAIResponsesModelsRequest {
+  account_id?: number
+  base_url: string
+  api_key: string
+  proxy_url?: string
+}
+
+export interface FetchOpenAIResponsesModelsResponse {
+  base_url: string
+  models: string[]
+}
+
 export interface UpdateAccountSchedulerRequest {
   score_bias_override: number | null
   base_concurrency_override: number | null
@@ -140,6 +172,31 @@ export interface HealthResponse {
   status: 'ok' | string
   available: number
   total: number
+}
+
+export interface SelfUpdateStatusResponse {
+  supported: boolean
+  running: boolean
+  method?: string
+  target_container?: string
+  target_image?: string
+  watchtower_image?: string
+  message?: string
+  error?: string
+  reason?: string
+  started_at?: ISODateString
+}
+
+export interface SelfUpdateStartResponse extends MessageResponse {
+  supported: boolean
+  target_container?: string
+  target_image?: string
+  watchtower_image?: string
+}
+
+export interface SiteBranding {
+  site_name: string
+  site_logo: string
 }
 
 export interface AccountEventTrendPoint {
@@ -206,6 +263,8 @@ export interface OpsOverviewResponse {
 }
 
 export interface SystemSettings {
+  site_name: string
+  site_logo: string
   max_concurrency: number
   global_rpm: number
   test_model: string

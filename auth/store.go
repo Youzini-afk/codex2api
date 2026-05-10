@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -39,6 +40,8 @@ const (
 	HealthTierBanned  AccountHealthTier = "banned"
 )
 
+const UpstreamOpenAIResponses = "openai_responses"
+
 // Account 运行时账号状态
 type Account struct {
 	mu             sync.RWMutex
@@ -51,6 +54,10 @@ type Account struct {
 	Email          string
 	PlanType       string
 	ProxyURL       string
+	UpstreamType   string
+	BaseURL        string
+	APIKey         string
+	Models         []string
 	Status         AccountStatus
 	CooldownUtil   time.Time
 	CooldownReason string // rate_limited / unauthorized / 空
@@ -170,6 +177,97 @@ func (a *Account) Mu() *sync.RWMutex {
 	return &a.mu
 }
 
+func (a *Account) isOpenAIResponsesAPILocked() bool {
+	if a == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(a.UpstreamType), UpstreamOpenAIResponses) &&
+		strings.TrimSpace(a.BaseURL) != "" &&
+		strings.TrimSpace(a.APIKey) != ""
+}
+
+func (a *Account) hasDispatchCredentialLocked() bool {
+	if a == nil {
+		return false
+	}
+	if a.isOpenAIResponsesAPILocked() {
+		return true
+	}
+	return strings.TrimSpace(a.AccessToken) != ""
+}
+
+func (a *Account) IsOpenAIResponsesAPI() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isOpenAIResponsesAPILocked()
+}
+
+func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
+	if a == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.isOpenAIResponsesAPILocked() || len(a.Models) == 0 {
+		return false
+	}
+	for _, candidate := range a.Models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Account) OpenAIResponsesModels() []string {
+	if a == nil {
+		return []string{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.isOpenAIResponsesAPILocked() {
+		return []string{}
+	}
+	return cloneStringSlice(a.Models)
+}
+
+func (a *Account) OpenAIResponsesCredentials() (baseURL, apiKey string) {
+	if a == nil {
+		return "", ""
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.isOpenAIResponsesAPILocked() {
+		return "", ""
+	}
+	return strings.TrimRight(strings.TrimSpace(a.BaseURL), "/"), strings.TrimSpace(a.APIKey)
+}
+
+func (a *Account) GetProxyURL() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return strings.TrimSpace(a.ProxyURL)
+}
+
+func (a *Account) GetAccessToken() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return strings.TrimSpace(a.AccessToken)
+}
+
 func clampInt(value, minValue, maxValue int) int {
 	if value < minValue {
 		return minValue
@@ -195,6 +293,81 @@ func cloneInt64Slice(values []int64) []int64 {
 	cloned := make([]int64, len(values))
 	copy(cloned, values)
 	return cloned
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func normalizeModelList(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, value)
+	}
+	if len(result) == 0 {
+		return []string{}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return strings.ToLower(result[i]) < strings.ToLower(result[j])
+	})
+	return result
+}
+
+func NormalizeOpenAIResponsesModels(values []string) []string {
+	return normalizeModelList(values)
+}
+
+func NormalizeOpenAIResponsesBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = "https://api.openai.com"
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("base_url 必须是完整的 http/https URL")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("base_url 仅支持 http/https")
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String(), nil
+}
+
+func OpenAIResponsesEndpoint(baseURL, suffix string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" {
+		return baseURL
+	}
+	if !strings.HasPrefix(suffix, "/") {
+		suffix = "/" + suffix
+	}
+	if strings.HasSuffix(strings.ToLower(baseURL), "/v1") && strings.HasPrefix(strings.ToLower(suffix), "/v1/") {
+		return baseURL + strings.TrimPrefix(suffix, "/v1")
+	}
+	return baseURL + suffix
 }
 
 func normalizeAllowedAPIKeyIDs(values []int64) []int64 {
@@ -338,7 +511,7 @@ func (a *Account) healthTierLocked() AccountHealthTier {
 	if a.HealthTier != "" {
 		return a.HealthTier
 	}
-	if a.AccessToken != "" {
+	if a.hasDispatchCredentialLocked() {
 		return HealthTierHealthy
 	}
 	return HealthTierWarm
@@ -532,7 +705,7 @@ func (a *Account) dispatchBonusEligibleLocked(now time.Time, tier AccountHealthT
 	if a.usageExhaustedLocked() {
 		return false
 	}
-	if a.AccessToken == "" {
+	if !a.hasDispatchCredentialLocked() {
 		return false
 	}
 	return true
@@ -648,9 +821,9 @@ func (a *Account) IsAvailable() bool {
 	}
 	// 冷却期过了自动恢复
 	if a.Status == StatusCooldown && !time.Now().Before(a.CooldownUtil) {
-		return a.AccessToken != ""
+		return a.hasDispatchCredentialLocked()
 	}
-	return a.AccessToken != ""
+	return a.hasDispatchCredentialLocked()
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -750,7 +923,7 @@ func (a *Account) RuntimeStatus() string {
 			}
 			return "cooldown"
 		}
-		if a.AccessToken != "" {
+		if a.hasDispatchCredentialLocked() {
 			return "active" // 冷却过期，已恢复
 		}
 		if a.RefreshToken != "" {
@@ -758,7 +931,7 @@ func (a *Account) RuntimeStatus() string {
 		}
 		return "error"
 	default:
-		if a.AccessToken != "" {
+		if a.hasDispatchCredentialLocked() {
 			return "active"
 		}
 		if a.RefreshToken != "" && a.ErrorMsg == "" {
@@ -1720,7 +1893,12 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		rt := row.GetCredential("refresh_token")
 		st := row.GetCredential("session_token")
 		at := row.GetCredential("access_token")
-		if rt == "" && st == "" && at == "" {
+		upstreamType := row.GetCredential("upstream_type")
+		baseURL := row.GetCredential("base_url")
+		apiKey := row.GetCredential("api_key")
+		models := normalizeModelList(row.GetCredentialStringSlice("models"))
+		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
+		if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount {
 			log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
 			continue
 		}
@@ -1732,6 +1910,16 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			ProxyURL:     strings.TrimSpace(row.ProxyURL),
 			HealthTier:   HealthTierWarm,
 			AddedAt:      row.CreatedAt.UnixNano(),
+			UpstreamType: upstreamType,
+			BaseURL:      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+			APIKey:       strings.TrimSpace(apiKey),
+			Models:       models,
+		}
+		if isOpenAIResponsesAccount {
+			account.HealthTier = HealthTierHealthy
+			if account.PlanType == "" {
+				account.PlanType = "api"
+			}
 		}
 		account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
 		account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
@@ -2418,6 +2606,31 @@ func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64)
 
 	acc.mu.Lock()
 	acc.setAllowedAPIKeyIDsLocked(allowedAPIKeyIDs)
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, models []string, proxyURL string) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	acc.UpstreamType = UpstreamOpenAIResponses
+	acc.BaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.TrimSpace(apiKey) != "" {
+		acc.APIKey = strings.TrimSpace(apiKey)
+	}
+	acc.Models = normalizeModelList(models)
+	acc.ProxyURL = strings.TrimSpace(proxyURL)
+	acc.Email = acc.BaseURL
+	acc.PlanType = "api"
+	if acc.Status != StatusError {
+		acc.HealthTier = HealthTierHealthy
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true

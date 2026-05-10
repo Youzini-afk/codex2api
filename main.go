@@ -66,6 +66,7 @@ func main() {
 		// 初次运行，保存初始安全设置到数据库
 		log.Printf("初次运行，初始化系统默认设置...")
 		settings = &database.SystemSettings{
+			SiteName:                         database.DefaultSiteName,
 			MaxConcurrency:                   2,
 			GlobalRPM:                        0,
 			TestModel:                        "gpt-5.4",
@@ -99,6 +100,7 @@ func main() {
 	} else if err != nil {
 		log.Printf("警告: 读取系统设置失败: %v，将采用安全后备策略", err)
 		settings = &database.SystemSettings{
+			SiteName:                         database.DefaultSiteName,
 			MaxConcurrency:                   2,
 			GlobalRPM:                        0,
 			TestModel:                        "gpt-5.4",

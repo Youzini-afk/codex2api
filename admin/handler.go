@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -58,6 +59,13 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
+
+	// 容器自更新状态（由一次性 Watchtower 容器执行实际更新）
+	selfUpdateMu        sync.Mutex
+	selfUpdateRunning   bool
+	selfUpdateStartedAt time.Time
+	selfUpdateMessage   string
+	selfUpdateError     string
 }
 
 type chartCacheEntry struct {
@@ -100,6 +108,7 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/img/:id", h.GetSignedImageAssetFile)
+	r.GET("/api/branding", h.GetBranding)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
@@ -112,6 +121,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts", h.ListAccounts)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
+	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
+	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
+	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
@@ -138,6 +150,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/keys", h.CreateAPIKey)
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/health", h.GetHealth)
+	api.GET("/system/update", h.GetSelfUpdateStatus)
+	api.POST("/system/update", h.StartSelfUpdate)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
@@ -293,6 +307,10 @@ type accountResponse struct {
 	Status                   string                     `json:"status"`
 	ErrorMessage             string                     `json:"error_message,omitempty"`
 	ATOnly                   bool                       `json:"at_only"`
+	AccountType              string                     `json:"account_type,omitempty"`
+	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
+	BaseURL                  string                     `json:"base_url,omitempty"`
+	Models                   []string                   `json:"models,omitempty"`
 	HealthTier               string                     `json:"health_tier"`
 	SchedulerScore           float64                    `json:"scheduler_score"`
 	DispatchScore            float64                    `json:"dispatch_score"`
@@ -388,20 +406,34 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
+		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+		email := row.GetCredential("email")
+		baseURL := row.GetCredential("base_url")
+		if isOpenAIResponsesAccount && email == "" {
+			email = baseURL
+		}
+		planType := row.GetCredential("plan_type")
+		if isOpenAIResponsesAccount && planType == "" {
+			planType = "api"
+		}
 		resp := accountResponse{
 			ID:                       row.ID,
 			Name:                     row.Name,
-			Email:                    row.GetCredential("email"),
-			PlanType:                 row.GetCredential("plan_type"),
+			Email:                    email,
+			PlanType:                 planType,
 			Status:                   row.Status,
 			ErrorMessage:             row.ErrorMessage,
-			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			AccountType:              row.Type,
+			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
+			BaseURL:                  baseURL,
+			Models:                   row.GetCredentialStringSlice("models"),
 			ProxyURL:                 row.ProxyURL,
 			Enabled:                  row.Enabled,
 			Locked:                   row.Locked,
 			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
-			ScoreBiasEffective:       effectiveScoreBias(row.GetCredential("plan_type"), row.ScoreBiasOverride),
+			ScoreBiasEffective:       effectiveScoreBias(planType, row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
 			BaseConcurrencyEffective: effectiveBaseConcurrency(row.BaseConcurrencyOverride, int64(h.store.GetMaxConcurrency())),
 			CreatedAt:                row.CreatedAt.Format(time.RFC3339),
@@ -1050,6 +1082,330 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		"success": successCount,
 		"failed":  failCount,
 	})
+}
+
+type addOpenAIResponsesAccountReq struct {
+	Name     string   `json:"name"`
+	BaseURL  string   `json:"base_url"`
+	APIKey   string   `json:"api_key"`
+	Models   []string `json:"models"`
+	ProxyURL string   `json:"proxy_url"`
+}
+
+type fetchOpenAIResponsesModelsReq struct {
+	AccountID int64  `json:"account_id"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	ProxyURL  string `json:"proxy_url"`
+}
+
+func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
+	var req addOpenAIResponsesAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	models := auth.NormalizeOpenAIResponsesModels(req.Models)
+
+	if req.APIKey == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+	if len(models) == 0 {
+		writeError(c, http.StatusBadRequest, "至少需要添加一个模型")
+		return
+	}
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	existing, err := h.db.GetAllOpenAIAPIKeys(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if existing[req.APIKey] {
+		writeError(c, http.StatusConflict, "该 API Key 已存在")
+		return
+	}
+
+	name := req.Name
+	if name == "" {
+		name = "openai-responses"
+	}
+	credentials := map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      baseURL,
+		"api_key":       req.APIKey,
+		"models":        models,
+		"plan_type":     "api",
+		"email":         baseURL,
+	}
+	id, err := h.db.InsertOpenAIResponsesAccount(ctx, name, credentials, req.ProxyURL)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
+
+	h.store.AddAccount(&auth.Account{
+		DBID:         id,
+		ProxyURL:     req.ProxyURL,
+		HealthTier:   auth.HealthTierHealthy,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      baseURL,
+		APIKey:       req.APIKey,
+		Models:       models,
+		Email:        baseURL,
+		PlanType:     "api",
+	})
+
+	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "成功添加 OpenAI Responses API 账号",
+		"id":      id,
+	})
+}
+
+func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
+	var req fetchOpenAIResponsesModelsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	if req.AccountID > 0 && req.APIKey == "" {
+		row, err := h.db.GetAccountByID(c.Request.Context(), req.AccountID)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeInternalError(c, err)
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses) {
+			writeError(c, http.StatusBadRequest, "仅 OpenAI Responses API 账号支持使用已保存的 API Key 获取模型")
+			return
+		}
+		req.APIKey = row.GetCredential("api_key")
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = row.GetCredential("base_url")
+		}
+		if strings.TrimSpace(req.ProxyURL) == "" {
+			req.ProxyURL = row.ProxyURL
+		}
+	}
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.APIKey == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"models":   models,
+		"base_url": baseURL,
+	})
+}
+
+func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req addOpenAIResponsesAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses) {
+		writeError(c, http.StatusBadRequest, "仅 OpenAI Responses API 账号支持账号设置")
+		return
+	}
+
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	models := auth.NormalizeOpenAIResponsesModels(req.Models)
+	if len(models) == 0 {
+		writeError(c, http.StatusBadRequest, "至少需要添加一个模型")
+		return
+	}
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	name := req.Name
+	if name == "" {
+		name = row.Name
+	}
+	if name == "" {
+		name = "openai-responses"
+	}
+
+	credentials := map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      baseURL,
+		"models":        models,
+		"plan_type":     "api",
+		"email":         baseURL,
+	}
+	if req.APIKey != "" {
+		credentials["api_key"] = req.APIKey
+	}
+	if req.APIKey == "" && strings.TrimSpace(row.GetCredential("api_key")) == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+
+	if err := h.db.UpdateOpenAIResponsesAccount(ctx, id, name, credentials, req.ProxyURL); err != nil {
+		if err == sql.ErrNoRows {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if h.store != nil {
+		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, req.ProxyURL)
+	}
+	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
+
+	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
+}
+
+func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = baseDialer.DialContext
+	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
+		return nil, fmt.Errorf("代理URL无效: %w", err)
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   20 * time.Second,
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建模型列表请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求 /v1/models 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+		if message == "" {
+			message = strings.TrimSpace(string(body))
+		}
+		if message == "" {
+			message = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("/v1/models 返回 %d: %s", resp.StatusCode, message)
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("解析 /v1/models 响应失败: %w", err)
+	}
+	models := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		models = append(models, item.ID)
+	}
+	models = auth.NormalizeOpenAIResponsesModels(models)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("/v1/models 未返回可用模型")
+	}
+	return models, nil
 }
 
 // importToken 导入时的统一 token 载体
@@ -2325,6 +2681,8 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
+	SiteName                         string `json:"site_name"`
+	SiteLogo                         string `json:"site_logo"`
 	MaxConcurrency                   int    `json:"max_concurrency"`
 	GlobalRPM                        int    `json:"global_rpm"`
 	TestModel                        string `json:"test_model"`
@@ -2382,6 +2740,8 @@ type settingsResponse struct {
 }
 
 type updateSettingsReq struct {
+	SiteName                         *string `json:"site_name"`
+	SiteLogo                         *string `json:"site_logo"`
 	MaxConcurrency                   *int    `json:"max_concurrency"`
 	GlobalRPM                        *int    `json:"global_rpm"`
 	TestModel                        *string `json:"test_model"`
@@ -2432,6 +2792,72 @@ type updateSettingsReq struct {
 	ImageS3ForcePathStyle            *bool   `json:"image_s3_force_path_style"`
 }
 
+type brandingResponse struct {
+	SiteName string `json:"site_name"`
+	SiteLogo string `json:"site_logo"`
+}
+
+const maxSiteLogoBytes = 600 * 1024
+const maxSiteLogoURLChars = 4096
+
+func normalizeSiteLogo(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "data:image/") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("网站图标 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("网站图标 base64 数据无效")
+		}
+		if len(decoded) > maxSiteLogoBytes {
+			return "", fmt.Errorf("网站图标不能超过 600KB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://"):
+		if len(value) > maxSiteLogoURLChars {
+			return "", fmt.Errorf("网站图标 URL 过长")
+		}
+		return value, nil
+	case strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//"):
+		if len(value) > maxSiteLogoURLChars {
+			return "", fmt.Errorf("网站图标路径过长")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("网站图标仅支持 http(s) URL、站内路径或 data:image base64")
+	}
+}
+
+func brandingFromSettings(settings *database.SystemSettings) brandingResponse {
+	resp := brandingResponse{SiteName: database.DefaultSiteName}
+	if settings == nil {
+		return resp
+	}
+	resp.SiteName = database.NormalizeSiteName(settings.SiteName)
+	resp.SiteLogo = strings.TrimSpace(settings.SiteLogo)
+	return resp
+}
+
+// GetBranding 获取公开站点品牌配置（无需管理密钥）。
+func (h *Handler) GetBranding(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	settings, err := h.db.GetSystemSettings(ctx)
+	if err != nil {
+		log.Printf("读取站点品牌配置失败: %v", err)
+		c.JSON(http.StatusOK, brandingFromSettings(nil))
+		return
+	}
+	c.JSON(http.StatusOK, brandingFromSettings(settings))
+}
+
 // GetSettings 获取当前系统设置
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
@@ -2440,6 +2866,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
 	var resinURL, resinPlatformName string
+	branding := brandingFromSettings(dbSettings)
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -2452,6 +2879,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	imgCfg := imagestore.CurrentConfig()
 	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
 	c.JSON(http.StatusOK, settingsResponse{
+		SiteName:                         branding.SiteName,
+		SiteLogo:                         branding.SiteLogo,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -2517,8 +2946,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	currentAdminSecret := ""
-	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
-		currentAdminSecret = dbSettings.AdminSecret
+	siteName := database.DefaultSiteName
+	siteLogo := ""
+	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
+	if existingSettings != nil {
+		currentAdminSecret = existingSettings.AdminSecret
+		siteName = database.NormalizeSiteName(existingSettings.SiteName)
+		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -2527,6 +2961,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		} else {
 			log.Printf("检测到环境变量 ADMIN_SECRET，忽略前端提交的 admin_secret")
 		}
+	}
+	if req.SiteName != nil {
+		siteName = database.NormalizeSiteName(*req.SiteName)
+		log.Printf("设置已更新: site_name = %s", siteName)
+	}
+	if req.SiteLogo != nil {
+		normalized, err := normalizeSiteLogo(*req.SiteLogo)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		siteLogo = normalized
+		log.Printf("设置已更新: site_logo (长度=%d)", len(siteLogo))
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -2824,9 +3271,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	// Resin 粘性代理池配置
 	resinURL := ""
 	resinPlatformName := ""
-	if existSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && existSettings != nil {
-		resinURL = existSettings.ResinURL
-		resinPlatformName = existSettings.ResinPlatformName
+	if existingSettings != nil {
+		resinURL = existingSettings.ResinURL
+		resinPlatformName = existingSettings.ResinPlatformName
 	}
 	if req.ResinURL != nil {
 		resinURL = *req.ResinURL
@@ -2903,6 +3350,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
+		SiteName:                         siteName,
+		SiteLogo:                         siteLogo,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -2963,6 +3412,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, settingsResponse{
+		SiteName:                         siteName,
+		SiteLogo:                         siteLogo,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),

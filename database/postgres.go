@@ -78,6 +78,17 @@ func (a *AccountRow) GetCredentialInt64Slice(key string) []int64 {
 	return int64SliceFromValue(value)
 }
 
+func (a *AccountRow) GetCredentialStringSlice(key string) []string {
+	if a.Credentials == nil {
+		return []string{}
+	}
+	value, ok := a.Credentials[key]
+	if !ok || value == nil {
+		return []string{}
+	}
+	return stringSliceFromValue(value)
+}
+
 // DB PostgreSQL 数据库操作
 type DB struct {
 	conn   *sql.DB
@@ -503,6 +514,8 @@ func (db *DB) migrate(ctx context.Context) error {
 
 			CREATE TABLE IF NOT EXISTS system_settings (
 				id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+				site_name          TEXT DEFAULT 'CodexProxy',
+				site_logo          TEXT DEFAULT '',
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
@@ -525,6 +538,8 @@ func (db *DB) migrate(ctx context.Context) error {
 		PRIMARY KEY (account_id, model)
 	);
 	CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'CodexProxy';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -757,8 +772,24 @@ func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error)
 
 // ==================== System Settings ====================
 
+const DefaultSiteName = "CodexProxy"
+
+func NormalizeSiteName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return DefaultSiteName
+	}
+	runes := []rune(value)
+	if len(runes) > 80 {
+		return string(runes[:80])
+	}
+	return value
+}
+
 // SystemSettings 运行时设置项
 type SystemSettings struct {
+	SiteName                         string
+	SiteLogo                         string
 	MaxConcurrency                   int
 	GlobalRPM                        int
 	TestModel                        string
@@ -806,7 +837,8 @@ type SystemSettings struct {
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
 	err := db.conn.QueryRowContext(ctx, `
-		SELECT max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+		SELECT COALESCE(site_name, 'CodexProxy'), COALESCE(site_logo, ''),
+		       max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),
 		       COALESCE(fast_scheduler_enabled, false),
@@ -840,6 +872,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(image_storage_config, '{}')
 		FROM system_settings WHERE id = 1
 	`).Scan(
+		&s.SiteName, &s.SiteLogo,
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
@@ -856,6 +889,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
+	s.SiteName = NormalizeSiteName(s.SiteName)
+	s.SiteLogo = strings.TrimSpace(s.SiteLogo)
 	return s, err
 }
 
@@ -863,7 +898,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
 	_, err := db.conn.ExecContext(ctx, `
 			INSERT INTO system_settings (
-				id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
 				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
@@ -874,8 +909,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
 				image_storage_config
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
 			ON CONFLICT (id) DO UPDATE SET
+				site_name               = EXCLUDED.site_name,
+				site_logo               = EXCLUDED.site_logo,
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
 				test_model              = EXCLUDED.test_model,
@@ -917,7 +954,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				stream_flush_policy = EXCLUDED.stream_flush_policy,
 				stream_flush_interval_ms = EXCLUDED.stream_flush_interval_ms,
 				image_storage_config = EXCLUDED.image_storage_config
-		`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
+		`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
+		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
@@ -2530,6 +2568,47 @@ func (db *DB) UpdateCredentials(ctx context.Context, id int64, credentials map[s
 	return tx.Commit()
 }
 
+func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name string, credentials map[string]interface{}, proxyURL string) error {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	selectQuery := `SELECT credentials FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
+	if !db.isSQLite() {
+		selectQuery += ` FOR UPDATE`
+	}
+
+	var currentRaw interface{}
+	if err := tx.QueryRowContext(ctx, selectQuery, id).Scan(&currentRaw); err != nil {
+		return err
+	}
+
+	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	credJSON, err := json.Marshal(merged)
+	if err != nil {
+		return fmt.Errorf("序列化 credentials 失败: %w", err)
+	}
+
+	updateQuery := `UPDATE accounts SET name = $1, credentials = $2, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+	if !db.isSQLite() {
+		updateQuery = `UPDATE accounts SET name = $1, credentials = $2::jsonb, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+	}
+	res, err := tx.ExecContext(ctx, updateQuery, name, credJSON, proxyURL, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 // UpdateUsageSnapshot 持久化账号用量快照（7d + 5h）
 func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, updatedAt time.Time) error {
 	return db.UpdateCredentials(ctx, id, map[string]interface{}{
@@ -2774,6 +2853,22 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 	)
 }
 
+func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, credentials map[string]interface{}, proxyURL string) (int64, error) {
+	if credentials == nil {
+		credentials = map[string]interface{}{}
+	}
+	credJSON, err := json.Marshal(credentials)
+	if err != nil {
+		return 0, err
+	}
+
+	return db.insertRowID(ctx,
+		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, 'openai', 'responses_api', $2, $3) RETURNING id`,
+		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, 'openai', 'responses_api', $2, $3)`,
+		name, credJSON, proxyURL,
+	)
+}
+
 // GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重，排除已删除账号）
 func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
 	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`)
@@ -2791,6 +2886,28 @@ func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
 		at := credentialString(raw, "access_token")
 		if at != "" {
 			result[at] = true
+		}
+	}
+	return result, rows.Err()
+}
+
+func (db *DB) GetAllOpenAIAPIKeys(ctx context.Context) (map[string]bool, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]bool)
+	for rows.Next() {
+		var raw interface{}
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		apiKey := strings.TrimSpace(credentialString(raw, "api_key"))
+		upstreamType := strings.TrimSpace(credentialString(raw, "upstream_type"))
+		if apiKey != "" && upstreamType == "openai_responses" {
+			result[apiKey] = true
 		}
 	}
 	return result, rows.Err()

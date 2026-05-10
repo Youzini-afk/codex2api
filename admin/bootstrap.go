@@ -183,6 +183,7 @@ func (h *Handler) PostBootstrap(c *gin.Context) {
 // 写入空值导致后续业务设置缺失。
 func defaultBootstrapSettings() *database.SystemSettings {
 	return &database.SystemSettings{
+		SiteName:                         database.DefaultSiteName,
 		MaxConcurrency:                   2,
 		GlobalRPM:                        0,
 		TestModel:                        "gpt-5.4",

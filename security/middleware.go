@@ -24,7 +24,7 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
 
 		// Content Security Policy
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self';")
+		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self'; connect-src 'self' https://api.github.com;")
 
 		// Strict Transport Security (HTTPS only)
 		// c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
@@ -168,8 +168,8 @@ type IPRateLimiter struct {
 }
 
 type visitor struct {
-	tokens    int
-	lastSeen  time.Time
+	tokens   int
+	lastSeen time.Time
 }
 
 // NewIPRateLimiter creates a new rate limiter
@@ -254,6 +254,7 @@ func IsSensitiveEndpoint(path string) bool {
 		"/api/admin/keys",
 		"/api/admin/settings",
 		"/api/admin/proxies",
+		"/api/admin/system/update",
 	}
 	for _, p := range sensitivePaths {
 		if strings.HasPrefix(path, p) {

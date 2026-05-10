@@ -230,6 +230,51 @@ func int64SliceFromValue(value interface{}) []int64 {
 	}
 }
 
+func stringSliceFromValue(value interface{}) []string {
+	if value == nil {
+		return []string{}
+	}
+
+	add := func(result []string, item string, seen map[string]struct{}) []string {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			return result
+		}
+		key := strings.ToLower(item)
+		if _, exists := seen[key]; exists {
+			return result
+		}
+		seen[key] = struct{}{}
+		return append(result, item)
+	}
+
+	seen := make(map[string]struct{})
+	result := make([]string, 0)
+	switch typed := value.(type) {
+	case []string:
+		for _, item := range typed {
+			result = add(result, item, seen)
+		}
+	case []interface{}:
+		for _, item := range typed {
+			if s, ok := item.(string); ok {
+				result = add(result, s, seen)
+			}
+		}
+	case string:
+		fields := strings.FieldsFunc(typed, func(r rune) bool {
+			return r == ',' || r == '\n' || r == '\r' || r == '\t'
+		})
+		for _, item := range fields {
+			result = add(result, item, seen)
+		}
+	}
+	if result == nil {
+		return []string{}
+	}
+	return result
+}
+
 func credentialString(raw interface{}, key string) string {
 	credentials := decodeCredentials(raw)
 	if credentials == nil {

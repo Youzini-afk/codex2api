@@ -90,6 +90,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
 					id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+					site_name TEXT DEFAULT 'CodexProxy',
+					site_logo TEXT DEFAULT '',
 					max_concurrency INTEGER DEFAULT 2,
 				global_rpm INTEGER DEFAULT 0,
 				test_model TEXT DEFAULT 'gpt-5.4',
@@ -262,6 +264,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
 		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
+		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
+		{"system_settings", "site_logo", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
