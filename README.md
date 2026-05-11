@@ -93,7 +93,9 @@
 
 ### 一键交互部署 (推荐)
 
-`deploy.sh` 提供 6 步交互式向导，依次询问 **端口 / 监听范围 / 数据库 / 密钥 / 构建方式 / 确认**，自动生成 `.env` 并拉起容器。
+`deploy.sh` 提供 7 步交互式向导，依次询问 **端口 / 监听范围 / 数据库 / 密钥 / 构建方式 / 更新能力 / 确认**，会先尝试拉取最新代码，再自动生成 `.env` 并拉起容器。
+
+如果当前目录已有 `.env`，脚本会读取其中的端口、监听地址、数据库、Redis、管理密钥和 API 密钥作为默认值，后续重跑脚本时可直接回车复用原配置。
 
 **场景 1：尚未克隆仓库（一行远程拉起）**
 
@@ -120,6 +122,15 @@ bash deploy.sh
 
 绑定地址会写入 `.env` 的 `BIND_HOST`，后续可手动修改后 `docker compose up -d` 重启生效。
 
+**更新能力选项**
+
+| 选项 | 行为 | 适用场景 |
+| --- | --- | --- |
+| 1) 不挂载 Docker socket (默认) | 不向容器暴露 Docker API | 更安全，适合普通部署 |
+| 2) 启用一键更新 | 生成运行时 compose override 并挂载 `/var/run/docker.sock:/var/run/docker.sock` | 需要在管理后台触发 Watchtower 一键更新的可信服务器 |
+
+该选项仅对拉取镜像部署生效，本地构建模式会自动跳过 Docker socket 挂载。运行时 override 默认写入 `.deploy/docker-socket.override.yml`，`.deploy/` 已被 git 忽略，不影响后续拉取最新代码。
+
 **可选环境变量**（用于自定义自举行为）
 
 | 变量 | 默认 | 说明 |
@@ -127,6 +138,8 @@ bash deploy.sh
 | `CODEX2API_REPO_URL` | `https://github.com/james-6-23/codex2api.git` | 克隆使用的仓库地址 |
 | `CODEX2API_REPO_BRANCH` | `main` | 克隆使用的分支 |
 | `CODEX2API_DIR_NAME` | `codex2api` | 克隆到本地的目录名 |
+| `CODEX2API_DEPLOY_RUNTIME_DIR` | `.deploy` | 部署脚本生成运行时 compose override 的目录 |
+| `CODEX2API_SKIP_GIT_PULL` | 空 | 设为 `1` 或 `true` 时跳过部署前自动拉取最新代码 |
 
 ### 部署模式总览
 
