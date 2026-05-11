@@ -128,37 +128,74 @@ env_default() {
   printf "%s" "${value:-$fallback}"
 }
 
-load_existing_env_defaults() {
+known_compose_service_exists() {
+  local compose_file
+  for compose_file in docker-compose.yml docker-compose.sqlite.yml docker-compose.local.yml docker-compose.sqlite.local.yml; do
+    [[ -f "$compose_file" ]] || continue
+    if [[ -n "$($COMPOSE_CMD -f "$compose_file" ps -q codex2api 2>/dev/null || true)" ]]; then
+      EXISTING_COMPOSE_FILE="$compose_file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_deployment_state() {
+  DEPLOY_ACTION="full"
+  DEPLOYMENT_STATE="first"
+  DEPLOYMENT_REASON="未检测到 .env 或已创建的 compose 服务"
+  EXISTING_COMPOSE_FILE=""
+
   if [[ -f "$EXISTING_ENV_FILE" ]]; then
-    success "检测到已有 .env，将作为交互默认值"
+    DEPLOYMENT_STATE="existing"
+    DEPLOYMENT_REASON="检测到已有 .env"
+  fi
+
+  if known_compose_service_exists; then
+    DEPLOYMENT_STATE="existing"
+    if [[ -f "$EXISTING_ENV_FILE" ]]; then
+      DEPLOYMENT_REASON="检测到已有 .env 和 compose 服务 ($EXISTING_COMPOSE_FILE)"
+    else
+      DEPLOYMENT_REASON="检测到已有 compose 服务 ($EXISTING_COMPOSE_FILE)"
+    fi
   fi
 }
 
-step_existing_deployment_action() {
-  DEPLOY_ACTION="full"
-  if [[ ! -f "$EXISTING_ENV_FILE" ]]; then
+step_deployment_route() {
+  detect_deployment_state
+
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 部署状态检查 ━━━${NC}\n"
+  echo ""
+  if [[ "$DEPLOYMENT_STATE" == "first" ]]; then
+    success "检测结果: 首次部署"
+    info "$DEPLOYMENT_REASON"
+    success "部署线路: 完整部署向导"
     return 0
   fi
 
-  echo ""
-  printf "${BOLD}${CYAN}━━━ 已有部署 ━━━${NC}\n"
+  success "检测结果: 已有部署"
+  info "$DEPLOYMENT_REASON"
+  if [[ -f "$EXISTING_ENV_FILE" ]]; then
+    success "已有 .env 将作为交互默认值"
+  fi
   echo ""
   echo "  1) 完整部署向导      — 重新确认端口、数据库、密钥等配置"
   echo "  2) 仅配置一键更新    — 只切换 Docker socket 挂载并重启服务"
   echo ""
-  ask "请选择 (1 或 2)" "2" EXISTING_DEPLOY_CHOICE
+  ask "请选择部署线路 (1 或 2)" "2" DEPLOY_ROUTE_CHOICE
 
-  case "$EXISTING_DEPLOY_CHOICE" in
+  case "$DEPLOY_ROUTE_CHOICE" in
     1|full|deploy)
       DEPLOY_ACTION="full"
-      success "进入完整部署向导"
+      success "部署线路: 完整部署向导"
       ;;
     2|update|socket|docker|watchtower)
       DEPLOY_ACTION="update_options"
-      success "进入一键更新配置模式"
+      success "部署线路: 仅配置一键更新"
       ;;
     *)
-      error "无效选择: $EXISTING_DEPLOY_CHOICE"
+      error "无效选择: $DEPLOY_ROUTE_CHOICE"
       ;;
   esac
 }
@@ -812,8 +849,7 @@ main() {
   bootstrap_repo "$@"
   preflight
   update_repo_code
-  load_existing_env_defaults
-  step_existing_deployment_action
+  step_deployment_route
   if [[ "$DEPLOY_ACTION" == "update_options" ]]; then
     run_update_options_only
     exit 0
