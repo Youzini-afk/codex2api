@@ -134,6 +134,35 @@ load_existing_env_defaults() {
   fi
 }
 
+step_existing_deployment_action() {
+  DEPLOY_ACTION="full"
+  if [[ ! -f "$EXISTING_ENV_FILE" ]]; then
+    return 0
+  fi
+
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 已有部署 ━━━${NC}\n"
+  echo ""
+  echo "  1) 完整部署向导      — 重新确认端口、数据库、密钥等配置"
+  echo "  2) 仅配置一键更新    — 只切换 Docker socket 挂载并重启服务"
+  echo ""
+  ask "请选择 (1 或 2)" "2" EXISTING_DEPLOY_CHOICE
+
+  case "$EXISTING_DEPLOY_CHOICE" in
+    1|full|deploy)
+      DEPLOY_ACTION="full"
+      success "进入完整部署向导"
+      ;;
+    2|update|socket|docker|watchtower)
+      DEPLOY_ACTION="update_options"
+      success "进入一键更新配置模式"
+      ;;
+    *)
+      error "无效选择: $EXISTING_DEPLOY_CHOICE"
+      ;;
+  esac
+}
+
 is_codex2api_repo() {
   [[ -f "docker-compose.yml" ]] && [[ -f "deploy.sh" ]] \
     && grep -q '^name: codex2api' docker-compose.yml 2>/dev/null
@@ -382,7 +411,11 @@ step_build_mode() {
 # ---------- 第六步：更新能力 ----------
 step_update_options() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 6/7 更新能力 ━━━${NC}\n"
+  if [[ "${DEPLOY_ACTION:-full}" == "update_options" ]]; then
+    printf "${BOLD}${CYAN}━━━ 更新能力 ━━━${NC}\n"
+  else
+    printf "${BOLD}${CYAN}━━━ 6/7 更新能力 ━━━${NC}\n"
+  fi
   echo ""
 
   if [[ "$BUILD_MODE" == "local" ]]; then
@@ -414,6 +447,96 @@ step_update_options() {
       error "无效选择: $DOCKER_SOCKET_CHOICE"
       ;;
   esac
+}
+
+infer_existing_deploy_config() {
+  PORT="$(env_default CODEX_PORT "$(env_default PORT "8080")")"
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    error "已有 .env 中的端口无效: $PORT"
+  fi
+
+  local bind_default db_default
+  bind_default="$(env_default BIND_HOST "0.0.0.0")"
+  case "$bind_default" in
+    127.*|localhost)
+      BIND_HOST="127.0.0.1"
+      BIND_MODE="loopback"
+      ;;
+    *)
+      BIND_HOST="0.0.0.0"
+      BIND_MODE="all"
+      ;;
+  esac
+
+  db_default="$(env_default DATABASE_DRIVER "sqlite")"
+  db_default="$(printf "%s" "$db_default" | tr '[:upper:]' '[:lower:]')"
+  case "$db_default" in
+    postgres|postgresql|pg)
+      DB_MODE="postgres"
+      ;;
+    *)
+      DB_MODE="sqlite"
+      ;;
+  esac
+
+  ADMIN_SECRET="$(env_default ADMIN_SECRET "")"
+  API_KEYS="$(env_default CODEX_API_KEYS "")"
+  BUILD_MODE="image"
+
+  if existing_local_build_compose_active; then
+    BUILD_MODE="local"
+  fi
+}
+
+existing_local_build_compose_active() {
+  local compose_file
+  if [[ "${DB_MODE:-}" == "sqlite" ]]; then
+    compose_file="docker-compose.sqlite.local.yml"
+  else
+    compose_file="docker-compose.local.yml"
+  fi
+
+  [[ -f "$compose_file" ]] || return 1
+  [[ -n "$($COMPOSE_CMD -f "$compose_file" ps -q codex2api 2>/dev/null || true)" ]]
+}
+
+confirm_update_options_only() {
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 配置确认 ━━━${NC}\n"
+  echo ""
+  echo "  模式:       仅配置一键更新"
+  echo "  端口:       $PORT"
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    echo "  监听范围:   127.0.0.1 (仅本机访问)"
+  else
+    echo "  监听范围:   0.0.0.0 (全部网络)"
+  fi
+  echo "  数据库:     $DB_MODE"
+  echo "  构建方式:   $( [[ "$BUILD_MODE" == "image" ]] && echo "拉取镜像" || echo "本地构建" )"
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    echo "  一键更新:   本地构建无需挂载"
+  else
+    echo "  一键更新:   $( [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]] && echo "启用 Docker socket 挂载" || echo "未启用" )"
+  fi
+  echo ""
+  ask "确认应用并重启服务? (y/n)" "y" CONFIRM
+  if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+    warn "已取消"
+    exit 0
+  fi
+}
+
+run_update_options_only() {
+  infer_existing_deploy_config
+  step_update_options
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    success "当前为本地构建部署，一键更新无需 Docker socket 挂载，未重启服务"
+    return 0
+  fi
+  confirm_update_options_only
+  resolve_compose_file
+  apply_docker_socket_option
+  deploy
 }
 
 # ---------- 第七步：确认 ----------
@@ -690,6 +813,11 @@ main() {
   preflight
   update_repo_code
   load_existing_env_defaults
+  step_existing_deployment_action
+  if [[ "$DEPLOY_ACTION" == "update_options" ]]; then
+    run_update_options_only
+    exit 0
+  fi
   step_port
   step_bind
   step_database
