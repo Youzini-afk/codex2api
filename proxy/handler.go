@@ -1068,6 +1068,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
 	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
+	openAIResponsesBody := PrepareOpenAIResponsesBody(rawBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
@@ -1138,7 +1139,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel = upstreamCancel
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
-			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, rawBody, proxyURL, downstreamHeaders)
+			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, openAIResponsesBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -1173,6 +1174,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						invalidEncryptedContentRetried = true
 						if rawChanged {
 							rawBody = strippedRawBody
+							openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
 						}
 						if codexChanged {
 							codexBody = strippedCodexBody
@@ -1435,6 +1437,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					invalidEncryptedContentRetried = true
 					if rawChanged {
 						rawBody = strippedRawBody
+						openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
 					}
 					if codexChanged {
 						codexBody = strippedCodexBody

@@ -489,6 +489,40 @@ func TestPrepareResponsesBody_NormalizesLegacyImageContentPart(t *testing.T) {
 	}
 }
 
+func TestPrepareOpenAIResponsesBody_NormalizesLegacyImageContentPart(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+				]
+			}
+		]
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_image" {
+		t.Fatalf("expected legacy image_url part to normalize to input_image, got %q; body=%s", typ, got)
+	}
+	if imageURL := gjson.GetBytes(got, "input.0.content.0.image_url").String(); imageURL != "https://example.com/cat.png" {
+		t.Fatalf("expected image_url object to be flattened, got %q; body=%s", imageURL, got)
+	}
+	if gjson.GetBytes(got, "include").Exists() {
+		t.Fatalf("OpenAI Responses body should not get Codex include defaults; body=%s", got)
+	}
+	if gjson.GetBytes(got, "store").Exists() {
+		t.Fatalf("OpenAI Responses body should not get Codex store defaults; body=%s", got)
+	}
+	if stream := gjson.GetBytes(got, "stream"); !stream.Exists() || stream.Bool() {
+		t.Fatalf("OpenAI Responses body should preserve stream=false; body=%s", got)
+	}
+}
+
 func TestPrepareResponsesBody_SanitizesTextFormatJSONSchema(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

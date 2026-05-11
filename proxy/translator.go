@@ -1165,6 +1165,47 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	return result, expandedInputRaw
 }
 
+// PrepareOpenAIResponsesBody keeps native OpenAI Responses requests compatible
+// without applying Codex-specific fields such as store/include/tool injection.
+func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return rawBody
+	}
+
+	if re, ok := body["reasoning_effort"].(string); ok {
+		if normalized := normalizeReasoningEffort(re); normalized != "" {
+			reasoning, _ := body["reasoning"].(map[string]any)
+			if reasoning == nil {
+				reasoning = map[string]any{}
+			}
+			if _, hasEffort := reasoning["effort"]; !hasEffort {
+				reasoning["effort"] = normalized
+				body["reasoning"] = reasoning
+			}
+		}
+	}
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok {
+			if normalized := normalizeReasoningEffort(effort); normalized != "" {
+				reasoning["effort"] = normalized
+			} else {
+				delete(reasoning, "effort")
+			}
+		}
+	}
+
+	normalizeResponsesStructuredOutputFormat(body)
+	normalizeResponsesContentPartTypes(body)
+	normalizeResponsesInputMessageContent(body)
+
+	result, err := json.Marshal(body)
+	if err != nil {
+		return rawBody
+	}
+	return result
+}
+
 // PrepareCompactResponsesBody 将 /responses/compact 请求转换为上游可接受的格式。
 // 它复用通用 Responses 预处理，但会移除 compact 端点不接受的自动注入字段。
 func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
