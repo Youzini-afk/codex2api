@@ -52,6 +52,7 @@ export interface AccountRow {
     success_bonus: number
     usage_penalty_7d: number
     usage_urgency_bonus_5h?: number
+    usage_urgency_bonus_7d?: number
     latency_penalty: number
     success_rate_penalty?: number
   }

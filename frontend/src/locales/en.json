@@ -631,7 +631,8 @@
     "reasonFailure": "Failure Run",
     "reasonLatency": "Latency",
     "reasonSuccess": "Success",
-    "reason5hUrgency": "5h Reset Soon"
+    "reason5hUrgency": "5h Reset Soon",
+    "reason7dUrgency": "7d Reset Soon"
   },
   "usage": {
     "title": "Usage Statistics",

@@ -134,6 +134,10 @@ const (
 	premium5hUrgencyMaxBonus         = 25.0
 	premium5hUrgencyMinRemainingPct  = 5.0
 	premium5hUrgencyFullRemainingPct = 50.0
+	premium7dUrgencyWindow           = 72 * time.Hour
+	premium7dUrgencyMaxBonus         = 80.0
+	premium7dUrgencyMinRemainingPct  = 5.0
+	premium7dUrgencyFullRemainingPct = 70.0
 )
 
 // SchedulerBreakdown 调度评分拆解
@@ -147,6 +151,7 @@ type SchedulerBreakdown struct {
 	ProvenBonus         float64 // 经过验证的账号（TotalRequests > 10）加分
 	UsagePenalty7d      float64
 	UsageUrgencyBonus5h float64
+	UsageUrgencyBonus7d float64
 	LatencyPenalty      float64
 	SuccessRatePenalty  float64 // 滑动窗口成功率惩罚
 }
@@ -680,6 +685,49 @@ func (a *Account) premium5hUsageUrgencyBonusLocked(now time.Time) float64 {
 	return premium5hUrgencyMaxBonus * timeFactor * quotaFactor
 }
 
+func (a *Account) premium7dUsageUrgencyBonusLocked(now time.Time) float64 {
+	if !IsPlusOrHigherPlan(a.PlanType) {
+		return 0
+	}
+	if !a.UsagePercent7dValid || a.Reset7dAt.IsZero() {
+		return 0
+	}
+	if a.UsagePercent7d >= 100 {
+		return 0
+	}
+	if a.AccessToken == "" || a.Status == StatusError || a.HealthTier == HealthTierBanned {
+		return 0
+	}
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		return 0
+	}
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+		return 0
+	}
+
+	timeRemaining := a.Reset7dAt.Sub(now)
+	if timeRemaining <= 0 || timeRemaining > premium7dUrgencyWindow {
+		return 0
+	}
+
+	quotaRemaining := 100 - a.UsagePercent7d
+	if quotaRemaining <= premium7dUrgencyMinRemainingPct {
+		return 0
+	}
+
+	timeFactor := 1 - float64(timeRemaining)/float64(premium7dUrgencyWindow)
+	quotaFactor := quotaRemaining / premium7dUrgencyFullRemainingPct
+	if quotaFactor > 1 {
+		quotaFactor = 1
+	}
+	if quotaFactor < 0 {
+		quotaFactor = 0
+	}
+	weightedQuotaFactor := 0.6 + 0.4*quotaFactor
+
+	return premium7dUrgencyMaxBonus * timeFactor * weightedQuotaFactor
+}
+
 func (a *Account) effectiveBaseConcurrencyLocked(storeBaseLimit int64) int64 {
 	if a.BaseConcurrencyOverride != nil && *a.BaseConcurrencyOverride > 0 {
 		return *a.BaseConcurrencyOverride
@@ -770,8 +818,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	scoreBiasEffective := a.effectiveScoreBiasLocked(now, tier)
 	if a.dispatchBonusEligibleLocked(now, tier) {
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
+		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 	}
-	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h
+	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d
 
 	a.HealthTier = tier
 	a.SchedulerScore = score
@@ -1274,6 +1323,7 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 	breakdown := a.schedulerBreakdownLocked(now)
 	if a.dispatchBonusEligibleLocked(now, a.HealthTier) {
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
+		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 	}
 	return SchedulerDebugSnapshot{
 		HealthTier:               string(a.HealthTier),

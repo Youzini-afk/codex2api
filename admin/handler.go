@@ -450,6 +450,7 @@ type schedulerBreakdownResponse struct {
 	SuccessBonus        float64 `json:"success_bonus"`
 	UsagePenalty7d      float64 `json:"usage_penalty_7d"`
 	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
+	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -538,6 +539,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				SuccessBonus:        debug.Breakdown.SuccessBonus,
 				UsagePenalty7d:      debug.Breakdown.UsagePenalty7d,
 				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
+				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}

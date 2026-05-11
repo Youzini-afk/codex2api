@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -327,6 +328,94 @@ func TestAccountPremium5hUrgencyBonusSkipsNearlyExhaustedWindow(t *testing.T) {
 	}
 	if snapshot.DispatchScore != 150 {
 		t.Fatalf("DispatchScore = %v, want only plan bias", snapshot.DispatchScore)
+	}
+}
+
+func TestAccountPremium7dUrgencyBonusOnlyAffectsDispatchScore(t *testing.T) {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      63,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(36 * time.Hour),
+	}
+
+	snapshot := acc.GetSchedulerDebugSnapshot(4)
+
+	if snapshot.SchedulerScore != 100 {
+		t.Fatalf("SchedulerScore = %v, want 100", snapshot.SchedulerScore)
+	}
+	if snapshot.Breakdown.UsageUrgencyBonus7d <= 20 {
+		t.Fatalf("UsageUrgencyBonus7d = %v, want > 20", snapshot.Breakdown.UsageUrgencyBonus7d)
+	}
+	if snapshot.DispatchScore <= 170 {
+		t.Fatalf("DispatchScore = %v, want plan bias plus 7d urgency bonus", snapshot.DispatchScore)
+	}
+	if snapshot.HealthTier != string(HealthTierHealthy) {
+		t.Fatalf("HealthTier = %q, want %q", snapshot.HealthTier, HealthTierHealthy)
+	}
+}
+
+func TestAccountPremium7dUrgencyBonusSkipsDistantReset(t *testing.T) {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      63,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(5 * 24 * time.Hour),
+	}
+
+	snapshot := acc.GetSchedulerDebugSnapshot(4)
+
+	if snapshot.Breakdown.UsageUrgencyBonus7d != 0 {
+		t.Fatalf("UsageUrgencyBonus7d = %v, want 0", snapshot.Breakdown.UsageUrgencyBonus7d)
+	}
+	if snapshot.DispatchScore != 150 {
+		t.Fatalf("DispatchScore = %v, want only plan bias", snapshot.DispatchScore)
+	}
+}
+
+func TestStoreNextPrefersPremium7dResetSoonOverProvenAccount(t *testing.T) {
+	now := time.Now()
+	soon := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      63,
+		UsagePercent7dValid: true,
+		Reset7dAt:           now.Add(36 * time.Hour),
+	}
+	later := &Account{
+		DBID:                2,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      68,
+		UsagePercent7dValid: true,
+		Reset7dAt:           now.Add(5 * 24 * time.Hour),
+	}
+	atomic.StoreInt64(&later.TotalRequests, 450)
+	recomputeTestAccount(soon, 2)
+	recomputeTestAccount(later, 2)
+
+	store := &Store{
+		accounts: []*Account{later, soon},
+	}
+	store.SetMaxConcurrency(2)
+
+	got := store.Next()
+	if got == nil {
+		t.Fatal("Next() returned nil")
+	}
+	defer store.Release(got)
+
+	if got.DBID != soon.DBID {
+		t.Fatalf("Next() picked dbID=%d, want 7d reset-soon account %d", got.DBID, soon.DBID)
 	}
 }
 
