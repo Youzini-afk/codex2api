@@ -601,6 +601,66 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 	}
 }
 
+func classifyResponseFailedOutcome(payload []byte) streamOutcome {
+	statusCode := responseFailedStatusCode(payload)
+	message := usageLogErrorMessage(statusCode, payload)
+	if strings.TrimSpace(message) == "" || message == fmt.Sprintf("HTTP %d", statusCode) {
+		message = "上游返回 response.failed"
+	}
+	kind := upstreamErrorKind(statusCode, payload, codex429Decision{})
+	if kind == "" {
+		if statusCode >= 500 {
+			kind = "server"
+		} else {
+			kind = "client"
+		}
+	}
+	return streamOutcome{
+		logStatusCode:  statusCode,
+		failureKind:    kind,
+		failureMessage: message,
+		penalize:       statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500,
+	}
+}
+
+func responseFailedStatusCode(payload []byte) int {
+	for _, path := range []string{
+		"response.status_code",
+		"response.error.status_code",
+		"response.status_details.error.status_code",
+		"status_code",
+		"error.status_code",
+	} {
+		code := int(gjson.GetBytes(payload, path).Int())
+		if code >= 400 && code <= 599 {
+			return code
+		}
+	}
+
+	codeOrType := strings.ToLower(strings.Join([]string{
+		gjson.GetBytes(payload, "response.error.code").String(),
+		gjson.GetBytes(payload, "response.error.type").String(),
+		gjson.GetBytes(payload, "response.status_details.error.code").String(),
+		gjson.GetBytes(payload, "response.status_details.error.type").String(),
+		gjson.GetBytes(payload, "error.code").String(),
+		gjson.GetBytes(payload, "error.type").String(),
+	}, " "))
+	switch {
+	case strings.Contains(codeOrType, "rate_limit"):
+		return http.StatusTooManyRequests
+	case strings.Contains(codeOrType, "unauthorized") || strings.Contains(codeOrType, "invalid_api_key"):
+		return http.StatusUnauthorized
+	case strings.Contains(codeOrType, "payment"):
+		return http.StatusPaymentRequired
+	case strings.Contains(codeOrType, "forbidden"):
+		return http.StatusForbidden
+	case strings.Contains(codeOrType, "invalid") || strings.Contains(codeOrType, "bad_request"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries int, wroteAnyBody bool, ctxErr, writeErr error) bool {
 	if attempt >= maxRetries {
 		return false
@@ -1179,6 +1239,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var writeErr error
 			wroteAnyBody := false
 			var imageLogInfo imageUsageLogInfo
+			var terminalFailurePayload []byte
 
 			if isStream {
 				c.Header("Content-Type", "text/event-stream")
@@ -1215,6 +1276,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						gotTerminal = true
 					}
 					if eventType == "response.failed" {
+						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
 					}
 					if image, ok := extractImageFromOutputItemDone(data, model); ok {
@@ -1251,6 +1313,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			totalDuration := int(time.Since(start).Milliseconds())
 			outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+			if len(terminalFailurePayload) > 0 {
+				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
@@ -1297,6 +1362,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+				logInput.UpstreamErrorKind = outcome.failureKind
 			}
 			if usage != nil {
 				logInput.PromptTokens = usage.PromptTokens
@@ -1439,6 +1505,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		wroteAnyBody := false
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
+		var terminalFailurePayload []byte
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -1490,6 +1557,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 				}
 
@@ -1537,6 +1605,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					return false
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -1557,6 +1626,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if len(terminalFailurePayload) > 0 {
+			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -1585,7 +1657,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 		if !isStream {
-			if responseJSON != nil {
+			if len(terminalFailurePayload) > 0 {
+				c.JSON(logStatusCode, gin.H{
+					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				})
+			} else if responseJSON != nil {
 				c.Data(http.StatusOK, "application/json", responseJSON)
 			} else {
 				c.JSON(http.StatusBadGateway, gin.H{
@@ -1612,6 +1688,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -2087,6 +2164,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var compactResult []byte
+		var terminalFailurePayload []byte
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
 		created := time.Now().Unix()
@@ -2133,6 +2211,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 				}
 
@@ -2195,6 +2274,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 					return false
 				case "response.failed":
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					return false
 				}
@@ -2207,6 +2287,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if len(terminalFailurePayload) > 0 {
+			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -2235,7 +2318,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		if !isStream {
-			if compactResult != nil {
+			if len(terminalFailurePayload) > 0 {
+				c.JSON(logStatusCode, gin.H{
+					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				})
+			} else if compactResult != nil {
 				c.Data(http.StatusOK, "application/json", compactResult)
 			} else {
 				c.JSON(http.StatusBadGateway, gin.H{
@@ -2262,6 +2349,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
