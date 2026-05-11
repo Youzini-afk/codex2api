@@ -22,6 +22,37 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-test-lookup-1234567890"
+	id, err := db.InsertAPIKey(ctx, "lookup", key)
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	count, err := db.CountAPIKeys(ctx)
+	if err != nil {
+		t.Fatalf("CountAPIKeys 返回错误: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountAPIKeys = %d, want 1", count)
+	}
+	row, err := db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.ID != id || row.Name != "lookup" || row.Key != key {
+		t.Fatalf("API key row = %#v, want id=%d name=lookup key=%s", row, id, key)
+	}
+}
+
 func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

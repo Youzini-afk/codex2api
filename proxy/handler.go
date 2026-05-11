@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,12 +10,12 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
@@ -31,11 +32,24 @@ type Handler struct {
 	db         *database.DB
 	cfg        *config.Config       // 全局配置
 	deviceCfg  *DeviceProfileConfig // 设备指纹配置
+	cache      cache.TokenCache     // Redis/Memory 运行态缓存
+}
 
-	// 动态 key 缓存
-	dbKeysMu    sync.RWMutex
-	dbKeys      map[string]*database.APIKeyRow
-	dbKeysUntil time.Time
+const (
+	apiKeyCacheNamespace      = "api-key"
+	apiKeyCountCacheNamespace = "api-key-count"
+	apiKeyCacheTTL            = 5 * time.Minute
+	apiKeyCountCacheTTL       = 30 * time.Second
+)
+
+type apiKeyRuntimeRecord struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type apiKeyCountRuntimeRecord struct {
+	Count int `json:"count"`
 }
 
 func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
@@ -47,6 +61,13 @@ func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int
 		return nil, ""
 	}
 	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
+}
+
+func (h *Handler) withModelCooldownFilter(model string, filter auth.AccountFilter) auth.AccountFilter {
+	if h == nil || h.store == nil {
+		return filter
+	}
+	return h.store.WithModelCooldownFilter(model, filter)
 }
 
 func (h *Handler) shouldUseWebsocketForHTTP() bool {
@@ -306,50 +327,24 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 	}
 }
 
+// SetRuntimeCache wires Redis/Memory runtime cache for hot auth metadata.
+func (h *Handler) SetRuntimeCache(tc cache.TokenCache) {
+	if h == nil {
+		return
+	}
+	h.cache = tc
+}
+
 // NewHandlerWithDeviceProfile 创建处理器（带设备指纹配置）
 func NewHandlerWithDeviceProfile(store *auth.Store, db *database.DB, deviceCfg *DeviceProfileConfig) *Handler {
 	return NewHandler(store, db, nil, deviceCfg)
 }
 
-// refreshDBKeys 从数据库刷新密钥缓存（5 分钟）
-func (h *Handler) refreshDBKeys() map[string]*database.APIKeyRow {
-	h.dbKeysMu.RLock()
-	if time.Now().Before(h.dbKeysUntil) {
-		keys := h.dbKeys
-		h.dbKeysMu.RUnlock()
-		return keys
-	}
-	h.dbKeysMu.RUnlock()
-
-	h.dbKeysMu.Lock()
-	defer h.dbKeysMu.Unlock()
-
-	// double check
-	if time.Now().Before(h.dbKeysUntil) {
-		return h.dbKeys
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	rows, err := h.db.ListAPIKeys(ctx)
-	if err != nil {
-		log.Printf("刷新 API Keys 缓存失败: %v", err)
-		return h.dbKeys
-	}
-
-	newMap := make(map[string]*database.APIKeyRow, len(rows))
-	for _, row := range rows {
-		if row == nil || row.Key == "" {
-			continue
-		}
-		newMap[row.Key] = row
-	}
-	h.dbKeys = newMap
-	h.dbKeysUntil = time.Now().Add(5 * time.Minute)
-	return newMap
-}
-
 func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, false
+	}
 	if h.configKeys[key] {
 		return &database.APIKeyRow{
 			ID:   0,
@@ -357,9 +352,73 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
 			Key:  key,
 		}, true
 	}
-	dbKeys := h.refreshDBKeys()
-	row, ok := dbKeys[key]
-	return row, ok
+	if row, ok := h.resolveAPIKeyFromRuntimeCache(key); ok {
+		return row, true
+	}
+	if h.db == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	row, err := h.db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("查询 API Key 失败: %v", err)
+		}
+		return nil, false
+	}
+	h.setAPIKeyRuntimeCache(row)
+	return row, true
+}
+
+func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow, bool) {
+	if h == nil || h.cache == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	raw, ok, err := h.cache.GetRuntime(ctx, apiKeyCacheNamespace, key)
+	if err != nil {
+		log.Printf("读取 API Key Redis 缓存失败: %v", err)
+		return nil, false
+	}
+	if !ok || len(raw) == 0 {
+		return nil, false
+	}
+	var record apiKeyRuntimeRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		log.Printf("解析 API Key Redis 缓存失败: %v", err)
+		return nil, false
+	}
+	if record.ID <= 0 {
+		return nil, false
+	}
+	return &database.APIKeyRow{
+		ID:        record.ID,
+		Name:      record.Name,
+		Key:       key,
+		CreatedAt: record.CreatedAt,
+	}, true
+}
+
+func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
+	if h == nil || h.cache == nil || row == nil || strings.TrimSpace(row.Key) == "" || row.ID <= 0 {
+		return
+	}
+	record := apiKeyRuntimeRecord{
+		ID:        row.ID,
+		Name:      row.Name,
+		CreatedAt: row.CreatedAt,
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, row.Key, payload, apiKeyCacheTTL); err != nil {
+		log.Printf("写入 API Key Redis 缓存失败: id=%d err=%v", row.ID, err)
+	}
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）
@@ -373,8 +432,38 @@ func (h *Handler) hasAnyKeys() bool {
 	if len(h.configKeys) > 0 {
 		return true
 	}
-	dbKeys := h.refreshDBKeys()
-	return len(dbKeys) > 0
+	if h.cache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		raw, ok, err := h.cache.GetRuntime(ctx, apiKeyCountCacheNamespace, "all")
+		cancel()
+		if err != nil {
+			log.Printf("读取 API Key 数量缓存失败: %v", err)
+		} else if ok {
+			var record apiKeyCountRuntimeRecord
+			if err := json.Unmarshal(raw, &record); err == nil {
+				return record.Count > 0
+			}
+		}
+	}
+	if h.db == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	count, err := h.db.CountAPIKeys(ctx)
+	if err != nil {
+		log.Printf("统计 API Key 数量失败: %v", err)
+		return false
+	}
+	if h.cache != nil {
+		payload, _ := json.Marshal(apiKeyCountRuntimeRecord{Count: count})
+		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		if err := h.cache.SetRuntime(cacheCtx, apiKeyCountCacheNamespace, "all", payload, apiKeyCountCacheTTL); err != nil {
+			log.Printf("写入 API Key 数量缓存失败: %v", err)
+		}
+		cacheCancel()
+	}
+	return count > 0
 }
 
 // logUsage 记录请求日志（非阻塞，写入内存缓冲由后台批量 flush）
@@ -925,6 +1014,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -934,6 +1024,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
+	invalidEncryptedContentRetried := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1012,11 +1103,31 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			if resp.StatusCode != http.StatusOK {
+				errBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+					if rawChanged || codexChanged {
+						invalidEncryptedContentRetried = true
+						if rawChanged {
+							rawBody = strippedRawBody
+						}
+						if codexChanged {
+							codexBody = strippedCodexBody
+							expandedInputRaw = responsesInputRaw(codexBody)
+						}
+						log.Printf("OpenAI Responses 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+						h.store.Release(account)
+						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						continue
+					}
+				}
+
 				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
-				errBody, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				excludeAccounts[account.ID()] = true
@@ -1248,12 +1359,32 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+				if rawChanged || codexChanged {
+					invalidEncryptedContentRetried = true
+					if rawChanged {
+						rawBody = strippedRawBody
+					}
+					if codexChanged {
+						codexBody = strippedCodexBody
+						expandedInputRaw = responsesInputRaw(codexBody)
+					}
+					log.Printf("上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
+
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
@@ -1575,6 +1706,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	accountFilter := accountFilterForModel(effectiveModel)
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1584,6 +1716,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
+	invalidEncryptedContentRetried := false
 
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
@@ -1637,12 +1770,31 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+				if rawChanged || codexChanged {
+					invalidEncryptedContentRetried = true
+					if rawChanged {
+						rawBody = strippedRawBody
+					}
+					if codexChanged {
+						codexBody = strippedCodexBody
+					}
+					log.Printf("compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
+
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
@@ -1781,6 +1933,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	accountFilter := accountFilterForModel(effectiveModel)
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)

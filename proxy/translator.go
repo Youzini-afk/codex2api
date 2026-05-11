@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -696,6 +697,18 @@ func normalizeResponsesContentItemType(item map[string]any, role string) bool {
 		}
 		itemType = firstNonEmptyAnyString(item["type"])
 		modified = true
+	case "input_text":
+		if strings.TrimSpace(role) == "assistant" {
+			item["type"] = "output_text"
+			itemType = "output_text"
+			modified = true
+		}
+	case "output_text":
+		if strings.TrimSpace(role) != "assistant" {
+			item["type"] = "input_text"
+			itemType = "input_text"
+			modified = true
+		}
 	}
 
 	if itemType == "input_file" {
@@ -709,6 +722,114 @@ func normalizeResponsesContentItemType(item map[string]any, role string) bool {
 		}
 	}
 	return modified
+}
+
+func isInvalidEncryptedContentError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	for _, path := range []string{"error.code", "detail.code", "code"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "invalid_encrypted_content") {
+			return true
+		}
+	}
+	msgParts := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "detail").String(),
+		string(body),
+	}
+	for _, msg := range msgParts {
+		msg = strings.ToLower(msg)
+		if strings.Contains(msg, "invalid_encrypted_content") {
+			return true
+		}
+		if strings.Contains(msg, "encrypted content") &&
+			(strings.Contains(msg, "could not be verified") || strings.Contains(msg, "could not be decrypted")) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
+		return body, false
+	}
+	input, ok := root["input"]
+	if !ok {
+		return body, false
+	}
+	strippedInput, changed, keep := stripInvalidEncryptedContentValue(input, false)
+	if !changed {
+		return body, false
+	}
+	if keep {
+		root["input"] = strippedInput
+	} else {
+		delete(root, "input")
+	}
+	stripped, err := json.Marshal(root)
+	if err != nil {
+		return body, false
+	}
+	return stripped, true
+}
+
+func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bool) {
+	switch v := value.(type) {
+	case []any:
+		changed := false
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			stripped, itemChanged, keep := stripInvalidEncryptedContentValue(item, true)
+			if itemChanged {
+				changed = true
+			}
+			if !keep {
+				changed = true
+				continue
+			}
+			out = append(out, stripped)
+		}
+		return out, changed, true
+	case map[string]any:
+		changed := false
+		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" {
+			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
+				if arrayItem {
+					return nil, true, false
+				}
+				delete(v, "encrypted_content")
+				changed = true
+			}
+		} else if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
+			delete(v, "encrypted_content")
+			changed = true
+		}
+		for key, child := range v {
+			stripped, childChanged, keep := stripInvalidEncryptedContentValue(child, false)
+			if childChanged {
+				changed = true
+			}
+			if keep {
+				v[key] = stripped
+			} else {
+				delete(v, key)
+			}
+		}
+		return v, changed, true
+	default:
+		return value, false, true
+	}
+}
+
+func responsesInputRaw(body []byte) string {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() {
+		return ""
+	}
+	return input.Raw
 }
 
 func normalizeResponsesInputFileFields(item map[string]any) bool {
@@ -863,14 +984,16 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		out["reasoning"] = map[string]any{"effort": effort}
 	}
 
-	// 3. service tier（保留合法值，丢弃不支持的；fast 映射为上游接受的 priority）
+	// 3. service tier（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
 	tier := req.ServiceTier
 	if tier == "" {
 		tier = req.ServiceTierAlt
 	}
 	tier = strings.TrimSpace(tier)
 	if isAllowedServiceTier(tier) {
-		out["service_tier"] = upstreamServiceTier(tier)
+		if upstreamTier, ok := upstreamServiceTier(tier); ok {
+			out["service_tier"] = upstreamTier
+		}
 	}
 
 	// 4. tools 格式转换 + schema 清理
@@ -943,14 +1066,16 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		}
 	}
 
-	// 4. service tier 清理（fast 映射为上游接受的 priority）
+	// 4. service tier 清理（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
 	delete(body, "serviceTier")
 	if tier, ok := body["service_tier"].(string); ok {
 		tier = strings.TrimSpace(tier)
 		if !isAllowedServiceTier(tier) {
 			delete(body, "service_tier")
+		} else if upstreamTier, ok := upstreamServiceTier(tier); ok {
+			body["service_tier"] = upstreamTier
 		} else {
-			body["service_tier"] = upstreamServiceTier(tier)
+			delete(body, "service_tier")
 		}
 	}
 	normalizeResponsesStructuredOutputFormat(body)
@@ -1076,12 +1201,17 @@ func isAllowedServiceTier(tier string) bool {
 	}
 }
 
-// upstreamServiceTier 将客户端 service_tier 映射为上游接受的值（fast → priority）
-func upstreamServiceTier(tier string) string {
-	if tier == "fast" {
-		return "priority"
+// upstreamServiceTier 将客户端 service_tier 映射为上游接受的值。
+// Codex 上游当前只接受 priority；auto/default/flex/scale 都不应显式转发。
+func upstreamServiceTier(tier string) (string, bool) {
+	switch tier {
+	case "fast", "priority":
+		return "priority", true
+	case "auto", "default", "flex", "scale":
+		return "", false
+	default:
+		return "", false
 	}
-	return tier
 }
 
 // convertMessagesToInputSlice 将 OpenAI messages 转换为 Codex input 数组（纯内存操作，零中间序列化）
@@ -1277,9 +1407,10 @@ func sanitizeServiceTierForUpstream(body []byte) []byte {
 	switch tier {
 	case "auto", "default", "flex", "priority", "scale", "fast":
 		body, _ = sjson.DeleteBytes(body, "serviceTier")
-		// fast 映射为上游接受的 priority
-		if tier == "fast" {
-			body, _ = sjson.SetBytes(body, "service_tier", "priority")
+		if upstreamTier, ok := upstreamServiceTier(tier); ok {
+			body, _ = sjson.SetBytes(body, "service_tier", upstreamTier)
+		} else {
+			body, _ = sjson.DeleteBytes(body, "service_tier")
 		}
 		return body
 	default:

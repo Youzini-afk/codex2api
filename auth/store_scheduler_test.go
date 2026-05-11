@@ -202,6 +202,30 @@ func TestApplyRefreshedPlanTypeKeepsFreeUsageLimitAuthoritative(t *testing.T) {
 	}
 }
 
+func TestApplyRefreshedPlanTypeKeepsActiveFreeUsageWindowAuthoritative(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		PlanType:            "free",
+		UsagePercent7d:      3,
+		UsagePercent7dValid: true,
+		Reset7dAt:           now.Add(24 * time.Hour),
+	}
+
+	acc.mu.Lock()
+	plan, applied := acc.applyRefreshedPlanTypeLocked("pro", now)
+	acc.mu.Unlock()
+
+	if plan != "pro" {
+		t.Fatalf("plan = %q, want pro", plan)
+	}
+	if applied {
+		t.Fatal("refreshed pro plan should not override an active free 7d usage window")
+	}
+	if got := acc.GetPlanType(); got != "free" {
+		t.Fatalf("PlanType = %q, want free", got)
+	}
+}
+
 func TestApplyRefreshedPlanTypeAllowsPlanUpgradeAfterUsageReset(t *testing.T) {
 	now := time.Now()
 	acc := &Account{

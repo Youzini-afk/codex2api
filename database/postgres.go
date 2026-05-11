@@ -761,6 +761,28 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
 	return keys, rows.Err()
 }
 
+// CountAPIKeys 返回当前 API Key 数量。
+func (db *DB) CountAPIKeys(ctx context.Context) (int, error) {
+	var count int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM api_keys`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// GetAPIKeyByValue 通过完整 API Key 查找元数据，用于鉴权热路径的按 key 缓存。
+func (db *DB) GetAPIKeyByValue(ctx context.Context, key string) (*APIKeyRow, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, created_at FROM api_keys WHERE key = $1`, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, sql.ErrNoRows
+	}
+	return scanAPIKeyRow(rows)
+}
+
 // InsertAPIKey 插入新 API 密钥
 func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error) {
 	return db.insertRowID(ctx,

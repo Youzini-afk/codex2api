@@ -114,6 +114,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		return
 	}
 	accountFilter := accountFilterForModel(effectiveModel)
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)

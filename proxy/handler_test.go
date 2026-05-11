@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -837,6 +838,59 @@ func TestAuthMiddlewareSetsAPIKeyContext(t *testing.T) {
 	}
 	if payload.Raw != key {
 		t.Fatalf("raw = %q, want %q", payload.Raw, key)
+	}
+}
+
+func TestAuthMiddlewareUsesRuntimeAPIKeyCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	key := "sk-test-runtime-cache-1234567890"
+	tc := cache.NewMemory(1)
+	ctx := context.Background()
+	keyPayload, _ := json.Marshal(apiKeyRuntimeRecord{
+		ID:        42,
+		Name:      "Cached Team",
+		CreatedAt: time.Now(),
+	})
+	if err := tc.SetRuntime(ctx, apiKeyCacheNamespace, key, keyPayload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime api key: %v", err)
+	}
+	countPayload, _ := json.Marshal(apiKeyCountRuntimeRecord{Count: 1})
+	if err := tc.SetRuntime(ctx, apiKeyCountCacheNamespace, "all", countPayload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime api key count: %v", err)
+	}
+
+	handler := NewHandler(nil, nil, nil, nil)
+	handler.SetRuntimeCache(tc)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"id":   c.MustGet(contextAPIKeyID),
+			"name": c.MustGet(contextAPIKeyName),
+			"raw":  c.MustGet("apiKey"),
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+		Raw  string `json:"raw"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal 返回错误: %v", err)
+	}
+	if payload.ID != 42 || payload.Name != "Cached Team" || payload.Raw != key {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
 

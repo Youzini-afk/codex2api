@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -69,6 +70,27 @@ func TestSanitizeServiceTierForUpstream_FastToPriority(t *testing.T) {
 	}
 }
 
+func TestSanitizeServiceTierForUpstream_DropsUnsupportedClientTiers(t *testing.T) {
+	for _, tier := range []string{"auto", "default", "flex", "scale"} {
+		t.Run(tier, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{
+				"model":"gpt-5.4",
+				"service_tier":%q,
+				"serviceTier":%q
+			}`, tier, tier))
+
+			got := sanitizeServiceTierForUpstream(raw)
+
+			if gjson.GetBytes(got, "service_tier").Exists() {
+				t.Fatalf("%s service_tier should be omitted for upstream, got body=%s", tier, got)
+			}
+			if gjson.GetBytes(got, "serviceTier").Exists() {
+				t.Fatalf("serviceTier should be removed for upstream, got body=%s", got)
+			}
+		})
+	}
+}
+
 func TestTranslateRequest_PreservesSupportedServiceTier(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -90,6 +112,37 @@ func TestTranslateRequest_PreservesSupportedServiceTier(t *testing.T) {
 	}
 	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "high" {
 		t.Fatalf("reasoning.effort mismatch: got %q want %q", effort, "high")
+	}
+}
+
+func TestTranslateRequest_DropsUnsupportedClientServiceTier(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hello"}],
+		"service_tier":"flex"
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if gjson.GetBytes(got, "service_tier").Exists() {
+		t.Fatalf("unsupported client service_tier should be omitted for upstream, got body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_DropsUnsupportedClientServiceTier(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"service_tier":"flex"
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if gjson.GetBytes(got, "service_tier").Exists() {
+		t.Fatalf("unsupported client service_tier should be omitted for upstream, got body=%s", got)
 	}
 }
 
@@ -343,6 +396,51 @@ func TestPrepareResponsesBody_NormalizesLegacyFileContentPart(t *testing.T) {
 	}
 	if typ := gjson.Get(expandedInputRaw, "0.content.1.type").String(); typ != "input_file" {
 		t.Fatalf("expanded input should contain normalized input_file, got %q; expanded=%s", typ, expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesAssistantInputTextToOutputText(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[
+					{"type":"input_text","text":"prior assistant answer"}
+				]
+			}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "output_text" {
+		t.Fatalf("assistant input_text should normalize to output_text, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.Get(expandedInputRaw, "0.content.0.type").String(); typ != "output_text" {
+		t.Fatalf("expanded assistant content should normalize to output_text, got %q; expanded=%s", typ, expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesUserOutputTextToInputText(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"output_text","text":"hello"}
+				]
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_text" {
+		t.Fatalf("user output_text should normalize to input_text, got %q; body=%s", typ, got)
 	}
 }
 
@@ -1021,6 +1119,52 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 	}
 	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_123" {
 		t.Fatalf("function_call call_id should be preserved, got %q; body=%s", callID, got)
+	}
+}
+
+func TestInvalidEncryptedContentErrorDetection(t *testing.T) {
+	body := []byte(`{
+		"error":{
+			"code":"invalid_encrypted_content",
+			"type":"invalid_request_error",
+			"message":"The encrypted content gAAA...Vw== could not be verified. Reason: Encrypted content could not be decrypted or parsed."
+		}
+	}`)
+
+	if !isInvalidEncryptedContentError(http.StatusBadRequest, body) {
+		t.Fatalf("expected invalid encrypted content error to be detected")
+	}
+	if isInvalidEncryptedContentError(http.StatusInternalServerError, body) {
+		t.Fatalf("non-400 response should not trigger encrypted content fallback")
+	}
+}
+
+func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+			{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
+		]
+	}`)
+
+	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
+	if !changed {
+		t.Fatalf("expected body to be changed")
+	}
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("expected reasoning item to be removed, got %d items: %s", len(items), got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("first input should remain message, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call" {
+		t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+	}
+	if strings.Contains(string(got), "encrypted_content") {
+		t.Fatalf("encrypted_content should be removed from retry body: %s", got)
 	}
 }
 
