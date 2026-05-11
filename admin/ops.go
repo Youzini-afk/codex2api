@@ -159,7 +159,7 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	usageStats, err := h.db.GetUsageStats(ctx)
+	usageStats, err := h.getUsageStatsCached(ctx)
 	if err != nil {
 		writeInternalError(c, err)
 		return
