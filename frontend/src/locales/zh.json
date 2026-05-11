@@ -589,6 +589,12 @@
     "copyJson": "复制 JSON",
     "copySuccess": "错误日志已复制",
     "copyFailed": "复制失败",
+    "exportJson": "导出 JSON",
+    "exporting": "导出中",
+    "exportDedupe": "去重",
+    "exclude401429": "排除 401/429",
+    "exportSuccess": "错误日志 JSON 已导出",
+    "exportFailed": "导出失败",
     "noErrorMessage": "暂无错误信息"
   },
   "scheduler": {

@@ -159,6 +159,7 @@ const maxTools = 128
 const (
 	codexImageGenerationBridgeMarker = "<codex2api-codex-image-generation>"
 	codexImageGenerationBridgeText   = codexImageGenerationBridgeMarker + "\nWhen the user asks for raster image generation or editing, use the OpenAI Responses native `image_generation` tool attached to this request. The local Codex client may not expose an `image_gen` namespace, but that does not mean image generation is unavailable. Do not ask the user to switch to CLI fallback solely because `image_gen` is absent.\n</codex2api-codex-image-generation>"
+	jsonObjectFormatInputHint        = "Return a valid JSON object."
 )
 
 var responsesImageGenerationOptionFields = []string{
@@ -1037,8 +1038,8 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 
 	// 2. 字符串 input → 数组包装（Codex 要求 input 为 list）
 	if inputStr, ok := body["input"].(string); ok {
-		body["input"] = []map[string]string{
-			{"role": "user", "content": inputStr},
+		body["input"] = []any{
+			map[string]any{"role": "user", "content": inputStr},
 		}
 	}
 	promptText := extractResponsesPromptText(body)
@@ -1581,7 +1582,95 @@ func normalizeResponsesStructuredOutputFormat(body map[string]any) bool {
 	if sanitizeStructuredOutputSchema(format) {
 		modified = true
 	}
+	if ensureJSONModeInputMentionsJSON(body, format) {
+		modified = true
+	}
 	return modified
+}
+
+func ensureJSONModeInputMentionsJSON(body map[string]any, format map[string]any) bool {
+	if strings.TrimSpace(firstNonEmptyAnyString(format["type"])) != "json_object" {
+		return false
+	}
+	input, ok := body["input"]
+	if !ok || responsesInputContainsJSON(input) {
+		return false
+	}
+
+	switch inputValue := input.(type) {
+	case string:
+		body["input"] = jsonObjectFormatInputHint + "\n\n" + inputValue
+		return true
+	case []any:
+		body["input"] = append([]any{jsonObjectDeveloperMessage()}, inputValue...)
+		return true
+	case []map[string]string:
+		inputItems := make([]any, 0, len(inputValue)+1)
+		inputItems = append(inputItems, jsonObjectDeveloperMessage())
+		for _, item := range inputValue {
+			inputItems = append(inputItems, item)
+		}
+		body["input"] = inputItems
+		return true
+	case []map[string]any:
+		inputItems := make([]any, 0, len(inputValue)+1)
+		inputItems = append(inputItems, jsonObjectDeveloperMessage())
+		for _, item := range inputValue {
+			inputItems = append(inputItems, item)
+		}
+		body["input"] = inputItems
+		return true
+	default:
+		return false
+	}
+}
+
+func jsonObjectDeveloperMessage() map[string]any {
+	return map[string]any{
+		"type": "message",
+		"role": "developer",
+		"content": []any{
+			map[string]any{"type": "input_text", "text": jsonObjectFormatInputHint},
+		},
+	}
+}
+
+func responsesInputContainsJSON(value any) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.Contains(strings.ToLower(v), "json")
+	case []any:
+		for _, item := range v {
+			if responsesInputContainsJSON(item) {
+				return true
+			}
+		}
+	case []map[string]string:
+		for _, item := range v {
+			if responsesInputContainsJSON(item) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, item := range v {
+			if responsesInputContainsJSON(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, key := range []string{"content", "text", "output"} {
+			if child, ok := v[key]; ok && responsesInputContainsJSON(child) {
+				return true
+			}
+		}
+	case map[string]string:
+		for _, key := range []string{"content", "text", "output"} {
+			if child, ok := v[key]; ok && responsesInputContainsJSON(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func responsesTextFormatFromResponseFormat(responseFormat map[string]any) map[string]any {

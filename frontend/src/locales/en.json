@@ -589,6 +589,12 @@
     "copyJson": "Copy JSON",
     "copySuccess": "Error log copied",
     "copyFailed": "Copy failed",
+    "exportJson": "Export JSON",
+    "exporting": "Exporting",
+    "exportDedupe": "Deduplicate",
+    "exclude401429": "Exclude 401/429",
+    "exportSuccess": "Error log JSON exported",
+    "exportFailed": "Export failed",
     "noErrorMessage": "No error message"
   },
   "scheduler": {

@@ -646,6 +646,90 @@ func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_JSONObjectInjectsJSONHintWhenInputOmitsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"return name"}],
+		"response_format":{"type":"json_object"}
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_object" {
+		t.Fatalf("expected json_object text format, got %q; body=%s", typ, got)
+	}
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("expected injected developer hint, got role %q; body=%s", role, got)
+	}
+	if hint := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(strings.ToLower(hint), "json") {
+		t.Fatalf("expected injected hint to mention JSON, got %q; body=%s", hint, got)
+	}
+	if userText := gjson.GetBytes(got, "input.1.content.0.text").String(); userText != "return name" {
+		t.Fatalf("expected original user input to be preserved, got %q; body=%s", userText, got)
+	}
+}
+
+func TestTranslateRequest_JSONObjectDoesNotInjectWhenInputMentionsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"return JSON with name"}],
+		"response_format":{"type":"json_object"}
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "user" {
+		t.Fatalf("did not expect injected hint when input already mentions JSON, got role %q; body=%s", role, got)
+	}
+	if inputLen := len(gjson.GetBytes(got, "input").Array()); inputLen != 1 {
+		t.Fatalf("expected one input item, got %d; body=%s", inputLen, got)
+	}
+}
+
+func TestPrepareResponsesBody_JSONObjectInjectsJSONHintWhenInputOmitsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"return name",
+		"text":{"format":{"type":"json_object"}}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("expected injected developer hint, got role %q; body=%s", role, got)
+	}
+	if hint := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(strings.ToLower(hint), "json") {
+		t.Fatalf("expected injected hint to mention JSON, got %q; body=%s", hint, got)
+	}
+	if userText := gjson.GetBytes(got, "input.1.content").String(); userText != "return name" {
+		t.Fatalf("expected original user input to be preserved, got %q; body=%s", userText, got)
+	}
+}
+
+func TestPrepareOpenAIResponsesBody_JSONObjectPrefixesStringInputWhenInputOmitsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"return name",
+		"text":{"format":{"type":"json_object"}}
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+
+	input := gjson.GetBytes(got, "input").String()
+	if !strings.Contains(strings.ToLower(input), "json") || !strings.Contains(input, "return name") {
+		t.Fatalf("expected string input to include JSON hint and original input, got %q; body=%s", input, got)
+	}
+	if gjson.GetBytes(got, "include").Exists() {
+		t.Fatalf("OpenAI Responses body should not get Codex include defaults; body=%s", got)
+	}
+}
+
 func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

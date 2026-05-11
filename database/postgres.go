@@ -2151,6 +2151,56 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	return result, rows.Err()
 }
 
+// ListUsageLogsByFilter 按过滤条件查询请求日志，不分页，用于导出。
+func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*UsageLog, error) {
+	where, args := db.buildUsageLogWhere(f)
+	where += ` ORDER BY u.created_at DESC`
+
+	query := `SELECT u.id, u.account_id, u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+			COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
+			COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
+			COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+			COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
+			COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
+			COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
+			COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
+			COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+			COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+		FROM usage_logs u
+		LEFT JOIN accounts a ON u.account_id = a.id
+		WHERE ` + where
+
+	rows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var logs []*UsageLog
+	for rows.Next() {
+		l := &UsageLog{}
+		var credentialRaw interface{}
+		var createdAtRaw interface{}
+		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
+			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.CachedTokens,
+			&l.ServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
+		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		l.populateBillingBreakdown()
+		logs = append(logs, l)
+	}
+	if logs == nil {
+		logs = []*UsageLog{}
+	}
+	return logs, rows.Err()
+}
+
 // ClearUsageLogs 清空所有使用日志（先快照累计值到基线表）
 func (db *DB) ClearUsageLogs(ctx context.Context) error {
 	// 先将当前日志的累计值叠加到基线表

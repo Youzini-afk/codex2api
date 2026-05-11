@@ -162,6 +162,8 @@ function buildOpsErrorSearchParams(params: {
   stream?: string
   fast?: string
   q?: string
+  dedupe?: boolean
+  excludeStatus?: string
 }) {
   const search = new URLSearchParams()
   search.set('start', params.start)
@@ -173,6 +175,8 @@ function buildOpsErrorSearchParams(params: {
   if (params.stream) search.set('stream', params.stream)
   if (params.fast) search.set('fast', params.fast)
   if (params.q) search.set('q', params.q)
+  if (typeof params.dedupe === 'boolean') search.set('dedupe', String(params.dedupe))
+  if (params.excludeStatus) search.set('exclude_status', params.excludeStatus)
   return search
 }
 
@@ -242,6 +246,22 @@ export const api = {
     search.set('page', String(params.page))
     if (params.pageSize) search.set('page_size', String(params.pageSize))
     return request<UsageLogsPagedResponse>(`/ops/errors?${search.toString()}`)
+  },
+  downloadOpsErrors: (params: {
+    start: string
+    end: string
+    status?: string
+    errorKind?: string
+    endpoint?: string
+    apiKeyId?: string
+    stream?: string
+    fast?: string
+    q?: string
+    dedupe?: boolean
+    excludeStatus?: string
+  }) => {
+    const search = buildOpsErrorSearchParams(params)
+    return requestBlob(`/ops/errors/export?${search.toString()}`)
   },
   getUsageStats: () => request<UsageStats>('/usage/stats'),
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {

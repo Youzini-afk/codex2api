@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -228,6 +229,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/system/update", h.StartSelfUpdate)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
+	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
@@ -2560,6 +2562,72 @@ func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogF
 	return filter, true
 }
 
+type opsErrorExportFile struct {
+	Version           int                   `json:"version"`
+	GeneratedAt       time.Time             `json:"generated_at"`
+	Range             opsErrorExportRange   `json:"range"`
+	Filters           opsErrorExportFilters `json:"filters"`
+	Options           opsErrorExportOptions `json:"options"`
+	TotalMatched      int                   `json:"total_matched"`
+	ExcludedCount     int                   `json:"excluded_count"`
+	ExportedCount     int                   `json:"exported_count"`
+	DuplicatesRemoved int                   `json:"duplicates_removed"`
+	Errors            []opsErrorExportEntry `json:"errors"`
+}
+
+type opsErrorExportRange struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+type opsErrorExportFilters struct {
+	Email        string `json:"email,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	APIKeyID     *int64 `json:"api_key_id,omitempty"`
+	AccountID    *int64 `json:"account_id,omitempty"`
+	FastOnly     *bool  `json:"fast_only,omitempty"`
+	StreamOnly   *bool  `json:"stream_only,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	StatusFamily string `json:"status_family,omitempty"`
+	ErrorKind    string `json:"error_kind,omitempty"`
+	Query        string `json:"query,omitempty"`
+}
+
+type opsErrorExportOptions struct {
+	Dedupe              bool  `json:"dedupe"`
+	ExcludedStatusCodes []int `json:"excluded_status_codes,omitempty"`
+}
+
+type opsErrorExportEntry struct {
+	Signature          string    `json:"signature"`
+	Occurrences        int       `json:"occurrences"`
+	FirstSeen          time.Time `json:"first_seen"`
+	LastSeen           time.Time `json:"last_seen"`
+	SampleIDs          []int64   `json:"sample_ids"`
+	AffectedAccountIDs []int64   `json:"affected_account_ids,omitempty"`
+	AffectedAPIKeyIDs  []int64   `json:"affected_api_key_ids,omitempty"`
+	ID                 int64     `json:"id"`
+	CreatedAt          time.Time `json:"created_at"`
+	StatusCode         int       `json:"status_code"`
+	ErrorKind          string    `json:"error_kind"`
+	ErrorMessage       string    `json:"error_message"`
+	AccountID          int64     `json:"account_id"`
+	AccountEmail       string    `json:"account_email"`
+	APIKeyID           int64     `json:"api_key_id"`
+	APIKeyName         string    `json:"api_key_name"`
+	APIKeyMasked       string    `json:"api_key_masked"`
+	Endpoint           string    `json:"endpoint"`
+	UpstreamEndpoint   string    `json:"upstream_endpoint"`
+	Model              string    `json:"model"`
+	EffectiveModel     string    `json:"effective_model"`
+	Stream             bool      `json:"stream"`
+	DurationMs         int       `json:"duration_ms"`
+	FirstTokenMs       int       `json:"first_token_ms"`
+	IsRetryAttempt     bool      `json:"is_retry_attempt"`
+	AttemptIndex       int       `json:"attempt_index"`
+}
+
 // GetOpsErrorLogs 获取运维错误日志
 func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
@@ -2575,6 +2643,219 @@ func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// ExportOpsErrorLogs 导出运维错误日志 JSON。
+func (h *Handler) ExportOpsErrorLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	dedupe := parseBoolQueryDefault(c, "dedupe", true)
+	excludedStatusCodes, excludedStatusSet, ok := parseExcludedStatusCodes(c.Query("exclude_status"))
+	if !ok {
+		writeError(c, http.StatusBadRequest, "exclude_status 参数无效")
+		return
+	}
+
+	logs, err := h.db.ListUsageLogsByFilter(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	exportFile := buildOpsErrorExportFile(logs, filter, dedupe, excludedStatusCodes, excludedStatusSet)
+	body, err := json.MarshalIndent(exportFile, "", "  ")
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	body = append(body, '\n')
+
+	filename := fmt.Sprintf("ops-errors-%s.json", time.Now().Format("20060102-150405"))
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+func parseBoolQueryDefault(c *gin.Context, name string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(c.Query(name)))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func parseExcludedStatusCodes(raw string) ([]int, map[int]bool, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, map[int]bool{}, true
+	}
+	seen := map[int]bool{}
+	var statuses []int
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		code, err := strconv.Atoi(part)
+		if err != nil || code < 100 || code > 599 {
+			return nil, nil, false
+		}
+		if !seen[code] {
+			seen[code] = true
+			statuses = append(statuses, code)
+		}
+	}
+	sort.Ints(statuses)
+	return statuses, seen, true
+}
+
+func buildOpsErrorExportFile(logs []*database.UsageLog, filter database.UsageLogFilter, dedupe bool, excludedStatusCodes []int, excludedStatusSet map[int]bool) opsErrorExportFile {
+	exportFile := opsErrorExportFile{
+		Version:      1,
+		GeneratedAt:  time.Now(),
+		Range:        opsErrorExportRange{Start: filter.Start, End: filter.End},
+		Filters:      opsErrorExportFiltersFromUsageFilter(filter),
+		Options:      opsErrorExportOptions{Dedupe: dedupe, ExcludedStatusCodes: excludedStatusCodes},
+		TotalMatched: len(logs),
+		Errors:       []opsErrorExportEntry{},
+	}
+
+	filteredLogs := make([]*database.UsageLog, 0, len(logs))
+	for _, logRow := range logs {
+		if logRow == nil {
+			continue
+		}
+		if excludedStatusSet[logRow.StatusCode] {
+			exportFile.ExcludedCount++
+			continue
+		}
+		filteredLogs = append(filteredLogs, logRow)
+	}
+
+	if !dedupe {
+		for _, logRow := range filteredLogs {
+			entry := newOpsErrorExportEntry(logRow)
+			exportFile.Errors = append(exportFile.Errors, entry)
+		}
+		exportFile.ExportedCount = len(exportFile.Errors)
+		return exportFile
+	}
+
+	entryBySignature := make(map[string]int)
+	for _, logRow := range filteredLogs {
+		entry := newOpsErrorExportEntry(logRow)
+		if idx, exists := entryBySignature[entry.Signature]; exists {
+			exportFile.Errors[idx].merge(logRow)
+			continue
+		}
+		entryBySignature[entry.Signature] = len(exportFile.Errors)
+		exportFile.Errors = append(exportFile.Errors, entry)
+	}
+	sort.SliceStable(exportFile.Errors, func(i, j int) bool {
+		if exportFile.Errors[i].Occurrences != exportFile.Errors[j].Occurrences {
+			return exportFile.Errors[i].Occurrences > exportFile.Errors[j].Occurrences
+		}
+		return exportFile.Errors[i].LastSeen.After(exportFile.Errors[j].LastSeen)
+	})
+	exportFile.ExportedCount = len(exportFile.Errors)
+	exportFile.DuplicatesRemoved = len(filteredLogs) - len(exportFile.Errors)
+	return exportFile
+}
+
+func opsErrorExportFiltersFromUsageFilter(filter database.UsageLogFilter) opsErrorExportFilters {
+	return opsErrorExportFilters{
+		Email:        filter.Email,
+		Model:        filter.Model,
+		Endpoint:     filter.Endpoint,
+		APIKeyID:     filter.APIKeyID,
+		AccountID:    filter.AccountID,
+		FastOnly:     filter.FastOnly,
+		StreamOnly:   filter.StreamOnly,
+		StatusCode:   filter.StatusCode,
+		StatusFamily: filter.StatusFamily,
+		ErrorKind:    filter.ErrorKind,
+		Query:        filter.Query,
+	}
+}
+
+func newOpsErrorExportEntry(logRow *database.UsageLog) opsErrorExportEntry {
+	entry := opsErrorExportEntry{
+		Signature:          opsErrorSignature(logRow),
+		Occurrences:        1,
+		FirstSeen:          logRow.CreatedAt,
+		LastSeen:           logRow.CreatedAt,
+		SampleIDs:          []int64{logRow.ID},
+		AffectedAccountIDs: appendUniqueInt64(nil, logRow.AccountID, 50),
+		AffectedAPIKeyIDs:  appendUniqueInt64(nil, logRow.APIKeyID, 50),
+		ID:                 logRow.ID,
+		CreatedAt:          logRow.CreatedAt,
+		StatusCode:         logRow.StatusCode,
+		ErrorKind:          logRow.UpstreamErrorKind,
+		ErrorMessage:       logRow.ErrorMessage,
+		AccountID:          logRow.AccountID,
+		AccountEmail:       logRow.AccountEmail,
+		APIKeyID:           logRow.APIKeyID,
+		APIKeyName:         logRow.APIKeyName,
+		APIKeyMasked:       logRow.APIKeyMasked,
+		Endpoint:           firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		UpstreamEndpoint:   logRow.UpstreamEndpoint,
+		Model:              logRow.Model,
+		EffectiveModel:     logRow.EffectiveModel,
+		Stream:             logRow.Stream,
+		DurationMs:         logRow.DurationMs,
+		FirstTokenMs:       logRow.FirstTokenMs,
+		IsRetryAttempt:     logRow.IsRetryAttempt,
+		AttemptIndex:       logRow.AttemptIndex,
+	}
+	return entry
+}
+
+func (entry *opsErrorExportEntry) merge(logRow *database.UsageLog) {
+	entry.Occurrences++
+	if logRow.CreatedAt.Before(entry.FirstSeen) {
+		entry.FirstSeen = logRow.CreatedAt
+	}
+	if logRow.CreatedAt.After(entry.LastSeen) {
+		entry.LastSeen = logRow.CreatedAt
+	}
+	entry.SampleIDs = appendUniqueInt64(entry.SampleIDs, logRow.ID, 20)
+	entry.AffectedAccountIDs = appendUniqueInt64(entry.AffectedAccountIDs, logRow.AccountID, 50)
+	entry.AffectedAPIKeyIDs = appendUniqueInt64(entry.AffectedAPIKeyIDs, logRow.APIKeyID, 50)
+}
+
+func opsErrorSignature(logRow *database.UsageLog) string {
+	parts := []string{
+		strconv.Itoa(logRow.StatusCode),
+		strings.TrimSpace(logRow.UpstreamErrorKind),
+		strings.Join(strings.Fields(logRow.ErrorMessage), " "),
+		firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		strings.TrimSpace(logRow.UpstreamEndpoint),
+		strings.TrimSpace(logRow.Model),
+		strings.TrimSpace(logRow.EffectiveModel),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x1f")))
+	return hex.EncodeToString(sum[:12])
+}
+
+func appendUniqueInt64(values []int64, value int64, limit int) []int64 {
+	if value <= 0 || (limit > 0 && len(values) >= limit) {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 // GetOpsErrorSummary 获取运维错误日志概览
