@@ -188,7 +188,7 @@ export default function OperationsErrors() {
       attempt_index: log.attempt_index,
     }, null, 2)
     try {
-      await navigator.clipboard.writeText(text)
+      await copyTextToClipboard(text)
       showToast(t('opsErrors.copySuccess'))
     } catch {
       showToast(t('opsErrors.copyFailed'), 'error')
@@ -599,6 +599,33 @@ function formatEndpoint(log: UsageLog): string {
     return `${inbound} → ${log.upstream_endpoint}`
   }
   return inbound
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      // Fall back for non-secure contexts or browsers that block clipboard writes.
+    }
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'true')
+  textarea.style.position = 'fixed'
+  textarea.style.top = '-1000px'
+  textarea.style.opacity = '0'
+  textarea.style.pointerEvents = 'none'
+  document.body.appendChild(textarea)
+  textarea.select()
+  textarea.setSelectionRange(0, text.length)
+  const copied = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  if (!copied) {
+    throw new Error('copy failed')
+  }
 }
 
 function classifyStatus(statusCode: number): string {
