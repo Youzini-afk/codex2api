@@ -3008,8 +3008,12 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 }
 
 type createKeyReq struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
+	Name          string   `json:"name"`
+	Key           string   `json:"key"`
+	QuotaLimit    *float64 `json:"quota_limit"`
+	Quota         *float64 `json:"quota"`
+	ExpiresAt     string   `json:"expires_at"`
+	ExpiresInDays *int     `json:"expires_in_days"`
 }
 
 // generateKey 生成随机 API Key
@@ -3044,6 +3048,28 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		return
 	}
 
+	quotaLimit := 0.0
+	if req.Quota != nil {
+		quotaLimit = *req.Quota
+	}
+	if req.QuotaLimit != nil {
+		quotaLimit = *req.QuotaLimit
+	}
+	if quotaLimit < 0 {
+		writeError(c, http.StatusBadRequest, "额度限制不能小于 0")
+		return
+	}
+	if quotaLimit > 1000000000 {
+		writeError(c, http.StatusBadRequest, "额度限制过大")
+		return
+	}
+
+	expiresAt, err := parseAPIKeyExpiresAt(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	key := req.Key
 	if key == "" {
 		key = generateKey()
@@ -3059,7 +3085,12 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	id, err := h.db.InsertAPIKey(ctx, req.Name, key)
+	id, err := h.db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name:       req.Name,
+		Key:        key,
+		QuotaLimit: quotaLimit,
+		ExpiresAt:  expiresAt,
+	})
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
 		return
@@ -3069,11 +3100,57 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	// 记录安全审计日志
 	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
 
+	var expiresAtResponse *string
+	if expiresAt.Valid {
+		formatted := expiresAt.Time.Format(time.RFC3339)
+		expiresAtResponse = &formatted
+	}
 	c.JSON(http.StatusOK, createAPIKeyResponse{
-		ID:   id,
-		Key:  key,
-		Name: req.Name,
+		ID:         id,
+		Key:        key,
+		Name:       req.Name,
+		QuotaLimit: quotaLimit,
+		QuotaUsed:  0,
+		ExpiresAt:  expiresAtResponse,
 	})
+}
+
+func parseAPIKeyExpiresAt(raw string, expiresInDays *int) (sql.NullTime, error) {
+	if expiresInDays != nil {
+		if *expiresInDays < 0 {
+			return sql.NullTime{}, fmt.Errorf("过期天数不能小于 0")
+		}
+		if *expiresInDays > 0 {
+			if *expiresInDays > 3650 {
+				return sql.NullTime{}, fmt.Errorf("过期天数不能超过 3650 天")
+			}
+			return sql.NullTime{Time: time.Now().AddDate(0, 0, *expiresInDays), Valid: true}, nil
+		}
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return sql.NullTime{}, nil
+	}
+	layouts := []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02 15:04", "2006-01-02"}
+	var parsed time.Time
+	var err error
+	for _, layout := range layouts {
+		if layout == time.RFC3339 {
+			parsed, err = time.Parse(layout, raw)
+		} else {
+			parsed, err = time.ParseInLocation(layout, raw, time.Local)
+		}
+		if err == nil {
+			if layout == "2006-01-02" {
+				parsed = parsed.Add(24*time.Hour - time.Nanosecond)
+			}
+			if !parsed.After(time.Now()) {
+				return sql.NullTime{}, fmt.Errorf("过期时间必须晚于当前时间")
+			}
+			return sql.NullTime{Time: parsed, Valid: true}, nil
+		}
+	}
+	return sql.NullTime{}, fmt.Errorf("过期时间格式无效")
 }
 
 // DeleteAPIKey 删除 API 密钥

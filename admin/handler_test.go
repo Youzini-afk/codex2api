@@ -145,6 +145,46 @@ func TestRefreshAccountReturnsRefreshFailure(t *testing.T) {
 	}
 }
 
+func TestCreateAPIKeyPersistsQuotaAndExpiration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	handler := &Handler{db: db}
+	body := `{"name":"Client A","key":"sk-test-client-a-1234567890","quota_limit":0.25,"expires_in_days":7}`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/keys", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.CreateAPIKey(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload createAPIKeyResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.ID <= 0 || payload.QuotaLimit != 0.25 || payload.ExpiresAt == nil {
+		t.Fatalf("payload = %#v, want quota and expiration", payload)
+	}
+
+	row, err := db.GetAPIKeyByValue(context.Background(), "sk-test-client-a-1234567890")
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.QuotaLimit != 0.25 || !row.ExpiresAt.Valid {
+		t.Fatalf("row = %#v, want quota and expiration", row)
+	}
+}
+
 func TestGetAccountAuthJSONRejectsInvalidID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

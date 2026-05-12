@@ -405,6 +405,9 @@ func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
 	if h == nil || h.cache == nil || row == nil || strings.TrimSpace(row.Key) == "" || row.ID <= 0 {
 		return
 	}
+	if row.HasAccessConstraints() {
+		return
+	}
 	record := apiKeyRuntimeRecord{
 		ID:        row.ID,
 		Name:      row.Name,
@@ -947,6 +950,20 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			security.SecurityAuditLog("AUTH_FAILED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
 			// Use standardized error format from api package
 			api.SendError(c, api.ErrInvalidAPIKey)
+			c.Abort()
+			return
+		}
+		if apiKeyRow.IsExpired(time.Now()) {
+			maskedKey := security.MaskAPIKey(key)
+			security.SecurityAuditLog("AUTH_FAILED_EXPIRED_KEY", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
+			api.SendError(c, api.NewAPIError(api.ErrCodeInvalidAuth, "API key has expired", api.ErrorTypeAuthentication))
+			c.Abort()
+			return
+		}
+		if apiKeyRow.IsQuotaExhausted() {
+			maskedKey := security.MaskAPIKey(key)
+			security.SecurityAuditLog("AUTH_FAILED_QUOTA_EXHAUSTED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
+			api.SendError(c, api.NewAPIError(api.ErrCodeRateLimitReached, "API key quota exhausted", api.ErrorTypeRateLimit))
 			c.Abort()
 			return
 		}

@@ -10,6 +10,7 @@ import type {
   ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
+  CreateAPIKeyRequest,
   FetchOpenAIResponsesModelsRequest,
   FetchOpenAIResponsesModelsResponse,
   CreateImageJobPayload,
@@ -303,10 +304,10 @@ export const api = {
     return request<{ trend: AccountEventTrendPoint[] }>(`/accounts/event-trend?${sp.toString()}`)
   },
   getAPIKeys: () => request<APIKeysResponse>('/keys'),
-  createAPIKey: (name: string, key?: string) =>
+  createAPIKey: (data: CreateAPIKeyRequest) =>
     request<CreateAPIKeyResponse>('/keys', {
       method: 'POST',
-      body: JSON.stringify({ name, ...(key ? { key } : {}) }),
+      body: JSON.stringify(data),
     }),
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),

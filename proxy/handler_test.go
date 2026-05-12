@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
@@ -873,6 +875,81 @@ func TestAuthMiddlewareSetsAPIKeyContext(t *testing.T) {
 	}
 	if payload.Raw != key {
 		t.Fatalf("raw = %q, want %q", payload.Raw, key)
+	}
+}
+
+func TestAuthMiddlewareRejectsExpiredAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	key := "sk-test-expired-1234567890"
+	if _, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
+		Name:      "Expired",
+		Key:       key,
+		ExpiresAt: sql.NullTime{Time: time.Now().Add(-time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	handler := NewHandler(nil, db, nil, nil)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); got != string(api.ErrCodeInvalidAuth) {
+		t.Fatalf("error.code = %q, want %q", got, api.ErrCodeInvalidAuth)
+	}
+}
+
+func TestAuthMiddlewareRejectsQuotaExhaustedAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	key := "sk-test-quota-1234567890"
+	if _, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
+		Name:       "Quota",
+		Key:        key,
+		QuotaLimit: 0.01,
+		QuotaUsed:  0.01,
+	}); err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	handler := NewHandler(nil, db, nil, nil)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusTooManyRequests, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); got != string(api.ErrCodeRateLimitReached) {
+		t.Fatalf("error.code = %q, want %q", got, api.ErrCodeRateLimitReached)
 	}
 }
 
