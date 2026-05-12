@@ -569,6 +569,44 @@ func TestPrepareResponsesBody_SanitizesTextFormatJSONSchema(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_JSONSchemaDoesNotInjectImageBridge(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":"Extract the name and age from: John is 30 years old",
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"name":"person",
+				"strict":true,
+				"schema":{
+					"type":"object",
+					"properties":{
+						"name":{"type":"string"},
+						"age":{"type":"integer"}
+					},
+					"required":["name","age"],
+					"additionalProperties":false
+				}
+			}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if gjson.GetBytes(got, "tools").Exists() {
+		t.Fatalf("json_schema responses should not get implicit image tools; body=%s", got)
+	}
+	if gjson.GetBytes(got, "instructions").Exists() {
+		t.Fatalf("json_schema responses should not get image bridge instructions; body=%s", got)
+	}
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_schema" {
+		t.Fatalf("expected json_schema format to be preserved, got %q; body=%s", typ, got)
+	}
+	if input := gjson.GetBytes(got, "input.0.content").String(); input != "Extract the name and age from: John is 30 years old" {
+		t.Fatalf("expected original input to be preserved, got %q; body=%s", input, got)
+	}
+}
+
 func TestPrepareResponsesBody_ConvertsAndSanitizesLegacyResponseFormat(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

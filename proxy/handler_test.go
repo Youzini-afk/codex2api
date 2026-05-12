@@ -16,6 +16,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func TestSupportedModelsIncludeLatestRequestedModels(t *testing.T) {
@@ -287,6 +288,40 @@ func TestExtractResponseImageGenerationOutputDedupes(t *testing.T) {
 
 	if _, ok := extractResponseImageGenerationOutput(event, seen); ok {
 		t.Fatal("expected duplicate image_generation_call output to be ignored")
+	}
+}
+
+func TestRestoreMissingResponseOutputsUsesOutputItemDone(t *testing.T) {
+	response := []byte(`{"id":"resp_1","object":"response","output":[]}`)
+	outputItems := []json.RawMessage{
+		json.RawMessage(`{"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]}`),
+		json.RawMessage(`{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"{\"age\":30,\"name\":\"John\"}"}]}`),
+	}
+
+	got := restoreMissingResponseOutputs(response, outputItems)
+
+	output := gjson.GetBytes(got, "output")
+	if !output.IsArray() || len(output.Array()) != 2 {
+		t.Fatalf("output count = %d, want 2; body=%s", len(output.Array()), got)
+	}
+	if typ := output.Array()[0].Get("type").String(); typ != "reasoning" {
+		t.Fatalf("first output type = %q, want reasoning; body=%s", typ, got)
+	}
+	if text := output.Array()[1].Get("content.0.text").String(); text != `{"age":30,"name":"John"}` {
+		t.Fatalf("message text = %q, want structured JSON; body=%s", text, got)
+	}
+}
+
+func TestRestoreMissingResponseOutputsPreservesCompletedOutput(t *testing.T) {
+	response := []byte(`{"id":"resp_1","object":"response","output":[{"id":"msg_existing","type":"message","content":[{"type":"output_text","text":"done"}]}]}`)
+	outputItems := []json.RawMessage{
+		json.RawMessage(`{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"fallback"}]}`),
+	}
+
+	got := restoreMissingResponseOutputs(response, outputItems)
+
+	if string(got) != string(response) {
+		t.Fatalf("non-empty completed output should be preserved, got %s", got)
 	}
 }
 

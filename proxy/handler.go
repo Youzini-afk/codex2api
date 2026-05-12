@@ -716,6 +716,76 @@ func extractResponseImageGenerationOutput(data []byte, seen map[string]struct{})
 	return json.RawMessage(raw), true
 }
 
+func responseOutputItemDoneKey(item gjson.Result) string {
+	if key := strings.TrimSpace(item.Get("id").String()); key != "" {
+		return key
+	}
+	return strings.TrimSpace(item.Get("type").String()) + "|" + strings.TrimSpace(item.Raw)
+}
+
+func extractResponseOutputItemDone(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
+	if len(data) == 0 || !gjson.ValidBytes(data) {
+		return nil, false
+	}
+	if gjson.GetBytes(data, "type").String() != "response.output_item.done" {
+		return nil, false
+	}
+	item := gjson.GetBytes(data, "item")
+	if !item.Exists() || !item.IsObject() {
+		return nil, false
+	}
+	key := responseOutputItemDoneKey(item)
+	if key != "" && seen != nil {
+		if _, ok := seen[key]; ok {
+			return nil, false
+		}
+		seen[key] = struct{}{}
+	}
+	raw := []byte(item.Raw)
+	if item.Get("type").String() == "image_generation_call" {
+		var output map[string]any
+		if err := json.Unmarshal(raw, &output); err == nil && addImageStatsToMap(output) {
+			if annotated, err := json.Marshal(output); err == nil {
+				raw = annotated
+			}
+		}
+	}
+	return json.RawMessage(raw), true
+}
+
+func restoreMissingResponseOutputs(responseJSON []byte, outputItems []json.RawMessage) []byte {
+	if len(responseJSON) == 0 || len(outputItems) == 0 {
+		return responseJSON
+	}
+	var response map[string]any
+	if err := json.Unmarshal(responseJSON, &response); err != nil {
+		return responseJSON
+	}
+	if outputs, ok := response["output"].([]any); ok && len(outputs) > 0 {
+		return responseJSON
+	}
+	outputs := make([]any, 0, len(outputItems))
+	for _, rawItem := range outputItems {
+		if len(rawItem) == 0 || !gjson.ValidBytes(rawItem) {
+			continue
+		}
+		var decoded any
+		if err := json.Unmarshal(rawItem, &decoded); err != nil {
+			continue
+		}
+		outputs = append(outputs, decoded)
+	}
+	if len(outputs) == 0 {
+		return responseJSON
+	}
+	response["output"] = outputs
+	restored, err := json.Marshal(response)
+	if err != nil {
+		return responseJSON
+	}
+	return restored
+}
+
 func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.RawMessage) []byte {
 	if len(responseJSON) == 0 {
 		return responseJSON
@@ -1580,11 +1650,16 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
+			outputItems := make([]json.RawMessage, 0, 2)
+			seenOutputItems := make(map[string]struct{})
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
+					outputItems = append(outputItems, outputItem)
+				}
 				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
@@ -1620,6 +1695,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				responseObj := gjson.GetBytes(lastResponseData, "response")
 				if responseObj.Exists() {
 					responseJSON = []byte(responseObj.Raw)
+					responseJSON = restoreMissingResponseOutputs(responseJSON, outputItems)
 					responseJSON = appendMissingResponseImageOutputs(responseJSON, imageOutputs)
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(responseJSON)
 				}

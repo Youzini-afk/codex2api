@@ -479,6 +479,54 @@ func applyResponsesImageGenerationBridgeInstructions(body map[string]any) bool {
 	return true
 }
 
+func hasTopLevelResponsesImageOptions(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	for _, key := range responsesImageGenerationOptionFields {
+		if value, exists := body[key]; exists && value != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func isStructuredResponsesFormatType(formatType string) bool {
+	switch strings.ToLower(strings.TrimSpace(formatType)) {
+	case "json_schema", "json_object":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasStructuredResponsesFormat(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	if text, ok := body["text"].(map[string]any); ok {
+		if format, ok := text["format"].(map[string]any); ok {
+			if isStructuredResponsesFormatType(firstNonEmptyAnyString(format["type"])) {
+				return true
+			}
+		}
+	}
+	if responseFormat, ok := body["response_format"].(map[string]any); ok {
+		return isStructuredResponsesFormatType(firstNonEmptyAnyString(responseFormat["type"]))
+	}
+	return false
+}
+
+func shouldAutoInjectResponsesImageGenerationTool(body map[string]any) bool {
+	if len(body) == 0 || hasResponsesImageGenerationTool(body) {
+		return false
+	}
+	if hasTopLevelResponsesImageOptions(body) {
+		return true
+	}
+	return !hasStructuredResponsesFormat(body)
+}
+
 func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -1112,7 +1160,9 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 			}
 		}
 	}
-	ensureResponsesImageGenerationTool(body)
+	if shouldAutoInjectResponsesImageGenerationTool(body) {
+		ensureResponsesImageGenerationTool(body)
+	}
 	moveTopLevelResponsesImageOptions(body)
 	normalizeResponsesImageGenerationTools(body, promptText)
 	applyResponsesImageGenerationBridgeInstructions(body)
