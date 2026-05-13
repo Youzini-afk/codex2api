@@ -4168,7 +4168,10 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			}
 		}
 		rt := row.GetCredential("refresh_token")
-		if rt == "" {
+		at := row.GetCredential("access_token")
+		// AT-only accounts (没有 refresh_token,只靠 access_token,常用于规避
+		// add-phone 的 Plus 号) 也需要可导出与可迁移。仅当两个凭证都缺失才跳过。
+		if rt == "" && at == "" {
 			continue
 		}
 		entries = append(entries, cpaExportEntry{
@@ -4183,7 +4186,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			Expired:             row.GetCredential("expires_at"),
 			IDToken:             row.GetCredential("id_token"),
 			AccountID:           row.GetCredential("account_id"),
-			AccessToken:         row.GetCredential("access_token"),
+			AccessToken:         at,
 			LastRefresh:         row.UpdatedAt.Format(time.RFC3339),
 			RefreshToken:        rt,
 		})
@@ -4254,11 +4257,13 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 		return
 	}
 
-	// 转换为 importToken 格式，复用 importAccountsCommon
+	// 转换为 importToken 格式，复用 importAccountsCommon (原生支持 AT-only 混合导入)
 	var tokens []importToken
 	for _, entry := range remoteAccounts {
 		rt := strings.TrimSpace(entry.RefreshToken)
-		if rt == "" {
+		at := strings.TrimSpace(entry.AccessToken)
+		// 至少需要一种凭证;两者都为空表示账号根本没有可用凭证。
+		if rt == "" && at == "" {
 			continue
 		}
 		name := entry.Email
@@ -4267,7 +4272,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 		}
 		tokens = append(tokens, importToken{
 			refreshToken:        rt,
-			accessToken:         strings.TrimSpace(entry.AccessToken),
+			accessToken:         at,
 			name:                name,
 			email:               strings.TrimSpace(entry.Email),
 			idToken:             strings.TrimSpace(entry.IDToken),

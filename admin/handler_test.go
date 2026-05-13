@@ -654,6 +654,112 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	}
 }
 
+// AT-only 账号(没有 refresh_token,只靠 access_token)是规避 Codex Plus "add
+// phone" 流程的常用形态。导出/迁移以前会因为 rt=="" 直接跳过这些账号,导致
+// issue #123 中的迁移丢号。下面两个测试保护已修好的过滤逻辑。
+func TestExportAccountsIncludesATOnly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+
+	rtID, err := db.InsertAccount(context.Background(), "rt-account", "rt_value", "")
+	if err != nil {
+		t.Fatalf("insert rt account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), rtID, map[string]interface{}{
+		"email":        "rt@example.com",
+		"access_token": "at_for_rt",
+	}); err != nil {
+		t.Fatalf("update rt credentials: %v", err)
+	}
+
+	atID, err := db.InsertAccount(context.Background(), "at-account", "", "")
+	if err != nil {
+		t.Fatalf("insert at-only account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), atID, map[string]interface{}{
+		"email":        "at@example.com",
+		"access_token": "at_only_value",
+	}); err != nil {
+		t.Fatalf("update at-only credentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/export?filter=all", nil)
+
+	handler.ExportAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var entries []cpaExportEntry
+	if err := json.Unmarshal(recorder.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("got %d entries, want 2 (rt + at-only)", len(entries))
+	}
+
+	byEmail := make(map[string]cpaExportEntry, len(entries))
+	for _, e := range entries {
+		byEmail[e.Email] = e
+	}
+
+	rt, ok := byEmail["rt@example.com"]
+	if !ok {
+		t.Fatal("rt-based account missing from export")
+	}
+	if rt.RefreshToken != "rt_value" || rt.AccessToken != "at_for_rt" {
+		t.Fatalf("rt entry tokens = (rt=%q, at=%q), want (rt_value, at_for_rt)", rt.RefreshToken, rt.AccessToken)
+	}
+
+	at, ok := byEmail["at@example.com"]
+	if !ok {
+		t.Fatal("AT-only account missing from export")
+	}
+	if at.RefreshToken != "" {
+		t.Fatalf("AT-only RefreshToken = %q, want empty", at.RefreshToken)
+	}
+	if at.AccessToken != "at_only_value" {
+		t.Fatalf("AT-only AccessToken = %q, want at_only_value", at.AccessToken)
+	}
+}
+
+func TestExportAccountsSkipsAccountsWithoutCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+
+	if _, err := db.InsertAccount(context.Background(), "empty-account", "", ""); err != nil {
+		t.Fatalf("insert empty account: %v", err)
+	}
+
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/export?filter=all", nil)
+
+	handler.ExportAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var entries []cpaExportEntry
+	if err := json.Unmarshal(recorder.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("got %d entries, want 0 (account has no credentials)", len(entries))
+	}
+}
+
 func newTestAdminDB(t *testing.T) *database.DB {
 	t.Helper()
 
