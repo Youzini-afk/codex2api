@@ -164,6 +164,7 @@ type opsTrafficResponse struct {
 	TodayRequests int64   `json:"today_requests"`
 	TodayTokens   int64   `json:"today_tokens"`
 	RPMLimit      int     `json:"rpm_limit"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
 }
 
 func writeError(c *gin.Context, statusCode int, message string) {

@@ -260,6 +260,7 @@ export interface OpsOverviewResponse {
     today_requests: number
     today_tokens: number
     rpm_limit: number
+    avg_duration_ms: number
   }
 }
 

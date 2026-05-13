@@ -21,6 +21,7 @@ interface AccountRateLimitRecoveryChartProps {
   accounts: AccountRow[]
   currentRpm?: number
   rpmLimit?: number
+  avgDurationMs?: number
   className?: string
   compact?: boolean
 }
@@ -115,10 +116,14 @@ const tooltipContentStyle = {
 }
 const tooltipLabelStyle = { color: 'var(--color-foreground)', fontWeight: 600 }
 const tooltipItemStyle = { color: 'var(--color-foreground)' }
-// Assumed throughput per concurrency slot: 6 rpm ≈ 10s avg request duration.
-// TODO: switch to adaptive value derived from usage stats avg_duration_ms once
-// the ops/traffic overview exposes it.
-const RPM_PER_CONCURRENCY_SLOT = 6
+// Default throughput per concurrency slot when no avg_duration_ms is provided
+// (6 rpm ≈ 10s avg request duration). At runtime we adapt this to actual
+// avg_duration_ms via getRpmPerSlot — see usage sites below.
+const RPM_PER_CONCURRENCY_SLOT_DEFAULT = 6
+// Adaptive bounds: avg_duration_ms outside [2s, 60s] is treated as noisy and
+// clamped, so the slot rate stays in [1, 30] rpm/slot.
+const RPM_PER_CONCURRENCY_SLOT_MIN = 1
+const RPM_PER_CONCURRENCY_SLOT_MAX = 30
 // Fraction of dispatchable accounts with a 429 in the recent window that we
 // consider "fully saturated" (=> pressure 1). Replaces the prior lifetime
 // rate_limit_attempts/total_requests ratio which never moved for old accounts.
@@ -150,7 +155,7 @@ const BURN_MIN_ELAPSED_RATIO = 0.05
 // inconsistent (5h:1h=20% vs 7d:24h=14%) leaving 7d under-warned.
 const SOON_WINDOW_RATIO = 0.2
 
-export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0, rpmLimit = 0, className = '', compact = false }: AccountRateLimitRecoveryChartProps) {
+export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0, rpmLimit = 0, avgDurationMs = 0, className = '', compact = false }: AccountRateLimitRecoveryChartProps) {
   const { t } = useTranslation()
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [windowKey, setWindowKey] = useState<RecoveryWindow>('5h')
@@ -180,9 +185,9 @@ export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0
       candidates,
       points: createRecoveryPoints(candidates, windowKey, nowMs),
       unknown,
-      forecast: estimatePressureForecast(accounts, windowKey, nowMs, currentRpm, rpmLimit),
+      forecast: estimatePressureForecast(accounts, windowKey, nowMs, currentRpm, rpmLimit, avgDurationMs),
     }
-  }, [accounts, currentRpm, nowMs, rpmLimit, windowKey])
+  }, [accounts, avgDurationMs, currentRpm, nowMs, rpmLimit, windowKey])
 
   const resetStats = useMemo(() => createResetStats(accounts, nowMs), [accounts, nowMs])
   const limitedTotal = recovery.candidates.length + recovery.unknown
@@ -669,9 +674,10 @@ function getNiceTickStep(rawStep: number): number {
   return 10 * magnitude
 }
 
-function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWindow, nowMs: number, currentRpm: number, rpmLimit: number): PressureForecast {
+function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWindow, nowMs: number, currentRpm: number, rpmLimit: number, avgDurationMs: number): PressureForecast {
   const windowMs = getWindowMs(windowKey)
   const burnMinElapsedMs = windowMs * BURN_MIN_ELAPSED_RATIO
+  const rpmPerSlot = getRpmPerSlot(avgDurationMs)
   const projectedLimitTimes: number[] = []
   const supplyEvents: SupplyEvent[] = []
   const dispatchableAccounts = accounts.filter((account) => isInSupplyPool(account, windowKey))
@@ -708,7 +714,7 @@ function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWin
   // mathematically equal to totalConcurrency × slot but the latter makes intent
   // explicit ("each concurrency slot contributes ~6 rpm of headroom").
   const concurrencyRpmLimit = totalConcurrency > 0
-    ? Math.max(1, Math.round(totalConcurrency * RPM_PER_CONCURRENCY_SLOT))
+    ? Math.max(1, Math.round(totalConcurrency * rpmPerSlot))
     : 0
   const effectiveRpmLimit = getEffectiveRpmLimit(configuredRpmLimit, concurrencyRpmLimit)
   const rpmPressure = effectiveRpmLimit > 0 ? normalizedRpm / effectiveRpmLimit : null
@@ -791,12 +797,13 @@ function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWin
     configuredRpmLimit,
     totalConcurrency,
     nowMs,
+    rpmPerSlot,
   )
   // Capacity-driven threshold: how many accounts can vanish before remaining
-  // concurrency can no longer absorb currentRpm at RPM_PER_CONCURRENCY_SLOT
-  // rpm/slot. Falls back to the historical 30% ratio when there's no traffic.
+  // concurrency can no longer absorb currentRpm at the current rpm/slot rate.
+  // Falls back to the historical 30% ratio when there's no traffic.
   const minAccountsForRpm = (normalizedRpm > 0 && avgConcurrency > 0)
-    ? Math.ceil(normalizedRpm / (avgConcurrency * RPM_PER_CONCURRENCY_SLOT))
+    ? Math.ceil(normalizedRpm / (avgConcurrency * rpmPerSlot))
     : 0
   const capacityThreshold = minAccountsForRpm > 0 && dispatchableAccounts.length > 0
     ? Math.max(BULK_LIMIT_MIN_COUNT, dispatchableAccounts.length - minAccountsForRpm)
@@ -893,6 +900,17 @@ function getEffectiveConcurrency(account: AccountRow): number {
   return clamp(normalizeNumber(value), 1, 50)
 }
 
+// Adaptive RPM/slot: 60000ms / avgDurationMs gives "requests a slot can finish
+// per minute". Falls back to the historical 6 (≈10s/req) when avg_duration_ms
+// is unavailable, and is clamped to [1, 30] so a freakishly fast/slow sample
+// (single request, batched timeouts) doesn't dominate the supply estimate.
+function getRpmPerSlot(avgDurationMs: number): number {
+  if (!avgDurationMs || avgDurationMs <= 0 || !Number.isFinite(avgDurationMs)) {
+    return RPM_PER_CONCURRENCY_SLOT_DEFAULT
+  }
+  return clamp(60_000 / avgDurationMs, RPM_PER_CONCURRENCY_SLOT_MIN, RPM_PER_CONCURRENCY_SLOT_MAX)
+}
+
 function getEffectiveRpmLimit(configuredRpmLimit: number, concurrencyRpmLimit: number): number {
   if (concurrencyRpmLimit <= 0) {
     return 0
@@ -916,13 +934,13 @@ function getPressureFactor(rpmPressure: number | null, activePressure: number, r
   return clamp(1 + composite, 1, PRESSURE_FACTOR_MAX)
 }
 
-function estimateSupplyPressurePoint(events: SupplyEvent[], currentRpm: number, configuredRpmLimit: number, totalConcurrency: number, nowMs: number): SupplyPressurePoint {
+function estimateSupplyPressurePoint(events: SupplyEvent[], currentRpm: number, configuredRpmLimit: number, totalConcurrency: number, nowMs: number, rpmPerSlot: number): SupplyPressurePoint {
   if (currentRpm <= 0) {
     return { highPressureAt: null, supplyShortageAt: null }
   }
 
   let remainingConcurrency = totalConcurrency
-  let capacity = getEffectiveRpmLimit(configuredRpmLimit, Math.round(remainingConcurrency * RPM_PER_CONCURRENCY_SLOT))
+  let capacity = getEffectiveRpmLimit(configuredRpmLimit, Math.round(remainingConcurrency * rpmPerSlot))
   let pressure = capacity > 0 ? currentRpm / capacity : Number.POSITIVE_INFINITY
   let highPressureAt = pressure >= 0.9 ? nowMs : null
   let supplyShortageAt = pressure >= 1 ? nowMs : null
@@ -933,7 +951,7 @@ function estimateSupplyPressurePoint(events: SupplyEvent[], currentRpm: number, 
     // RPM ceiling and then recover — that's expected, the forecast surfaces the
     // earliest crossing only.
     remainingConcurrency = Math.max(0, remainingConcurrency + event.delta * event.concurrency)
-    capacity = getEffectiveRpmLimit(configuredRpmLimit, Math.round(remainingConcurrency * RPM_PER_CONCURRENCY_SLOT))
+    capacity = getEffectiveRpmLimit(configuredRpmLimit, Math.round(remainingConcurrency * rpmPerSlot))
     pressure = capacity > 0 ? currentRpm / capacity : Number.POSITIVE_INFINITY
 
     if (!highPressureAt && pressure >= 0.9) {

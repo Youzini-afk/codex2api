@@ -269,6 +269,7 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 			TodayRequests: usageStats.TodayRequests,
 			TodayTokens:   usageStats.TodayTokens,
 			RPMLimit:      h.rateLimiter.GetRPM(),
+			AvgDurationMs: usageStats.AvgDurationMs,
 		},
 	})
 }

@@ -289,7 +289,7 @@
     "pressureForecastHigh": "接近供应上限",
     "pressureForecastShortage": "预计供应不足",
     "pressureForecastLimitRisk": "预计批量限流",
-    "pressureForecastLogic": "供应池包括 OAuth 与 Responses API 在内的所有可调度账号(非 disabled/unauth/限流中);仅 OAuth 且 plan 对应窗口的账号参与配额燃尽预测,Responses 与非 premium-5h 账号只贡献容量。对每个账号按当前窗口已用比例线性外推额度燃尽时间;若窗口经过时间 < 5% 则不参与排序以避免噪声。批量限流阈值取 dispatchable − ceil(当前 RPM / (avg并发 × 6 rpm/槽)),即\"维持当前 RPM 所需的最少账号\";RPM=0 时回退到样本 30%。账号池容量按 min(全局 RPM, 可调度总并发 × 6 rpm/槽) 估算,事件流模拟 −1 耗尽 / +1 reset 回补的双向变动。当 当前 RPM / 未来容量 ≥ 90% 记为高压,≥ 100% 记为供应不足;危险窗口取当前窗口的 20%(5h→1h,7d→34h)。429 信号取最近 1 小时内发生过 429 的账号占可调度账号比例,30% 视为饱和。压力放大因子取主导项 + 次要项 × 0.5(避免重复计数 RPM/活跃信号),最高 ×2.5。已知样本占比 < 40% 时标注\"低置信\"并谨慎升级风险等级。",
+    "pressureForecastLogic": "供应池包括 OAuth 与 Responses API 在内的所有可调度账号(非 disabled/unauth/限流中);仅 OAuth 且 plan 对应窗口的账号参与配额燃尽预测,Responses 与非 premium-5h 账号只贡献容量。对每个账号按当前窗口已用比例线性外推额度燃尽时间;若窗口经过时间 < 5% 则不参与排序以避免噪声。每个并发槽位的吞吐用 60s/avg_duration_ms 自适应计算(回退 6 rpm/槽,clamp 在 1-30)。批量限流阈值取 dispatchable − ceil(当前 RPM / (avg并发 × rpm/槽)),即\"维持当前 RPM 所需的最少账号\";RPM=0 时回退到样本 30%。账号池容量按 min(全局 RPM, 可调度总并发 × rpm/槽) 估算,事件流模拟 −1 耗尽 / +1 reset 回补的双向变动。当 当前 RPM / 未来容量 ≥ 90% 记为高压,≥ 100% 记为供应不足;危险窗口取当前窗口的 20%(5h→1h,7d→34h)。429 信号取最近 1 小时内发生过 429 的账号占可调度账号比例,30% 视为饱和。压力放大因子取主导项 + 次要项 × 0.5(避免重复计数 RPM/活跃信号),最高 ×2.5。已知样本占比 < 40% 时标注\"低置信\"并谨慎升级风险等级。",
     "pressureForecastDesc": "{{state}};RPM {{rpm}}/{{rpmLimit}}({{rpmPressure}});可调度 {{dispatchable}};临界 {{threshold}}/{{sampled}}。",
     "pressureForecastLowConfidence": "低置信 {{percent}}%",
     "pressureForecastLowConfidenceHint": "已统计 {{sampled}} 个账号,未知 {{unknown}} 个。样本覆盖偏低,预测时间点仅作参考,实时 RPM/并发信号仍可信。",

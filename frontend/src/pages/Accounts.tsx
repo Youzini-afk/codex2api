@@ -1456,6 +1456,7 @@ export default function Accounts() {
               accounts={accounts}
               currentRpm={opsOverview?.traffic?.rpm}
               rpmLimit={opsOverview?.traffic?.rpm_limit}
+              avgDurationMs={opsOverview?.traffic?.avg_duration_ms}
               compact
               className="min-w-0"
             />
