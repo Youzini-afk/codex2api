@@ -119,8 +119,12 @@ const tooltipItemStyle = { color: 'var(--color-foreground)' }
 // TODO: switch to adaptive value derived from usage stats avg_duration_ms once
 // the ops/traffic overview exposes it.
 const RPM_PER_CONCURRENCY_SLOT = 6
-// rate_limit_attempts ratio that we consider "fully saturated" (=> pressure 1).
-const RATE_LIMIT_SATURATION_RATIO = 0.05
+// Fraction of dispatchable accounts with a 429 in the recent window that we
+// consider "fully saturated" (=> pressure 1). Replaces the prior lifetime
+// rate_limit_attempts/total_requests ratio which never moved for old accounts.
+const RATE_LIMIT_SATURATION_FRACTION = 0.3
+// Treat a 429 as "currently active" only if it happened within this window.
+const RECENT_RATE_LIMIT_WINDOW_MS = 60 * 60_000
 // Bulk-limit threshold: how many sampled accounts must be projected to exhaust
 // before we treat it as a pool-wide event. min 3, otherwise 30% of sample.
 const BULK_LIMIT_RATIO = 0.3
@@ -141,6 +145,10 @@ const LOW_CONFIDENCE_THRESHOLD = 0.4
 // extrapolation. Below this, a freshly-rotated account at usage=1% can blow up
 // burn rate (because elapsed is tiny) and predict exhaustion within minutes.
 const BURN_MIN_ELAPSED_RATIO = 0.05
+// Fraction of the active window that counts as "soon" for risk-escalation.
+// 20% is the same for 5h (→ 1h) and 7d (→ 33.6h); the previous values were
+// inconsistent (5h:1h=20% vs 7d:24h=14%) leaving 7d under-warned.
+const SOON_WINDOW_RATIO = 0.2
 
 export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0, rpmLimit = 0, className = '', compact = false }: AccountRateLimitRecoveryChartProps) {
   const { t } = useTranslation()
@@ -541,7 +549,7 @@ function createResetStats(accounts: AccountRow[], nowMs: number): ResetStats {
   let unknown = 0
 
   for (const account of accounts) {
-    if (!isEligibleForForecast(account, '7d')) {
+    if (!hasBurnPrediction(account, '7d')) {
       continue
     }
     total += 1
@@ -662,19 +670,38 @@ function getNiceTickStep(rawStep: number): number {
 }
 
 function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWindow, nowMs: number, currentRpm: number, rpmLimit: number): PressureForecast {
-  const windowMs = windowKey === '5h' ? 5 * 60 * 60_000 : 7 * 24 * 60 * 60_000
+  const windowMs = getWindowMs(windowKey)
   const burnMinElapsedMs = windowMs * BURN_MIN_ELAPSED_RATIO
   const projectedLimitTimes: number[] = []
   const supplyEvents: SupplyEvent[] = []
-  const dispatchableAccounts = accounts.filter((account) => isDispatchableForForecast(account, windowKey))
+  const dispatchableAccounts = accounts.filter((account) => isInSupplyPool(account, windowKey))
   const totalConcurrency = dispatchableAccounts.reduce((sum, account) => sum + getEffectiveConcurrency(account), 0)
   const avgConcurrency = dispatchableAccounts.length > 0 ? totalConcurrency / dispatchableAccounts.length : 0
   const activeRequests = dispatchableAccounts.reduce((sum, account) => sum + normalizeNumber(account.active_requests), 0)
   const activePressure = totalConcurrency > 0 ? clamp(activeRequests / totalConcurrency, 0, 3) : 0
-  const rateLimitAttempts = dispatchableAccounts.reduce((sum, account) => sum + normalizeNumber(account.rate_limit_attempts), 0)
-  const totalRequests = dispatchableAccounts.reduce((sum, account) => sum + normalizeNumber(account.total_requests), 0)
-  const rateLimitAttemptRate = totalRequests > 0 ? rateLimitAttempts / totalRequests : 0
-  const rateLimitPressure = clamp(rateLimitAttemptRate / RATE_LIMIT_SATURATION_RATIO, 0, 1)
+  // Real-time 429 signal: include both (a) accounts currently in a window
+  // rate-limit (not in dispatchable pool right now) and (b) dispatchable
+  // accounts that hit a 429 within RECENT_RATE_LIMIT_WINDOW_MS. Denominator is
+  // the full eligible pool — dispatchable plus those currently rate-limited.
+  // Replaces the prior sum(rate_limit_attempts)/sum(total_requests) which used
+  // lifetime counters and was therefore nearly static once accounts had history.
+  const currentlyRateLimited = accounts.filter((account) => {
+    const status = (account.status || '').toLowerCase()
+    if (status === 'unauthorized') return false
+    if (account.enabled === false) return false
+    return isWindowRateLimitLike(account, windowKey)
+  })
+  const recentlyRateLimitedFromPool = dispatchableAccounts.filter((account) => {
+    if (!account.last_rate_limited_at) return false
+    const ts = new Date(account.last_rate_limited_at).getTime()
+    return Number.isFinite(ts) && ts > 0 && nowMs - ts <= RECENT_RATE_LIMIT_WINDOW_MS
+  })
+  const rateLimitedSignalDenominator = dispatchableAccounts.length + currentlyRateLimited.length
+  const rateLimitedSignalNumerator = recentlyRateLimitedFromPool.length + currentlyRateLimited.length
+  const recentRateLimitedFraction = rateLimitedSignalDenominator > 0
+    ? rateLimitedSignalNumerator / rateLimitedSignalDenominator
+    : 0
+  const rateLimitPressure = clamp(recentRateLimitedFraction / RATE_LIMIT_SATURATION_FRACTION, 0, 1)
   const normalizedRpm = normalizeNumber(currentRpm)
   const configuredRpmLimit = normalizeNumber(rpmLimit)
   // Simplified from accounts.length × avgConcurrency × slot: the product is
@@ -690,10 +717,13 @@ function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWin
   let unknown = 0
 
   for (const account of accounts) {
-    if (!isEligibleForForecast(account, windowKey)) {
+    // Burn prediction requires a quota window — skip Responses API accounts
+    // and 5h-on-non-premium entirely (they still contribute to supply via the
+    // dispatchableAccounts filter above, just not to burn forecasting).
+    if (!hasBurnPrediction(account, windowKey)) {
       continue
     }
-    const isDispatchable = isDispatchableForForecast(account, windowKey)
+    const inSupply = isInSupplyPool(account, windowKey)
     const concurrency = getEffectiveConcurrency(account)
     const usage = windowKey === '5h' ? account.usage_percent_5h : account.usage_percent_7d
     const rawResetAt = windowKey === '5h' ? account.reset_5h_at : account.reset_7d_at
@@ -704,11 +734,11 @@ function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWin
     const knownResetAt = futureTimestamp(rawResetAt, nowMs)
     const resetAt = knownResetAt ?? (nowMs + windowMs)
 
-    // Currently rate-limited accounts (or otherwise non-dispatchable) aren't in
-    // totalConcurrency; if they have a known reset they'll replenish supply at
-    // resetAt. Schedule an unpaired +1 event so the supply curve models
-    // recovery, but findBulkLimitTime won't decrement exhaust count for it.
-    if (!isDispatchable) {
+    // Currently rate-limited (or otherwise out of supply pool right now) but
+    // burn-predictable: not in totalConcurrency, but will replenish at reset.
+    // Schedule an unpaired +1 event so the supply curve models recovery, while
+    // findBulkLimitTime won't decrement exhaust count for it.
+    if (!inSupply) {
       if (knownResetAt) {
         supplyEvents.push({ at: knownResetAt, concurrency, delta: 1 })
       }
@@ -829,19 +859,30 @@ function findBulkLimitTime(events: SupplyEvent[], threshold: number): number | n
   return null
 }
 
-function isEligibleForForecast(account: AccountRow, windowKey: RecoveryWindow): boolean {
+// Account contributes RPM/concurrency to the supply pool. We include all
+// account classes that actually serve proxy traffic — OAuth + Responses API +
+// non-premium-on-5h — and only filter out hard-disabled/unauthorized or
+// currently rate-limited entries. This corrects a prior bias that dropped
+// Responses accounts from totalConcurrency and made mixed deployments look
+// far smaller than they really are.
+function isInSupplyPool(account: AccountRow, windowKey: RecoveryWindow): boolean {
   const status = (account.status || '').toLowerCase()
-  if (status === 'unauthorized' || account.openai_responses_api) {
-    return false
-  }
-  if (windowKey === '5h') {
-    return isPremiumUsagePlan(account.plan_type)
-  }
+  if (status === 'unauthorized') return false
+  if (account.enabled === false) return false
+  if (isWindowRateLimitLike(account, windowKey)) return false
   return true
 }
 
-function isDispatchableForForecast(account: AccountRow, windowKey: RecoveryWindow): boolean {
-  return isEligibleForForecast(account, windowKey) && account.enabled !== false && !isWindowRateLimitLike(account, windowKey)
+// Account has a quota window we can linearly extrapolate to an exhaustion
+// time. Excludes Responses API accounts (no per-user quota tracking) and 5h
+// for non-premium plans (no 5h quota cap). Unauthorized is also excluded
+// since burn data won't be refreshed.
+function hasBurnPrediction(account: AccountRow, windowKey: RecoveryWindow): boolean {
+  const status = (account.status || '').toLowerCase()
+  if (status === 'unauthorized') return false
+  if (account.openai_responses_api) return false
+  if (windowKey === '5h') return isPremiumUsagePlan(account.plan_type)
+  return true
 }
 
 function getEffectiveConcurrency(account: AccountRow): number {
@@ -907,6 +948,10 @@ function estimateSupplyPressurePoint(events: SupplyEvent[], currentRpm: number, 
   return { highPressureAt, supplyShortageAt }
 }
 
+function getWindowMs(windowKey: RecoveryWindow): number {
+  return windowKey === '5h' ? 5 * 60 * 60_000 : 7 * 24 * 60 * 60_000
+}
+
 function getForecastRiskLevel(
   predictedAt: number | null,
   highPressureAt: number | null,
@@ -918,7 +963,7 @@ function getForecastRiskLevel(
   rateLimitPressure: number,
   confidence: number,
 ): PressureForecast['riskLevel'] {
-  const soonWindowMs = windowKey === '5h' ? 60 * 60_000 : 24 * 60 * 60_000
+  const soonWindowMs = getWindowMs(windowKey) * SOON_WINDOW_RATIO
   // Real-time signals (RPM, active queue, historical 429s) are always reliable,
   // so they can independently raise risk. The quota-burn projection however
   // depends on sample coverage — gate predictedAt-based escalation behind a
