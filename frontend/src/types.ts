@@ -30,6 +30,10 @@ export interface AccountRow {
   status: AccountStatus
   error_message?: string
   at_only?: boolean
+  account_type?: string
+  openai_responses_api?: boolean
+  base_url?: string
+  models?: string[]
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -50,7 +54,10 @@ export interface AccountRow {
     failure_penalty: number
     success_bonus: number
     usage_penalty_7d: number
+    usage_urgency_bonus_5h?: number
+    usage_urgency_bonus_7d?: number
     latency_penalty: number
+    success_rate_penalty?: number
   }
   last_unauthorized_at?: ISODateString
   last_rate_limited_at?: ISODateString
@@ -103,6 +110,34 @@ export interface AddATAccountRequest {
   proxy_url: string
 }
 
+export interface AddOpenAIResponsesAccountRequest {
+  name?: string
+  base_url: string
+  api_key: string
+  models: string[]
+  proxy_url: string
+}
+
+export interface UpdateOpenAIResponsesAccountRequest {
+  name?: string
+  base_url: string
+  api_key?: string
+  models: string[]
+  proxy_url: string
+}
+
+export interface FetchOpenAIResponsesModelsRequest {
+  account_id?: number
+  base_url: string
+  api_key: string
+  proxy_url?: string
+}
+
+export interface FetchOpenAIResponsesModelsResponse {
+  base_url: string
+  models: string[]
+}
+
 export interface UpdateAccountSchedulerRequest {
   score_bias_override: number | null
   base_concurrency_override: number | null
@@ -151,6 +186,31 @@ export interface HealthResponse {
   status: 'ok' | string
   available: number
   total: number
+}
+
+export interface SelfUpdateStatusResponse {
+  supported: boolean
+  running: boolean
+  method?: string
+  target_container?: string
+  target_image?: string
+  watchtower_image?: string
+  message?: string
+  error?: string
+  reason?: string
+  started_at?: ISODateString
+}
+
+export interface SelfUpdateStartResponse extends MessageResponse {
+  supported: boolean
+  target_container?: string
+  target_image?: string
+  watchtower_image?: string
+}
+
+export interface SiteBranding {
+  site_name: string
+  site_logo: string
 }
 
 export interface AccountEventTrendPoint {
@@ -213,10 +273,13 @@ export interface OpsOverviewResponse {
     today_requests: number
     today_tokens: number
     rpm_limit: number
+    avg_duration_ms: number
   }
 }
 
 export interface SystemSettings {
+  site_name: string
+  site_logo: string
   max_concurrency: number
   global_rpm: number
   test_model: string
@@ -256,6 +319,21 @@ export interface SystemSettings {
   prompt_filter_sensitive_words: string
   prompt_filter_custom_patterns: string
   prompt_filter_disabled_patterns: string
+  client_compat_mode: 'preserve' | 'auto' | 'force' | string
+  codex_min_cli_version: string
+  usage_log_mode: 'full' | 'errors' | 'off' | string
+  usage_log_batch_size: number
+  usage_log_flush_interval_seconds: number
+  stream_flush_policy: 'immediate' | 'coalesce' | string
+  stream_flush_interval_ms: number
+  image_storage_backend: 'local' | 's3' | string
+  image_s3_endpoint: string
+  image_s3_region: string
+  image_s3_bucket: string
+  image_s3_access_key: string
+  image_s3_secret_key: string
+  image_s3_prefix: string
+  image_s3_force_path_style: boolean
 }
 
 export interface PromptFilterMatch {
@@ -374,6 +452,8 @@ export interface UsageStats {
   total_cached_tokens: number
   total_account_billed: number
   total_user_billed: number
+  avg_account_billed_per_request: number
+  avg_user_billed_per_request: number
   today_requests: number
   today_tokens: number
   today_account_billed: number
@@ -382,6 +462,50 @@ export interface UsageStats {
   tpm: number
   avg_duration_ms: number
   error_rate: number
+  feature_stats: UsageFeatureStats
+  model_stats: UsageModelStat[]
+  endpoint_stats: UsageEndpointStat[]
+  api_key_stats: UsageAPIKeyStat[]
+}
+
+export interface UsageModelStat {
+  model: string
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  account_billed: number
+  user_billed: number
+  error_count: number
+}
+
+export interface UsageFeatureStats {
+  stream_requests: number
+  sync_requests: number
+  fast_requests: number
+  cache_hit_requests: number
+  reasoning_requests: number
+  image_requests: number
+  retry_requests: number
+  error_requests: number
+}
+
+export interface UsageEndpointStat {
+  endpoint: string
+  requests: number
+  tokens: number
+  error_count: number
+  user_billed: number
+}
+
+export interface UsageAPIKeyStat {
+  api_key_id: number
+  label: string
+  requests: number
+  tokens: number
+  error_count: number
+  user_billed: number
 }
 
 export interface UsageLog {
@@ -426,6 +550,9 @@ export interface UsageLog {
   output_price_per_mtoken: number
   cache_read_price_per_mtoken: number
   rate_multiplier: number
+  is_retry_attempt: boolean
+  attempt_index: number
+  upstream_error_kind: string
   error_message: string
 }
 
@@ -436,6 +563,18 @@ export interface UsageLogsPagedResponse {
   total: number
 }
 
+export interface OpsErrorSummary {
+  total_errors: number
+  status_4xx: number
+  status_5xx: number
+  unauthorized: number
+  rate_limited: number
+  canceled: number
+  timeouts: number
+  retry_attempts: number
+  avg_duration_ms: number
+}
+
 export interface ChartTimelinePoint {
   bucket: string
   requests: number
@@ -444,7 +583,8 @@ export interface ChartTimelinePoint {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
-  errors_401: number
+  errors_4xx: number
+  errors_5xx: number
 }
 
 export interface ChartModelPoint {
@@ -462,15 +602,30 @@ export interface APIKeyRow {
   name: string
   key: string
   raw_key: string
+  quota_limit: number
+  quota_used: number
+  expires_at?: ISODateString | null
+  status?: 'active' | 'expired' | 'quota_exhausted'
   created_at: ISODateString
 }
 
 export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow>
 
+export interface CreateAPIKeyRequest {
+  name: string
+  key?: string
+  quota_limit?: number
+  expires_at?: string
+  expires_in_days?: number
+}
+
 export interface CreateAPIKeyResponse {
   id: number
   key: string
   name: string
+  quota_limit: number
+  quota_used: number
+  expires_at?: ISODateString | null
 }
 
 export interface ImagePromptTemplate {

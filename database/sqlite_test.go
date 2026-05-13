@@ -40,6 +40,91 @@ func TestNewSQLiteCreatesParentDirectories(t *testing.T) {
 	}
 }
 
+func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-test-lookup-1234567890"
+	id, err := db.InsertAPIKey(ctx, "lookup", key)
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	count, err := db.CountAPIKeys(ctx)
+	if err != nil {
+		t.Fatalf("CountAPIKeys 返回错误: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountAPIKeys = %d, want 1", count)
+	}
+	row, err := db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.ID != id || row.Name != "lookup" || row.Key != key {
+		t.Fatalf("API key row = %#v, want id=%d name=lookup key=%s", row, id, key)
+	}
+}
+
+func TestSQLiteAPIKeyQuotaAndExpiration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-test-limited-1234567890"
+	expiresAt := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	id, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
+		Name:       "limited",
+		Key:        key,
+		QuotaLimit: 0.01,
+		ExpiresAt:  sql.NullTime{Time: expiresAt, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	row, err := db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.ID != id || row.QuotaLimit != 0.01 || !row.ExpiresAt.Valid {
+		t.Fatalf("API key row = %#v, want quota and expiration", row)
+	}
+	if !row.ExpiresAt.Time.Equal(expiresAt) {
+		t.Fatalf("ExpiresAt = %s, want %s", row.ExpiresAt.Time, expiresAt)
+	}
+
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		APIKeyID:     id,
+		Endpoint:     "/v1/responses",
+		Model:        "gpt-5.4",
+		StatusCode:   200,
+		InputTokens:  1000,
+		OutputTokens: 0,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	row, err = db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue after usage 返回错误: %v", err)
+	}
+	if row.QuotaUsed != 0.0025 {
+		t.Fatalf("QuotaUsed = %.12f, want %.12f", row.QuotaUsed, 0.0025)
+	}
+}
+
 func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -103,6 +188,201 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
+	}
+}
+
+func TestUsageLogModeErrorsSkipsSuccessfulLogs(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+	db.SetUsageLogConfig(UsageLogModeErrors, 10, 5)
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:  1,
+		Endpoint:   "/v1/responses",
+		Model:      "gpt-5.4",
+		StatusCode: 200,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog success 返回错误: %v", err)
+	}
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:    1,
+		Endpoint:     "/v1/responses",
+		Model:        "gpt-5.4",
+		StatusCode:   500,
+		ErrorMessage: "upstream failed",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog error 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+	if logs[0].StatusCode != 500 {
+		t.Fatalf("StatusCode = %d, want 500", logs[0].StatusCode)
+	}
+}
+
+func TestUsageErrorSummaryAndFilters(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	for _, usageLog := range []*UsageLogInput{
+		{
+			AccountID:         1,
+			Endpoint:          "/v1/responses",
+			InboundEndpoint:   "/v1/responses",
+			UpstreamEndpoint:  "/backend-api/codex/responses",
+			Model:             "gpt-5.4",
+			StatusCode:        500,
+			DurationMs:        1200,
+			IsRetryAttempt:    true,
+			AttemptIndex:      1,
+			UpstreamErrorKind: "upstream_timeout",
+			ErrorMessage:      "upstream timeout",
+		},
+		{
+			AccountID:         2,
+			Endpoint:          "/v1/messages",
+			InboundEndpoint:   "/v1/messages",
+			Model:             "claude-sonnet-4.5",
+			StatusCode:        401,
+			DurationMs:        80,
+			UpstreamErrorKind: "unauthorized",
+			ErrorMessage:      "invalid access token",
+		},
+		{
+			AccountID:    3,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   499,
+			DurationMs:   30,
+			ErrorMessage: "client canceled",
+		},
+		{
+			AccountID:  4,
+			Endpoint:   "/v1/responses",
+			Model:      "gpt-5.4",
+			StatusCode: 200,
+			DurationMs: 90,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	now := time.Now()
+	filter := UsageLogFilter{
+		Start:           now.Add(-1 * time.Hour),
+		End:             now.Add(1 * time.Hour),
+		Page:            1,
+		PageSize:        10,
+		ErrorOnly:       true,
+		IncludeCanceled: true,
+	}
+	page, err := db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
+	}
+	if page.Total != 3 {
+		t.Fatalf("page.Total = %d, want 3", page.Total)
+	}
+
+	foundRetry := false
+	for _, usageLog := range page.Logs {
+		if usageLog.UpstreamErrorKind == "upstream_timeout" {
+			foundRetry = true
+			if !usageLog.IsRetryAttempt {
+				t.Fatal("IsRetryAttempt = false, want true")
+			}
+			if usageLog.AttemptIndex != 1 {
+				t.Fatalf("AttemptIndex = %d, want 1", usageLog.AttemptIndex)
+			}
+		}
+	}
+	if !foundRetry {
+		t.Fatal("未找到 upstream_timeout 错误日志")
+	}
+
+	summary, err := db.GetUsageErrorSummary(ctx, filter)
+	if err != nil {
+		t.Fatalf("GetUsageErrorSummary 返回错误: %v", err)
+	}
+	if summary.TotalErrors != 3 {
+		t.Fatalf("TotalErrors = %d, want 3", summary.TotalErrors)
+	}
+	if summary.Status5xx != 1 || summary.Unauthorized != 1 || summary.Canceled != 1 || summary.Timeouts != 1 || summary.RetryAttempts != 1 {
+		t.Fatalf("summary = %+v, want one 5xx/401/499/timeout/retry", summary)
+	}
+
+	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5)
+	if err != nil {
+		t.Fatalf("GetChartAggregation 返回错误: %v", err)
+	}
+	var chart4xx, chart5xx int64
+	for _, point := range charts.Timeline {
+		chart4xx += point.Errors4xx
+		chart5xx += point.Errors5xx
+	}
+	if chart4xx != 1 || chart5xx != 1 {
+		t.Fatalf("chart errors = 4xx:%d 5xx:%d, want 1/1", chart4xx, chart5xx)
+	}
+
+	filter.StatusFamily = "5xx"
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged status family 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 500 {
+		t.Fatalf("5xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+}
+
+func TestUsageLogModeOffSkipsAllLogs(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+	db.SetUsageLogConfig(UsageLogModeOff, 10, 5)
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:  1,
+		Endpoint:   "/v1/responses",
+		Model:      "gpt-5.4",
+		StatusCode: 500,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("len(logs) = %d, want 0", len(logs))
 	}
 }
 
@@ -408,6 +688,124 @@ func TestUsageStatsIncludeBillingTotals(t *testing.T) {
 	}
 	if stats.TodayAccountBilled != want || stats.TodayUserBilled != want {
 		t.Fatalf("today billing = account %.12f user %.12f, want %.12f", stats.TodayAccountBilled, stats.TodayUserBilled, want)
+	}
+	if stats.AvgAccountBilled != want || stats.AvgUserBilled != want {
+		t.Fatalf("avg billing = account %.12f user %.12f, want %.12f", stats.AvgAccountBilled, stats.AvgUserBilled, want)
+	}
+	if len(stats.ModelStats) != 1 {
+		t.Fatalf("ModelStats len = %d, want 1: %+v", len(stats.ModelStats), stats.ModelStats)
+	}
+	modelStats := stats.ModelStats[0]
+	if modelStats.Model != "gpt-5.5" || modelStats.Requests != 1 || modelStats.Tokens != 1500 {
+		t.Fatalf("ModelStats[0] = %+v, want gpt-5.5 requests=1 tokens=1500", modelStats)
+	}
+	if modelStats.AccountBilled != want || modelStats.UserBilled != want {
+		t.Fatalf("model billing = account %.12f user %.12f, want %.12f", modelStats.AccountBilled, modelStats.UserBilled, want)
+	}
+}
+
+func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	logs := []*UsageLogInput{
+		{
+			AccountID:       1,
+			Endpoint:        "/v1/responses",
+			InboundEndpoint: "/v1/responses",
+			Model:           "gpt-5.5",
+			StatusCode:      200,
+			InputTokens:     1000,
+			OutputTokens:    500,
+			TotalTokens:     1500,
+			Stream:          true,
+			ServiceTier:     "fast",
+			CachedTokens:    128,
+			ReasoningTokens: 32,
+			APIKeyID:        7,
+			APIKeyName:      "Claude Code",
+			APIKeyMasked:    "sk-...1111",
+		},
+		{
+			AccountID:       1,
+			Endpoint:        "/v1/images/generations",
+			InboundEndpoint: "/v1/images/generations",
+			Model:           "gpt-image-2",
+			StatusCode:      200,
+			ImageCount:      1,
+			APIKeyID:        7,
+			APIKeyName:      "Claude Code",
+			APIKeyMasked:    "sk-...1111",
+		},
+		{
+			AccountID:      2,
+			Endpoint:       "/v1/chat/completions",
+			Model:          "gpt-5.4",
+			StatusCode:     500,
+			InputTokens:    100,
+			OutputTokens:   20,
+			TotalTokens:    120,
+			APIKeyID:       8,
+			APIKeyName:     "Cherry Studio",
+			APIKeyMasked:   "sk-...2222",
+			IsRetryAttempt: true,
+			AttemptIndex:   1,
+		},
+		{
+			AccountID:       3,
+			Endpoint:        "/v1/responses",
+			InboundEndpoint: "/v1/responses",
+			Model:           "gpt-5.4",
+			StatusCode:      499,
+			Stream:          true,
+			APIKeyID:        9,
+			APIKeyName:      "Canceled",
+		},
+	}
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	stats, err := db.GetUsageStats(ctx)
+	if err != nil {
+		t.Fatalf("GetUsageStats 返回错误: %v", err)
+	}
+	if stats.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", stats.TotalRequests)
+	}
+	features := stats.FeatureStats
+	if features.StreamRequests != 1 || features.SyncRequests != 2 || features.FastRequests != 1 ||
+		features.CacheHitRequests != 1 || features.ReasoningRequests != 1 || features.ImageRequests != 1 ||
+		features.RetryRequests != 1 || features.ErrorRequests != 1 {
+		t.Fatalf("FeatureStats = %+v, want stream/sync/fast/cache/reasoning/image/retry/error = 1/2/1/1/1/1/1/1", features)
+	}
+
+	endpoints := make(map[string]UsageEndpointStat)
+	for _, item := range stats.EndpointStats {
+		endpoints[item.Endpoint] = item
+	}
+	if endpoints["/v1/responses"].Requests != 1 || endpoints["/v1/images/generations"].Requests != 1 || endpoints["/v1/chat/completions"].ErrorCount != 1 {
+		t.Fatalf("EndpointStats = %+v", stats.EndpointStats)
+	}
+
+	apiKeys := make(map[int64]UsageAPIKeyStat)
+	for _, item := range stats.APIKeyStats {
+		apiKeys[item.APIKeyID] = item
+	}
+	if apiKeys[7].Requests != 2 || apiKeys[7].Label != "Claude Code" {
+		t.Fatalf("APIKeyStats[7] = %+v, want Claude Code requests=2", apiKeys[7])
+	}
+	if apiKeys[8].Requests != 1 || apiKeys[8].ErrorCount != 1 {
+		t.Fatalf("APIKeyStats[8] = %+v, want requests=1 errors=1", apiKeys[8])
 	}
 }
 

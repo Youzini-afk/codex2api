@@ -380,6 +380,7 @@ data: [DONE]
         "failure_penalty": 0,
         "success_bonus": 12,
         "usage_penalty_7d": -5,
+        "usage_urgency_bonus_5h": 0,
         "latency_penalty": 0,
         "success_rate_penalty": 0
       }

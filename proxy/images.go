@@ -851,12 +851,13 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
 }
 
-func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
-	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, imagePreferredAccountFilter)
+func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
+	preferredFilter := h.withModelCooldownFilter(model, imagePreferredAccountFilter)
+	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	return h.nextAccountForSession("", apiKeyID, exclude)
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
@@ -875,9 +876,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts)
+		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts, requestModel)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, nil))
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -1127,15 +1128,26 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
+	streamWriter := newStreamFlushWriter(c.Writer, flusher)
 	writeEvent := func(eventName string, payload []byte) {
+		var builder strings.Builder
 		if strings.TrimSpace(eventName) != "" {
-			fmt.Fprintf(c.Writer, "event: %s\n", eventName)
+			builder.WriteString("event: ")
+			builder.WriteString(eventName)
+			builder.WriteString("\n")
 		}
-		fmt.Fprintf(c.Writer, "data: %s\n\n", payload)
-		flusher.Flush()
+		builder.WriteString("data: ")
+		builder.Write(payload)
+		builder.WriteString("\n\n")
+		if err := streamWriter.WriteString(builder.String()); err != nil && readErr == nil {
+			readErr = err
+		}
 	}
 
 	err := ReadSSEStream(body, func(data []byte) bool {
+		if readErr != nil {
+			return false
+		}
 		if firstTokenMs == 0 {
 			firstTokenMs = int(time.Since(start).Milliseconds())
 		}
@@ -1206,6 +1218,9 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 	})
 	if err != nil {
 		return usage, imageCount, firstTokenMs, imageLogInfo, err
+	}
+	if readErr == nil {
+		readErr = streamWriter.Flush()
 	}
 	if imageCount == 0 && len(pendingResults) > 0 && readErr == nil {
 		eventName := streamPrefix + ".completed"

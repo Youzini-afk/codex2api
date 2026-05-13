@@ -31,10 +31,16 @@ banner() {
 
 EOF
   printf "${NC}"
-  echo "  交互式部署脚本 v1.0"
+  echo "  交互式部署脚本 v1.1"
   echo "  ────────────────────────────────────────"
   echo ""
 }
+
+# 输入源：兼容 `bash <(curl ...)` / 管道执行场景，强制从终端读取
+_INPUT_FD="/dev/tty"
+if [[ ! -r "$_INPUT_FD" ]]; then
+  _INPUT_FD="/dev/stdin"
+fi
 
 # 读取用户输入，支持默认值
 ask() {
@@ -44,8 +50,8 @@ ask() {
   else
     printf "${BOLD}%s${NC}: " "$prompt"
   fi
-  read -r input
-  eval "$varname=\"${input:-$default}\""
+  read -r input < "$_INPUT_FD"
+  printf -v "$varname" "%s" "${input:-$default}"
 }
 
 # 读取密码（不回显）
@@ -56,9 +62,9 @@ ask_secret() {
   else
     printf "${BOLD}%s${NC} (留空则自动生成): " "$prompt"
   fi
-  read -rs input
+  read -rs input < "$_INPUT_FD"
   echo ""
-  eval "$varname=\"${input:-$default}\""
+  printf -v "$varname" "%s" "${input:-$default}"
 }
 
 # 生成随机密钥
@@ -69,6 +75,205 @@ gen_secret() {
     head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 32
   else
     date +%s%N | sha256sum | head -c 32
+  fi
+}
+
+# ---------- 自举：确保位于 codex2api 仓库目录 ----------
+# 触发条件:
+#   1) 通过 `bash <(curl ...)` 远程拉起 (BASH_SOURCE 不是真实文件)
+#   2) 或当前目录缺少必要的 compose / deploy.sh 文件
+# 行为:
+#   - 若已在仓库目录: 直接返回
+#   - 否则: clone 仓库到 ./codex2api，切入并 exec ./deploy.sh
+REPO_URL="${CODEX2API_REPO_URL:-https://github.com/james-6-23/codex2api.git}"
+REPO_BRANCH="${CODEX2API_REPO_BRANCH:-main}"
+REPO_DIR_NAME="${CODEX2API_DIR_NAME:-codex2api}"
+DEPLOY_RUNTIME_DIR="${CODEX2API_DEPLOY_RUNTIME_DIR:-.deploy}"
+DOCKER_SOCKET_OVERRIDE_FILE="$DEPLOY_RUNTIME_DIR/docker-socket.override.yml"
+EXISTING_ENV_FILE=".env"
+
+env_default() {
+  local key="$1" fallback="${2:-}" value=""
+
+  if [[ -f "$EXISTING_ENV_FILE" ]]; then
+    value="$(awk -v target="$key" '
+      /^[[:space:]]*($|#)/ { next }
+      {
+        line=$0
+        sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+        pos=index(line, "=")
+        if (pos == 0) next
+
+        key=substr(line, 1, pos - 1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+        if (key != target) next
+
+        value=substr(line, pos + 1)
+        sub(/\r$/, "", value)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+
+        first=substr(value, 1, 1)
+        last=substr(value, length(value), 1)
+        quote=sprintf("%c", 39)
+        if ((first == "\"" && last == "\"") || (first == quote && last == quote)) {
+          value=substr(value, 2, length(value) - 2)
+        }
+
+        print value
+        exit
+      }
+    ' "$EXISTING_ENV_FILE")"
+  fi
+
+  printf "%s" "${value:-$fallback}"
+}
+
+known_compose_service_exists() {
+  local compose_file
+  for compose_file in docker-compose.yml docker-compose.sqlite.yml docker-compose.local.yml docker-compose.sqlite.local.yml; do
+    [[ -f "$compose_file" ]] || continue
+    if [[ -n "$($COMPOSE_CMD -f "$compose_file" ps -q codex2api 2>/dev/null || true)" ]]; then
+      EXISTING_COMPOSE_FILE="$compose_file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_deployment_state() {
+  DEPLOY_ACTION="full"
+  DEPLOYMENT_STATE="first"
+  DEPLOYMENT_REASON="未检测到 .env 或已创建的 compose 服务"
+  EXISTING_COMPOSE_FILE=""
+
+  if [[ -f "$EXISTING_ENV_FILE" ]]; then
+    DEPLOYMENT_STATE="existing"
+    DEPLOYMENT_REASON="检测到已有 .env"
+  fi
+
+  if known_compose_service_exists; then
+    DEPLOYMENT_STATE="existing"
+    if [[ -f "$EXISTING_ENV_FILE" ]]; then
+      DEPLOYMENT_REASON="检测到已有 .env 和 compose 服务 ($EXISTING_COMPOSE_FILE)"
+    else
+      DEPLOYMENT_REASON="检测到已有 compose 服务 ($EXISTING_COMPOSE_FILE)"
+    fi
+  fi
+}
+
+step_deployment_route() {
+  detect_deployment_state
+
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 部署状态检查 ━━━${NC}\n"
+  echo ""
+  if [[ "$DEPLOYMENT_STATE" == "first" ]]; then
+    success "检测结果: 首次部署"
+    info "$DEPLOYMENT_REASON"
+    success "部署线路: 完整部署向导"
+    return 0
+  fi
+
+  success "检测结果: 已有部署"
+  info "$DEPLOYMENT_REASON"
+  if [[ -f "$EXISTING_ENV_FILE" ]]; then
+    success "已有 .env 将作为交互默认值"
+  fi
+  echo ""
+  echo "  1) 完整部署向导      — 重新确认端口、数据库、密钥等配置"
+  echo "  2) 仅配置一键更新    — 只切换 Docker socket 挂载并重启服务"
+  echo ""
+  ask "请选择部署线路 (1 或 2)" "2" DEPLOY_ROUTE_CHOICE
+
+  case "$DEPLOY_ROUTE_CHOICE" in
+    1|full|deploy)
+      DEPLOY_ACTION="full"
+      success "部署线路: 完整部署向导"
+      ;;
+    2|update|socket|docker|watchtower)
+      DEPLOY_ACTION="update_options"
+      success "部署线路: 仅配置一键更新"
+      ;;
+    *)
+      error "无效选择: $DEPLOY_ROUTE_CHOICE"
+      ;;
+  esac
+}
+
+is_codex2api_repo() {
+  [[ -f "docker-compose.yml" ]] && [[ -f "deploy.sh" ]] \
+    && grep -q '^name: codex2api' docker-compose.yml 2>/dev/null
+}
+
+bootstrap_repo() {
+  # 已经在仓库目录里：什么都不做
+  if is_codex2api_repo; then
+    success "检测到当前目录为 codex2api 仓库"
+    return 0
+  fi
+
+  warn "当前目录不是 codex2api 仓库，进入自动拉取流程"
+
+  if ! command -v git >/dev/null 2>&1; then
+    error "未找到 git，请先安装 git 后重试"
+  fi
+
+  # 如果同名目录已存在且是仓库，直接复用
+  if [[ -d "$REPO_DIR_NAME/.git" ]]; then
+    info "发现已有目录 $REPO_DIR_NAME，尝试更新到最新代码..."
+    (cd "$REPO_DIR_NAME" && git fetch --depth=1 origin "$REPO_BRANCH" && git reset --hard "origin/$REPO_BRANCH") \
+      || warn "拉取更新失败，将沿用已有代码继续部署"
+  elif [[ -e "$REPO_DIR_NAME" ]]; then
+    error "目录 $REPO_DIR_NAME 已存在但不是 git 仓库，请手动处理后重试"
+  else
+    info "克隆仓库: $REPO_URL ($REPO_BRANCH) → ./$REPO_DIR_NAME"
+    git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR_NAME" \
+      || error "git clone 失败，请检查网络或仓库地址"
+  fi
+
+  cd "$REPO_DIR_NAME" || error "无法进入 $REPO_DIR_NAME 目录"
+
+  if ! is_codex2api_repo; then
+    error "克隆后仍未识别为 codex2api 仓库，请手动检查"
+  fi
+
+  success "已切换到 $(pwd)"
+  info "重新运行 ./deploy.sh 完成部署..."
+  echo ""
+  # exec 掉本进程，避免远程脚本/旧上下文继续运行
+  exec bash ./deploy.sh "$@"
+}
+
+update_repo_code() {
+  if [[ "${CODEX2API_SKIP_GIT_PULL:-}" == "1" || "${CODEX2API_SKIP_GIT_PULL:-}" == "true" ]]; then
+    warn "已跳过自动拉取最新代码 (CODEX2API_SKIP_GIT_PULL=${CODEX2API_SKIP_GIT_PULL})"
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    warn "当前目录不是 git 仓库，跳过自动拉取最新代码"
+    return 0
+  fi
+
+  if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+    warn "检测到本地已跟踪文件存在未提交更改，跳过自动拉取最新代码，避免覆盖本地修改"
+    return 0
+  fi
+
+  local branch="${REPO_BRANCH:-main}"
+  if [[ -z "$branch" ]]; then
+    branch="$(git branch --show-current 2>/dev/null || true)"
+  fi
+  if [[ -z "$branch" ]]; then
+    warn "无法识别当前分支，跳过自动拉取最新代码"
+    return 0
+  fi
+
+  info "拉取最新代码: origin/$branch"
+  if git fetch origin "$branch" && git pull --ff-only origin "$branch"; then
+    success "代码已更新到最新可快进版本"
+  else
+    warn "自动拉取最新代码失败，将沿用当前代码继续部署"
   fi
 }
 
@@ -94,8 +299,8 @@ preflight() {
 # ---------- 第一步：端口 ----------
 step_port() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 1/5 服务端口 ━━━${NC}\n"
-  ask "服务监听端口" "8080" PORT
+  printf "${BOLD}${CYAN}━━━ 1/7 服务端口 ━━━${NC}\n"
+  ask "服务监听端口" "$(env_default CODEX_PORT "$(env_default PORT "8080")")" PORT
 
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     error "无效端口号: $PORT"
@@ -103,15 +308,63 @@ step_port() {
   success "端口: $PORT"
 }
 
-# ---------- 第二步：数据库模式 ----------
+# ---------- 第二步：监听范围 ----------
+step_bind() {
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 2/7 监听范围 ━━━${NC}\n"
+  echo ""
+  echo "  1) 仅本机访问  — 绑定 127.0.0.1，外部无法访问 (内网/反向代理后端推荐)"
+  echo "  2) 全部网络    — 绑定 0.0.0.0，可通过内网/公网 IP 访问 (默认)"
+  echo ""
+  local bind_default bind_choice_default
+  bind_default="$(env_default BIND_HOST "0.0.0.0")"
+  case "$bind_default" in
+    127.*|localhost)
+      bind_choice_default="1"
+      ;;
+    *)
+      bind_choice_default="2"
+      ;;
+  esac
+  ask "请选择 (1 或 2)" "$bind_choice_default" BIND_CHOICE
+
+  case "$BIND_CHOICE" in
+    1|local|loopback|127*)
+      BIND_HOST="127.0.0.1"
+      BIND_MODE="loopback"
+      success "监听范围: 仅本机 (127.0.0.1)"
+      ;;
+    2|all|public|0*)
+      BIND_HOST="0.0.0.0"
+      BIND_MODE="all"
+      success "监听范围: 全部网络 (0.0.0.0)"
+      ;;
+    *)
+      error "无效选择: $BIND_CHOICE"
+      ;;
+  esac
+}
+
+# ---------- 第三步：数据库模式 ----------
 step_database() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 2/5 数据库模式 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 3/7 数据库模式 ━━━${NC}\n"
   echo ""
   echo "  1) SQLite   — 轻量单文件，适合个人 / 测试"
   echo "  2) PG+Redis — PostgreSQL + Redis，适合生产 / 多并发"
   echo ""
-  ask "请选择 (1 或 2)" "1" DB_CHOICE
+  local db_default db_choice_default
+  db_default="$(env_default DATABASE_DRIVER "sqlite")"
+  db_default="$(printf "%s" "$db_default" | tr '[:upper:]' '[:lower:]')"
+  case "$db_default" in
+    postgres|postgresql|pg)
+      db_choice_default="2"
+      ;;
+    *)
+      db_choice_default="1"
+      ;;
+  esac
+  ask "请选择 (1 或 2)" "$db_choice_default" DB_CHOICE
 
   case "$DB_CHOICE" in
     1|sqlite|SQLite)
@@ -132,45 +385,45 @@ step_database() {
 
 step_sqlite_config() {
   echo ""
-  ask "SQLite 数据文件路径 (容器内)" "/data/codex2api.db" SQLITE_PATH
+  ask "SQLite 数据文件路径 (容器内)" "$(env_default DATABASE_PATH "/data/codex2api.db")" SQLITE_PATH
 }
 
 step_pg_config() {
   echo ""
   info "PostgreSQL 配置 (Docker 内置，通常保持默认即可)"
-  ask "数据库用户名" "codex2api" PG_USER
-  ask "数据库名称"   "codex2api" PG_DB
+  ask "数据库用户名" "$(env_default DATABASE_USER "$(env_default POSTGRES_USER "codex2api")")" PG_USER
+  ask "数据库名称"   "$(env_default DATABASE_NAME "$(env_default POSTGRES_DB "codex2api")")" PG_DB
   echo ""
-  ask_secret "数据库密码" "" PG_PASS
+  ask_secret "数据库密码" "$(env_default DATABASE_PASSWORD "$(env_default POSTGRES_PASSWORD "")")" PG_PASS
   if [[ -z "$PG_PASS" ]]; then
     PG_PASS=$(gen_secret)
     success "已自动生成数据库密码"
   fi
   echo ""
   info "Redis 配置"
-  ask_secret "Redis 密码 (留空则无密码)" "" REDIS_PASS
+  ask_secret "Redis 密码 (留空则无密码)" "$(env_default REDIS_PASSWORD "")" REDIS_PASS
 }
 
-# ---------- 第三步：密钥 ----------
+# ---------- 第四步：密钥 ----------
 step_secrets() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 3/5 安全密钥 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 4/7 安全密钥 ━━━${NC}\n"
   echo ""
 
-  ask_secret "管理后台密钥 (ADMIN_SECRET)" "" ADMIN_SECRET
+  ask_secret "管理后台密钥 (ADMIN_SECRET)" "$(env_default ADMIN_SECRET "")" ADMIN_SECRET
   if [[ -z "$ADMIN_SECRET" ]]; then
     ADMIN_SECRET=$(gen_secret)
     success "已自动生成管理密钥"
   fi
 
   echo ""
-  ask "下游 API 密钥 (CODEX_API_KEYS, 多个用逗号分隔, 留空不启用)" "" API_KEYS
+  ask "下游 API 密钥 (CODEX_API_KEYS, 多个用逗号分隔, 留空不启用)" "$(env_default CODEX_API_KEYS "")" API_KEYS
 }
 
-# ---------- 第四步：构建方式 ----------
+# ---------- 第五步：构建方式 ----------
 step_build_mode() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 4/5 构建方式 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 5/7 构建方式 ━━━${NC}\n"
   echo ""
   echo "  1) 拉取镜像 — 使用预构建镜像 (ghcr.io)，部署快"
   echo "  2) 本地构建 — 从源码编译，适合自定义修改"
@@ -192,12 +445,148 @@ step_build_mode() {
   esac
 }
 
-# ---------- 第五步：确认 ----------
+# ---------- 第六步：更新能力 ----------
+step_update_options() {
+  echo ""
+  if [[ "${DEPLOY_ACTION:-full}" == "update_options" ]]; then
+    printf "${BOLD}${CYAN}━━━ 更新能力 ━━━${NC}\n"
+  else
+    printf "${BOLD}${CYAN}━━━ 6/7 更新能力 ━━━${NC}\n"
+  fi
+  echo ""
+
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    ENABLE_DOCKER_SOCKET="false"
+    success "本地构建模式不需要 Docker socket 挂载，已跳过"
+    return 0
+  fi
+
+  echo "  1) 不挂载 Docker socket — 默认，更安全"
+  echo "  2) 启用一键更新       — 挂载 /var/run/docker.sock:/var/run/docker.sock"
+  echo ""
+  warn "Docker socket 权限较高，只建议在可信服务器上启用"
+  local docker_socket_choice_default="1"
+  if [[ -f "$DOCKER_SOCKET_OVERRIDE_FILE" ]]; then
+    docker_socket_choice_default="2"
+  fi
+  ask "请选择 (1 或 2)" "$docker_socket_choice_default" DOCKER_SOCKET_CHOICE
+
+  case "$DOCKER_SOCKET_CHOICE" in
+    1|no|n|false|off)
+      ENABLE_DOCKER_SOCKET="false"
+      success "一键更新: 未启用 Docker socket 挂载"
+      ;;
+    2|yes|y|true|on)
+      ENABLE_DOCKER_SOCKET="true"
+      success "一键更新: 将挂载 /var/run/docker.sock:/var/run/docker.sock"
+      ;;
+    *)
+      error "无效选择: $DOCKER_SOCKET_CHOICE"
+      ;;
+  esac
+}
+
+infer_existing_deploy_config() {
+  PORT="$(env_default CODEX_PORT "$(env_default PORT "8080")")"
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    error "已有 .env 中的端口无效: $PORT"
+  fi
+
+  local bind_default db_default
+  bind_default="$(env_default BIND_HOST "0.0.0.0")"
+  case "$bind_default" in
+    127.*|localhost)
+      BIND_HOST="127.0.0.1"
+      BIND_MODE="loopback"
+      ;;
+    *)
+      BIND_HOST="0.0.0.0"
+      BIND_MODE="all"
+      ;;
+  esac
+
+  db_default="$(env_default DATABASE_DRIVER "sqlite")"
+  db_default="$(printf "%s" "$db_default" | tr '[:upper:]' '[:lower:]')"
+  case "$db_default" in
+    postgres|postgresql|pg)
+      DB_MODE="postgres"
+      ;;
+    *)
+      DB_MODE="sqlite"
+      ;;
+  esac
+
+  ADMIN_SECRET="$(env_default ADMIN_SECRET "")"
+  API_KEYS="$(env_default CODEX_API_KEYS "")"
+  BUILD_MODE="image"
+
+  if existing_local_build_compose_active; then
+    BUILD_MODE="local"
+  fi
+}
+
+existing_local_build_compose_active() {
+  local compose_file
+  if [[ "${DB_MODE:-}" == "sqlite" ]]; then
+    compose_file="docker-compose.sqlite.local.yml"
+  else
+    compose_file="docker-compose.local.yml"
+  fi
+
+  [[ -f "$compose_file" ]] || return 1
+  [[ -n "$($COMPOSE_CMD -f "$compose_file" ps -q codex2api 2>/dev/null || true)" ]]
+}
+
+confirm_update_options_only() {
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 配置确认 ━━━${NC}\n"
+  echo ""
+  echo "  模式:       仅配置一键更新"
+  echo "  端口:       $PORT"
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    echo "  监听范围:   127.0.0.1 (仅本机访问)"
+  else
+    echo "  监听范围:   0.0.0.0 (全部网络)"
+  fi
+  echo "  数据库:     $DB_MODE"
+  echo "  构建方式:   $( [[ "$BUILD_MODE" == "image" ]] && echo "拉取镜像" || echo "本地构建" )"
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    echo "  一键更新:   本地构建无需挂载"
+  else
+    echo "  一键更新:   $( [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]] && echo "启用 Docker socket 挂载" || echo "未启用" )"
+  fi
+  echo ""
+  ask "确认应用并重启服务? (y/n)" "y" CONFIRM
+  if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+    warn "已取消"
+    exit 0
+  fi
+}
+
+run_update_options_only() {
+  infer_existing_deploy_config
+  step_update_options
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    success "当前为本地构建部署，一键更新无需 Docker socket 挂载，未重启服务"
+    return 0
+  fi
+  confirm_update_options_only
+  resolve_compose_file
+  apply_docker_socket_option
+  deploy
+}
+
+# ---------- 第七步：确认 ----------
 step_confirm() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 5/5 配置确认 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 7/7 配置确认 ━━━${NC}\n"
   echo ""
   echo "  端口:       $PORT"
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    echo "  监听范围:   127.0.0.1 (仅本机访问)"
+  else
+    echo "  监听范围:   0.0.0.0 (全部网络)"
+  fi
   echo "  数据库:     $DB_MODE"
   if [[ "$DB_MODE" == "sqlite" ]]; then
     echo "  数据路径:   $SQLITE_PATH"
@@ -208,7 +597,12 @@ step_confirm() {
     echo "  Redis:      内置容器"
   fi
   echo "  构建方式:   $( [[ "$BUILD_MODE" == "image" ]] && echo "拉取镜像" || echo "本地构建" )"
-  echo "  管理密钥:   ${ADMIN_SECRET:0:6}******"
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    echo "  一键更新:   本地构建无需挂载"
+  else
+    echo "  一键更新:   $( [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]] && echo "启用 Docker socket 挂载" || echo "未启用" )"
+  fi
+  echo "  管理密钥:   ${ADMIN_SECRET}"
   if [[ -n "${API_KEYS:-}" ]]; then
     echo "  API 密钥:   已设置"
   else
@@ -242,6 +636,9 @@ generate_env() {
 # 服务端口
 CODEX_PORT=${PORT}
 
+# 端口绑定地址 (127.0.0.1=仅本机, 0.0.0.0=全部网络)
+BIND_HOST=${BIND_HOST}
+
 # 管理后台密钥
 ADMIN_SECRET=${ADMIN_SECRET}
 
@@ -264,6 +661,9 @@ EOF
 
 # 服务端口
 CODEX_PORT=${PORT}
+
+# 端口绑定地址 (127.0.0.1=仅本机, 0.0.0.0=全部网络)
+BIND_HOST=${BIND_HOST}
 
 # 管理后台密钥
 ADMIN_SECRET=${ADMIN_SECRET}
@@ -321,6 +721,41 @@ resolve_compose_file() {
   fi
 
   success "Compose 文件: $COMPOSE_FILE"
+
+  COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")
+}
+
+apply_docker_socket_option() {
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    return 0
+  fi
+
+  if [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]]; then
+    mkdir -p "$DEPLOY_RUNTIME_DIR" || error "无法创建运行时配置目录: $DEPLOY_RUNTIME_DIR"
+    cat > "$DOCKER_SOCKET_OVERRIDE_FILE" <<'EOF'
+services:
+  codex2api:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+EOF
+    COMPOSE_FILE_ARGS+=(-f "$DOCKER_SOCKET_OVERRIDE_FILE")
+    success "Docker socket 挂载已启用: $DOCKER_SOCKET_OVERRIDE_FILE"
+    return 0
+  fi
+
+  if [[ -f "$DOCKER_SOCKET_OVERRIDE_FILE" ]]; then
+    rm -f "$DOCKER_SOCKET_OVERRIDE_FILE"
+  fi
+  success "Docker socket 挂载未启用"
+}
+
+compose_cmd_display() {
+  local display="$COMPOSE_CMD"
+  local arg
+  for arg in "${COMPOSE_FILE_ARGS[@]}"; do
+    display+=" $arg"
+  done
+  printf "%s" "$display"
 }
 
 # ---------- 部署 ----------
@@ -330,41 +765,105 @@ deploy() {
 
   if [[ "$BUILD_MODE" == "local" ]]; then
     info "本地构建并启动..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build
+    $COMPOSE_CMD "${COMPOSE_FILE_ARGS[@]}" up -d --build
   else
     info "拉取最新镜像..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" pull
+    $COMPOSE_CMD "${COMPOSE_FILE_ARGS[@]}" pull
     info "启动服务..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d
+    $COMPOSE_CMD "${COMPOSE_FILE_ARGS[@]}" up -d
   fi
 
   echo ""
   success "部署完成!"
   echo ""
+
+  local PUBLIC_IP="" LAN_IP=""
+
+  if [[ "$BIND_MODE" == "all" ]]; then
+    # 仅在对外开放时才探测/展示对外 IP
+    PUBLIC_IP=$(curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null \
+      || curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null \
+      || curl -fsS4 --max-time 3 https://ipinfo.io/ip 2>/dev/null \
+      || true)
+    PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
+
+    if command -v hostname >/dev/null 2>&1; then
+      LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    fi
+    if [[ -z "$LAN_IP" ]] && command -v ip >/dev/null 2>&1; then
+      LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    fi
+    if [[ -z "$LAN_IP" ]] && command -v ifconfig >/dev/null 2>&1; then
+      LAN_IP=$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.' | head -n1)
+    fi
+  fi
+
   echo "  ┌──────────────────────────────────────────┐"
-  echo "  │                                          │"
-  echo "  │  服务地址: http://localhost:${PORT}          "
-  echo "  │  管理后台: http://localhost:${PORT}/admin    "
-  echo "  │  管理密钥: ${ADMIN_SECRET:0:6}******        "
-  echo "  │                                          │"
-  echo "  │  查看日志: $COMPOSE_CMD -f $COMPOSE_FILE logs -f"
-  echo "  │  停止服务: $COMPOSE_CMD -f $COMPOSE_FILE down"
-  echo "  │                                          │"
+  echo "  │  部署信息                                  │"
   echo "  └──────────────────────────────────────────┘"
+  echo ""
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    echo "  监听范围 : 127.0.0.1 (仅本机访问)"
+    echo ""
+    echo "  本地访问 : http://127.0.0.1:${PORT}"
+    echo "             http://127.0.0.1:${PORT}/admin"
+  else
+    echo "  监听范围 : 0.0.0.0 (全部网络)"
+    echo ""
+    echo "  本地访问 : http://localhost:${PORT}"
+    echo "             http://localhost:${PORT}/admin"
+    if [[ -n "$LAN_IP" ]]; then
+      echo "  内网访问 : http://${LAN_IP}:${PORT}"
+      echo "             http://${LAN_IP}:${PORT}/admin"
+    fi
+    if [[ -n "$PUBLIC_IP" ]]; then
+      echo "  公网访问 : http://${PUBLIC_IP}:${PORT}"
+      echo "             http://${PUBLIC_IP}:${PORT}/admin"
+    fi
+  fi
+  echo ""
+  echo "  管理密钥 : ${ADMIN_SECRET}"
+  if [[ "$BUILD_MODE" == "local" ]]; then
+    echo "  一键更新 : 本地构建无需挂载"
+  elif [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]]; then
+    echo "  一键更新 : 已启用 Docker socket 挂载"
+  else
+    echo "  一键更新 : 未启用"
+  fi
+  echo ""
+  echo "  查看日志 : $(compose_cmd_display) logs -f"
+  echo "  停止服务 : $(compose_cmd_display) down"
+  echo ""
+  if [[ "$BIND_MODE" == "all" && -n "$PUBLIC_IP" ]]; then
+    warn "服务对外开放，请确认防火墙/安全组已放行 ${PORT} 端口"
+  fi
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    info "如需对外暴露，可重新运行 deploy.sh 选择「全部网络」，或在 .env 中将 BIND_HOST 改为 0.0.0.0"
+  fi
   echo ""
 }
 
 # ---------- 主流程 ----------
 main() {
   banner
+  bootstrap_repo "$@"
   preflight
+  update_repo_code
+  step_deployment_route
+  if [[ "$DEPLOY_ACTION" == "update_options" ]]; then
+    run_update_options_only
+    exit 0
+  fi
   step_port
+  step_bind
   step_database
   step_secrets
   step_build_mode
+  step_update_options
   step_confirm
   generate_env
   resolve_compose_file
+  apply_docker_socket_option
   deploy
 }
 

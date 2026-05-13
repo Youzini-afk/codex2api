@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/codex2api/cache"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -29,13 +31,20 @@ type responseCacheEntry struct {
 }
 
 var respCache struct {
-	mu    sync.RWMutex
-	store map[string]*responseCacheEntry
+	mu           sync.RWMutex
+	store        map[string]*responseCacheEntry
+	runtimeCache cache.TokenCache
 }
 
 func init() {
 	respCache.store = make(map[string]*responseCacheEntry)
 	go respCacheCleanupLoop()
+}
+
+func SetResponseContextCache(tc cache.TokenCache) {
+	respCache.mu.Lock()
+	respCache.runtimeCache = tc
+	respCache.mu.Unlock()
 }
 
 // setResponseCache 存储响应上下文
@@ -66,29 +75,67 @@ func setResponseCache(responseID string, items []json.RawMessage) {
 		items:     itemsCopy,
 		createdAt: time.Now(),
 	}
+	runtimeCache := respCache.runtimeCache
 	respCache.mu.Unlock()
+
+	if runtimeCache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if err := runtimeCache.SetResponseContext(ctx, responseID, itemsCopy, responseCacheTTL); err != nil {
+			log.Printf("写入 Redis response context 失败: response_id=%s err=%v", responseID, err)
+		}
+	}
 }
 
 // getResponseCache 查找缓存的响应上下文
 func getResponseCache(responseID string) []json.RawMessage {
 	respCache.mu.RLock()
 	entry, ok := respCache.store[responseID]
+	runtimeCache := respCache.runtimeCache
 	respCache.mu.RUnlock()
-	if !ok {
-		return nil
-	}
-	// entry.createdAt 在创建后不可变，无锁访问安全
-	if time.Since(entry.createdAt) > responseCacheTTL {
-		// 同步删除过期条目，避免goroutine爆炸
-		respCache.mu.Lock()
-		// 双重检查：确认条目仍然存在且已过期
-		if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {
-			delete(respCache.store, responseID)
+	if ok {
+		// entry.createdAt 在创建后不可变，无锁访问安全
+		if time.Since(entry.createdAt) > responseCacheTTL {
+			// 同步删除过期条目，避免goroutine爆炸
+			respCache.mu.Lock()
+			// 双重检查：确认条目仍然存在且已过期
+			if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {
+				delete(respCache.store, responseID)
+			}
+			respCache.mu.Unlock()
+		} else {
+			return entry.items
 		}
-		respCache.mu.Unlock()
+	}
+
+	if runtimeCache == nil {
 		return nil
 	}
-	return entry.items
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	items, err := runtimeCache.GetResponseContext(ctx, responseID)
+	if err != nil {
+		log.Printf("读取 Redis response context 失败: response_id=%s err=%v", responseID, err)
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	setResponseCacheLocal(responseID, items)
+	return items
+}
+
+func setResponseCacheLocal(responseID string, items []json.RawMessage) {
+	itemsCopy := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		itemsCopy[i] = append(json.RawMessage(nil), item...)
+	}
+	respCache.mu.Lock()
+	respCache.store[responseID] = &responseCacheEntry{
+		items:     itemsCopy,
+		createdAt: time.Now(),
+	}
+	respCache.mu.Unlock()
 }
 
 // respCacheCleanupLoop 后台清理过期条目
@@ -121,14 +168,30 @@ func expandPreviousResponse(codexBody []byte) ([]byte, string) {
 		return codexBody, ""
 	}
 
+	currentInput := gjson.GetBytes(codexBody, "input")
+
+	// 客户端已经自带 function_call 等续链项时，跳过注入。
+	// 缓存里只会存 function_call 类项（见 cacheCompletedResponse + isCodexToolCallContextType），
+	// 再注入会让同一 call_id 出现两次，上游会以 "duplicate call_id" 等 400 拒绝。
+	// 仍返回 prevID，让 cacheCompletedResponse 能把这一轮响应链入缓存。
+	if currentInput.IsArray() && inputHasToolCallContext(currentInput) {
+		log.Printf("input 已自带工具续链项，跳过 previous_response_id=%s 的历史注入", prevID)
+		return codexBody, prevID
+	}
+
 	cached := getResponseCache(prevID)
 	if cached == nil {
-		// 缓存未命中（首次请求 / 过期 / 其他实例），无法展开，按原样继续
+		// 缓存未命中（首次请求 / 过期 / 其他实例），无法展开，按原样继续。
+		// 若 input 仅含 function_call_output 又拿不到对应的 function_call，
+		// 上游通常会返回 "No tool call found for function call output" 400，
+		// 这里打日志便于诊断（不阻断，让上游错误透传给客户端）。
+		if currentInput.IsArray() && inputHasFunctionCallOutput(currentInput) {
+			log.Printf("缓存未命中且 input 含 function_call_output，previous_response_id=%s，上游可能返回 400", prevID)
+		}
 		return codexBody, prevID
 	}
 
 	// 构建新 input: 缓存的历史 items + 当前 input items
-	currentInput := gjson.GetBytes(codexBody, "input")
 	var merged []json.RawMessage
 	merged = append(merged, cached...)
 	if currentInput.IsArray() {
@@ -147,6 +210,35 @@ func expandPreviousResponse(codexBody []byte) ([]byte, string) {
 	codexBody, _ = sjson.SetRawBytes(codexBody, "input", mergedJSON)
 	log.Printf("已展开 previous_response_id=%s，注入 %d 条历史 items", prevID, len(cached))
 	return codexBody, prevID
+}
+
+// inputHasToolCallContext 判断 input 数组里是否已包含 function_call 类续链项，
+// 这类项一旦同时出现在缓存里会造成 call_id 冲突。
+func inputHasToolCallContext(input gjson.Result) bool {
+	found := false
+	input.ForEach(func(_, v gjson.Result) bool {
+		if isCodexToolCallContextType(v.Get("type").String()) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// inputHasFunctionCallOutput 判断 input 数组里是否含 *_output 项（缺少配对的 function_call 时上游会 400）。
+func inputHasFunctionCallOutput(input gjson.Result) bool {
+	found := false
+	input.ForEach(func(_, v gjson.Result) bool {
+		switch v.Get("type").String() {
+		case "function_call_output", "tool_call_output", "local_shell_call_output",
+			"tool_search_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // cacheCompletedResponse 从 response.completed 事件中提取 response.id 和 response.output，
@@ -182,20 +274,55 @@ func cacheCompletedResponse(expandedInputRaw []byte, completedData []byte) {
 	inputItems := gjson.ParseBytes(expandedInputRaw)
 	if inputItems.IsArray() {
 		inputItems.ForEach(func(_, v gjson.Result) bool {
-			items = append(items, json.RawMessage(v.Raw))
+			if item, ok := replayableCachedInputItem(v); ok {
+				items = append(items, item)
+			}
 			return true
 		})
 	}
 
-	// 添加响应 output items
+	// 添加响应 output 中真正需要续链的工具上下文；reasoning/message 等
+	// 服务端输出 item 带有 rs_/msg_ id，store=false 时回灌会触发 item not found。
 	output.ForEach(func(_, v gjson.Result) bool {
-		items = append(items, json.RawMessage(v.Raw))
+		if item, ok := replayableCachedOutputItem(v); ok {
+			items = append(items, item)
+		}
 		return true
 	})
 
 	if len(items) > 0 {
 		setResponseCache(respID, items)
 	}
+}
+
+func replayableCachedInputItem(item gjson.Result) (json.RawMessage, bool) {
+	if item.Get("type").String() == "reasoning" && item.Get("encrypted_content").Exists() {
+		return nil, false
+	}
+	return stripResponseItemID(json.RawMessage(item.Raw))
+}
+
+func replayableCachedOutputItem(item gjson.Result) (json.RawMessage, bool) {
+	if !isCodexToolCallContextType(item.Get("type").String()) {
+		return nil, false
+	}
+	return stripResponseItemID(json.RawMessage(item.Raw))
+}
+
+func stripResponseItemID(raw json.RawMessage) (json.RawMessage, bool) {
+	var item map[string]any
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return raw, true
+	}
+	if _, exists := item["id"]; !exists {
+		return raw, true
+	}
+	delete(item, "id")
+	stripped, err := json.Marshal(item)
+	if err != nil {
+		return nil, false
+	}
+	return stripped, true
 }
 
 func isCodexToolCallContextType(typ string) bool {

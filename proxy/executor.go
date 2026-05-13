@@ -324,6 +324,48 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	return resp, nil
 }
 
+func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, requestBody []byte, proxyOverride string, headers http.Header) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	baseURL, apiKey := account.OpenAIResponsesCredentials()
+	account.Mu().RLock()
+	proxyURL := account.ProxyURL
+	account.Mu().RUnlock()
+	if proxyOverride != "" {
+		proxyURL = proxyOverride
+	}
+	if baseURL == "" || apiKey == "" {
+		return nil, ErrNoAvailableAccount()
+	}
+
+	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, ErrInternalError("创建请求失败", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if headers != nil {
+		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key"} {
+			if value := strings.TrimSpace(headers.Get(key)); value != "" {
+				req.Header.Set(key, value)
+			}
+		}
+	}
+
+	resp, err := getPooledClient(account, proxyURL).Do(req)
+	if err != nil {
+		if shouldRecyclePooledClient(err) {
+			recyclePooledClient(account, proxyURL)
+		}
+		return nil, ErrUpstream(0, "请求 OpenAI Responses API 失败", err)
+	}
+	return resp, nil
+}
+
 // ExecuteCompactRequest 向 Codex 上游发送 /responses/compact 请求（非流式压缩接口）
 func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
 	if ctx == nil {
@@ -408,6 +450,50 @@ func codexVersionFromUserAgent(userAgent, fallback string) string {
 	return strings.TrimSpace(fallback)
 }
 
+func codexVersionFromString(raw string) (cliVersion, bool) {
+	raw = strings.TrimSpace(strings.TrimPrefix(raw, "v"))
+	if raw == "" {
+		return cliVersion{}, false
+	}
+	return parseCodexCLIVersion("codex_cli_rs/" + raw)
+}
+
+func generatedCodexClientHeaders(account *auth.Account) (string, string) {
+	accountID := int64(0)
+	if account != nil {
+		accountID = account.ID()
+	}
+	profile := ProfileForAccount(accountID)
+	userAgent := strings.TrimSpace(profile.UserAgent)
+	version := strings.TrimSpace(profile.Version)
+	if userAgent == "" {
+		userAgent = latestCodexCLIUserAgentPrefix
+	}
+	if version == "" {
+		version = codexVersionFromUserAgent(userAgent, latestCodexCLIVersion)
+	}
+	return userAgent, version
+}
+
+func shouldGenerateCodexClientHeaders(settings RuntimeSettings, userAgent, originator string) bool {
+	switch settings.ClientCompatMode {
+	case ClientCompatModeForce:
+		return true
+	case ClientCompatModeAuto:
+		version, ok := parseCodexCLIVersion(userAgent)
+		if !ok {
+			return false
+		}
+		minVersion, ok := codexVersionFromString(settings.CodexMinCLIVersion)
+		if !ok {
+			minVersion, _ = codexVersionFromString(defaultCodexMinCLIVersion)
+		}
+		return IsCodexOfficialClientByHeaders(userAgent, originator) && version.Compare(minVersion) < 0
+	default:
+		return false
+	}
+}
+
 func applyCodexAllowedForwardHeaders(req *http.Request, downstreamHeaders http.Header) {
 	if req == nil || downstreamHeaders == nil {
 		return
@@ -433,6 +519,7 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 
 	var profile deviceProfile
 	version := ""
+	usedGeneratedHeaders := false
 	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
 		profile = ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
 		version = codexVersionFromProfile(profile, strings.TrimSpace(deviceCfg.PackageVersion))
@@ -442,7 +529,12 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	} else {
 		userAgent := strings.TrimSpace(downstreamHeaders.Get("User-Agent"))
 		originator := strings.TrimSpace(downstreamHeaders.Get("Originator"))
-		if IsCodexOfficialClientByHeaders(userAgent, originator) && userAgent != "" {
+		if shouldGenerateCodexClientHeaders(CurrentRuntimeSettings(), userAgent, originator) {
+			generatedUA, generatedVersion := generatedCodexClientHeaders(account)
+			req.Header.Set("User-Agent", generatedUA)
+			version = generatedVersion
+			usedGeneratedHeaders = true
+		} else if IsCodexOfficialClientByHeaders(userAgent, originator) && userAgent != "" {
 			req.Header.Set("User-Agent", userAgent)
 			version = firstNonEmptyHeader(downstreamHeaders, "Version", codexVersionFromUserAgent(userAgent, latestCodexCLIVersion))
 		} else {
@@ -461,7 +553,7 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	if version != "" {
 		req.Header.Set("Version", version)
 	}
-	if originator := strings.TrimSpace(downstreamHeaders.Get("Originator")); originator != "" && IsCodexOfficialClientByHeaders("", originator) {
+	if originator := strings.TrimSpace(downstreamHeaders.Get("Originator")); !usedGeneratedHeaders && originator != "" && IsCodexOfficialClientByHeaders("", originator) {
 		req.Header.Set("Originator", originator)
 	} else {
 		req.Header.Set("Originator", Originator)

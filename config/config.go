@@ -4,11 +4,23 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
 )
+
+// schemaNameRegex 限定 PostgreSQL schema 名为 ASCII 标识符，避免 DSN/DDL 注入。
+var schemaNameRegex = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// IsValidSchemaName 校验 PostgreSQL schema 名（首字母为字母或下划线，余下为字母/数字/下划线，长度 ≤63）。
+func IsValidSchemaName(name string) bool {
+	if name == "" || len(name) > 63 {
+		return false
+	}
+	return schemaNameRegex.MatchString(name)
+}
 
 // DatabaseConfig 数据库核心配置。
 type DatabaseConfig struct {
@@ -20,6 +32,7 @@ type DatabaseConfig struct {
 	User             string
 	Password         string
 	DBName           string
+	Schema           string // PostgreSQL schema（search_path）；空值保持数据库默认行为
 	SSLMode          string
 }
 
@@ -35,8 +48,14 @@ func (d *DatabaseConfig) DSN() string {
 	if sslMode == "" {
 		sslMode = "disable"
 	}
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		d.Host, d.Port, d.User, d.Password, d.DBName, sslMode)
+	if d.Schema != "" {
+		// 通过 libpq options 在连接启动时设置 search_path，覆盖连接池中的所有连接。
+		// schema 已在 Load() 阶段做白名单校验，此处可安全拼接。
+		dsn += fmt.Sprintf(" options='-c search_path=%s,public'", d.Schema)
+	}
+	return dsn
 }
 
 // Label 返回用于展示的数据库标签。
@@ -158,6 +177,12 @@ func Load(envPath string) (*Config, error) {
 	cfg.Database.User = firstNonEmpty(cfg.Database.User, firstNonEmptyEnv("DATABASE_USER", "POSTGRES_USER", "POSTGRES_USERNAME", "POSTGRESQL_USER", "POSTGRESQL_USERNAME"))
 	cfg.Database.Password = firstNonEmpty(cfg.Database.Password, firstNonEmptyEnv("DATABASE_PASSWORD", "POSTGRES_PASSWORD", "POSTGRESQL_PASSWORD"))
 	cfg.Database.DBName = firstNonEmpty(cfg.Database.DBName, firstNonEmptyEnv("DATABASE_NAME", "POSTGRES_DB", "POSTGRES_DATABASE", "POSTGRESQL_DB", "POSTGRESQL_DATABASE"))
+	if v := strings.TrimSpace(os.Getenv("DATABASE_SCHEMA")); v != "" {
+		if !IsValidSchemaName(v) {
+			return nil, fmt.Errorf("非法的 DATABASE_SCHEMA: %q（仅允许字母、数字、下划线，且不能以数字开头，长度不超过 63）", v)
+		}
+		cfg.Database.Schema = v
+	}
 	if v := firstNonEmptyEnv("DATABASE_SSLMODE", "POSTGRES_SSLMODE", "POSTGRESQL_SSLMODE"); v != "" {
 		cfg.Database.SSLMode = v
 	}

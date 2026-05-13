@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -32,6 +33,28 @@ func TestResolveServiceTier(t *testing.T) {
 	if got := resolveServiceTier("default", "fast"); got != "fast" {
 		t.Fatalf("expected requested fast to win for logging, got %q", got)
 	}
+	// priority 是 fast 的同义词，入库归一化为 fast，便于 UI 徽章/筛选统一识别
+	if got := resolveServiceTier("priority", ""); got != "fast" {
+		t.Fatalf("expected priority to normalize to fast, got %q", got)
+	}
+	if got := resolveServiceTier("", "priority"); got != "fast" {
+		t.Fatalf("expected requested priority to normalize to fast, got %q", got)
+	}
+	if got := resolveServiceTier("priority", "default"); got != "fast" {
+		t.Fatalf("expected actual priority to normalize to fast, got %q", got)
+	}
+	// codex CLI 0.129+ 直接发 service_tier="priority"；上游配额耗尽降级到 default 时，
+	// 也要锁定为 fast，避免 fast 用户的日志被错误归类成 default。
+	if got := resolveServiceTier("default", "priority"); got != "fast" {
+		t.Fatalf("expected requested priority + downgraded default to be fast, got %q", got)
+	}
+	// flex / default 等其它 tier 保持原值
+	if got := resolveServiceTier("flex", ""); got != "flex" {
+		t.Fatalf("expected flex tier to be preserved, got %q", got)
+	}
+	if got := resolveServiceTier("default", ""); got != "default" {
+		t.Fatalf("expected default tier with no requested intent to stay default, got %q", got)
+	}
 }
 
 func TestSanitizeServiceTierForUpstream_FastToPriority(t *testing.T) {
@@ -44,6 +67,27 @@ func TestSanitizeServiceTierForUpstream_FastToPriority(t *testing.T) {
 
 	if tier := gjson.GetBytes(got, "service_tier").String(); tier != "priority" {
 		t.Fatalf("fast should be mapped to priority for upstream, got %q", tier)
+	}
+}
+
+func TestSanitizeServiceTierForUpstream_DropsUnsupportedClientTiers(t *testing.T) {
+	for _, tier := range []string{"auto", "default", "flex", "scale"} {
+		t.Run(tier, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{
+				"model":"gpt-5.4",
+				"service_tier":%q,
+				"serviceTier":%q
+			}`, tier, tier))
+
+			got := sanitizeServiceTierForUpstream(raw)
+
+			if gjson.GetBytes(got, "service_tier").Exists() {
+				t.Fatalf("%s service_tier should be omitted for upstream, got body=%s", tier, got)
+			}
+			if gjson.GetBytes(got, "serviceTier").Exists() {
+				t.Fatalf("serviceTier should be removed for upstream, got body=%s", got)
+			}
+		})
 	}
 }
 
@@ -68,6 +112,37 @@ func TestTranslateRequest_PreservesSupportedServiceTier(t *testing.T) {
 	}
 	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "high" {
 		t.Fatalf("reasoning.effort mismatch: got %q want %q", effort, "high")
+	}
+}
+
+func TestTranslateRequest_DropsUnsupportedClientServiceTier(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hello"}],
+		"service_tier":"flex"
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if gjson.GetBytes(got, "service_tier").Exists() {
+		t.Fatalf("unsupported client service_tier should be omitted for upstream, got body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_DropsUnsupportedClientServiceTier(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"service_tier":"flex"
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if gjson.GetBytes(got, "service_tier").Exists() {
+		t.Fatalf("unsupported client service_tier should be omitted for upstream, got body=%s", got)
 	}
 }
 
@@ -119,6 +194,46 @@ func TestTranslateRequest_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_DropsInvalidRequiredInToolSchema(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"test"}],
+		"tools":[
+			{
+				"type":"function",
+				"function":{
+					"name":"session_status",
+					"parameters":{
+						"type":"object",
+						"required":null,
+						"properties":{
+							"session_id":{"type":"string"},
+							"metadata":{
+								"type":"object",
+								"required":[null, "", "kind"],
+								"properties":{"kind":{"type":"string"}}
+							}
+						}
+					}
+				}
+			}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if required := gjson.GetBytes(got, "tools.0.parameters.required"); required.Exists() {
+		t.Fatalf("null required should be removed from tool schema, got %s; body=%s", required.Raw, got)
+	}
+	nestedRequired := gjson.GetBytes(got, "tools.0.parameters.properties.metadata.required")
+	if nestedRequired.Raw != `["kind"]` {
+		t.Fatalf("nested required should keep only string entries, got %s; body=%s", nestedRequired.Raw, got)
+	}
+}
+
 func TestPrepareResponsesBody_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -142,6 +257,514 @@ func TestPrepareResponsesBody_FillsMissingArrayItemsInToolSchema(t *testing.T) {
 	items := gjson.GetBytes(got, "tools.0.parameters.properties.args.items")
 	if !items.Exists() || items.Type != gjson.JSON {
 		t.Fatalf("expected array schema items object to be injected, got %s", items.Raw)
+	}
+}
+
+func TestPrepareResponsesBody_DropsInvalidRequiredInToolSchema(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"tools":[
+			{
+				"type":"function",
+				"name":"session_status",
+				"parameters":{
+					"type":"object",
+					"required":null,
+					"properties":{
+						"session_id":{"type":"string"},
+						"metadata":{
+							"type":"object",
+							"required":[null, "", "kind"],
+							"properties":{"kind":{"type":"string"}}
+						}
+					}
+				}
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if required := gjson.GetBytes(got, "tools.0.parameters.required"); required.Exists() {
+		t.Fatalf("null required should be removed from tool schema, got %s; body=%s", required.Raw, got)
+	}
+	nestedRequired := gjson.GetBytes(got, "tools.0.parameters.properties.metadata.required")
+	if nestedRequired.Raw != `["kind"]` {
+		t.Fatalf("nested required should keep only string entries, got %s; body=%s", nestedRequired.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_DefaultsNullFunctionToolParameters(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"tools":[
+			{
+				"type":"function",
+				"name":"Agent",
+				"parameters":null
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "tools.0.parameters.type").String(); typ != "object" {
+		t.Fatalf("expected default function schema type object, got %q; body=%s", typ, got)
+	}
+	if props := gjson.GetBytes(got, "tools.0.parameters.properties"); !props.Exists() || props.Type != gjson.JSON {
+		t.Fatalf("expected default function schema properties object, got %s; body=%s", props.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_DefaultsMissingFunctionToolParameters(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"tools":[
+			{
+				"type":"function",
+				"name":"Agent"
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "tools.0.parameters.type").String(); typ != "object" {
+		t.Fatalf("expected default function schema type object, got %q; body=%s", typ, got)
+	}
+}
+
+func TestTranslateRequest_DefaultsNullFunctionToolParameters(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"test"}],
+		"tools":[
+			{
+				"type":"function",
+				"function":{
+					"name":"Agent",
+					"parameters":null
+				}
+			}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if typ := gjson.GetBytes(got, "tools.0.parameters.type").String(); typ != "object" {
+		t.Fatalf("expected default function schema type object, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesLegacyFileContentPart(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"text","text":"read this"},
+					{"type":"file","file":{"file_id":"file_abc","filename":"notes.pdf"}}
+				]
+			}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_text" {
+		t.Fatalf("expected legacy text part to normalize to input_text, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.content.1.type").String(); typ != "input_file" {
+		t.Fatalf("expected legacy file part to normalize to input_file, got %q; body=%s", typ, got)
+	}
+	if fileID := gjson.GetBytes(got, "input.0.content.1.file_id").String(); fileID != "file_abc" {
+		t.Fatalf("expected file_id to be flattened, got %q; body=%s", fileID, got)
+	}
+	if filename := gjson.GetBytes(got, "input.0.content.1.filename").String(); filename != "notes.pdf" {
+		t.Fatalf("expected filename to be preserved, got %q; body=%s", filename, got)
+	}
+	if gjson.GetBytes(got, "input.0.content.1.file").Exists() {
+		t.Fatalf("legacy file wrapper should be removed; body=%s", got)
+	}
+	if typ := gjson.Get(expandedInputRaw, "0.content.1.type").String(); typ != "input_file" {
+		t.Fatalf("expanded input should contain normalized input_file, got %q; expanded=%s", typ, expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesAssistantInputTextToOutputText(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[
+					{"type":"input_text","text":"prior assistant answer"}
+				]
+			}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "output_text" {
+		t.Fatalf("assistant input_text should normalize to output_text, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.Get(expandedInputRaw, "0.content.0.type").String(); typ != "output_text" {
+		t.Fatalf("expanded assistant content should normalize to output_text, got %q; expanded=%s", typ, expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesUserOutputTextToInputText(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"output_text","text":"hello"}
+				]
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_text" {
+		t.Fatalf("user output_text should normalize to input_text, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesLegacyTopLevelFileInput(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"file","file":"file_top"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "input_file" {
+		t.Fatalf("expected top-level legacy file input to normalize to input_file, got %q; body=%s", typ, got)
+	}
+	if fileID := gjson.GetBytes(got, "input.0.file_id").String(); fileID != "file_top" {
+		t.Fatalf("expected top-level file shorthand to become file_id, got %q; body=%s", fileID, got)
+	}
+	if gjson.GetBytes(got, "input.0.file").Exists() {
+		t.Fatalf("legacy file wrapper should be removed; body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_NormalizesLegacyImageContentPart(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+				]
+			}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_image" {
+		t.Fatalf("expected legacy image_url part to normalize to input_image, got %q; body=%s", typ, got)
+	}
+	if imageURL := gjson.GetBytes(got, "input.0.content.0.image_url").String(); imageURL != "https://example.com/cat.png" {
+		t.Fatalf("expected image_url object to be flattened, got %q; body=%s", imageURL, got)
+	}
+}
+
+func TestPrepareOpenAIResponsesBody_NormalizesLegacyImageContentPart(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+				]
+			}
+		]
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.content.0.type").String(); typ != "input_image" {
+		t.Fatalf("expected legacy image_url part to normalize to input_image, got %q; body=%s", typ, got)
+	}
+	if imageURL := gjson.GetBytes(got, "input.0.content.0.image_url").String(); imageURL != "https://example.com/cat.png" {
+		t.Fatalf("expected image_url object to be flattened, got %q; body=%s", imageURL, got)
+	}
+	if gjson.GetBytes(got, "include").Exists() {
+		t.Fatalf("OpenAI Responses body should not get Codex include defaults; body=%s", got)
+	}
+	if gjson.GetBytes(got, "store").Exists() {
+		t.Fatalf("OpenAI Responses body should not get Codex store defaults; body=%s", got)
+	}
+	if stream := gjson.GetBytes(got, "stream"); !stream.Exists() || stream.Bool() {
+		t.Fatalf("OpenAI Responses body should preserve stream=false; body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_SanitizesTextFormatJSONSchema(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"name":"codex_output_schema",
+				"schema":{
+					"type":"object",
+					"properties":{
+						"testEnvironmentContract":{
+							"type":"object",
+							"minProperties":1,
+							"maxProperties":2,
+							"properties":{
+								"runtime":{"type":"string","minLength":1}
+							}
+						},
+						"steps":{"type":"array"}
+					}
+				},
+				"strict":true
+			}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if name := gjson.GetBytes(got, "text.format.name").String(); name != "codex_output_schema" {
+		t.Fatalf("expected text.format.name to be preserved, got %q; body=%s", name, got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
+		t.Fatalf("minProperties should be stripped from structured output schema; body=%s", got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.maxProperties").Exists() {
+		t.Fatalf("maxProperties should be stripped from structured output schema; body=%s", got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.properties.runtime.minLength").Exists() {
+		t.Fatalf("nested minLength should be stripped from structured output schema; body=%s", got)
+	}
+	if items := gjson.GetBytes(got, "text.format.schema.properties.steps.items"); !items.Exists() || items.Type != gjson.JSON {
+		t.Fatalf("array items should be injected in structured output schema, got %s; body=%s", items.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_JSONSchemaDoesNotInjectImageBridge(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":"Extract the name and age from: John is 30 years old",
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"name":"person",
+				"strict":true,
+				"schema":{
+					"type":"object",
+					"properties":{
+						"name":{"type":"string"},
+						"age":{"type":"integer"}
+					},
+					"required":["name","age"],
+					"additionalProperties":false
+				}
+			}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if gjson.GetBytes(got, "tools").Exists() {
+		t.Fatalf("json_schema responses should not get implicit image tools; body=%s", got)
+	}
+	if gjson.GetBytes(got, "instructions").Exists() {
+		t.Fatalf("json_schema responses should not get image bridge instructions; body=%s", got)
+	}
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_schema" {
+		t.Fatalf("expected json_schema format to be preserved, got %q; body=%s", typ, got)
+	}
+	if input := gjson.GetBytes(got, "input.0.content").String(); input != "Extract the name and age from: John is 30 years old" {
+		t.Fatalf("expected original input to be preserved, got %q; body=%s", input, got)
+	}
+}
+
+func TestPrepareResponsesBody_ConvertsAndSanitizesLegacyResponseFormat(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"response_format":{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"codex_output_schema",
+				"schema":{
+					"type":"object",
+					"properties":{
+						"testEnvironmentContract":{
+							"type":"object",
+							"minProperties":1,
+							"properties":{}
+						}
+					}
+				},
+				"strict":true
+			}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if gjson.GetBytes(got, "response_format").Exists() {
+		t.Fatalf("legacy response_format should be removed after conversion; body=%s", got)
+	}
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_schema" {
+		t.Fatalf("expected response_format to convert to text.format json_schema, got %q; body=%s", typ, got)
+	}
+	if name := gjson.GetBytes(got, "text.format.name").String(); name != "codex_output_schema" {
+		t.Fatalf("expected json_schema name to be preserved, got %q; body=%s", name, got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
+		t.Fatalf("minProperties should be stripped after response_format conversion; body=%s", got)
+	}
+}
+
+func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"test"}],
+		"response_format":{
+			"type":"json_schema",
+			"json_schema":{
+				"name":"codex_output_schema",
+				"schema":{
+					"type":"object",
+					"properties":{
+						"testEnvironmentContract":{
+							"type":"object",
+							"minProperties":1,
+							"properties":{}
+						}
+					}
+				}
+			}
+		}
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if gjson.GetBytes(got, "response_format").Exists() {
+		t.Fatalf("legacy response_format should not be forwarded, got %s", got)
+	}
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_schema" {
+		t.Fatalf("expected text.format json_schema, got %q; body=%s", typ, got)
+	}
+	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
+		t.Fatalf("minProperties should be stripped in translated response_format schema; body=%s", got)
+	}
+}
+
+func TestTranslateRequest_JSONObjectInjectsJSONHintWhenInputOmitsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"return name"}],
+		"response_format":{"type":"json_object"}
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if typ := gjson.GetBytes(got, "text.format.type").String(); typ != "json_object" {
+		t.Fatalf("expected json_object text format, got %q; body=%s", typ, got)
+	}
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("expected injected developer hint, got role %q; body=%s", role, got)
+	}
+	if hint := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(strings.ToLower(hint), "json") {
+		t.Fatalf("expected injected hint to mention JSON, got %q; body=%s", hint, got)
+	}
+	if userText := gjson.GetBytes(got, "input.1.content.0.text").String(); userText != "return name" {
+		t.Fatalf("expected original user input to be preserved, got %q; body=%s", userText, got)
+	}
+}
+
+func TestTranslateRequest_JSONObjectDoesNotInjectWhenInputMentionsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"return JSON with name"}],
+		"response_format":{"type":"json_object"}
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "user" {
+		t.Fatalf("did not expect injected hint when input already mentions JSON, got role %q; body=%s", role, got)
+	}
+	if inputLen := len(gjson.GetBytes(got, "input").Array()); inputLen != 1 {
+		t.Fatalf("expected one input item, got %d; body=%s", inputLen, got)
+	}
+}
+
+func TestPrepareResponsesBody_JSONObjectInjectsJSONHintWhenInputOmitsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"return name",
+		"text":{"format":{"type":"json_object"}}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("expected injected developer hint, got role %q; body=%s", role, got)
+	}
+	if hint := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(strings.ToLower(hint), "json") {
+		t.Fatalf("expected injected hint to mention JSON, got %q; body=%s", hint, got)
+	}
+	if userText := gjson.GetBytes(got, "input.1.content").String(); userText != "return name" {
+		t.Fatalf("expected original user input to be preserved, got %q; body=%s", userText, got)
+	}
+}
+
+func TestPrepareOpenAIResponsesBody_JSONObjectPrefixesStringInputWhenInputOmitsJSON(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"return name",
+		"text":{"format":{"type":"json_object"}}
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+
+	input := gjson.GetBytes(got, "input").String()
+	if !strings.Contains(strings.ToLower(input), "json") || !strings.Contains(input, "return name") {
+		t.Fatalf("expected string input to include JSON hint and original input, got %q; body=%s", input, got)
+	}
+	if gjson.GetBytes(got, "include").Exists() {
+		t.Fatalf("OpenAI Responses body should not get Codex include defaults; body=%s", got)
 	}
 }
 
@@ -583,6 +1206,121 @@ func TestPrepareCompactResponsesBody_ConvertsPlaintextCompactionToDeveloperMessa
 	}
 	if gotText := input.Get("1.content.0.text").String(); !strings.Contains(gotText, "previous context was compacted") {
 		t.Fatalf("converted compaction text = %q, want summary; input=%s", gotText, input.Raw)
+	}
+}
+
+func TestPrepareResponsesBody_DefaultsMissingMessageContent(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"function_call","call_id":"call_abc","name":"lookup","arguments":"{}"},
+			{"type":"message","role":"user"}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	if content := gjson.GetBytes(got, "input.2.content"); !content.Exists() || content.String() != "" {
+		t.Fatalf("missing message content should be defaulted to empty string, got %s; body=%s", content.Raw, got)
+	}
+	if gjson.GetBytes(got, "input.1.content").Exists() {
+		t.Fatalf("non-message tool context item should not receive content, got %s", got)
+	}
+	if content := gjson.Get(expandedInputRaw, "2.content"); !content.Exists() || content.String() != "" {
+		t.Fatalf("expanded input should include normalized empty content, got %s; expanded=%s", content.Raw, expandedInputRaw)
+	}
+}
+
+func TestPrepareResponsesBody_DefaultsNullMessageContent(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"role":"developer","content":null},
+			{"type":"message","role":"assistant","content":null}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	for i := 0; i < 2; i++ {
+		if content := gjson.GetBytes(got, fmt.Sprintf("input.%d.content", i)); !content.Exists() || content.String() != "" {
+			t.Fatalf("null message content at input[%d] should be defaulted, got %s; body=%s", i, content.Raw, got)
+		}
+	}
+}
+
+func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"reasoning","id":"rs_123","encrypted_content":"opaque"},
+			{"type":"message","id":"msg_123","role":"user","content":"continue"},
+			{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":"{}"}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	for i := 0; i < 3; i++ {
+		if id := gjson.GetBytes(got, fmt.Sprintf("input.%d.id", i)); id.Exists() {
+			t.Fatalf("input[%d].id should be stripped for store=false, got %s; body=%s", i, id.Raw, got)
+		}
+		if id := gjson.Get(expandedInputRaw, fmt.Sprintf("%d.id", i)); id.Exists() {
+			t.Fatalf("expanded input[%d].id should be stripped for cache replay, got %s; expanded=%s", i, id.Raw, expandedInputRaw)
+		}
+	}
+	if encrypted := gjson.GetBytes(got, "input.0.encrypted_content").String(); encrypted != "opaque" {
+		t.Fatalf("reasoning encrypted_content should be preserved, got %q; body=%s", encrypted, got)
+	}
+	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_123" {
+		t.Fatalf("function_call call_id should be preserved, got %q; body=%s", callID, got)
+	}
+}
+
+func TestInvalidEncryptedContentErrorDetection(t *testing.T) {
+	body := []byte(`{
+		"error":{
+			"code":"invalid_encrypted_content",
+			"type":"invalid_request_error",
+			"message":"The encrypted content gAAA...Vw== could not be verified. Reason: Encrypted content could not be decrypted or parsed."
+		}
+	}`)
+
+	if !isInvalidEncryptedContentError(http.StatusBadRequest, body) {
+		t.Fatalf("expected invalid encrypted content error to be detected")
+	}
+	if isInvalidEncryptedContentError(http.StatusInternalServerError, body) {
+		t.Fatalf("non-400 response should not trigger encrypted content fallback")
+	}
+}
+
+func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+			{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
+		]
+	}`)
+
+	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
+	if !changed {
+		t.Fatalf("expected body to be changed")
+	}
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("expected reasoning item to be removed, got %d items: %s", len(items), got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("first input should remain message, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call" {
+		t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+	}
+	if strings.Contains(string(got), "encrypted_content") {
+		t.Fatalf("encrypted_content should be removed from retry body: %s", got)
 	}
 }
 

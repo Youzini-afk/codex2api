@@ -80,6 +80,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
 			key TEXT NOT NULL UNIQUE,
+			quota_limit REAL DEFAULT 0,
+			quota_used REAL DEFAULT 0,
+			expires_at TIMESTAMP NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE TABLE IF NOT EXISTS account_model_cooldowns (
@@ -92,6 +95,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
 					id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+					site_name TEXT DEFAULT 'CodexProxy',
+					site_logo TEXT DEFAULT '',
 					max_concurrency INTEGER DEFAULT 2,
 				global_rpm INTEGER DEFAULT 0,
 				test_model TEXT DEFAULT 'gpt-5.4',
@@ -109,10 +114,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				auto_clean_error INTEGER DEFAULT 0,
 				auto_clean_expired INTEGER DEFAULT 0,
 				proxy_pool_enabled INTEGER DEFAULT 0,
-			fast_scheduler_enabled INTEGER DEFAULT 0,
+				fast_scheduler_enabled INTEGER DEFAULT 0,
 				max_retries INTEGER DEFAULT 2,
 				max_rate_limit_retries INTEGER DEFAULT 1,
-				allow_remote_migration INTEGER DEFAULT 0
+				allow_remote_migration INTEGER DEFAULT 0,
+				client_compat_mode TEXT DEFAULT 'preserve',
+				codex_min_cli_version TEXT DEFAULT '0.118.0',
+				usage_log_mode TEXT DEFAULT 'full',
+				usage_log_batch_size INTEGER DEFAULT 200,
+				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
+				stream_flush_policy TEXT DEFAULT 'immediate',
+				stream_flush_interval_ms INTEGER DEFAULT 20,
+				image_storage_config TEXT DEFAULT '{}'
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -258,6 +271,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
 		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
+		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
+		{"api_keys", "quota_used", "REAL DEFAULT 0"},
+		{"api_keys", "expires_at", "TIMESTAMP NULL"},
+		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
+		{"system_settings", "site_logo", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
@@ -286,6 +304,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_sensitive_words", "TEXT DEFAULT ''"},
 		{"system_settings", "prompt_filter_custom_patterns", "TEXT DEFAULT '[]'"},
 		{"system_settings", "prompt_filter_disabled_patterns", "TEXT DEFAULT '[]'"},
+		{"system_settings", "client_compat_mode", "TEXT DEFAULT 'preserve'"},
+		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.118.0'"},
+		{"system_settings", "usage_log_mode", "TEXT DEFAULT 'full'"},
+		{"system_settings", "usage_log_batch_size", "INTEGER DEFAULT 200"},
+		{"system_settings", "usage_log_flush_interval_seconds", "INTEGER DEFAULT 5"},
+		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
+		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
+		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"accounts", "enabled", "INTEGER DEFAULT 1"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
 		{"accounts", "image_quota_remaining", "INTEGER NULL"},
@@ -311,6 +337,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);`,
@@ -461,7 +488,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		outputTokens    int64
 		reasoningTokens int64
 		cachedTokens    int64
-		errors401       int64
+		errors4xx       int64
+		errors5xx       int64
 	}
 
 	result := &ChartAggregation{}
@@ -497,8 +525,11 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		agg.outputTokens += outputTokens
 		agg.reasoningTokens += reasoningTokens
 		agg.cachedTokens += cachedTokens
-		if statusCode == 401 {
-			agg.errors401++
+		if statusCode >= 400 && statusCode < 500 {
+			agg.errors4xx++
+		}
+		if statusCode >= 500 && statusCode < 600 {
+			agg.errors5xx++
 		}
 
 		modelName := "unknown"
@@ -530,7 +561,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 			OutputTokens:    agg.outputTokens,
 			ReasoningTokens: agg.reasoningTokens,
 			CachedTokens:    agg.cachedTokens,
-			Errors401:       agg.errors401,
+			Errors4xx:       agg.errors4xx,
+			Errors5xx:       agg.errors5xx,
 		})
 	}
 	if result.Timeline == nil {
@@ -708,12 +740,20 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 
 	// 可见请求总数（排除 499）
 	var visibleTotal int64
+	var currentTokens, currentPrompt, currentCompletion, currentCached int64
 	var currentAccountBilled, currentUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0)
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(prompt_tokens), 0),
+			COALESCE(SUM(completion_tokens), 0),
+			COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(account_billed), 0),
+			COALESCE(SUM(user_billed), 0)
 		FROM usage_logs
 		WHERE status_code <> 499
-	`).Scan(&visibleTotal, &currentAccountBilled, &currentUserBilled)
+	`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &currentAccountBilled, &currentUserBilled)
 
 	// 基线值
 	var bReq, bTok, bPrompt, bComp, bCached int64
@@ -724,12 +764,23 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bAccountBilled, &bUserBilled)
 
 	stats.TotalRequests = visibleTotal + bReq
-	stats.TotalTokens = stats.TodayTokens + bTok
-	stats.TotalPrompt += bPrompt
-	stats.TotalCompletion += bComp
-	stats.TotalCachedTokens += bCached
+	stats.TotalTokens = currentTokens + bTok
+	stats.TotalPrompt = currentPrompt + bPrompt
+	stats.TotalCompletion = currentCompletion + bComp
+	stats.TotalCachedTokens = currentCached + bCached
 	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
 	stats.TotalUserBilled = currentUserBilled + bUserBilled
+	if stats.TotalRequests > 0 {
+		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
+		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
+	}
+	stats.ModelStats, err = db.getUsageModelStats(ctx, 10)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.populateUsageBreakdownStats(ctx, stats); err != nil {
+		return nil, err
+	}
 
 	return stats, nil
 }

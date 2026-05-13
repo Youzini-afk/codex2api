@@ -118,6 +118,12 @@ func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
 		return
 	}
 
+	s.fastSchedulerUpdate(acc)
+
+	if s.db == nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := s.db.UpdateUsageSnapshot5h(ctx, acc.DBID, pct5h, reset5hAt, updatedAt); err != nil {
@@ -153,6 +159,7 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	acc.mu.Unlock()
 
 	s.fastSchedulerUpdate(acc)
+	s.setCachedAccountCooldown(acc.DBID, "rate_limited", resetAt)
 
 	if s.db == nil {
 		return

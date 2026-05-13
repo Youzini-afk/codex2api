@@ -68,6 +68,7 @@ func TestGetAdminSessionStatusDisabledWithoutSecret(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	handler := &Handler{
+		db:           newTestAdminDB(t),
 		sessionStore: newAdminSessionStore(),
 	}
 	router := newAdminAuthTestRouter(handler)

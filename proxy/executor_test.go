@@ -85,6 +85,41 @@ func TestClassifyStreamOutcome(t *testing.T) {
 	}
 }
 
+func TestClassifyResponseFailedOutcome(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"server_error","message":"An error occurred while processing your request. Please include the request ID req-123."}}}`)
+
+	outcome := classifyResponseFailedOutcome(payload)
+
+	if outcome.logStatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusInternalServerError)
+	}
+	if outcome.failureKind != "server" {
+		t.Fatalf("failure kind = %q, want server", outcome.failureKind)
+	}
+	if !outcome.penalize {
+		t.Fatal("response.failed server error should be penalized")
+	}
+	if !strings.Contains(outcome.failureMessage, "server_error") || !strings.Contains(outcome.failureMessage, "req-123") {
+		t.Fatalf("failure message = %q, want upstream code and request id", outcome.failureMessage)
+	}
+}
+
+func TestClassifyResponseFailedOutcomeInvalidRequest(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_value","type":"invalid_request_error","message":"Invalid input"}}}`)
+
+	outcome := classifyResponseFailedOutcome(payload)
+
+	if outcome.logStatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusBadRequest)
+	}
+	if outcome.failureKind != "client" {
+		t.Fatalf("failure kind = %q, want client", outcome.failureKind)
+	}
+	if outcome.penalize {
+		t.Fatal("client-side response.failed should not penalize account")
+	}
+}
+
 func TestShouldRecyclePooledClient(t *testing.T) {
 	tests := []struct {
 		name string
@@ -218,6 +253,10 @@ func TestApplyCodexRequestHeadersUsesMinimalFallbackByDefault(t *testing.T) {
 }
 
 func TestApplyCodexRequestHeadersPreservesOfficialClientHeaders(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	ApplyRuntimeSettings(RuntimeSettings{ClientCompatMode: ClientCompatModePreserve})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {
 		t.Fatalf("http.NewRequest() error = %v", err)
@@ -250,6 +289,34 @@ func TestApplyCodexRequestHeadersPreservesOfficialClientHeaders(t *testing.T) {
 	}
 }
 
+func TestApplyCodexRequestHeadersAutoUpgradesOldCodexCLI(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	ApplyRuntimeSettings(RuntimeSettings{
+		ClientCompatMode:   ClientCompatModeAuto,
+		CodexMinCLIVersion: "0.118.0",
+	})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	acc := &auth.Account{DBID: 42, AccountID: "acct-42"}
+	downstreamHeaders := http.Header{
+		"User-Agent": []string{"codex_cli_rs/0.117.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464"},
+		"Originator": []string{Originator},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+	if got := req.Header.Get("User-Agent"); got == downstreamHeaders.Get("User-Agent") {
+		t.Fatalf("User-Agent preserved old CLI UA %q", got)
+	}
+	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
+		t.Fatalf("Version = %q, want %q", got, latestCodexCLIVersion)
+	}
+}
+
 func TestApplyCodexRequestHeadersFallsBackForNonOfficialClient(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {
@@ -258,7 +325,7 @@ func TestApplyCodexRequestHeadersFallsBackForNonOfficialClient(t *testing.T) {
 	acc := &auth.Account{DBID: 42}
 	downstreamHeaders := http.Header{
 		"User-Agent": []string{"curl/8.0"},
-		"Originator": []string{"opencode"},
+		"Originator": []string{"random-client"},
 	}
 
 	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
@@ -271,6 +338,31 @@ func TestApplyCodexRequestHeadersFallsBackForNonOfficialClient(t *testing.T) {
 	}
 	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
 		t.Fatalf("Version = %q, want %q", got, latestCodexCLIVersion)
+	}
+}
+
+func TestApplyCodexRequestHeadersPreservesOpenCodeClient(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	ApplyRuntimeSettings(RuntimeSettings{ClientCompatMode: ClientCompatModePreserve})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	acc := &auth.Account{DBID: 42, AccountID: "acct-42"}
+	downstreamHeaders := http.Header{
+		"User-Agent": []string{"opencode/0.5.0"},
+		"Originator": []string{"opencode"},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+	if got := req.Header.Get("User-Agent"); got != "opencode/0.5.0" {
+		t.Fatalf("User-Agent = %q, want %q", got, "opencode/0.5.0")
+	}
+	if got := req.Header.Get("Originator"); got != "opencode" {
+		t.Fatalf("Originator = %q, want %q", got, "opencode")
 	}
 }
 
