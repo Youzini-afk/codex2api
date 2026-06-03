@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -119,10 +120,18 @@ func recyclePooledClientForAccount(account *auth.Account) {
 	recyclePooledClient(account, proxyURL)
 }
 
+// codexTLSSessionCache 在所有标准 transport 间共享 TLS 会话缓存，
+// 让重连(连接池 TTL 淘汰或 30s 空闲关闭后)走 TLS resumption(1-RTT)，降低重连握手成本。
+var codexTLSSessionCache = tls.NewLRUClientSessionCache(256)
+
 func newCodexStandardTransport(proxyURL string) http.RoundTripper {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConnsPerHost = 1
-	transport.IdleConnTimeout = 30 * time.Second
+	transport.MaxIdleConnsPerHost = 4
+	transport.IdleConnTimeout = 90 * time.Second
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.ClientSessionCache = codexTLSSessionCache
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport.DialContext = baseDialer.DialContext
 	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
@@ -201,7 +210,7 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	entry := &poolEntry{
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   0,
+			Timeout:   10 * time.Minute,
 		},
 	}
 	entry.touch()
@@ -224,6 +233,7 @@ var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-State",
 	"X-Codex-Turn-Metadata",
 	"X-Client-Request-Id",
+	"X-Codex-Beta-Features",
 }
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
@@ -243,9 +253,18 @@ func IsolateCodexSessionID(apiKeyID int64, raw string) string {
 // useWebsocket 可选，如果为 true 则使用 WebSocket 连接
 // headers 下游请求头，用于设备指纹学习
 func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
-	// 检查是否使用 WebSocket
-	if len(useWebsocket) > 0 && useWebsocket[0] && WebsocketExecuteFunc != nil {
+	// 检查是否使用 WebSocket：调用方显式要求，或全局开关 CodexForceWebsocket 开启
+	wantWebsocket := len(useWebsocket) > 0 && useWebsocket[0]
+	if !wantWebsocket && CurrentRuntimeSettings().CodexForceWebsocket {
+		wantWebsocket = true
+	}
+	if wantWebsocket && WebsocketExecuteFunc != nil {
 		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers)
+	}
+	if wantWebsocket && WebsocketExecuteFunc == nil {
+		// 请求/配置要求走 WebSocket，但 WS 执行器未注册（如嵌入式调用或初始化顺序问题）。
+		// 静默落回 HTTP 会让“以为开了 WS 实际走 HTTP”难以排查，这里显式告警。
+		log.Printf("[WS] 警告: 期望走 WebSocket 上游，但 WebsocketExecuteFunc 未注册，已回退到 HTTP (account %d)", account.ID())
 	}
 
 	if ctx == nil {
@@ -276,6 +295,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 	// 2. 清理可能导致上游报错的多余字段
 	requestBody, _ = sjson.DeleteBytes(requestBody, "previous_response_id")
+	// 注意：HTTP /responses 上游不接受 prompt_cache_retention（会 400），必须删除；
+	// 该字段的 cache 收益只在 WS 路径注入（见 wsrelay 的 prepareWebsocketBody）。
 	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
@@ -390,6 +411,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 		requestBody, _ = sjson.SetBytes(requestBody, "instructions", "")
 	}
 	requestBody, _ = sjson.DeleteBytes(requestBody, "previous_response_id")
+	// compact 端点同样走 HTTP，不接受 prompt_cache_retention，必须删除。
 	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")

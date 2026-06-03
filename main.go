@@ -74,7 +74,9 @@ func main() {
 			MaxRateLimitRetries:              1,
 			BackgroundRefreshIntervalMinutes: 2,
 			UsageProbeMaxAgeMinutes:          10,
+			UsageProbeConcurrency:            16,
 			RecoveryProbeIntervalMinutes:     30,
+			LazyMode:                         false,
 			ProxyURL:                         "",
 			PgMaxConns:                       50,
 			RedisPoolSize:                    30,
@@ -94,6 +96,8 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			FirstTokenTimeoutSeconds:         0,
+			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
@@ -108,7 +112,9 @@ func main() {
 			MaxRateLimitRetries:              1,
 			BackgroundRefreshIntervalMinutes: 2,
 			UsageProbeMaxAgeMinutes:          10,
+			UsageProbeConcurrency:            16,
 			RecoveryProbeIntervalMinutes:     30,
+			LazyMode:                         false,
 			PgMaxConns:                       50,
 			RedisPoolSize:                    30,
 			PromptFilterMode:                 "monitor",
@@ -125,11 +131,16 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			FirstTokenTimeoutSeconds:         0,
+			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
+	}
+	if envPolicy := strings.TrimSpace(os.Getenv("CODEX_BILLING_TIER_POLICY")); envPolicy != "" {
+		settings.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(envPolicy)
 	}
 
 	// 4. 初始化缓存（使用数据库中保存的连接池大小）
@@ -179,7 +190,7 @@ func main() {
 	}
 	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
 	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
-	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms",
+	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_timeout=%ds billing_tier_policy=%s",
 		runtimeSettings.ClientCompatMode,
 		runtimeSettings.CodexMinCLIVersion,
 		db.GetUsageLogMode(),
@@ -187,6 +198,8 @@ func main() {
 		db.GetUsageLogFlushIntervalSeconds(),
 		runtimeSettings.StreamFlushPolicy,
 		runtimeSettings.StreamFlushIntervalMS,
+		runtimeSettings.FirstTokenTimeoutSec,
+		runtimeSettings.BillingTierPolicy,
 	)
 
 	// 4b'. 应用图片存储后端配置
@@ -260,6 +273,14 @@ func main() {
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
+
+	// 上游 WS 空闲连接保活常驻任务（默认关闭：goroutine 常驻但仅在运行时开关开启时才发送 Ping）
+	wsKeepalive := wsrelay.NewKeepaliveTask(
+		wsrelay.GetManager(),
+		store.CodexWSKeepaliveEnabled,
+		store.CodexWSKeepaliveIntervalSec,
+	)
+	wsKeepalive.Start()
 
 	r.Use(rateLimiter.Middleware())
 	if settings.GlobalRPM > 0 {
@@ -340,8 +361,16 @@ func main() {
 	log.Println("==========================================")
 
 	// 优雅关闭
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: r,
+		// ReadHeaderTimeout 防 Slowloris 慢速攻击；IdleTimeout 回收空闲 keep-alive 连接。
+		// 注意：WriteTimeout 必须保持 0 —— LLM 流式响应可持续数分钟，任何固定写超时都会中途切断长回答。
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
-		if err := r.Run(addr); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP 服务启动失败: %v", err)
 		}
 	}()
@@ -351,6 +380,12 @@ func main() {
 	<-quit
 
 	log.Println("正在关闭...")
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP 服务优雅关闭超时: %v", err)
+	}
+	wsKeepalive.Stop()
 	store.Stop()
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()

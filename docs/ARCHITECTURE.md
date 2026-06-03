@@ -239,6 +239,7 @@ func TranslateStreamChunk(data []byte, model, chunkID string) ([]byte, bool)
 - `messages` → `input`
 - `max_tokens/temperature` → 删除（Codex 不支持）
 - `reasoning_effort` → `reasoning.effort`
+- Anthropic `/v1/messages` 的 `speed:"fast"` → Codex `service_tier:"priority"`（Anthropic 入参 `service_tier` 为 Priority Tier，不参与 fast mode 映射）
 - SSE 事件类型转换
 
 ---
@@ -443,7 +444,7 @@ CREATE TABLE system_settings (
     id INTEGER PRIMARY KEY DEFAULT 1,
     max_concurrency INTEGER DEFAULT 2,
     global_rpm INTEGER DEFAULT 0,
-    test_model VARCHAR(100) DEFAULT 'gpt-5.4',
+    test_model VARCHAR(100) DEFAULT 'gpt-5.5',
     test_concurrency INTEGER DEFAULT 50,
     proxy_url VARCHAR(500),
     pg_max_conns INTEGER DEFAULT 50,

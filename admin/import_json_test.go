@@ -298,6 +298,20 @@ func TestReadUploadedImportFilesReadsRepeatedFileFields(t *testing.T) {
 	}
 }
 
+func TestValidateImportFileSize(t *testing.T) {
+	if err := validateImportFileSize(&multipart.FileHeader{Filename: "ok.txt", Size: importFileSizeLimitBytes}); err != nil {
+		t.Fatalf("validateImportFileSize returned error for boundary size: %v", err)
+	}
+
+	err := validateImportFileSize(&multipart.FileHeader{Filename: "too-big.txt", Size: importFileSizeLimitBytes + 1})
+	if err == nil {
+		t.Fatal("expected oversized file error, got nil")
+	}
+	if got, want := err.Error(), "文件 too-big.txt 大小超过 20MB"; got != want {
+		t.Fatalf("error = %q, want %q", got, want)
+	}
+}
+
 func TestImportAccountsJSONReturnsExistingNoTokenMessageForUnsupportedJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

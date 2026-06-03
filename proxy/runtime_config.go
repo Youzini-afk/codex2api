@@ -16,12 +16,18 @@ const (
 	StreamFlushPolicyImmediate = "immediate"
 	StreamFlushPolicyCoalesce  = "coalesce"
 
+	BillingTierPolicyActual    = "actual"
+	BillingTierPolicyRequested = "requested"
+
 	defaultClientCompatMode      = ClientCompatModePreserve
 	defaultCodexMinCLIVersion    = "0.118.0"
 	defaultStreamFlushPolicy     = StreamFlushPolicyImmediate
 	defaultStreamFlushIntervalMS = 20
 	minStreamFlushIntervalMS     = 1
 	maxStreamFlushIntervalMS     = 1000
+	defaultFirstTokenTimeoutSec  = 0
+	maxFirstTokenTimeoutSec      = 600
+	defaultBillingTierPolicy     = BillingTierPolicyActual
 )
 
 type RuntimeSettings struct {
@@ -29,6 +35,9 @@ type RuntimeSettings struct {
 	CodexMinCLIVersion    string
 	StreamFlushPolicy     string
 	StreamFlushIntervalMS int
+	FirstTokenTimeoutSec  int
+	BillingTierPolicy     string
+	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -43,6 +52,8 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexMinCLIVersion:    defaultCodexMinCLIVersion,
 		StreamFlushPolicy:     defaultStreamFlushPolicy,
 		StreamFlushIntervalMS: defaultStreamFlushIntervalMS,
+		FirstTokenTimeoutSec:  defaultFirstTokenTimeoutSec,
+		BillingTierPolicy:     defaultBillingTierPolicy,
 	}
 }
 
@@ -70,10 +81,22 @@ func NormalizeStreamFlushPolicy(policy string) string {
 	}
 }
 
+func NormalizeBillingTierPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "", BillingTierPolicyActual:
+		return BillingTierPolicyActual
+	case BillingTierPolicyRequested:
+		return BillingTierPolicyRequested
+	default:
+		return BillingTierPolicyActual
+	}
+}
+
 func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	defaults := DefaultRuntimeSettings()
 	settings.ClientCompatMode = NormalizeClientCompatMode(settings.ClientCompatMode)
 	settings.StreamFlushPolicy = NormalizeStreamFlushPolicy(settings.StreamFlushPolicy)
+	settings.BillingTierPolicy = NormalizeBillingTierPolicy(settings.BillingTierPolicy)
 	if strings.TrimSpace(settings.CodexMinCLIVersion) == "" {
 		settings.CodexMinCLIVersion = defaults.CodexMinCLIVersion
 	} else {
@@ -85,6 +108,12 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.StreamFlushIntervalMS > maxStreamFlushIntervalMS {
 		settings.StreamFlushIntervalMS = maxStreamFlushIntervalMS
 	}
+	if settings.FirstTokenTimeoutSec < 0 {
+		settings.FirstTokenTimeoutSec = defaultFirstTokenTimeoutSec
+	}
+	if settings.FirstTokenTimeoutSec > maxFirstTokenTimeoutSec {
+		settings.FirstTokenTimeoutSec = maxFirstTokenTimeoutSec
+	}
 	return settings
 }
 
@@ -95,6 +124,9 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexMinCLIVersion = settings.CodexMinCLIVersion
 		next.StreamFlushPolicy = settings.StreamFlushPolicy
 		next.StreamFlushIntervalMS = settings.StreamFlushIntervalMS
+		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
+		next.BillingTierPolicy = settings.BillingTierPolicy
+		next.CodexForceWebsocket = settings.CodexForceWebsocket
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)
@@ -120,4 +152,12 @@ func currentStreamFlushInterval() time.Duration {
 		ms = defaultStreamFlushIntervalMS
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func currentFirstTokenTimeout() time.Duration {
+	seconds := CurrentRuntimeSettings().FirstTokenTimeoutSec
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }

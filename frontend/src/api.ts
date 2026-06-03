@@ -7,6 +7,7 @@ import type {
   AddOpenAIResponsesAccountRequest,
   AdminErrorResponse,
   APIKeysResponse,
+  APIKeyTokenStat,
   AccountsResponse,
   ChartAggregation,
   CreateAccountResponse,
@@ -32,17 +33,24 @@ import type {
   PromptFilterLogsResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
-  SelfUpdateStartResponse,
-  SelfUpdateStatusResponse,
+  RuntimeStatusResponse,
+  ResetRadarResponse,
   SiteBranding,
   StatsResponse,
+  SetupHintsResponse,
   CPAExportEntry,
   SystemSettings,
   UpdateAccountSchedulerRequest,
+  UpdateAPIKeyRequest,
   UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
+  AccountGroup,
+  AccountGroupsResponse,
+  BackgroundUploadResponse,
+  CreateAccountGroupRequest,
+  UpdateAccountGroupRequest,
 } from './types'
 
 const BASE = '/api/admin'
@@ -90,7 +98,8 @@ function extractAdminErrorMessage(body: string, status: number): string {
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
-  if (options.body !== undefined && options.body !== null && !headers.has('Content-Type')) {
+  const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
+  if (options.body !== undefined && options.body !== null && !isFormData && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
 
@@ -101,6 +110,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   const res = await fetch(BASE + path, {
     ...options,
+    cache: options.cache ?? 'no-store',
     headers,
     credentials: 'same-origin',
   })
@@ -230,8 +240,17 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  forceUsageProbe: () =>
+    request<{ triggered: boolean; concurrency: number; reason?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
+  listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
+  createAccountGroup: (data: CreateAccountGroupRequest) =>
+    request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),
+  updateAccountGroup: (id: number, data: UpdateAccountGroupRequest) =>
+    request<MessageResponse>(`/account-groups/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteAccountGroup: (id: number, force = false) =>
+    request<MessageResponse>(`/account-groups/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' }),
   toggleAccountEnabled: (id: number, enabled: boolean) =>
     request<MessageResponse>(`/accounts/${id}/enable`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   toggleAccountLock: (id: number, locked: boolean) =>
@@ -242,11 +261,12 @@ export const api = {
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number) =>
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
+  updateAccountCredit: (id: number, data: { credit_enabled: boolean; credit_skip_usage_window: boolean }) =>
+    request<MessageResponse>(`/accounts/${id}/credit`, { method: 'PATCH', body: JSON.stringify(data) }),
   getHealth: () => request<HealthResponse>('/health'),
-  getSelfUpdateStatus: () => request<SelfUpdateStatusResponse>('/system/update'),
-  startSelfUpdate: (data: { version?: string } = {}) =>
-    request<SelfUpdateStartResponse>('/system/update', { method: 'POST', body: JSON.stringify(data) }),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
+  getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
+  getResetRadar: () => request<ResetRadarResponse>('/reset-radar'),
   getOpsErrorSummary: (params: {
     start: string
     end: string
@@ -295,7 +315,22 @@ export const api = {
     const search = buildOpsErrorSearchParams(params)
     return requestBlob(`/ops/errors/export?${search.toString()}`)
   },
-  getUsageStats: () => request<UsageStats>('/usage/stats'),
+  getUsageStats: (params: { start?: string; end?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    const qs = searchParams.toString()
+    return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats')
+  },
+  getAPIKeyTokenStats: (params: { start?: string; end?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    const qs = searchParams.toString()
+    return request<{ items: APIKeyTokenStat[] }>(
+      qs ? `/usage/api-keys?${qs}` : '/usage/api-keys',
+    )
+  },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start && params.end) {
@@ -342,6 +377,8 @@ export const api = {
     }),
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
+  updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
+    request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getImagePromptTemplates: (params: { q?: string; tag?: string } = {}) => {
     const sp = new URLSearchParams()
     if (params.q) sp.set('q', params.q)
@@ -357,6 +394,8 @@ export const api = {
     request<MessageResponse>(`/image-prompts/${id}`, { method: 'DELETE' }),
   createImageJob: (data: CreateImageJobPayload) =>
     request<ImageJobResponse>('/images/jobs', { method: 'POST', body: JSON.stringify(data) }),
+  createImageEditJob: (data: CreateImageJobPayload) =>
+    request<ImageJobResponse>('/images/edit-jobs', { method: 'POST', body: JSON.stringify(data) }),
   getImageJobs: (params: { page?: number; pageSize?: number } = {}) => {
     const sp = new URLSearchParams()
     if (params.page) sp.set('page', String(params.page))
@@ -369,6 +408,8 @@ export const api = {
     const query = sp.toString()
     return request<ImageJobResponse>(`/images/jobs/${id}${query ? `?${query}` : ''}`)
   },
+  deleteImageJob: (id: number) =>
+    request<MessageResponse>(`/images/jobs/${id}`, { method: 'DELETE' }),
   getImageAssets: (params: { page?: number; pageSize?: number } = {}) => {
     const sp = new URLSearchParams()
     if (params.page) sp.set('page', String(params.page))
@@ -386,9 +427,15 @@ export const api = {
     request<MessageResponse>(`/images/assets/${id}`, { method: 'DELETE' }),
   clearUsageLogs: () =>
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
+  getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
   getSettings: () => request<SystemSettings>('/settings'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  uploadBackground: (file: File) => {
+    const form = new FormData()
+    form.set('file', file)
+    return request<BackgroundUploadResponse>('/settings/background-upload', { method: 'POST', body: form })
+  },
   testImageStorageConnection: (data: {
     endpoint: string
     region: string
@@ -455,7 +502,7 @@ export const api = {
     request<{ message: string; inserted: number; total: number }>('/proxies', { method: 'POST', body: JSON.stringify(data) }),
   deleteProxy: (id: number) =>
     request<MessageResponse>(`/proxies/${id}`, { method: 'DELETE' }),
-  updateProxy: (id: number, data: { label?: string; enabled?: boolean }) =>
+  updateProxy: (id: number, data: { url?: string; label?: string; enabled?: boolean }) =>
     request<MessageResponse>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   batchDeleteProxies: (ids: number[]) =>
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),

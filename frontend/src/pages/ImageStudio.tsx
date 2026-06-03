@@ -4,7 +4,6 @@ import { NavLink, useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
-import ToastNotice from '../components/ToastNotice'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime } from '../utils/time'
@@ -23,7 +22,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { Copy, Download, Eye, Image as ImageIcon, Loader2, Pencil, Play, Plus, RefreshCcw, Save, Search, Sparkles, Star, Trash2, X } from 'lucide-react'
+import { Copy, Download, Eye, Image as ImageIcon, Loader2, Pencil, Play, Plus, RefreshCcw, Save, Search, Sparkles, Star, Trash2, Upload, X } from 'lucide-react'
 
 const IMAGE_VIEWS = ['studio', 'prompts', 'gallery', 'history'] as const
 type ImageView = typeof IMAGE_VIEWS[number]
@@ -238,6 +237,10 @@ function jobStatusClass(status: string): string {
   }
 }
 
+function isImageJobBusy(job: ImageGenerationJob): boolean {
+  return job.status === 'queued' || job.status === 'running'
+}
+
 function jobModel(job: ImageGenerationJob): string {
   const params = jobParams(job)
   return params.model || job.assets?.[0]?.model || '-'
@@ -427,6 +430,44 @@ export default function ImageStudio() {
   const [apiKeyID, setAPIKeyID] = useState('')
   const [templateName, setTemplateName] = useState('')
   const [templateTags, setTemplateTags] = useState('')
+  const [imageToImageMode, setImageToImageMode] = useState(false)
+  const [inputImageDataURLs, setInputImageDataURLs] = useState<string[]>([])
+
+  const handleImageFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files
+    if (!files || files.length === 0) return
+    const MAX_INPUT_IMAGES = 10
+    const currentCount = inputImageDataURLs.length
+    if (currentCount >= MAX_INPUT_IMAGES) {
+      showToast(t('images.maxInputImages', { max: MAX_INPUT_IMAGES }), 'error')
+      e.target.value = ''
+      return
+    }
+    const remaining = MAX_INPUT_IMAGES - currentCount
+    const filesToRead = Array.from(files).slice(0, remaining)
+    const reads: Promise<string>[] = []
+    for (let i = 0; i < filesToRead.length; i++) {
+      reads.push(new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result as string)
+        reader.onerror = () => reject(new Error('Failed to read file'))
+        reader.readAsDataURL(filesToRead[i])
+      }))
+    }
+    Promise.allSettled(reads).then(results => {
+      const dataURLs: string[] = []
+      for (const r of results) {
+        if (r.status === 'fulfilled') dataURLs.push(r.value)
+      }
+      if (dataURLs.length > 0) {
+        setInputImageDataURLs(prev => [...prev, ...dataURLs].slice(0, MAX_INPUT_IMAGES))
+      }
+      if (dataURLs.length < results.length) {
+        showToast(t('images.loadFailed'), 'error')
+      }
+    })
+    e.target.value = ''
+  }, [showToast, t, inputImageDataURLs])
 
   useEffect(() => {
     if (view && !IMAGE_VIEWS.includes(view as ImageView)) {
@@ -762,17 +803,27 @@ export default function ImageStudio() {
     if (style.trim()) payload.style = style.trim()
     if (apiKeyID) payload.api_key_id = Number(apiKeyID)
     if (selectedTemplateId) payload.template_id = selectedTemplateId
+    if (imageToImageMode && inputImageDataURLs.length > 0) payload.input_images = inputImageDataURLs
     return payload
   }
 
-  const submitJob = async (payload = createJobPayload()) => {
+  const submitJob = async (payload = createJobPayload(), forceMode?: 'text' | 'edit') => {
+    const isEditMode = forceMode != null
+      ? forceMode === 'edit'
+      : Array.isArray(payload.input_images) && payload.input_images.length > 0
     if (!payload.prompt.trim()) {
       showToast(t('images.promptRequired'), 'error')
       return
     }
+    if (isEditMode && (!payload.input_images || payload.input_images.length === 0)) {
+      showToast(t('images.inputImageRequired'), 'error')
+      return
+    }
     setSubmitting(true)
     try {
-      const res = await api.createImageJob(payload)
+      const res = isEditMode
+        ? await api.createImageEditJob(payload)
+        : await api.createImageJob(payload)
       setCurrentJob(res.job)
       await loadJobs()
       showToast(t('images.jobCreated'), 'success')
@@ -787,6 +838,7 @@ export default function ImageStudio() {
     const params = jobParams(job)
     const nextModel = params.model || 'gpt-image-2'
     const nextSize = normalizeImageSizeForModel(nextModel, params.size || 'auto')
+    const isEditJob = params.input_images && params.input_images.length > 0
     setPrompt(job.prompt)
     setModel(nextModel)
     setSize(nextSize)
@@ -796,6 +848,13 @@ export default function ImageStudio() {
     setUpscale(normalizeUpscale(params.upscale))
     setStyle(params.style || '')
     setSelectedTemplateId(params.template_id ? Number(params.template_id) : null)
+    if (isEditJob) {
+      setImageToImageMode(true)
+      setInputImageDataURLs(params.input_images!)
+    } else {
+      setImageToImageMode(false)
+      setInputImageDataURLs([])
+    }
     navigate('/images/studio')
     void submitJob({
       prompt: job.prompt,
@@ -808,7 +867,8 @@ export default function ImageStudio() {
       style: params.style,
       api_key_id: apiKeyID ? Number(apiKeyID) : undefined,
       template_id: params.template_id ? Number(params.template_id) : undefined,
-    })
+      input_images: isEditJob ? params.input_images : undefined,
+    }, isEditJob ? 'edit' : 'text')
   }
 
   const rerunFromAsset = (asset: ImageAsset) => {
@@ -925,6 +985,44 @@ export default function ImageStudio() {
     }
   }
 
+  const deleteJob = async (job: ImageGenerationJob) => {
+    const ok = await confirm({
+      title: t('images.deleteJobTitle'),
+      description: t('images.deleteJobDesc', { id: job.id }),
+      confirmText: t('common.delete'),
+      tone: 'destructive',
+    })
+    if (!ok) return
+    try {
+      await api.deleteImageJob(job.id)
+      const jobAssets = job.assets ?? []
+      const deletedAssetIds = new Set(jobAssets.map(asset => asset.id))
+      for (const asset of jobAssets) {
+        const url = assetURLs[asset.id]
+        if (url) URL.revokeObjectURL(url)
+        assetURLRequestsRef.current.delete(asset.id)
+      }
+      await Promise.all(jobAssets.map(asset => deleteCachedImageAsset(asset.id)))
+      setAssetURLs(prev => {
+        const next = { ...prev }
+        deletedAssetIds.forEach(id => {
+          delete next[id]
+        })
+        return next
+      })
+      setAssets(prev => prev.filter(asset => !deletedAssetIds.has(asset.id)))
+      setJobs(prev => prev.filter(item => item.id !== job.id))
+      setHistoryJobs(prev => prev.filter(item => item.id !== job.id))
+      setHistoryTotal(total => Math.max(0, total - 1))
+      setPreviewAsset(prev => prev && deletedAssetIds.has(prev.id) ? null : prev)
+      setCurrentJob(prev => prev?.id === job.id ? null : prev)
+      await Promise.all([loadJobs(), loadAssets(), loadHistoryJobs()])
+      showToast(t('images.jobDeleted'), 'success')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : t('images.deleteFailed'), 'error')
+    }
+  }
+
   const latestAsset = currentJob?.assets?.[0]
   const recentJobs = jobs.slice(0, 3)
   const maxAssetPage = Math.max(1, Math.ceil(assetTotal / IMAGE_ASSET_PAGE_SIZE))
@@ -958,7 +1056,9 @@ export default function ImageStudio() {
     outputFormat !== 'png' ||
     background !== 'auto' ||
     upscale ||
-    apiKeyID
+    apiKeyID ||
+    imageToImageMode ||
+    inputImageDataURLs.length > 0
   )
 
   const clearGenerationForm = () => {
@@ -974,6 +1074,8 @@ export default function ImageStudio() {
     setAPIKeyID('')
     setTemplateName('')
     setTemplateTags('')
+    setImageToImageMode(false)
+    setInputImageDataURLs([])
   }
 
   const changeGenerationModel = (value: string) => {
@@ -992,6 +1094,28 @@ export default function ImageStudio() {
             disabled={templates.length === 0}
           />
         </Field>
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-muted-foreground">{t('images.mode')}:</span>
+          <div className="flex rounded-md border border-input bg-muted/50 p-0.5">
+            <button
+              type="button"
+              className={`rounded-[3px] px-3 py-1 text-xs font-semibold transition-colors ${!imageToImageMode ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => setImageToImageMode(false)}
+            >
+              <ImageIcon className="mr-1 inline-block size-3" />
+              {t('images.textToImage')}
+            </button>
+            <button
+              type="button"
+              className={`rounded-[3px] px-3 py-1 text-xs font-semibold transition-colors ${imageToImageMode ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              onClick={() => setImageToImageMode(true)}
+            >
+              <Upload className="mr-1 inline-block size-3" />
+              {t('images.imageToImage')}
+            </button>
+          </div>
+        </div>
 
         <div className="grid gap-3 md:grid-cols-3">
           <Field label={t('images.model')}><Select value={model} onValueChange={changeGenerationModel} options={IMAGE_MODELS} compact /></Field>
@@ -1015,6 +1139,54 @@ export default function ImageStudio() {
         </Field>
 
         <StylePresetPicker value={style} onChange={setStyle} onApply={() => showToast(t('images.stylePresetApplied'), 'success')} />
+
+        {imageToImageMode && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-muted-foreground">{t('images.inputImage')}</span>
+              <label className="inline-flex cursor-pointer items-center rounded-md px-2 py-1 text-xs font-semibold text-primary hover:bg-primary/10 transition-colors">
+                <Upload className="mr-1 size-3" />
+                {t('images.upload')}
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  className="hidden"
+                  onChange={handleImageFileChange}
+                />
+              </label>
+            </div>
+            {inputImageDataURLs.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {inputImageDataURLs.map((dataURL, index) => (
+                  <div key={`${index}-${dataURL.slice(0, 40)}`} className="group relative">
+                    <img src={dataURL} alt={`Input ${index + 1}`} className="h-20 w-20 rounded-md border border-border object-cover" />
+                    <button
+                      type="button"
+                      className="absolute -top-1.5 -right-1.5 flex size-5 items-center justify-center rounded-full bg-destructive text-destructive-foreground opacity-0 transition-opacity group-hover:opacity-100"
+                      onClick={() => setInputImageDataURLs(prev => prev.filter((_, i) => i !== index))}
+                      title={t('images.removeImage')}
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <label className="flex cursor-pointer flex-col items-center justify-center rounded-md border border-dashed border-border bg-muted/30 py-6 text-center text-xs text-muted-foreground hover:bg-muted/50 transition-colors">
+                <Upload className="mb-1 size-4 opacity-50" />
+                {t('images.inputImageHint')}
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  className="hidden"
+                  onChange={handleImageFileChange}
+                />
+              </label>
+            )}
+          </div>
+        )}
 
         <label className="flex min-h-0 flex-1 flex-col space-y-1.5">
           <span className="text-xs font-semibold text-muted-foreground">{t('images.prompt')}</span>
@@ -1043,7 +1215,7 @@ export default function ImageStudio() {
               <X className="size-4" />
               {t('images.clearSelection')}
             </Button>
-            <Button disabled={submitting || !prompt.trim()} onClick={() => void submitJob()}>
+            <Button disabled={submitting || !prompt.trim()} onClick={() => void submitJob(createJobPayload(), imageToImageMode ? 'edit' : 'text')}>
               {submitting ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
               {t('images.generate')}
             </Button>
@@ -1114,7 +1286,16 @@ export default function ImageStudio() {
       <CardContent className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="font-semibold">{t('images.currentJob')}</h2>
-          {currentJob && <Badge className={jobStatusClass(currentJob.status)}>{t(`images.status.${currentJob.status}`, { defaultValue: currentJob.status })}</Badge>}
+          {currentJob && (
+            <div className="flex items-center gap-1.5">
+              <Badge className={jobStatusClass(currentJob.status)}>{t(`images.status.${currentJob.status}`, { defaultValue: currentJob.status })}</Badge>
+              {!isImageJobBusy(currentJob) && (
+                <Button size="icon-xs" variant="ghost" onClick={() => void deleteJob(currentJob)} aria-label={t('images.deleteJob')} title={t('images.deleteJob')}>
+                  <Trash2 className="size-3" />
+                </Button>
+              )}
+            </div>
+          )}
         </div>
         {currentJob ? (
           <>
@@ -1241,6 +1422,7 @@ export default function ImageStudio() {
             onCopyPrompt={() => void copyPrompt(job.prompt)}
             onRerun={() => rerunFromJob(job)}
             onSaveTemplate={asset => void saveAssetPromptAsTemplate(asset)}
+            onDeleteJob={() => void deleteJob(job)}
             onDelete={asset => void deleteAsset(asset)}
           />
         ))}
@@ -1300,7 +1482,6 @@ export default function ImageStudio() {
         {activeView === 'studio' && <ImageNoticeCarousel />}
       </div>
       <ImageStudioTabs activeView={activeView} />
-      <ToastNotice toast={toast} />
       {confirmDialog}
 
       {activeView === 'studio' && (
@@ -1667,6 +1848,7 @@ function HistoryJobCard({
   onCopyPrompt,
   onRerun,
   onSaveTemplate,
+  onDeleteJob,
   onDelete,
 }: {
   job: ImageGenerationJob
@@ -1677,6 +1859,7 @@ function HistoryJobCard({
   onCopyPrompt: () => void
   onRerun: () => void
   onSaveTemplate: (asset: ImageAsset) => void
+  onDeleteJob: () => void
   onDelete: (asset: ImageAsset) => void
 }) {
   const { t } = useTranslation()
@@ -1700,6 +1883,9 @@ function HistoryJobCard({
               <Button size="xs" variant="outline" onClick={onSelect}>{t('images.selectJob')}</Button>
               <Button size="icon-xs" variant="ghost" onClick={onCopyPrompt} aria-label={t('images.copyPrompt')} title={t('images.copyPrompt')}><Copy className="size-3" /></Button>
               <Button size="icon-xs" variant="ghost" onClick={onRerun} aria-label={t('images.rerun')} title={t('images.rerun')}><RefreshCcw className="size-3" /></Button>
+              {!isImageJobBusy(job) && (
+                <Button size="icon-xs" variant="ghost" onClick={onDeleteJob} aria-label={t('images.deleteJob')} title={t('images.deleteJob')}><Trash2 className="size-3" /></Button>
+              )}
             </div>
           </div>
 

@@ -115,7 +115,7 @@ func Load(envPath string) (*Config, error) {
 
 	cfg := &Config{
 		Port:               8080,
-		MaxRequestBodySize: 32 * 1024 * 1024,
+		MaxRequestBodySize: 48 * 1024 * 1024,
 	}
 	zeaburEnv := isZeaburEnvironment()
 

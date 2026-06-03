@@ -5,13 +5,12 @@ import { api, clearAdminKey, resetAdminAuthState } from '../api'
 import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
-import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { HealthResponse, ModelInfo, SystemSettings } from '../types'
+import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
-import { DEFAULT_SITE_LOGO, sanitizeBrandingLogo, useBranding } from '../branding'
+import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -30,15 +29,25 @@ import { cn } from '@/lib/utils'
 import { ExternalLink, RefreshCw, Save, Trash2, Upload, X } from 'lucide-react'
 
 type ModelMappingEntry = [string, string]
+const EMPTY_MODEL_MAPPING_ENTRIES: ModelMappingEntry[] = []
+type ReasoningEffortModelEntry = {
+  model: string
+  effort: string
+}
+const EMPTY_REASONING_EFFORT_MODEL_ENTRIES: ReasoningEffortModelEntry[] = []
+const REASONING_EFFORT_OPTIONS = ['low', 'medium', 'high', 'xhigh'].map((effort) => ({
+  label: effort,
+  value: effort,
+}))
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
 
-const parseModelMappingEntries = (value: string): ModelMappingEntry[] => {
+const parseModelMappingEntries = (value: string, fallbackEntries: ModelMappingEntry[] = []): ModelMappingEntry[] => {
   try {
     const parsed = JSON.parse(value || '{}')
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return getDefaultModelMappingEntries()
+      return fallbackEntries
     }
 
     const entries = Object.entries(parsed).map(([key, model]) => [
@@ -46,10 +55,10 @@ const parseModelMappingEntries = (value: string): ModelMappingEntry[] => {
       typeof model === 'string' ? model : String(model ?? ''),
     ]) as ModelMappingEntry[]
 
-    // 如果数据库中为空，用默认值填充
-    return entries.length > 0 ? entries : getDefaultModelMappingEntries()
+    // 如果数据库中为空，按调用方提供的默认值填充
+    return entries.length > 0 ? entries : fallbackEntries
   } catch {
-    return getDefaultModelMappingEntries()
+    return fallbackEntries
   }
 }
 
@@ -63,16 +72,100 @@ const serializeModelMappingEntries = (entries: ModelMappingEntry[]) => {
   return JSON.stringify(obj)
 }
 
+const normalizeReasoningEffortValue = (effort: string) => {
+  const value = effort.trim().toLowerCase()
+  if (value === 'max') return 'xhigh'
+  return ['low', 'medium', 'high', 'xhigh'].includes(value) ? value : 'xhigh'
+}
+
+const parseReasoningEffortModelEntries = (value: string): ReasoningEffortModelEntry[] => {
+  try {
+    const parsed = JSON.parse(value || '[]')
+    if (!Array.isArray(parsed)) return EMPTY_REASONING_EFFORT_MODEL_ENTRIES
+    return parsed
+      .map((entry) => ({
+        model: typeof entry?.model === 'string' ? entry.model : '',
+        effort: normalizeReasoningEffortValue(typeof entry?.effort === 'string' ? entry.effort : 'xhigh'),
+      }))
+      .filter((entry) => entry.model.trim())
+  } catch {
+    return EMPTY_REASONING_EFFORT_MODEL_ENTRIES
+  }
+}
+
+const serializeReasoningEffortModelEntries = (entries: ReasoningEffortModelEntry[]) => {
+  const seen = new Set<string>()
+  const normalized: ReasoningEffortModelEntry[] = []
+  for (const entry of entries) {
+    const model = entry.model.trim()
+    const effort = normalizeReasoningEffortValue(entry.effort)
+    if (!model) continue
+    const key = `${model.toLowerCase()}(${effort})`
+    if (seen.has(key)) continue
+    seen.add(key)
+    normalized.push({ model, effort })
+  }
+  return JSON.stringify(normalized)
+}
+
+const reasoningEffortAlias = (entry: ReasoningEffortModelEntry) => {
+  const model = entry.model.trim()
+  const effort = normalizeReasoningEffortValue(entry.effort)
+  return model ? `${model}(${effort})` : ''
+}
+
 // 模型映射编辑器组件
-function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function ModelMappingEditor({
+  value,
+  onChange,
+  fallbackEntries = EMPTY_MODEL_MAPPING_ENTRIES,
+  sourceOptions,
+  targetOptions,
+  sourceLabel,
+  targetLabel,
+  sourcePlaceholder,
+  targetPlaceholder,
+}: {
+  value: string
+  onChange: (v: string) => void
+  fallbackEntries?: ModelMappingEntry[]
+  sourceOptions?: Array<{ label: string; value: string }>
+  targetOptions?: Array<{ label: string; value: string }>
+  sourceLabel: string
+  targetLabel: string
+  sourcePlaceholder: string
+  targetPlaceholder: string
+}) {
   const { t } = useTranslation()
-  const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value))
+  const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value, fallbackEntries))
   const lastEmittedValueRef = useRef<string | null>(null)
+  const sourceSelectOptions = useMemo(() => {
+    if (!sourceOptions) return []
+    const byValue = new Map(sourceOptions.map((option) => [option.value, option]))
+    for (const [source] of mappings) {
+      const value = source.trim()
+      if (value && !byValue.has(value)) {
+        byValue.set(value, { label: value, value })
+      }
+    }
+    return [...byValue.values()]
+  }, [mappings, sourceOptions])
+  const targetSelectOptions = useMemo(() => {
+    if (!targetOptions) return []
+    const byValue = new Map(targetOptions.map((option) => [option.value, option]))
+    for (const [, target] of mappings) {
+      const value = target.trim()
+      if (value && !byValue.has(value)) {
+        byValue.set(value, { label: value, value })
+      }
+    }
+    return [...byValue.values()]
+  }, [mappings, targetOptions])
 
   useEffect(() => {
     if (value === lastEmittedValueRef.current) return
-    setMappings(parseModelMappingEntries(value))
-  }, [value])
+    setMappings(parseModelMappingEntries(value, fallbackEntries))
+  }, [fallbackEntries, value])
 
   const updateMappings = (entries: ModelMappingEntry[]) => {
     setMappings(entries)
@@ -94,31 +187,56 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
   }
 
   const handleAdd = () => {
-    updateMappings([...mappings, ['', '']])
+    const defaultSource = sourceOptions && targetOptions
+      ? sourceOptions[1]?.value ?? sourceOptions[0]?.value ?? ''
+      : sourceOptions?.[0]?.value ?? ''
+    updateMappings([...mappings, [defaultSource, targetOptions?.[0]?.value ?? '']])
   }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
       <div className="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] gap-1.5 px-1 text-xs font-semibold text-muted-foreground">
-        <span>{t('settings2.anthropicModel')}</span>
-        <span>{t('settings2.codexModel')}</span>
+        <span>{sourceLabel}</span>
+        <span>{targetLabel}</span>
         <span />
       </div>
       <div className="min-h-[180px] flex-1 space-y-1.5 overflow-y-auto pr-1">
         {mappings.map(([k, v], i) => (
           <div key={i} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] items-center gap-1.5">
-            <Input
-              className="h-8 px-2 font-mono text-xs"
-              placeholder="claude-opus-4-6"
-              value={k}
-              onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
-            />
-            <Input
-              className="h-8 px-2 font-mono text-xs"
-              placeholder="gpt-5.4"
-              value={v}
-              onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
-            />
+            {sourceOptions ? (
+              <Select
+                compact
+                value={k.trim()}
+                options={sourceSelectOptions}
+                placeholder={sourcePlaceholder}
+                disabled={sourceSelectOptions.length === 0}
+                onValueChange={(next) => handleChange(i, 0, next)}
+              />
+            ) : (
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                placeholder={sourcePlaceholder}
+                value={k}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
+              />
+            )}
+            {targetOptions ? (
+              <Select
+                compact
+                value={v.trim()}
+                options={targetSelectOptions}
+                placeholder={targetPlaceholder}
+                disabled={targetSelectOptions.length === 0}
+                onValueChange={(next) => handleChange(i, 1, next)}
+              />
+            ) : (
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                placeholder={targetPlaceholder}
+                value={v}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
+              />
+            )}
             <button
               type="button"
               onClick={() => handleRemove(i)}
@@ -132,6 +250,106 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
       </div>
       <Button type="button" variant="outline" size="sm" className="self-start" onClick={handleAdd}>
         + {t('settings2.addMapping')}
+      </Button>
+    </div>
+  )
+}
+
+function ReasoningEffortModelsEditor({
+  value,
+  onChange,
+  baseModelOptions,
+}: {
+  value: string
+  onChange: (v: string) => void
+  baseModelOptions: Array<{ label: string; value: string }>
+}) {
+  const { t } = useTranslation()
+  const [entries, setEntries] = useState<ReasoningEffortModelEntry[]>(() => parseReasoningEffortModelEntries(value))
+  const lastEmittedValueRef = useRef<string | null>(null)
+  const modelOptions = useMemo(() => {
+    const byValue = new Map(baseModelOptions.map((option) => [option.value, option]))
+    for (const entry of entries) {
+      const model = entry.model.trim()
+      if (model && !byValue.has(model)) {
+        byValue.set(model, { label: model, value: model })
+      }
+    }
+    return [...byValue.values()]
+  }, [baseModelOptions, entries])
+
+  useEffect(() => {
+    if (value === lastEmittedValueRef.current) return
+    setEntries(parseReasoningEffortModelEntries(value))
+  }, [value])
+
+  const updateEntries = (nextEntries: ReasoningEffortModelEntry[]) => {
+    setEntries(nextEntries)
+    const serialized = serializeReasoningEffortModelEntries(nextEntries)
+    lastEmittedValueRef.current = serialized
+    onChange(serialized)
+  }
+
+  const handleChange = (index: number, patch: Partial<ReasoningEffortModelEntry>) => {
+    const next = entries.map((entry, i) => (i === index ? { ...entry, ...patch } : entry))
+    updateEntries(next)
+  }
+
+  const handleRemove = (index: number) => {
+    updateEntries(entries.filter((_, i) => i !== index))
+  }
+
+  const handleAdd = () => {
+    updateEntries([...entries, { model: baseModelOptions[0]?.value ?? 'gpt-5.5', effort: 'xhigh' }])
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="overflow-x-auto pb-1">
+        <div className="w-fit min-w-[32rem]">
+          <div className="grid shrink-0 grid-cols-[minmax(0,13rem)_8rem_max-content_2rem] gap-2 px-1 text-xs font-semibold text-muted-foreground">
+            <span>{t('settings2.baseModel')}</span>
+            <span>{t('settings2.reasoningEffort')}</span>
+            <span>{t('settings2.generatedModel')}</span>
+            <span />
+          </div>
+          <div className="mt-2 max-h-[220px] space-y-1.5 overflow-y-auto pr-1">
+            {entries.map((entry, i) => (
+              <div key={i} className="grid grid-cols-[minmax(0,13rem)_8rem_max-content_2rem] items-center gap-2">
+                <Select
+                  compact
+                  value={entry.model.trim()}
+                  options={modelOptions}
+                  placeholder={t('settings2.selectBaseModel')}
+                  disabled={modelOptions.length === 0}
+                  onValueChange={(model) => handleChange(i, { model })}
+                />
+                <Select
+                  compact
+                  value={normalizeReasoningEffortValue(entry.effort)}
+                  options={REASONING_EFFORT_OPTIONS}
+                  onValueChange={(effort) => handleChange(i, { effort })}
+                />
+                <div className="flex min-w-0">
+                  <Badge variant="secondary" className="max-w-full px-2 py-1 font-mono text-[11px]">
+                    <span className="truncate">{reasoningEffortAlias(entry) || '-'}</span>
+                  </Badge>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleRemove(i)}
+                  aria-label={t('common.delete')}
+                  className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-500/10"
+                >
+                  <Trash2 className="size-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <Button type="button" variant="outline" size="sm" className="self-start" onClick={handleAdd}>
+        + {t('settings2.addReasoningModel')}
       </Button>
     </div>
   )
@@ -199,7 +417,7 @@ function StatusTile({
   children: ReactNode
 }) {
   return (
-    <div className="flex min-h-[76px] flex-col justify-between gap-2 rounded-lg border border-border bg-muted/25 p-3">
+    <div data-slot="status-tile" className="flex min-h-[76px] flex-col justify-between gap-2 rounded-lg border border-border bg-muted/25 p-3">
       <span className="text-[11px] font-bold uppercase text-muted-foreground">{label}</span>
       <div className="text-sm font-semibold text-foreground">{children}</div>
     </div>
@@ -208,6 +426,8 @@ function StatusTile({
 
 const SITE_LOGO_MAX_BYTES = 600 * 1024
 const SITE_LOGO_CANVAS_SIZE = 80
+const BACKGROUND_IMAGE_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+const BACKGROUND_VIDEO_UPLOAD_MAX_BYTES = 40 * 1024 * 1024
 
 function formatBytesKB(bytes: number) {
   return Math.max(1, Math.round(bytes / 1024))
@@ -219,6 +439,17 @@ function getSiteLogoMimeType(file: File) {
   if (type === 'image/png' || name.endsWith('.png')) return 'image/png'
   if (type === 'image/jpeg' || name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg'
   if (type === 'image/svg+xml' || name.endsWith('.svg')) return 'image/svg+xml'
+  return ''
+}
+
+function getBackgroundImageMimeType(file: File) {
+  const type = file.type.toLowerCase()
+  const name = file.name.toLowerCase()
+  if (type === 'image/png' || name.endsWith('.png')) return 'image/png'
+  if (type === 'image/jpeg' || name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg'
+  if (type === 'image/webp' || name.endsWith('.webp')) return 'image/webp'
+  if (type === 'image/svg+xml' || name.endsWith('.svg')) return 'image/svg+xml'
+  if (type === 'video/mp4' || name.endsWith('.mp4')) return 'video/mp4'
   return ''
 }
 
@@ -342,9 +573,19 @@ async function compressSiteLogoFile(file: File, mimeType: string) {
 export default function Settings() {
   const { t } = useTranslation()
   const { applyBranding } = useBranding()
+  const defaultClaudeModelMappingEntries = useMemo(() => getDefaultModelMappingEntries(), [])
   const booleanOptions = [
     { label: t('common.disabled'), value: 'false' },
     { label: t('common.enabled'), value: 'true' },
+  ]
+  const schedulerModeOptions = [
+    { label: t('settings.schedulerModeRoundRobin'), value: 'round_robin' },
+    { label: t('settings.schedulerModeRemainingQuota'), value: 'remaining_quota' },
+  ]
+  const affinityModeOptions = [
+    { label: t('settings.affinityModeBounded'), value: 'bounded' },
+    { label: t('settings.affinityModeOff'), value: 'off' },
+    { label: t('settings.affinityModeStrict'), value: 'strict' },
   ]
   const clientCompatOptions = [
     { label: t('settings.clientCompatPreserve'), value: 'preserve' },
@@ -356,6 +597,10 @@ export default function Settings() {
     { label: t('settings.usageLogErrors'), value: 'errors' },
     { label: t('settings.usageLogOff'), value: 'off' },
   ]
+  const billingTierPolicyOptions = [
+    { label: t('settings.billingTierPolicyActual'), value: 'actual' },
+    { label: t('settings.billingTierPolicyRequested'), value: 'requested' },
+  ]
   const streamFlushPolicyOptions = [
     { label: t('settings.streamFlushImmediate'), value: 'immediate' },
     { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
@@ -364,16 +609,32 @@ export default function Settings() {
     { label: t('settings.imageStorageLocal'), value: 'local' },
     { label: t('settings.imageStorageS3'), value: 's3' },
   ]
+  const normalizeLazySettingsForm = useCallback((settings: SystemSettings): SystemSettings => {
+    if (!settings.lazy_mode) {
+      return settings
+    }
+    return {
+      ...settings,
+      auto_clean_full_usage: false,
+    }
+  }, [])
   const [settingsForm, setSettingsForm] = useState<SystemSettings>({
     site_name: 'CodexProxy',
     site_logo: '',
+    background_image: '',
+    background_opacity: 18,
+    background_blur: 0,
+    background_glass_opacity: 58,
+    background_glass_blur: 5,
     max_concurrency: 2,
     global_rpm: 0,
     test_model: '',
     test_concurrency: 50,
     background_refresh_interval_minutes: 2,
     usage_probe_max_age_minutes: 10,
+    usage_probe_concurrency: 16,
     recovery_probe_interval_minutes: 30,
+    lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -385,6 +646,11 @@ export default function Settings() {
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
+    codex_force_websocket: false,
+    codex_ws_keepalive_enabled: false,
+    codex_ws_keepalive_interval_sec: 60,
+    scheduler_mode: 'round_robin',
+    affinity_mode: 'bounded',
     max_retries: 2,
     max_rate_limit_retries: 1,
     allow_remote_migration: false,
@@ -393,6 +659,8 @@ export default function Settings() {
     cache_driver: 'redis',
     cache_label: 'Redis',
     model_mapping: '{}',
+    codex_model_mapping: '{}',
+    reasoning_effort_models: '[]',
     resin_url: '',
     resin_platform_name: '',
     prompt_filter_enabled: false,
@@ -411,6 +679,9 @@ export default function Settings() {
     usage_log_flush_interval_seconds: 5,
     stream_flush_policy: 'immediate',
     stream_flush_interval_ms: 20,
+    first_token_timeout_seconds: 0,
+    billing_tier_policy: 'actual',
+    show_full_usage_numbers: false,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',
@@ -420,6 +691,7 @@ export default function Settings() {
     image_s3_prefix: '',
     image_s3_force_path_style: false,
   })
+  const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
@@ -429,12 +701,24 @@ export default function Settings() {
   const [modelsSourceURL, setModelsSourceURL] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
   const logoFileInputRef = useRef<HTMLInputElement>(null)
+  const backgroundFileInputRef = useRef<HTMLInputElement>(null)
+  const persistedBrandingRef = useRef<Partial<SiteBranding> | null>(null)
   const { toast, showToast } = useToast()
 
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
-    setSettingsForm(settings)
-    applyBranding({ site_name: settings.site_name, site_logo: settings.site_logo })
+    setSettingsForm(normalizeLazySettingsForm(settings))
+    const branding = {
+      site_name: settings.site_name,
+      site_logo: settings.site_logo,
+      background_image: settings.background_image,
+      background_opacity: settings.background_opacity,
+      background_blur: settings.background_blur,
+      background_glass_opacity: settings.background_glass_opacity,
+      background_glass_blur: settings.background_glass_blur,
+    }
+    persistedBrandingRef.current = branding
+    applyBranding(branding)
     setLoadedAdminSecret(settings.admin_secret ?? '')
     setModelList(modelsResp.models ?? [])
     setModelItems(modelsResp.items ?? [])
@@ -443,7 +727,7 @@ export default function Settings() {
     return {
       health,
     }
-  }, [applyBranding])
+  }, [applyBranding, normalizeLazySettingsForm])
 
   const { data, loading, error, reload } = useDataLoader<{
     health: HealthResponse | null
@@ -458,9 +742,19 @@ export default function Settings() {
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const updated = await api.updateSettings(settingsForm)
-      setSettingsForm(updated)
-      applyBranding({ site_name: updated.site_name, site_logo: updated.site_logo })
+      const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
+      setSettingsForm(normalizeLazySettingsForm(updated))
+      const branding = {
+        site_name: updated.site_name,
+        site_logo: updated.site_logo,
+        background_image: updated.background_image,
+        background_opacity: updated.background_opacity,
+        background_blur: updated.background_blur,
+        background_glass_opacity: updated.background_glass_opacity,
+        background_glass_blur: updated.background_glass_blur,
+      }
+      persistedBrandingRef.current = branding
+      applyBranding(branding)
       setLoadedAdminSecret(updated.admin_secret ?? '')
       if (adminSecretChanged && updated.admin_auth_source !== 'env') {
         await api.logoutAdminSession().catch(() => undefined)
@@ -482,6 +776,36 @@ export default function Settings() {
       setSavingSettings(false)
     }
   }
+
+  useEffect(() => {
+    if (!persistedBrandingRef.current) return
+    applyBranding({
+      site_name: settingsForm.site_name,
+      site_logo: settingsForm.site_logo,
+      background_image: settingsForm.background_image,
+      background_opacity: settingsForm.background_opacity,
+      background_blur: settingsForm.background_blur,
+      background_glass_opacity: settingsForm.background_glass_opacity,
+      background_glass_blur: settingsForm.background_glass_blur,
+    })
+  }, [
+    applyBranding,
+    settingsForm.site_name,
+    settingsForm.site_logo,
+    settingsForm.background_image,
+    settingsForm.background_opacity,
+    settingsForm.background_blur,
+    settingsForm.background_glass_opacity,
+    settingsForm.background_glass_blur,
+  ])
+
+  useEffect(() => {
+    return () => {
+      if (persistedBrandingRef.current) {
+        applyBranding(persistedBrandingRef.current)
+      }
+    }
+  }, [applyBranding])
 
   const handleSiteLogoUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -507,6 +831,34 @@ export default function Settings() {
       }
     } catch {
       showToast(t('settings.siteLogoCompressionFailed'), 'error')
+    }
+  }
+
+  const handleBackgroundImageUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    const mimeType = getBackgroundImageMimeType(file)
+    if (!mimeType) {
+      showToast(t('settings.backgroundImageInvalidType'), 'error')
+      return
+    }
+    const maxBytes = mimeType === 'video/mp4' ? BACKGROUND_VIDEO_UPLOAD_MAX_BYTES : BACKGROUND_IMAGE_UPLOAD_MAX_BYTES
+    if (file.size > maxBytes) {
+      showToast(t(mimeType === 'video/mp4' ? 'settings.backgroundVideoTooLarge' : 'settings.backgroundImageTooLarge'), 'error')
+      return
+    }
+
+    try {
+      const uploaded = await api.uploadBackground(file)
+      setSettingsForm((f) => ({
+        ...f,
+        background_image: uploaded.url,
+        background_opacity: f.background_opacity || 18,
+      }))
+      showToast(t('settings.backgroundImageUploaded'))
+    } catch (err) {
+      showToast(getErrorMessage(err) || t('settings.backgroundImageUploadFailed'), 'error')
     }
   }
 
@@ -557,6 +909,8 @@ export default function Settings() {
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
   const siteLogoPreview = sanitizeBrandingLogo(settingsForm.site_logo) || DEFAULT_SITE_LOGO
+  const backgroundImagePreview = sanitizeBrandingImage(settingsForm.background_image)
+  const backgroundIsVideo = isBrandingVideo(backgroundImagePreview)
   const visibleModelItems = useMemo(() => {
     if (modelItems.length > 0) {
       return modelItems
@@ -570,8 +924,21 @@ export default function Settings() {
       api_key_auth_available: id !== 'gpt-5.5',
     }))
   }, [modelItems, modelList])
+  const codexModelOptions = visibleModelItems
+    .filter((model) =>
+      model.enabled &&
+      !model.id.includes('(') &&
+      !model.id.includes(')')
+    )
+    .map((model) => ({ label: model.id, value: model.id }))
   const textModelOptions = visibleModelItems
-    .filter((model) => model.enabled && model.category !== 'image' && !model.id.includes('image'))
+    .filter((model) =>
+      model.enabled &&
+      model.category !== 'image' &&
+      !model.id.includes('image') &&
+      !model.id.includes('(') &&
+      !model.id.includes(')')
+    )
     .map((model) => ({ label: model.id, value: model.id }))
   const enabledModelCount = visibleModelItems.filter((model) => model.enabled).length
   const modelsLastSyncedLabel = modelsLastSyncedAt ? formatBeijingTime(modelsLastSyncedAt) : t('settings.modelsNeverSynced')
@@ -627,9 +994,9 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.05fr)]">
+          <div className="grid gap-4 xl:grid-cols-3">
             <SettingsCard title={t('settings.trafficProtection')}>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-4">
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
                 <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')}>
                   <Input
                     type="number"
@@ -668,14 +1035,66 @@ export default function Settings() {
               </div>
             </SettingsCard>
 
-            <SettingsCard title={t('settings.scheduler')}>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4">
+            <SettingsCard title={t('settings.probeScheduling')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
+                <SettingField label={t('settings.backgroundRefreshInterval')} description={t('settings.backgroundRefreshIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={lazyModeActive ? 0 : settingsForm.background_refresh_interval_minutes}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.usageProbeMaxAge')} description={t('settings.usageProbeMaxAgeDesc')}>
+                  <Input
+                    type={lazyModeActive ? 'text' : 'number'}
+                    min={1}
+                    max={10080}
+                    value={lazyModeActive ? '∞' : settingsForm.usage_probe_max_age_minutes}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.usageProbeConcurrency')} description={t('settings.usageProbeConcurrencyDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={128}
+                    value={settingsForm.usage_probe_concurrency}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_concurrency: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
+                  <Input
+                    type={lazyModeActive ? 'text' : 'number'}
+                    min={1}
+                    max={10080}
+                    value={lazyModeActive ? '∞' : settingsForm.recovery_probe_interval_minutes}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.lazyMode')} description={t('settings.lazyModeDesc')}>
+                  <Select
+                    value={settingsForm.lazy_mode ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => normalizeLazySettingsForm({ ...f, lazy_mode: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
+              </div>
+            </SettingsCard>
+
+            <SettingsCard title={t('settings.schedulingStrategy')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
                 <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
-	                  <Select
-	                    value={settingsForm.test_model}
-	                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
-	                    options={textModelOptions}
-	                  />
+                  <Select
+                    value={settingsForm.test_model}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
+                    options={textModelOptions}
+                  />
                 </SettingField>
                 <SettingField label={t('settings.testConcurrency')} description={t('settings.testConcurrencyRange')}>
                   <Input
@@ -686,33 +1105,6 @@ export default function Settings() {
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
                   />
                 </SettingField>
-                <SettingField label={t('settings.backgroundRefreshInterval')} description={t('settings.backgroundRefreshIntervalDesc')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={1440}
-                    value={settingsForm.background_refresh_interval_minutes}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.usageProbeMaxAge')} description={t('settings.usageProbeMaxAgeDesc')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={10080}
-                    value={settingsForm.usage_probe_max_age_minutes}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={10080}
-                    value={settingsForm.recovery_probe_interval_minutes}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
-                  />
-                </SettingField>
                 <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')}>
                   <Select
                     value={settingsForm.fast_scheduler_enabled ? 'true' : 'false'}
@@ -720,9 +1112,51 @@ export default function Settings() {
                     options={booleanOptions}
                   />
                 </SettingField>
+                <SettingField label={t('settings.schedulerMode')} description={t('settings.schedulerModeDesc')}>
+                  <Select
+                    value={settingsForm.scheduler_mode}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, scheduler_mode: value }))}
+                    options={schedulerModeOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.affinityMode')} description={t('settings.affinityModeDesc')}>
+                  <Select
+                    value={settingsForm.affinity_mode || 'bounded'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, affinity_mode: value }))}
+                    options={affinityModeOptions}
+                  />
+                </SettingField>
               </div>
             </SettingsCard>
           </div>
+
+          <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
+              <SettingField label={t('settings.codexForceWebsocket')} description={t('settings.codexForceWebsocketDesc')}>
+                <Select
+                  value={settingsForm.codex_force_websocket ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_force_websocket: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexWSKeepaliveEnabled')} description={t('settings.codexWSKeepaliveEnabledDesc')}>
+                <Select
+                  value={settingsForm.codex_ws_keepalive_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_ws_keepalive_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexWSKeepaliveInterval')} description={t('settings.codexWSKeepaliveIntervalDesc')}>
+                <Input
+                  type="number"
+                  min={10}
+                  max={600}
+                  value={settingsForm.codex_ws_keepalive_interval_sec}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_ws_keepalive_interval_sec: parseInt(e.target.value) || 60 }))}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
 
           <SettingsCard title={t('settings.runtimeOptimization')} description={t('settings.runtimeOptimizationDesc')}>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
@@ -764,6 +1198,13 @@ export default function Settings() {
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_log_flush_interval_seconds: parseInt(e.target.value) || 5 }))}
                 />
               </SettingField>
+              <SettingField label={t('settings.billingTierPolicy')} description={t('settings.billingTierPolicyDesc')}>
+                <Select
+                  value={settingsForm.billing_tier_policy}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, billing_tier_policy: value }))}
+                  options={billingTierPolicyOptions}
+                />
+              </SettingField>
               <SettingField label={t('settings.streamFlushPolicy')} description={t('settings.streamFlushPolicyDesc')}>
                 <Select
                   value={settingsForm.stream_flush_policy}
@@ -778,6 +1219,15 @@ export default function Settings() {
                   max={1000}
                   value={settingsForm.stream_flush_interval_ms}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: parseInt(e.target.value) || 20 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.firstTokenTimeout')} description={t('settings.firstTokenTimeoutDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={600}
+                  value={settingsForm.first_token_timeout_seconds}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, first_token_timeout_seconds: parseInt(e.target.value) || 0 }))}
                 />
               </SettingField>
             </div>
@@ -879,8 +1329,9 @@ export default function Settings() {
               </SettingField>
               <SettingField label={t('settings.autoCleanFullUsage')} description={t('settings.autoCleanFullUsageDesc')}>
                 <Select
-                  value={settingsForm.auto_clean_full_usage ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_full_usage: value === 'true' }))}
+                  value={lazyModeActive ? 'false' : settingsForm.auto_clean_full_usage ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => normalizeLazySettingsForm({ ...f, auto_clean_full_usage: value === 'true' }))}
+                  disabled={lazyModeActive}
                   options={booleanOptions}
                 />
               </SettingField>
@@ -1032,9 +1483,137 @@ export default function Settings() {
                     ]}
                   />
                 </SettingField>
+                <SettingField label={t('settings.showFullUsageNumbers')} description={t('settings.showFullUsageNumbersDesc')}>
+                  <Select
+                    value={settingsForm.show_full_usage_numbers ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, show_full_usage_numbers: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
               </div>
             </SettingsCard>
           </div>
+
+          <SettingsCard title={t('settings.backgroundImage')} description={t('settings.backgroundImageDesc')}>
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(340px,0.65fr)]">
+              <div className="relative aspect-[16/7] min-h-[220px] overflow-hidden rounded-lg border border-border bg-muted/40 shadow-sm max-sm:aspect-[4/3]">
+                {backgroundImagePreview && backgroundIsVideo ? (
+                  <video
+                    src={backgroundImagePreview}
+                    className="size-full object-cover"
+                    style={{
+                      opacity: Math.min(100, Math.max(0, settingsForm.background_opacity)) / 100,
+                      filter: settingsForm.background_blur > 0 ? `blur(${settingsForm.background_blur}px)` : undefined,
+                      transform: settingsForm.background_blur > 0 ? 'scale(1.04)' : undefined,
+                    }}
+                    autoPlay
+                    muted
+                    loop
+                    playsInline
+                  />
+                ) : backgroundImagePreview ? (
+                  <img
+                    src={backgroundImagePreview}
+                    alt=""
+                    className="size-full object-cover"
+                    style={{
+                      opacity: Math.min(100, Math.max(0, settingsForm.background_opacity)) / 100,
+                      filter: settingsForm.background_blur > 0 ? `blur(${settingsForm.background_blur}px)` : undefined,
+                      transform: settingsForm.background_blur > 0 ? 'scale(1.04)' : undefined,
+                    }}
+                  />
+                ) : (
+                  <div className="flex size-full items-center justify-center text-xs font-medium text-muted-foreground">
+                    {t('settings.backgroundImageEmpty')}
+                  </div>
+                )}
+              </div>
+              <div className="flex min-w-0 flex-col justify-between gap-5">
+                <div className="min-w-0 space-y-3">
+                  <Input
+                    value={settingsForm.background_image}
+                    placeholder="/wallpaper.jpg or https://..."
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_image: e.target.value }))}
+                  />
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="button" variant="outline" size="sm" onClick={() => backgroundFileInputRef.current?.click()}>
+                      <Upload className="size-4" />
+                      {t('settings.backgroundImageUpload')}
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setSettingsForm(f => ({ ...f, background_image: '' }))}>
+                      <X className="size-4" />
+                      {t('settings.backgroundImageReset')}
+                    </Button>
+                  </div>
+                  <input
+                    ref={backgroundFileInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/svg+xml,video/mp4,.png,.jpg,.jpeg,.webp,.svg,.mp4"
+                    className="hidden"
+                    onChange={handleBackgroundImageUpload}
+                  />
+                </div>
+                <div className="grid gap-4">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-3 text-xs font-semibold text-muted-foreground">
+                      <span>{t('settings.backgroundOpacity')}</span>
+                      <span>{settingsForm.background_opacity}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={settingsForm.background_opacity}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_opacity: parseInt(e.target.value) || 0 }))}
+                      className="w-full accent-primary"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-3 text-xs font-semibold text-muted-foreground">
+                      <span>{t('settings.backgroundBlur')}</span>
+                      <span>{settingsForm.background_blur}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={24}
+                      value={settingsForm.background_blur}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_blur: parseInt(e.target.value) || 0 }))}
+                      className="w-full accent-primary"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-3 text-xs font-semibold text-muted-foreground">
+                      <span>{t('settings.backgroundGlassOpacity')}</span>
+                      <span>{settingsForm.background_glass_opacity}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={settingsForm.background_glass_opacity}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_glass_opacity: parseInt(e.target.value) || 0 }))}
+                      className="w-full accent-primary"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-3 text-xs font-semibold text-muted-foreground">
+                      <span>{t('settings.backgroundGlassBlur')}</span>
+                      <span>{settingsForm.background_glass_blur}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={20}
+                      value={settingsForm.background_glass_blur}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_glass_blur: parseInt(e.target.value) || 0 }))}
+                      className="w-full accent-primary"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </SettingsCard>
 
           <SettingsCard title={showConnectionPool ? t('settings.connectionPool') : t('settings.resinTitle')} description={showConnectionPool ? undefined : t('settings.resinDesc')}>
             <div className="space-y-5">
@@ -1125,7 +1704,11 @@ export default function Settings() {
                     <div key={model.id} className="flex h-fit flex-wrap items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1.5">
                       <span className="font-mono text-xs font-semibold text-foreground">{model.id}</span>
                       <Badge variant={model.source === 'official_codex_docs' ? 'default' : 'secondary'} className="text-[11px]">
-                        {model.source === 'official_codex_docs' ? t('settings.modelSourceOfficial') : t('settings.modelSourceBuiltin')}
+                        {model.source === 'official_codex_docs'
+                          ? t('settings.modelSourceOfficial')
+                          : model.source === 'reasoning_effort'
+                            ? t('settings.modelSourceReasoning')
+                            : t('settings.modelSourceBuiltin')}
                       </Badge>
                       {model.pro_only ? <Badge variant="outline" className="text-[11px]">{t('settings.modelProOnly')}</Badge> : null}
                       {model.category === 'image' ? <Badge variant="outline" className="text-[11px]">{t('settings.modelImage')}</Badge> : null}
@@ -1136,14 +1719,50 @@ export default function Settings() {
             </SettingsCard>
 
             <SettingsCard
-              title={t('settings2.modelMapping')}
-              description={t('settings2.modelMappingDesc')}
+              title={t('settings2.anthropicModelMapping')}
+              description={t('settings2.anthropicModelMappingDesc')}
               className="h-full xl:h-[430px]"
               contentClassName="flex h-full min-h-0 flex-col"
             >
               <ModelMappingEditor
                 value={settingsForm.model_mapping}
                 onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
+                fallbackEntries={defaultClaudeModelMappingEntries}
+                sourceLabel={t('settings2.anthropicModel')}
+                targetLabel={t('settings2.codexModel')}
+                sourcePlaceholder="claude-opus-4-6"
+                targetPlaceholder="gpt-5.5"
+              />
+            </SettingsCard>
+
+            <SettingsCard
+              title={t('settings2.codexModelMapping')}
+              description={t('settings2.codexModelMappingDesc')}
+              className="h-full xl:h-[430px]"
+              contentClassName="flex h-full min-h-0 flex-col"
+            >
+              <ModelMappingEditor
+                value={settingsForm.codex_model_mapping}
+                onChange={(v) => setSettingsForm(f => ({ ...f, codex_model_mapping: v }))}
+                sourceOptions={codexModelOptions}
+                targetOptions={codexModelOptions}
+                sourceLabel={t('settings2.requestedModel')}
+                targetLabel={t('settings2.targetModel')}
+                sourcePlaceholder="gpt-5.2"
+                targetPlaceholder="gpt-5.5"
+              />
+            </SettingsCard>
+
+            <SettingsCard
+              title={t('settings2.reasoningEffortModels')}
+              description={t('settings2.reasoningEffortModelsDesc')}
+              className="h-full xl:h-[430px]"
+              contentClassName="flex h-full min-h-0 flex-col"
+            >
+              <ReasoningEffortModelsEditor
+                value={settingsForm.reasoning_effort_models}
+                onChange={(v) => setSettingsForm(f => ({ ...f, reasoning_effort_models: v }))}
+                baseModelOptions={textModelOptions}
               />
             </SettingsCard>
           </div>
@@ -1201,7 +1820,6 @@ export default function Settings() {
           </div>
         </div>
 
-        <ToastNotice toast={toast} />
       </>
     </StateShell>
   )

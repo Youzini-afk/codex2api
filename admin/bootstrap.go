@@ -2,7 +2,9 @@ package admin
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -55,6 +58,140 @@ func bootstrapAllowRate() bool {
 	return newCount <= bootstrapMaxPerWin
 }
 
+func bootstrapAllowClientIP(clientIP string) bool {
+	ip := net.ParseIP(strings.TrimSpace(clientIP))
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, cidr := range strings.Split(os.Getenv("BOOTSTRAP_ALLOWED_CIDR"), ",") {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstForwardedHeaderValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if idx := strings.Index(value, ","); idx >= 0 {
+		value = value[:idx]
+	}
+	return strings.TrimSpace(value)
+}
+
+func bootstrapPublicBaseURL(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	proto := firstForwardedHeaderValue(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if r.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+	host := firstForwardedHeaderValue(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" {
+		return ""
+	}
+	return strings.TrimRight(proto+"://"+host, "/")
+}
+
+func bootstrapDatabaseLocation(driver string) string {
+	if strings.EqualFold(driver, "sqlite") {
+		return strings.TrimSpace(os.Getenv("DATABASE_PATH"))
+	}
+	host := strings.TrimSpace(os.Getenv("DATABASE_HOST"))
+	name := strings.TrimSpace(os.Getenv("DATABASE_NAME"))
+	port := strings.TrimSpace(os.Getenv("DATABASE_PORT"))
+	if host == "" || name == "" {
+		return ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return host + "/" + name
+}
+
+func (h *Handler) bootstrapSetupHints(r *http.Request) gin.H {
+	serviceURL := bootstrapPublicBaseURL(r)
+	adminURL := ""
+	apiBaseURL := ""
+	if serviceURL != "" {
+		adminURL = strings.TrimRight(serviceURL, "/") + "/admin/"
+		apiBaseURL = strings.TrimRight(serviceURL, "/") + "/v1"
+	}
+	databaseDriver := h.databaseDriver
+	databaseLabel := h.databaseLabel
+	if databaseDriver == "" && h.db != nil {
+		databaseDriver = h.db.Driver()
+	}
+	if databaseLabel == "" && h.db != nil {
+		databaseLabel = h.db.Label()
+	}
+	cacheDriver := h.cacheDriver
+	cacheLabel := h.cacheLabel
+	if cacheDriver == "" && h.cache != nil {
+		cacheDriver = h.cache.Driver()
+	}
+	if cacheLabel == "" && h.cache != nil {
+		cacheLabel = h.cache.Label()
+	}
+
+	usageLogMode := database.UsageLogModeFull
+	usageLogBatchSize := 200
+	usageLogFlushIntervalSeconds := 5
+	if h.db != nil {
+		usageLogMode = h.db.GetUsageLogMode()
+		usageLogBatchSize = h.db.GetUsageLogBatchSize()
+		usageLogFlushIntervalSeconds = h.db.GetUsageLogFlushIntervalSeconds()
+	}
+
+	imageBackend := imagestore.CurrentConfig().Backend
+	if imageBackend == "" {
+		imageBackend = imagestore.BackendLocal
+	}
+
+	return gin.H{
+		"service_url":  serviceURL,
+		"admin_url":    adminURL,
+		"api_base_url": apiBaseURL,
+		"database": gin.H{
+			"driver":   databaseDriver,
+			"label":    databaseLabel,
+			"location": bootstrapDatabaseLocation(databaseDriver),
+		},
+		"cache": gin.H{
+			"driver": cacheDriver,
+			"label":  cacheLabel,
+		},
+		"data": gin.H{
+			"image_local_dir":       imageAssetDir(),
+			"image_storage_backend": imageBackend,
+		},
+		"usage": gin.H{
+			"log_mode":               usageLogMode,
+			"batch_size":             usageLogBatchSize,
+			"flush_interval_seconds": usageLogFlushIntervalSeconds,
+		},
+	}
+}
+
 // GetBootstrapStatus 返回当前是否需要执行初始化（GET /api/admin/bootstrap-status）。
 //
 // 该端点不要求鉴权，前端 AuthGate 在拿到登录界面前会先轮询此端点：
@@ -93,7 +230,16 @@ func (h *Handler) GetBootstrapStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"needs_bootstrap": true,
 		"source":          "empty",
+		"setup":           h.bootstrapSetupHints(c.Request),
 	})
+}
+
+// GetSetupHints 返回登录后的部署检查信息。
+//
+// 与公开的 bootstrap-status 不同，该接口注册在 /api/admin 下，需要管理密钥，
+// 因此可以安全返回数据库位置、图片目录等部署诊断信息。
+func (h *Handler) GetSetupHints(c *gin.Context) {
+	c.JSON(http.StatusOK, h.bootstrapSetupHints(c.Request))
 }
 
 // PostBootstrap 接收用户在浏览器中输入的初始管理密钥并写入数据库。
@@ -105,6 +251,12 @@ func (h *Handler) GetBootstrapStatus(c *gin.Context) {
 //  4. 校验最小长度（8 个 rune），避免过弱密钥；
 //  5. 全程审计日志。
 func (h *Handler) PostBootstrap(c *gin.Context) {
+	if !bootstrapAllowClientIP(c.ClientIP()) {
+		security.SecurityAuditLog("BOOTSTRAP_REJECTED_IP", "ip="+c.ClientIP())
+		c.JSON(http.StatusForbidden, gin.H{"error": "当前来源不允许执行初始化"})
+		return
+	}
+
 	if !bootstrapAllowRate() {
 		security.SecurityAuditLog("BOOTSTRAP_RATE_LIMITED", "ip="+c.ClientIP())
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
@@ -191,6 +343,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		BackgroundRefreshIntervalMinutes: 2,
 		UsageProbeMaxAgeMinutes:          10,
 		RecoveryProbeIntervalMinutes:     30,
+		LazyMode:                         false,
 		PgMaxConns:                       50,
 		RedisPoolSize:                    30,
 		PromptFilterMode:                 "monitor",
@@ -207,5 +360,8 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		UsageLogFlushIntervalSeconds:     5,
 		StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 		StreamFlushIntervalMS:            20,
+		FirstTokenTimeoutSeconds:         0,
+		BillingTierPolicy:                proxy.BillingTierPolicyActual,
+		AffinityMode:                     "bounded",
 	}
 }

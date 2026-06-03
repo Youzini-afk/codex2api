@@ -43,6 +43,13 @@ const (
 	defaultImages4KSquareSize    = "2880x2880"
 
 	maxGPTImage2Pixels = 8294400
+
+	// maxImageAttempts caps the total number of upstream attempts for image
+	// generation requests, including retries across different accounts.
+	maxImageAttempts = 5
+
+	// MaxImageEditInputCount caps the number of input images for edit requests.
+	MaxImageEditInputCount = 10
 )
 
 type imageCallResult struct {
@@ -78,6 +85,11 @@ func decodeImageBase64(raw string) ([]byte, bool) {
 	if encoded == "" {
 		return nil, false
 	}
+	// Guard against extremely large inputs (100 MB limit).
+	const maxDecodeInputLen = 100 * 1024 * 1024
+	if len(encoded) > maxDecodeInputLen {
+		return nil, false
+	}
 	if strings.HasPrefix(strings.ToLower(encoded), "data:") {
 		if comma := strings.Index(encoded, ","); comma >= 0 {
 			encoded = encoded[comma+1:]
@@ -86,12 +98,24 @@ func decodeImageBase64(raw string) ([]byte, bool) {
 	if strings.ContainsAny(encoded, " \t\r\n") {
 		encoded = strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(encoded)
 	}
-	for _, encoding := range []*base64.Encoding{
+	// Prefer URL-safe encodings when the input contains '-' or '_'
+	// (characters that only appear in URL-safe base64).
+	preferURLSafe := strings.ContainsAny(encoded, "-_")
+	encodings := [4]*base64.Encoding{
 		base64.StdEncoding,
 		base64.RawStdEncoding,
 		base64.URLEncoding,
 		base64.RawURLEncoding,
-	} {
+	}
+	if preferURLSafe {
+		encodings = [4]*base64.Encoding{
+			base64.URLEncoding,
+			base64.RawURLEncoding,
+			base64.StdEncoding,
+			base64.RawStdEncoding,
+		}
+	}
+	for _, encoding := range encodings {
 		data, err := encoding.DecodeString(encoded)
 		if err == nil {
 			return data, true
@@ -550,6 +574,13 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 	if fileHeader == nil {
 		return "", fmt.Errorf("upload file is nil")
 	}
+	const maxImageUploadBytes = 20 * 1024 * 1024
+	if fileHeader.Size > maxImageUploadBytes {
+		return "", fmt.Errorf("upload file too large (%d bytes, max %d)", fileHeader.Size, maxImageUploadBytes)
+	}
+	if fileHeader.Size == 0 {
+		return "", fmt.Errorf("upload file is empty")
+	}
 	file, err := fileHeader.Open()
 	if err != nil {
 		return "", fmt.Errorf("open upload file failed: %w", err)
@@ -589,9 +620,17 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	}
 
 	imageModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	modelProvided := imageModel != ""
 	if imageModel == "" {
 		imageModel = defaultImagesToolModel
 	}
+	requestModel := imageModel
+	if modelProvided {
+		if mappedModel, ok := h.resolveConfiguredRequestModel(imageModel, h.supportedModelIDs(c.Request.Context())); ok {
+			imageModel = mappedModel
+		}
+	}
+	logEffectiveModel := usageEffectiveModelForMapping(requestModel, imageModel, !strings.EqualFold(requestModel, imageModel))
 	if err := validateImagesModel(imageModel); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -606,6 +645,9 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
+		return
+	}
+	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
@@ -624,7 +666,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, nil, tool)
-	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, responsesBody, responseFormat, "image_generation", stream)
+	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_generation", stream)
 }
 
 func (h *Handler) ImagesEdits(c *gin.Context) {
@@ -666,6 +708,10 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: image is required", "type": "invalid_request_error"}})
 		return
 	}
+	if len(imageFiles) > MaxImageEditInputCount {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": fmt.Sprintf("Invalid request: too many input images (%d, max %d)", len(imageFiles), MaxImageEditInputCount), "type": "invalid_request_error"}})
+		return
+	}
 
 	images := make([]string, 0, len(imageFiles))
 	for _, fileHeader := range imageFiles {
@@ -688,9 +734,17 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 
 	imageModel := strings.TrimSpace(c.PostForm("model"))
+	modelProvided := imageModel != ""
 	if imageModel == "" {
 		imageModel = defaultImagesToolModel
 	}
+	requestModel := imageModel
+	if modelProvided {
+		if mappedModel, ok := h.resolveConfiguredRequestModel(imageModel, h.supportedModelIDs(c.Request.Context())); ok {
+			imageModel = mappedModel
+		}
+	}
+	logEffectiveModel := usageEffectiveModelForMapping(requestModel, imageModel, !strings.EqualFold(requestModel, imageModel))
 	if err := validateImagesModel(imageModel); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -707,9 +761,12 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
 		return
 	}
+	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
+		return
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
 }
 
 func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
@@ -770,6 +827,10 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: images[].image_url is required", "type": "invalid_request_error"}})
 		return
 	}
+	if len(images) > MaxImageEditInputCount {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": fmt.Sprintf("Invalid request: too many input images (%d, max %d)", len(images), MaxImageEditInputCount), "type": "invalid_request_error"}})
+		return
+	}
 
 	maskDataURL := strings.TrimSpace(gjson.GetBytes(rawBody, "mask.image_url").String())
 	if maskDataURL == "" && gjson.GetBytes(rawBody, "mask.file_id").Exists() {
@@ -778,9 +839,17 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 
 	imageModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	modelProvided := imageModel != ""
 	if imageModel == "" {
 		imageModel = defaultImagesToolModel
 	}
+	requestModel := imageModel
+	if modelProvided {
+		if mappedModel, ok := h.resolveConfiguredRequestModel(imageModel, h.supportedModelIDs(c.Request.Context())); ok {
+			imageModel = mappedModel
+		}
+	}
+	logEffectiveModel := usageEffectiveModelForMapping(requestModel, imageModel, !strings.EqualFold(requestModel, imageModel))
 	if err := validateImagesModel(imageModel); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -795,6 +864,9 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
+	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
@@ -816,7 +888,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
 }
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
@@ -860,7 +932,10 @@ func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model
 	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
 }
 
-func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
+func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
+	if strings.TrimSpace(logModel) == "" {
+		logModel = requestModel
+	}
 	if err := validateResponsesImageGenerationSizes(responsesBody); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -875,7 +950,10 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < maxImageAttempts; attempt++ {
+		if err := c.Request.Context().Err(); err != nil {
+			return
+		}
 		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts, requestModel)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, nil))
@@ -927,14 +1005,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
-			logUpstreamError(inboundEndpoint, resp.StatusCode, requestModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
+			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          inboundEndpoint,
-				Model:             requestModel,
+				Model:             logModel,
+				EffectiveModel:    logEffectiveModel,
 				StatusCode:        resp.StatusCode,
 				DurationMs:        durationMs,
 				InboundEndpoint:   inboundEndpoint,
@@ -958,7 +1037,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", requestModel)
+		c.Set("x-model", logModel)
 
 		var usage *UsageInfo
 		var firstTokenMs int
@@ -973,18 +1052,62 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			if readErr == nil {
 				c.Data(http.StatusOK, "application/json", out)
 			} else {
+				// Check retryability BEFORE writing error response to avoid
+				// double-write when the error is transient.
+				resp.Body.Close()
+				h.store.Release(account)
+				excludeAccounts[account.ID()] = true
+				if shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) {
+					lastStatusCode = http.StatusBadGateway
+					lastBody = []byte(readErr.Error())
+					continue
+				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
+				h.logUsageForRequest(c, &database.UsageLogInput{
+					AccountID:      account.ID(),
+					Endpoint:       inboundEndpoint,
+					Model:          logModel,
+					EffectiveModel: logEffectiveModel,
+					StatusCode:     http.StatusBadGateway,
+				})
+				return
 			}
 		}
 
 		statusCode := http.StatusOK
 		if readErr != nil {
 			statusCode = http.StatusBadGateway
+			// Retry stream read errors on next account when there are attempts left.
+			// Stream disconnects and upstream image generation failures can be
+			// transient (e.g. upstream model overload, network hiccup).
+			resp.Body.Close()
+			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
+			if shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) {
+				lastStatusCode = statusCode
+				lastBody = []byte(readErr.Error())
+				if !c.Writer.Written() {
+					continue
+				}
+			}
+			// Non-retryable -- deliver error response if nothing written yet.
+			if !c.Writer.Written() {
+				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
+			}
+			h.logUsageForRequest(c, &database.UsageLogInput{
+				AccountID:      account.ID(),
+				Endpoint:       inboundEndpoint,
+				Model:          logModel,
+				EffectiveModel: logEffectiveModel,
+				StatusCode:     http.StatusBadGateway,
+			})
+			return
 		}
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         inboundEndpoint,
-			Model:            requestModel,
+			Model:            logModel,
+			EffectiveModel:   logEffectiveModel,
 			StatusCode:       statusCode,
 			DurationMs:       int(time.Since(start).Milliseconds()),
 			FirstTokenMs:     firstTokenMs,
@@ -1023,7 +1146,38 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		h.store.Release(account)
 		return
 	}
+	// Exhausted all attempts.
+	if lastStatusCode > 0 && len(lastBody) > 0 {
+		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+		return
+	}
+	c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
+}
 
+// shouldRetryImageStreamError determines whether an image generation stream
+// read error warrants retrying on a different account. Transient failures
+// (stream disconnects, upstream model errors) are retryable; permanent
+// failures (content policy, invalid request, quota exhausted) are not.
+func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetries int, attempt int, maxAttempts int) bool {
+	if err == nil || generalRetries == nil || *generalRetries >= maxGeneralRetries {
+		return false
+	}
+	if attempt >= maxAttempts-1 {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// Never retry content policy or safety violations.
+	for _, keyword := range []string{
+		"content_policy", "safety", "cyber_policy",
+		"unsupported_country", "invalid_request",
+	} {
+		if strings.Contains(msg, keyword) {
+			return false
+		}
+	}
+	// Retry transient upstream issues.
+	*generalRetries++
+	return true
 }
 
 func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {

@@ -23,9 +23,10 @@
 
 <table>
 <tr><td width="210"><b>统一兼容入口</b></td><td>同时覆盖 OpenAI 风格 Chat Completions / Responses / Images、Anthropic Messages、无前缀兼容路由和 Codex 原生 Responses 转发，客户端侧少改配置即可接入。</td></tr>
-<tr><td><b>账号池调度核心</b></td><td>围绕账号状态、健康层级、调度分、动态并发、冷却恢复和近期用量做选择，自动避开不可用账号，减少单账号打满和反复失败。</td></tr>
-<tr><td><b>可视化管理后台</b></td><td>内置 React / Vite 管理台，提供账号导入测试、API Key、代理池、生图、Prompt 检查、用量统计、运维概览、调度看板和系统设置。</td></tr>
-<tr><td><b>两种部署形态</b></td><td>生产环境用 PostgreSQL + Redis，单机测试用 SQLite + Memory；Docker 镜像、源码构建、本地开发和一键交互部署脚本都已准备好。</td></tr>
+<tr><td><b>账号池调度核心</b></td><td>围绕账号状态、健康层级、调度分、动态并发、冷却恢复和近期用量做选择，自动避开不可用账号，减少单账号打满和反复失败。支持 <code>round_robin</code> 和 <code>remaining_quota</code> 两种调度模式，以及单账号信用计费标记。</td></tr>
+<tr><td><b>可视化管理后台</b></td><td>内置 React / Vite 管理台，提供账号导入测试、API Key、代理池、生图（文生图 + 图生图）、Prompt 检查、用量统计、运维概览、调度看板和系统设置。</td></tr>
+<tr><td><b>两种部署形态</b></td><td>生产环境用 PostgreSQL + Redis，单机测试用 SQLite + Memory；Docker 镜像、源码构建、本地开发和一键交互部署脚本都已准备好。SQLite 模式默认绑定 <code>127.0.0.1</code> 以提升安全性。</td></tr>
+<tr><td><b>计费与可观测性</b></td><td>单账号 5h/7d 窗口化 USD 费用追踪、信用配额支持、API Key 用量追踪、OAuth PKCE 获取 Token、Prompt 过滤，以及含请求日志与趋势图表的用量仪表盘。</td></tr>
 </table>
 
 ---
@@ -72,6 +73,7 @@
 
 - [在线 Demo](#在线-demo)
 - [界面预览](#界面预览)
+- [赞助商](#赞助商)
 - [快速部署](#快速部署)
   - [一键交互部署 (推荐)](#一键交互部署-推荐)
 - [完整文档](#完整文档)
@@ -89,17 +91,30 @@
 
 ---
 
+## 赞助商
+
+> 想出现在这里？请到 GitHub 提交 Issue 联系。
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle"><a href="https://ai.centos.hk"><b>星辰·AI</b></a></td>
+<td valign="middle">感谢 <b><a href="https://ai.centos.hk">星辰·AI</a></b> 赞助了本项目！星辰·AI 提供稳定、高速的 Claude Code / Codex / Gemini 中转服务，面向个人开发者与团队均适用。</td>
+</tr>
+</table>
+
+---
+
 ## 快速部署
 
 > 详细部署指南请参考：[DEPLOYMENT.md](docs/DEPLOYMENT.md)
 
 ### 一键交互部署 (推荐)
 
-`deploy.sh` 提供 7 步交互式向导，依次询问 **端口 / 监听范围 / 数据库 / 密钥 / 构建方式 / 更新能力 / 确认**，会先尝试拉取最新代码，再自动生成 `.env` 并拉起容器。
+`deploy.sh` 提供 6 步交互式向导，依次询问 **端口 / 监听范围 / 数据库 / 密钥 / 构建方式 / 确认**，会先尝试拉取最新代码，再自动生成 `.env` 并拉起容器。
 
 如果当前目录已有 `.env`，脚本会读取其中的端口、监听地址、数据库、Redis、管理密钥和 API 密钥作为默认值，后续重跑脚本时可直接回车复用原配置。
 
-脚本会先检查当前系统是首次部署还是已有部署，再选择部署线路。已有部署后只想补开启一键更新时，重新运行 `bash deploy.sh`，在「部署状态检查」步骤选择 **仅配置一键更新** 即可。该模式不会重新询问端口、监听范围、数据库、密钥等配置，也不会重写 `.env`。
+脚本会先检查当前系统是首次部署还是已有部署；如果发现已有 `.env` 或 compose 服务，会读取现有配置作为默认值，再进入完整部署向导。
 
 **场景 1：尚未克隆仓库（一行远程拉起）**
 
@@ -126,15 +141,6 @@ bash deploy.sh
 
 绑定地址会写入 `.env` 的 `BIND_HOST`，后续可手动修改后 `docker compose up -d` 重启生效。
 
-**更新能力选项**
-
-| 选项 | 行为 | 适用场景 |
-| --- | --- | --- |
-| 1) 不挂载 Docker socket (默认) | 不向容器暴露 Docker API | 更安全，适合普通部署 |
-| 2) 启用一键更新 | 生成运行时 compose override 并挂载 `/var/run/docker.sock:/var/run/docker.sock` | 需要在管理后台触发 Watchtower 一键更新的可信服务器 |
-
-该选项仅对拉取镜像部署生效，本地构建模式会自动跳过 Docker socket 挂载。运行时 override 默认写入 `.deploy/docker-socket.override.yml`，`.deploy/` 已被 git 忽略，不影响后续拉取最新代码。
-
 **可选环境变量**（用于自定义自举行为）
 
 | 变量 | 默认 | 说明 |
@@ -142,7 +148,6 @@ bash deploy.sh
 | `CODEX2API_REPO_URL` | `https://github.com/james-6-23/codex2api.git` | 克隆使用的仓库地址 |
 | `CODEX2API_REPO_BRANCH` | `main` | 克隆使用的分支 |
 | `CODEX2API_DIR_NAME` | `codex2api` | 克隆到本地的目录名 |
-| `CODEX2API_DEPLOY_RUNTIME_DIR` | `.deploy` | 部署脚本生成运行时 compose override 的目录 |
 | `CODEX2API_SKIP_GIT_PULL` | 空 | 设为 `1` 或 `true` 时跳过部署前自动拉取最新代码 |
 
 ### 部署模式总览
@@ -205,7 +210,8 @@ docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
 - SQLite 镜像版容器名：`codex2api-sqlite`
 - SQLite 本地构建版容器名：`codex2api-sqlite-local`
 - SQLite 轻量版只启动 `codex2api` 单容器，数据保存在 `/data/codex2api.db`
-- 生图工作台图库默认保存在 `/data/images`，标准版和 SQLite 版 Docker 配置都会持久化 `/data`
+- **SQLite compose 文件默认绑定 `127.0.0.1`，仅本机可访问。** 如需暴露给外部，请在 `.env` 中设置 `BIND_HOST=0.0.0.0` 或修改 compose 文件中的端口绑定。标准版 compose 文件默认绑定 `0.0.0.0`（所有网络接口）。
+- 生图工作台图库默认保存在 `/data/images`，上传的后台背景默认保存在 `/data/backgrounds`，标准版和 SQLite 版 Docker 配置都会持久化 `/data`
 - `docker compose down` 默认不会删除命名卷；只有 `docker compose down -v`、`docker volume rm` 或 `docker volume prune` 才会删除持久化数据
 - 不同部署模式的数据卷彼此隔离；切换 compose 文件后看到空数据，通常是切到了另一组卷，而不是原卷被自动删除
 
@@ -283,6 +289,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | 变量 | 说明 |
 | --- | --- |
 | `CODEX_PORT` | HTTP 端口，默认 `8080` |
+| `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP 请求体上限，单位 MB，默认 `48` |
 | `ADMIN_SECRET` | 管理后台登录密钥；设置后首次访问 `/admin` 会弹出密码输入框 |
 | `DATABASE_DRIVER` | 数据库驱动，支持 `postgres` / `sqlite` |
 | `DATABASE_PATH` | SQLite 数据文件路径，`DATABASE_DRIVER=sqlite` 时生效 |
@@ -309,7 +316,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 以下参数**保存在数据库 `SystemSettings` 中**，通过管理台设置页面修改：
 
-`MaxConcurrency`、`GlobalRPM`、`TestModel`、`TestConcurrency`、`ProxyURL`、`PgMaxConns`、`RedisPoolSize`、`AdminSecret`、自动清理开关等。
+`MaxConcurrency`、`GlobalRPM`、`TestModel`、`TestConcurrency`、`ProxyURL`、`PgMaxConns`、`RedisPoolSize`、`AdminSecret`、`SchedulerMode`、自动清理开关等。
 
 首次启动时程序会自动写入默认设置。
 
@@ -331,8 +338,10 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `POST /v1/responses` | Responses 风格入口 |
 | `POST /v1/images/generations` | OpenAI Images 生成入口 |
 | `POST /v1/images/edits` | OpenAI Images 编辑入口 |
-| `GET /v1/models` | 返回可用模型列表 |
+| `GET /v1/models` | 返回可用模型列表（含 gpt-5.5、gpt-5.4、gpt-5.4-mini、gpt-5.3-codex、gpt-image-2 等） |
 | `GET /health` | 健康检查 |
+
+> **计费提示**：gpt-5.5 标准 tier 计费为 $5.00/M 输入 / $30.00/M 输出，priority tier 为 $12.50/M 输入 / $75.00/M 输出。其他模型按 billing 引擎规则计费。
 
 > 完整请求/响应格式、错误码参见 [API 文档](docs/API.md)。
 
@@ -396,6 +405,27 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 
 > 所有导入接口自动去重，已存在的 Token 不会重复写入。更多管理接口（导出、迁移、OAuth 授权等）参见 [API 文档](docs/API.md)。
 
+#### OAuth PKCE 授权
+
+Codex2API 支持通过 OAuth PKCE 流程获取 Refresh Token，适用于无法手动提取 Token 的场景：
+
+```bash
+# 步骤 1：生成授权 URL
+curl -X POST http://localhost:8080/api/admin/oauth/generate-auth-url \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# 步骤 2：在浏览器中打开返回的 auth_url，完成授权
+# 步骤 3：用授权码兑换 Token（自动创建账号）
+curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "...", "code": "...", "state": "..."}'
+```
+
+> 完整 OAuth 流程及所有管理接口参见 [API 文档](docs/API.md)。
+
 ---
 
 ## 管理后台
@@ -408,7 +438,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 | 账号管理 | `/admin/accounts` | 导入、测试、批量处理、调度信息查看 |
 | API 密钥 | `/admin/api-keys` | API Key 创建、查看、删除与调用凭据管理 |
 | 代理管理 | `/admin/proxies` | 代理池维护、账号代理分配与连通性管理 |
-| 生图工作台 | `/admin/images/studio` | 文生图、提示词模板、任务历史和服务器图库 |
+| 生图工作台 | `/admin/images/studio` | 文生图、图生图、提示词模板、任务历史和服务器图库 |
 | Prompt 检查 | `/admin/prompt-filter/overview` | Prompt 规则、触发日志、测试和处理模式配置 |
 | 使用统计 | `/admin/usage` | 请求日志、统计卡片、图表、日志清空 |
 | 运维概览 | `/admin/ops` | 运行态监控与系统概览 |
@@ -490,6 +520,24 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 - `GET /api/admin/accounts` — 健康层级、调度分、惩罚拆解
 - `GET /api/admin/ops/overview` — 系统运行态与连接池概览
 - `/admin/ops/scheduler` — 前端调度看板
+
+**调度模式**（`scheduler_mode`，通过管理后台设置）：
+
+| 模式 | 行为 |
+| --- | --- |
+| `round_robin`（默认） | 按健康层级轮询可用账号，权重按调度分排序 |
+| `remaining_quota` | 优先使用用量较低的账号；用量相同时轮询 |
+
+**信用账号**（单账号标记）：
+
+对采用信用计费而非 Free/Pro 用量计费的账号，可标记为信用账号以跳过用量窗口惩罚：
+
+| 字段 | 类型 | 作用 |
+| --- | --- | --- |
+| `credit_enabled` | bool | 标记账号为信用计费模式 |
+| `credit_skip_usage_window` | bool | 开启后跳过 7 天/5 小时用量窗口惩罚 |
+
+**窗口化 USD 费用**：账号列表展示每个账号在两个时间窗口内的累计计费金额——过去 5 小时和过去 7 天，窗口对齐各账号的用量重置边界。这反映的是实际扣费金额而非估算的 Token 费用。
 
 ---
 

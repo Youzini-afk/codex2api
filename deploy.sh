@@ -88,8 +88,6 @@ gen_secret() {
 REPO_URL="${CODEX2API_REPO_URL:-https://github.com/james-6-23/codex2api.git}"
 REPO_BRANCH="${CODEX2API_REPO_BRANCH:-main}"
 REPO_DIR_NAME="${CODEX2API_DIR_NAME:-codex2api}"
-DEPLOY_RUNTIME_DIR="${CODEX2API_DEPLOY_RUNTIME_DIR:-.deploy}"
-DOCKER_SOCKET_OVERRIDE_FILE="$DEPLOY_RUNTIME_DIR/docker-socket.override.yml"
 EXISTING_ENV_FILE=".env"
 
 env_default() {
@@ -141,7 +139,6 @@ known_compose_service_exists() {
 }
 
 detect_deployment_state() {
-  DEPLOY_ACTION="full"
   DEPLOYMENT_STATE="first"
   DEPLOYMENT_REASON="未检测到 .env 或已创建的 compose 服务"
   EXISTING_COMPOSE_FILE=""
@@ -179,25 +176,7 @@ step_deployment_route() {
   if [[ -f "$EXISTING_ENV_FILE" ]]; then
     success "已有 .env 将作为交互默认值"
   fi
-  echo ""
-  echo "  1) 完整部署向导      — 重新确认端口、数据库、密钥等配置"
-  echo "  2) 仅配置一键更新    — 只切换 Docker socket 挂载并重启服务"
-  echo ""
-  ask "请选择部署线路 (1 或 2)" "2" DEPLOY_ROUTE_CHOICE
-
-  case "$DEPLOY_ROUTE_CHOICE" in
-    1|full|deploy)
-      DEPLOY_ACTION="full"
-      success "部署线路: 完整部署向导"
-      ;;
-    2|update|socket|docker|watchtower)
-      DEPLOY_ACTION="update_options"
-      success "部署线路: 仅配置一键更新"
-      ;;
-    *)
-      error "无效选择: $DEPLOY_ROUTE_CHOICE"
-      ;;
-  esac
+  success "部署线路: 完整部署向导"
 }
 
 is_codex2api_repo() {
@@ -299,7 +278,7 @@ preflight() {
 # ---------- 第一步：端口 ----------
 step_port() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 1/7 服务端口 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 1/6 服务端口 ━━━${NC}\n"
   ask "服务监听端口" "$(env_default CODEX_PORT "$(env_default PORT "8080")")" PORT
 
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
@@ -311,7 +290,7 @@ step_port() {
 # ---------- 第二步：监听范围 ----------
 step_bind() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 2/7 监听范围 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 2/6 监听范围 ━━━${NC}\n"
   echo ""
   echo "  1) 仅本机访问  — 绑定 127.0.0.1，外部无法访问 (内网/反向代理后端推荐)"
   echo "  2) 全部网络    — 绑定 0.0.0.0，可通过内网/公网 IP 访问 (默认)"
@@ -348,7 +327,7 @@ step_bind() {
 # ---------- 第三步：数据库模式 ----------
 step_database() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 3/7 数据库模式 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 3/6 数据库模式 ━━━${NC}\n"
   echo ""
   echo "  1) SQLite   — 轻量单文件，适合个人 / 测试"
   echo "  2) PG+Redis — PostgreSQL + Redis，适合生产 / 多并发"
@@ -407,7 +386,7 @@ step_pg_config() {
 # ---------- 第四步：密钥 ----------
 step_secrets() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 4/7 安全密钥 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 4/6 安全密钥 ━━━${NC}\n"
   echo ""
 
   ask_secret "管理后台密钥 (ADMIN_SECRET)" "$(env_default ADMIN_SECRET "")" ADMIN_SECRET
@@ -423,7 +402,7 @@ step_secrets() {
 # ---------- 第五步：构建方式 ----------
 step_build_mode() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 5/7 构建方式 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 5/6 构建方式 ━━━${NC}\n"
   echo ""
   echo "  1) 拉取镜像 — 使用预构建镜像 (ghcr.io)，部署快"
   echo "  2) 本地构建 — 从源码编译，适合自定义修改"
@@ -445,141 +424,10 @@ step_build_mode() {
   esac
 }
 
-# ---------- 第六步：更新能力 ----------
-step_update_options() {
-  echo ""
-  if [[ "${DEPLOY_ACTION:-full}" == "update_options" ]]; then
-    printf "${BOLD}${CYAN}━━━ 更新能力 ━━━${NC}\n"
-  else
-    printf "${BOLD}${CYAN}━━━ 6/7 更新能力 ━━━${NC}\n"
-  fi
-  echo ""
-
-  if [[ "$BUILD_MODE" == "local" ]]; then
-    ENABLE_DOCKER_SOCKET="false"
-    success "本地构建模式不需要 Docker socket 挂载，已跳过"
-    return 0
-  fi
-
-  echo "  1) 不挂载 Docker socket — 默认，更安全"
-  echo "  2) 启用一键更新       — 挂载 /var/run/docker.sock:/var/run/docker.sock"
-  echo ""
-  warn "Docker socket 权限较高，只建议在可信服务器上启用"
-  local docker_socket_choice_default="1"
-  if [[ -f "$DOCKER_SOCKET_OVERRIDE_FILE" ]]; then
-    docker_socket_choice_default="2"
-  fi
-  ask "请选择 (1 或 2)" "$docker_socket_choice_default" DOCKER_SOCKET_CHOICE
-
-  case "$DOCKER_SOCKET_CHOICE" in
-    1|no|n|false|off)
-      ENABLE_DOCKER_SOCKET="false"
-      success "一键更新: 未启用 Docker socket 挂载"
-      ;;
-    2|yes|y|true|on)
-      ENABLE_DOCKER_SOCKET="true"
-      success "一键更新: 将挂载 /var/run/docker.sock:/var/run/docker.sock"
-      ;;
-    *)
-      error "无效选择: $DOCKER_SOCKET_CHOICE"
-      ;;
-  esac
-}
-
-infer_existing_deploy_config() {
-  PORT="$(env_default CODEX_PORT "$(env_default PORT "8080")")"
-  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-    error "已有 .env 中的端口无效: $PORT"
-  fi
-
-  local bind_default db_default
-  bind_default="$(env_default BIND_HOST "0.0.0.0")"
-  case "$bind_default" in
-    127.*|localhost)
-      BIND_HOST="127.0.0.1"
-      BIND_MODE="loopback"
-      ;;
-    *)
-      BIND_HOST="0.0.0.0"
-      BIND_MODE="all"
-      ;;
-  esac
-
-  db_default="$(env_default DATABASE_DRIVER "sqlite")"
-  db_default="$(printf "%s" "$db_default" | tr '[:upper:]' '[:lower:]')"
-  case "$db_default" in
-    postgres|postgresql|pg)
-      DB_MODE="postgres"
-      ;;
-    *)
-      DB_MODE="sqlite"
-      ;;
-  esac
-
-  ADMIN_SECRET="$(env_default ADMIN_SECRET "")"
-  API_KEYS="$(env_default CODEX_API_KEYS "")"
-  BUILD_MODE="image"
-
-  if existing_local_build_compose_active; then
-    BUILD_MODE="local"
-  fi
-}
-
-existing_local_build_compose_active() {
-  local compose_file
-  if [[ "${DB_MODE:-}" == "sqlite" ]]; then
-    compose_file="docker-compose.sqlite.local.yml"
-  else
-    compose_file="docker-compose.local.yml"
-  fi
-
-  [[ -f "$compose_file" ]] || return 1
-  [[ -n "$($COMPOSE_CMD -f "$compose_file" ps -q codex2api 2>/dev/null || true)" ]]
-}
-
-confirm_update_options_only() {
-  echo ""
-  printf "${BOLD}${CYAN}━━━ 配置确认 ━━━${NC}\n"
-  echo ""
-  echo "  模式:       仅配置一键更新"
-  echo "  端口:       $PORT"
-  if [[ "$BIND_MODE" == "loopback" ]]; then
-    echo "  监听范围:   127.0.0.1 (仅本机访问)"
-  else
-    echo "  监听范围:   0.0.0.0 (全部网络)"
-  fi
-  echo "  数据库:     $DB_MODE"
-  echo "  构建方式:   $( [[ "$BUILD_MODE" == "image" ]] && echo "拉取镜像" || echo "本地构建" )"
-  if [[ "$BUILD_MODE" == "local" ]]; then
-    echo "  一键更新:   本地构建无需挂载"
-  else
-    echo "  一键更新:   $( [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]] && echo "启用 Docker socket 挂载" || echo "未启用" )"
-  fi
-  echo ""
-  ask "确认应用并重启服务? (y/n)" "y" CONFIRM
-  if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-    warn "已取消"
-    exit 0
-  fi
-}
-
-run_update_options_only() {
-  infer_existing_deploy_config
-  step_update_options
-  if [[ "$BUILD_MODE" == "local" ]]; then
-    success "当前为本地构建部署，一键更新无需 Docker socket 挂载，未重启服务"
-    return 0
-  fi
-  confirm_update_options_only
-  resolve_compose_file
-  apply_docker_socket_option
-  deploy
-}
-
-# ---------- 第七步：确认 ----------
+# ---------- 第六步：确认 ----------
 step_confirm() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 7/7 配置确认 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 6/6 配置确认 ━━━${NC}\n"
   echo ""
   echo "  端口:       $PORT"
   if [[ "$BIND_MODE" == "loopback" ]]; then
@@ -597,11 +445,6 @@ step_confirm() {
     echo "  Redis:      内置容器"
   fi
   echo "  构建方式:   $( [[ "$BUILD_MODE" == "image" ]] && echo "拉取镜像" || echo "本地构建" )"
-  if [[ "$BUILD_MODE" == "local" ]]; then
-    echo "  一键更新:   本地构建无需挂载"
-  else
-    echo "  一键更新:   $( [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]] && echo "启用 Docker socket 挂载" || echo "未启用" )"
-  fi
   echo "  管理密钥:   ${ADMIN_SECRET}"
   if [[ -n "${API_KEYS:-}" ]]; then
     echo "  API 密钥:   已设置"
@@ -725,30 +568,6 @@ resolve_compose_file() {
   COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")
 }
 
-apply_docker_socket_option() {
-  if [[ "$BUILD_MODE" == "local" ]]; then
-    return 0
-  fi
-
-  if [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]]; then
-    mkdir -p "$DEPLOY_RUNTIME_DIR" || error "无法创建运行时配置目录: $DEPLOY_RUNTIME_DIR"
-    cat > "$DOCKER_SOCKET_OVERRIDE_FILE" <<'EOF'
-services:
-  codex2api:
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-EOF
-    COMPOSE_FILE_ARGS+=(-f "$DOCKER_SOCKET_OVERRIDE_FILE")
-    success "Docker socket 挂载已启用: $DOCKER_SOCKET_OVERRIDE_FILE"
-    return 0
-  fi
-
-  if [[ -f "$DOCKER_SOCKET_OVERRIDE_FILE" ]]; then
-    rm -f "$DOCKER_SOCKET_OVERRIDE_FILE"
-  fi
-  success "Docker socket 挂载未启用"
-}
-
 compose_cmd_display() {
   local display="$COMPOSE_CMD"
   local arg
@@ -823,14 +642,6 @@ deploy() {
   fi
   echo ""
   echo "  管理密钥 : ${ADMIN_SECRET}"
-  if [[ "$BUILD_MODE" == "local" ]]; then
-    echo "  一键更新 : 本地构建无需挂载"
-  elif [[ "${ENABLE_DOCKER_SOCKET:-false}" == "true" ]]; then
-    echo "  一键更新 : 已启用 Docker socket 挂载"
-  else
-    echo "  一键更新 : 未启用"
-  fi
-  echo ""
   echo "  查看日志 : $(compose_cmd_display) logs -f"
   echo "  停止服务 : $(compose_cmd_display) down"
   echo ""
@@ -850,20 +661,14 @@ main() {
   preflight
   update_repo_code
   step_deployment_route
-  if [[ "$DEPLOY_ACTION" == "update_options" ]]; then
-    run_update_options_only
-    exit 0
-  fi
   step_port
   step_bind
   step_database
   step_secrets
   step_build_mode
-  step_update_options
   step_confirm
   generate_env
   resolve_compose_file
-  apply_docker_socket_option
   deploy
 }
 

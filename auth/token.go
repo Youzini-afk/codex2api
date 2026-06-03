@@ -42,9 +42,10 @@ type TokenData struct {
 
 // AccountInfo 解析 id_token 获得的账号信息
 type AccountInfo struct {
-	Email            string `json:"email"`
-	ChatGPTAccountID string `json:"chatgpt_account_id"`
-	PlanType         string `json:"chatgpt_plan_type"`
+	Email                 string    `json:"email"`
+	ChatGPTAccountID      string    `json:"chatgpt_account_id"`
+	PlanType              string    `json:"chatgpt_plan_type"`
+	SubscriptionExpiresAt time.Time `json:"-"`
 }
 
 // RefreshAccessToken 用 RT 换取 AT
@@ -205,7 +206,11 @@ func RefreshWithSessionToken(ctx context.Context, sessionToken string, proxyURL 
 		return nil, nil, fmt.Errorf("创建 session 请求失败: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "CodexProxy/1.9")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.AddCookie(&http.Cookie{Name: "__Secure-next-auth.session-token", Value: sessionToken})
 	if ResinRequestDecorator != nil && accountID != "" {
 		req.Header.Set("X-Resin-Account", accountID)
@@ -215,7 +220,7 @@ func RefreshWithSessionToken(ctx context.Context, sessionToken string, proxyURL 
 	if ResinRequestDecorator != nil && accountID != "" {
 		client = &http.Client{Timeout: 30 * time.Second}
 	} else {
-		client = buildHTTPClient(proxyURL)
+		client = buildUTLSHTTPClient(proxyURL)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -311,7 +316,7 @@ func isNonRetryable(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	for _, needle := range []string{"invalid_grant", "invalid_client", "unauthorized_client", "access_denied"} {
+	for _, needle := range []string{"invalid_grant", "invalid_client", "unauthorized_client", "access_denied", "refresh_token_reused"} {
 		if strings.Contains(msg, needle) {
 			return true
 		}
@@ -349,8 +354,9 @@ func parseIDToken(idToken string) *AccountInfo {
 	var claims struct {
 		Email      string `json:"email"`
 		OpenAIAuth *struct {
-			ChatGPTAccountID string `json:"chatgpt_account_id"`
-			PlanType         string `json:"chatgpt_plan_type"`
+			ChatGPTAccountID               string `json:"chatgpt_account_id"`
+			PlanType                       string `json:"chatgpt_plan_type"`
+			ChatGPTSubscriptionActiveUntil string `json:"chatgpt_subscription_active_until"`
 		} `json:"https://api.openai.com/auth"`
 	}
 	if err := json.Unmarshal(decoded, &claims); err != nil {
@@ -361,16 +367,22 @@ func parseIDToken(idToken string) *AccountInfo {
 	if claims.OpenAIAuth != nil {
 		info.ChatGPTAccountID = claims.OpenAIAuth.ChatGPTAccountID
 		info.PlanType = claims.OpenAIAuth.PlanType
+		if s := claims.OpenAIAuth.ChatGPTSubscriptionActiveUntil; s != "" {
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				info.SubscriptionExpiresAt = t
+			}
+		}
 	}
 	return info
 }
 
 // AccessTokenInfo AT JWT 解析结果
 type AccessTokenInfo struct {
-	Email            string
-	ChatGPTAccountID string
-	PlanType         string
-	ExpiresAt        time.Time
+	Email                 string
+	ChatGPTAccountID      string
+	PlanType              string
+	ExpiresAt             time.Time
+	SubscriptionExpiresAt time.Time
 }
 
 // ParseAccessToken 解析 Access Token 的 JWT payload（不验签）
@@ -404,8 +416,9 @@ func ParseAccessToken(accessToken string) *AccessTokenInfo {
 	var claims struct {
 		Exp        int64 `json:"exp"`
 		OpenAIAuth *struct {
-			ChatGPTAccountID string `json:"chatgpt_account_id"`
-			PlanType         string `json:"chatgpt_plan_type"`
+			ChatGPTAccountID               string `json:"chatgpt_account_id"`
+			PlanType                       string `json:"chatgpt_plan_type"`
+			ChatGPTSubscriptionActiveUntil string `json:"chatgpt_subscription_active_until"`
 		} `json:"https://api.openai.com/auth"`
 		OpenAIProfile *struct {
 			Email string `json:"email"`
@@ -422,6 +435,11 @@ func ParseAccessToken(accessToken string) *AccessTokenInfo {
 	if claims.OpenAIAuth != nil {
 		info.ChatGPTAccountID = claims.OpenAIAuth.ChatGPTAccountID
 		info.PlanType = claims.OpenAIAuth.PlanType
+		if s := claims.OpenAIAuth.ChatGPTSubscriptionActiveUntil; s != "" {
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				info.SubscriptionExpiresAt = t
+			}
+		}
 	}
 	if claims.Exp > 0 {
 		info.ExpiresAt = time.Unix(claims.Exp, 0)

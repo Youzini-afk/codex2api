@@ -4,14 +4,75 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
 )
 
+const (
+	defaultSQLiteMaxOpenConns = 8
+	maxSQLiteOpenConns        = 16
+	sqliteBusyTimeoutMillis   = 15000
+)
+
+func sqliteConnectDSN(dsn string) string {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" || dsn == ":memory:" {
+		return dsn
+	}
+
+	q := url.Values{}
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMillis))
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+
+	if strings.HasPrefix(strings.ToLower(dsn), "file:") {
+		sep := "?"
+		if strings.Contains(dsn, "?") {
+			sep = "&"
+		}
+		return dsn + sep + q.Encode()
+	}
+
+	return "file:" + dsn + "?" + q.Encode()
+}
+
+func applySQLiteConnLimits(conn *sql.DB, n int) {
+	if conn == nil {
+		return
+	}
+	if n <= 0 {
+		n = defaultSQLiteMaxOpenConns
+	}
+	if n > maxSQLiteOpenConns {
+		n = maxSQLiteOpenConns
+	}
+	if n < 2 {
+		n = 2
+	}
+	conn.SetMaxOpenConns(n)
+	conn.SetMaxIdleConns(n)
+	conn.SetConnMaxLifetime(0)
+}
+
+func (db *DB) withSQLiteWriteLock(ctx context.Context, fn func() error) error {
+	if !db.isSQLite() || db.sqliteWriteSem == nil {
+		return fn()
+	}
+	select {
+	case db.sqliteWriteSem <- struct{}{}:
+		defer func() { <-db.sqliteWriteSem }()
+		return fn()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (db *DB) configureSQLite(ctx context.Context) error {
 	pragmas := []string{
+		fmt.Sprintf(`PRAGMA busy_timeout=%d;`, sqliteBusyTimeoutMillis),
 		`PRAGMA journal_mode=WAL;`,
-		`PRAGMA busy_timeout=15000;`,
 		`PRAGMA synchronous=NORMAL;`,
 	}
 	for _, pragma := range pragmas {
@@ -38,6 +99,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			base_concurrency_override INTEGER NULL,
 			usage_reserve_percent_5h INTEGER NULL,
 			usage_reserve_percent_7d INTEGER NULL,
+			skip_warm_tier INTEGER DEFAULT 0,
+			tags TEXT DEFAULT '[]',
 			error_message TEXT DEFAULT '',
 			deleted_at TIMESTAMP NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -62,10 +125,15 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			effective_model TEXT DEFAULT '',
 			inbound_endpoint TEXT DEFAULT '',
 			upstream_endpoint TEXT DEFAULT '',
-			stream INTEGER DEFAULT 0,
-			cached_tokens INTEGER DEFAULT 0,
-			service_tier TEXT DEFAULT '',
-			api_key_id INTEGER DEFAULT 0,
+				stream INTEGER DEFAULT 0,
+				compact INTEGER DEFAULT 0,
+				via_websocket INTEGER DEFAULT 0,
+				cached_tokens INTEGER DEFAULT 0,
+				service_tier TEXT DEFAULT '',
+				requested_service_tier TEXT DEFAULT '',
+				actual_service_tier TEXT DEFAULT '',
+				billing_service_tier TEXT DEFAULT '',
+				api_key_id INTEGER DEFAULT 0,
 			api_key_name TEXT DEFAULT '',
 			api_key_masked TEXT DEFAULT '',
 			image_count INTEGER DEFAULT 0,
@@ -82,8 +150,23 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			key TEXT NOT NULL UNIQUE,
 			quota_limit REAL DEFAULT 0,
 			quota_used REAL DEFAULT 0,
+			allowed_group_ids TEXT DEFAULT '[]',
 			expires_at TIMESTAMP NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS account_groups (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE NOT NULL,
+			description TEXT DEFAULT '',
+			color TEXT DEFAULT '',
+			sort_order INTEGER DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS account_group_members (
+			account_id INTEGER NOT NULL,
+			group_id INTEGER NOT NULL,
+			PRIMARY KEY (account_id, group_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS account_model_cooldowns (
 			account_id INTEGER NOT NULL,
@@ -97,6 +180,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 					site_name TEXT DEFAULT 'CodexProxy',
 					site_logo TEXT DEFAULT '',
+					background_config TEXT DEFAULT '{}',
 					max_concurrency INTEGER DEFAULT 2,
 				global_rpm INTEGER DEFAULT 0,
 				test_model TEXT DEFAULT 'gpt-5.4',
@@ -108,15 +192,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				auto_clean_rate_limited INTEGER DEFAULT 0,
 				background_refresh_interval_minutes INTEGER DEFAULT 2,
 				usage_probe_max_age_minutes INTEGER DEFAULT 10,
+				usage_probe_concurrency INTEGER DEFAULT 16,
 				recovery_probe_interval_minutes INTEGER DEFAULT 30,
 				admin_secret TEXT DEFAULT '',
 				auto_clean_full_usage INTEGER DEFAULT 0,
 				auto_clean_error INTEGER DEFAULT 0,
 				auto_clean_expired INTEGER DEFAULT 0,
+				lazy_mode INTEGER DEFAULT 0,
 				proxy_pool_enabled INTEGER DEFAULT 0,
 				fast_scheduler_enabled INTEGER DEFAULT 0,
 				max_retries INTEGER DEFAULT 2,
 				max_rate_limit_retries INTEGER DEFAULT 1,
+				reasoning_effort_models TEXT DEFAULT '[]',
 				allow_remote_migration INTEGER DEFAULT 0,
 				client_compat_mode TEXT DEFAULT 'preserve',
 				codex_min_cli_version TEXT DEFAULT '0.118.0',
@@ -125,7 +212,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
 				stream_flush_policy TEXT DEFAULT 'immediate',
 				stream_flush_interval_ms INTEGER DEFAULT 20,
-				image_storage_config TEXT DEFAULT '{}'
+				first_token_timeout_seconds INTEGER DEFAULT 0,
+				image_storage_config TEXT DEFAULT '{}',
+				show_full_usage_numbers INTEGER DEFAULT 0,
+				scheduler_mode TEXT DEFAULT 'round_robin',
+				affinity_mode TEXT DEFAULT 'bounded',
+				codex_force_websocket INTEGER DEFAULT 0,
+				codex_ws_keepalive_enabled INTEGER DEFAULT 0,
+				codex_ws_keepalive_interval_sec INTEGER DEFAULT 60
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -244,6 +338,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "base_concurrency_override", "INTEGER NULL"},
 		{"accounts", "usage_reserve_percent_5h", "INTEGER NULL"},
 		{"accounts", "usage_reserve_percent_7d", "INTEGER NULL"},
+		{"accounts", "tags", "TEXT DEFAULT '[]'"},
 		{"accounts", "deleted_at", "TIMESTAMP NULL"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
@@ -254,8 +349,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "inbound_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "upstream_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "stream", "INTEGER DEFAULT 0"},
+		{"usage_logs", "via_websocket", "INTEGER DEFAULT 0"},
+		{"usage_logs", "compact", "INTEGER DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "service_tier", "TEXT DEFAULT ''"},
+		{"usage_logs", "requested_service_tier", "TEXT DEFAULT ''"},
+		{"usage_logs", "actual_service_tier", "TEXT DEFAULT ''"},
+		{"usage_logs", "billing_service_tier", "TEXT DEFAULT ''"},
 		{"usage_logs", "api_key_id", "INTEGER DEFAULT 0"},
 		{"usage_logs", "api_key_name", "TEXT DEFAULT ''"},
 		{"usage_logs", "api_key_masked", "TEXT DEFAULT ''"},
@@ -273,26 +373,41 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
 		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
 		{"api_keys", "quota_used", "REAL DEFAULT 0"},
+		{"api_keys", "allowed_group_ids", "TEXT DEFAULT '[]'"},
+		{"api_keys", "limits", "TEXT DEFAULT '{}'"},
 		{"api_keys", "expires_at", "TIMESTAMP NULL"},
+		{"account_groups", "description", "TEXT DEFAULT ''"},
+		{"account_groups", "color", "TEXT DEFAULT ''"},
+		{"account_groups", "sort_order", "INTEGER DEFAULT 0"},
+		{"account_groups", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
+		{"account_groups", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
 		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
 		{"system_settings", "site_logo", "TEXT DEFAULT ''"},
+		{"system_settings", "background_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_clean_rate_limited", "INTEGER DEFAULT 0"},
 		{"system_settings", "background_refresh_interval_minutes", "INTEGER DEFAULT 2"},
 		{"system_settings", "usage_probe_max_age_minutes", "INTEGER DEFAULT 10"},
+		{"system_settings", "usage_probe_concurrency", "INTEGER DEFAULT 16"},
 		{"system_settings", "recovery_probe_interval_minutes", "INTEGER DEFAULT 30"},
 		{"system_settings", "admin_secret", "TEXT DEFAULT ''"},
 		{"system_settings", "auto_clean_full_usage", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_clean_error", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_clean_expired", "INTEGER DEFAULT 0"},
+		{"system_settings", "lazy_mode", "INTEGER DEFAULT 0"},
 		{"system_settings", "proxy_pool_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_force_websocket", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_ws_keepalive_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_ws_keepalive_interval_sec", "INTEGER DEFAULT 60"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
+		{"system_settings", "codex_model_mapping", "TEXT DEFAULT '{}'"},
+		{"system_settings", "reasoning_effort_models", "TEXT DEFAULT '[]'"},
 		{"system_settings", "resin_url", "TEXT DEFAULT ''"},
 		{"system_settings", "resin_platform_name", "TEXT DEFAULT ''"},
 		{"system_settings", "prompt_filter_enabled", "INTEGER DEFAULT 0"},
@@ -311,9 +426,17 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "usage_log_flush_interval_seconds", "INTEGER DEFAULT 5"},
 		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
 		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
+		{"system_settings", "first_token_timeout_seconds", "INTEGER DEFAULT 0"},
+		{"system_settings", "billing_tier_policy", "TEXT DEFAULT 'actual'"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
+		{"system_settings", "show_full_usage_numbers", "INTEGER DEFAULT 0"},
+		{"system_settings", "scheduler_mode", "TEXT DEFAULT 'round_robin'"},
+		{"system_settings", "affinity_mode", "TEXT DEFAULT 'bounded'"},
 		{"accounts", "enabled", "INTEGER DEFAULT 1"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
+		{"accounts", "credit_enabled", "INTEGER DEFAULT 0"},
+		{"accounts", "credit_skip_usage_window", "INTEGER DEFAULT 0"},
+		{"accounts", "skip_warm_tier", "INTEGER DEFAULT 0"},
 		{"accounts", "image_quota_remaining", "INTEGER NULL"},
 		{"accounts", "image_quota_total", "INTEGER NULL"},
 		{"accounts", "today_used_count", "INTEGER DEFAULT 0"},
@@ -338,6 +461,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_group_members_group ON account_group_members(group_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_group_members_account ON account_group_members(account_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);`,
@@ -675,18 +800,28 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 	return result, nil
 }
 
-// getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）
-func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
+// getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）。
+// rangeStart 为零值时回落到"今日"(本地 0 点起);rangeEnd 为零值表示至今。
+func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time) (*UsageStats, error) {
 	now := time.Now()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	if rangeStart.IsZero() {
+		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	}
 	minuteAgo := now.Add(-1 * time.Minute)
 
-	rows, err := db.conn.QueryContext(ctx, `
+	query := `
 			SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
-			       cached_tokens, duration_ms, status_code, account_billed, user_billed
+			       cached_tokens, first_token_ms, duration_ms, status_code, account_billed, user_billed
 			FROM usage_logs
 			WHERE created_at >= $1 AND status_code <> 499
-		`, db.timeArg(todayStart))
+		`
+	args := []interface{}{db.timeArg(rangeStart)}
+	if !rangeEnd.IsZero() {
+		query += " AND created_at < $2"
+		args = append(args, db.timeArg(rangeEnd))
+	}
+
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -695,15 +830,18 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	stats := &UsageStats{}
 	var todayErrors int64
 	var totalDuration float64
+	var totalFirstTokenMs float64
+	var totalFirstTokenSamples int64
+	var todayCacheHitRequests int64
 
 	for rows.Next() {
 		var createdRaw interface{}
 		var totalTokens, promptTokens, completionTokens, cachedTokens int64
-		var durationMs int
+		var firstTokenMs, durationMs int
 		var statusCode int
 		var accountBilled, userBilled float64
 		if err := rows.Scan(&createdRaw, &totalTokens, &promptTokens, &completionTokens,
-			&cachedTokens, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
+			&cachedTokens, &firstTokenMs, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -716,9 +854,17 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		stats.TotalPrompt += promptTokens
 		stats.TotalCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
+		stats.TodayCachedTokens += cachedTokens
 		stats.TodayAccountBilled += accountBilled
 		stats.TodayUserBilled += userBilled
 		totalDuration += float64(durationMs)
+		if firstTokenMs > 0 {
+			totalFirstTokenMs += float64(firstTokenMs)
+			totalFirstTokenSamples++
+		}
+		if cachedTokens > 0 {
+			todayCacheHitRequests++
+		}
 
 		if statusCode >= 400 {
 			todayErrors++
@@ -736,11 +882,16 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	if stats.TodayRequests > 0 {
 		stats.AvgDurationMs = totalDuration / float64(stats.TodayRequests)
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
+		stats.TodayCacheRate = float64(todayCacheHitRequests) / float64(stats.TodayRequests) * 100
+	}
+	if totalFirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = totalFirstTokenMs / float64(totalFirstTokenSamples)
 	}
 
 	// 可见请求总数（排除 499）
-	var visibleTotal int64
+	var visibleTotal, visibleCacheHitRequests, visibleFirstTokenSamples int64
 	var currentTokens, currentPrompt, currentCompletion, currentCached int64
+	var currentFirstTokenMsSum float64
 	var currentAccountBilled, currentUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
 		SELECT
@@ -749,19 +900,23 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 			COALESCE(SUM(prompt_tokens), 0),
 			COALESCE(SUM(completion_tokens), 0),
 			COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(account_billed), 0),
 			COALESCE(SUM(user_billed), 0)
 		FROM usage_logs
 		WHERE status_code <> 499
-	`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &currentAccountBilled, &currentUserBilled)
+	`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
 
 	// 基线值
-	var bReq, bTok, bPrompt, bComp, bCached int64
+	var bReq, bTok, bPrompt, bComp, bCached, bCacheHitRequests, bFirstTokenSamples int64
+	var bFirstTokenMsSum float64
 	var bAccountBilled, bUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, account_billed, user_billed
+		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
 		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bAccountBilled, &bUserBilled)
+	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bCacheHitRequests, &bFirstTokenMsSum, &bFirstTokenSamples, &bAccountBilled, &bUserBilled)
 
 	stats.TotalRequests = visibleTotal + bReq
 	stats.TotalTokens = currentTokens + bTok
@@ -770,6 +925,12 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	stats.TotalCachedTokens = currentCached + bCached
 	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
 	stats.TotalUserBilled = currentUserBilled + bUserBilled
+	if stats.TotalRequests > 0 {
+		stats.TotalCacheRate = float64(visibleCacheHitRequests+bCacheHitRequests) / float64(stats.TotalRequests) * 100
+	}
+	if visibleFirstTokenSamples+bFirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = (currentFirstTokenMsSum + bFirstTokenMsSum) / float64(visibleFirstTokenSamples+bFirstTokenSamples)
+	}
 	if stats.TotalRequests > 0 {
 		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)

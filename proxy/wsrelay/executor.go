@@ -3,7 +3,6 @@ package wsrelay
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -166,8 +165,7 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 		wsBody, _ = sjson.SetBytes(wsBody, "instructions", "")
 	}
 
-	// 2. 清理多余字段
-	wsBody, _ = sjson.DeleteBytes(wsBody, "previous_response_id")
+	// 2. 清理多余字段（prompt_cache_retention 上游不接受，会返回 400 Unsupported parameter，必须删除）
 	wsBody, _ = sjson.DeleteBytes(wsBody, "prompt_cache_retention")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "safety_identifier")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")
@@ -256,16 +254,7 @@ func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) 
 	if !wc.IsConnected() {
 		return fmt.Errorf("websocket connection is not connected")
 	}
-
-	// 构建消息
-	msg := NewHTTPRequestMessage(requestID, wc.session.ID, body)
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal message failed: %w", err)
-	}
-
-	// 发送消息（使用 marshaled msgBytes）
-	return wc.WriteMessage(websocket.TextMessage, msgBytes)
+	return wc.WriteMessage(websocket.TextMessage, body)
 }
 
 // ==================== WebSocket 响应处理 ====================
@@ -323,9 +312,13 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 
 // handleMessage 处理单条 WebSocket 消息
 func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bool) error {
-	// 检查是否是错误消息
-	if err := r.checkError(payload); err != nil {
-		return err
+	// 上游错误帧：透传给下游(转成 SSE 错误事件)，而不是转成 Go error 后静默关闭 pipe。
+	// 否则下游只会读到一个底层 read error → 表现为空响应，无从得知具体错误。
+	if errEvent, isErr := r.buildErrorEvent(payload); isErr {
+		// 把错误内容作为 SSE 数据写给下游，让客户端看到完整错误 JSON。
+		callback(errEvent)
+		// 错误即终止：结束流(等价于 response.failed)。
+		return io.EOF
 	}
 
 	// 标准化完成事件类型
@@ -345,32 +338,40 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	return nil
 }
 
-// checkError 检查并返回 WebSocket 错误
-func (r *WsResponse) checkError(payload []byte) error {
+// buildErrorEvent 判断 payload 是否为上游错误帧；若是，返回一个下游可识别的
+// response.failed SSE 事件(保留原始错误内容)，第二个返回值标记是否为错误帧。
+func (r *WsResponse) buildErrorEvent(payload []byte) ([]byte, bool) {
 	if len(payload) == 0 {
-		return nil
+		return nil, false
 	}
-
-	// 检查错误类型
 	if gjson.GetBytes(payload, "type").String() != "error" {
-		return nil
+		return nil, false
 	}
 
 	status := int(gjson.GetBytes(payload, "status").Int())
 	if status == 0 {
 		status = int(gjson.GetBytes(payload, "status_code").Int())
 	}
-	if status <= 0 {
-		return nil
-	}
 
-	// 构建错误消息
 	errMsg := gjson.GetBytes(payload, "error.message").String()
 	if errMsg == "" {
+		errMsg = gjson.GetBytes(payload, "message").String()
+	}
+	if errMsg == "" && status > 0 {
 		errMsg = http.StatusText(status)
 	}
+	if errMsg == "" {
+		errMsg = "upstream websocket error"
+	}
 
-	return fmt.Errorf("websocket error (status %d): %s", status, errMsg)
+	// 构造 response.failed 事件：下游 ReadSSEStream 已识别该类型为终止失败，
+	// 与 HTTP 路径的错误语义对齐；同时保留原始上游错误对象供客户端排查。
+	errObj := gjson.GetBytes(payload, "error").Raw
+	if errObj == "" {
+		errObj = fmt.Sprintf(`{"message":%q,"code":%d}`, errMsg, status)
+	}
+	event := fmt.Sprintf(`{"type":"response.failed","response":{"status":"failed","error":%s}}`, errObj)
+	return []byte(event), true
 }
 
 // normalizeCompletionEvent 标准化完成事件类型
@@ -462,19 +463,16 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 		return nil, err
 	}
 
-	// 检查 HTTP 握手响应状态
-	statusCode := http.StatusOK
-	if wsResp.HTTPResponse() != nil {
-		statusCode = wsResp.HTTPResponse().StatusCode
-		// 如果握手失败（非 2xx），返回错误响应
-		if statusCode < 200 || statusCode >= 300 {
-			wsResp.Close()
-			return &http.Response{
-				StatusCode: statusCode,
-				Header:     wsResp.HTTPResponse().Header.Clone(),
-				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
-			}, nil
-		}
+	// 检查 HTTP 握手响应状态。WebSocket 握手成功的标准状态是 101，
+	// 但这里要包装成现有 handler 可消费的 SSE HTTP 200 响应。
+	statusCode, handshakeHeader, handshakeFailed := normalizeWebsocketHandshakeResponse(wsResp.HTTPResponse())
+	if handshakeFailed {
+		wsResp.Close()
+		return &http.Response{
+			StatusCode: statusCode,
+			Header:     handshakeHeader.Clone(),
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
+		}, nil
 	}
 
 	// 将 WebSocket 响应包装为 http.Response
@@ -519,4 +517,17 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 	}()
 
 	return resp, nil
+}
+
+func normalizeWebsocketHandshakeResponse(handshakeResp *http.Response) (statusCode int, header http.Header, failed bool) {
+	if handshakeResp == nil {
+		return http.StatusOK, http.Header{}, false
+	}
+
+	statusCode = handshakeResp.StatusCode
+	header = handshakeResp.Header
+	if statusCode == http.StatusSwitchingProtocols || (statusCode >= 200 && statusCode < 300) {
+		return http.StatusOK, header, false
+	}
+	return statusCode, header, true
 }
