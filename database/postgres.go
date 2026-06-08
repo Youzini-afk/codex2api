@@ -85,6 +85,12 @@ type AccountCredentialIndex struct {
 	AccountIDs    map[string]bool
 }
 
+// AccountIdentityIndex holds workspace/account scoped user and email identity keys.
+type AccountIdentityIndex struct {
+	UserKeys  map[string]bool
+	EmailKeys map[string]bool
+}
+
 // GetCredential 从 credentials JSONB 获取字符串字段
 func (a *AccountRow) GetCredential(key string) string {
 	if a.Credentials == nil {
@@ -4635,6 +4641,39 @@ func (db *DB) GetAllChatGPTAccountIDs(ctx context.Context) (map[string]bool, err
 		}
 	}
 	return result, rows.Err()
+}
+
+// GetActiveAccountIdentityIndex 获取所有未删除账号中按 workspace/account 作用域归一化的 user/email 身份键。
+// 用于导入时识别同一 ChatGPT workspace/account 下同一用户在 access_token 变化后的重复账号。
+func (db *DB) GetActiveAccountIdentityIndex(ctx context.Context) (*AccountIdentityIndex, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	index := &AccountIdentityIndex{
+		UserKeys:  make(map[string]bool),
+		EmailKeys: make(map[string]bool),
+	}
+	for rows.Next() {
+		var raw interface{}
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		credentials := decodeCredentials(raw)
+		scope := normalizeAccountIdentityScope(credentials)
+		if scope == "" {
+			continue
+		}
+		if key := accountScopedIdentityKey(scope, normalizeAccountIdentityUser(credentials)); key != "" {
+			index.UserKeys[key] = true
+		}
+		if key := accountScopedIdentityKey(scope, normalizeAccountIdentityEmail(credentials)); key != "" {
+			index.EmailKeys[key] = true
+		}
+	}
+	return index, rows.Err()
 }
 
 func (db *DB) GetAllOpenAIAPIKeys(ctx context.Context) (map[string]bool, error) {

@@ -14,6 +14,7 @@ type tokenCredentialSeed struct {
 	accessToken           string
 	idToken               string
 	accountID             string
+	userID                string
 	email                 string
 	planType              string
 	expiresAt             time.Time
@@ -33,6 +34,7 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	seed.accessToken = strings.TrimSpace(seed.accessToken)
 	seed.idToken = strings.TrimSpace(seed.idToken)
 	seed.accountID = strings.TrimSpace(seed.accountID)
+	seed.userID = strings.TrimSpace(seed.userID)
 	seed.email = strings.TrimSpace(seed.email)
 	seed.planType = strings.TrimSpace(seed.planType)
 	seed.expiresAtRaw = strings.TrimSpace(seed.expiresAtRaw)
@@ -117,6 +119,11 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	}
 	if seed.accountID != "" {
 		credentials["account_id"] = seed.accountID
+		credentials["chatgpt_account_id"] = seed.accountID
+	}
+	if seed.userID != "" {
+		credentials["user_id"] = seed.userID
+		credentials["chatgpt_user_id"] = seed.userID
 	}
 	if seed.email != "" {
 		credentials["email"] = seed.email

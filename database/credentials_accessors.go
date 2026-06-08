@@ -1,6 +1,9 @@
 package database
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 func (a *AccountRow) GetCredentialFloat64(key string) (float64, bool) {
 	if a == nil || a.Credentials == nil {
@@ -46,5 +49,64 @@ func (a *AccountRow) GetCredentialBool(key string) bool {
 		return err == nil && parsed
 	default:
 		return false
+	}
+}
+
+func normalizeAccountIdentityScope(credentials map[string]interface{}) string {
+	return firstCredentialString(credentials, "chatgpt_account_id", "account_id")
+}
+
+func normalizeAccountIdentityUser(credentials map[string]interface{}) string {
+	return firstCredentialString(credentials, "chatgpt_user_id", "user_id", "chatgpt_account_user_id", "account_user_id", "accountUserID")
+}
+
+func normalizeAccountIdentityEmail(credentials map[string]interface{}) string {
+	return strings.ToLower(firstCredentialString(credentials, "email"))
+}
+
+func accountScopedIdentityKey(scope, value string) string {
+	scope = strings.TrimSpace(scope)
+	value = strings.TrimSpace(value)
+	if scope == "" || value == "" {
+		return ""
+	}
+	return scope + "\x00" + value
+}
+
+func firstCredentialString(credentials map[string]interface{}, keys ...string) string {
+	if credentials == nil {
+		return ""
+	}
+	for _, key := range keys {
+		value, ok := credentials[key]
+		if !ok || value == nil {
+			continue
+		}
+		s := strings.TrimSpace(credentialValueString(value))
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func credentialValueString(value interface{}) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(typed), 'f', -1, 32)
+	case int:
+		return strconv.FormatInt(int64(typed), 10)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case int32:
+		return strconv.FormatInt(int64(typed), 10)
+	case bool:
+		return strconv.FormatBool(typed)
+	default:
+		return ""
 	}
 }

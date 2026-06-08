@@ -2285,6 +2285,7 @@ type importToken struct {
 	idToken             string
 	accountID           string
 	chatgptAccountID    string // sub2api 等导出格式中的 ChatGPT 账号唯一标识，用于精确去重
+	userID              string // sub2api credentials 中的 ChatGPT 用户/成员标识，用于区分同 workspace 下不同用户
 	planType            string
 	expiresAt           string
 	codex7DUsedPercent  string
@@ -2296,23 +2297,27 @@ type importToken struct {
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken        string                 `json:"refresh_token"`
-	SessionToken        string                 `json:"session_token"`
-	SessionTokenCamel   string                 `json:"sessionToken"`
-	AccessToken         string                 `json:"access_token"`
-	IDToken             string                 `json:"id_token"`
-	AccountID           string                 `json:"account_id"`
-	ChatGPTAccountID    string                 `json:"chatgpt_account_id"`
-	Email               string                 `json:"email"`
-	Name                string                 `json:"name"`
-	PlanType            string                 `json:"plan_type"`
-	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
-	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
-	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
-	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
-	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
-	Expired             importJSONScalarString `json:"expired"`
-	ExpiresAt           importJSONScalarString `json:"expires_at"`
+	RefreshToken         string                 `json:"refresh_token"`
+	SessionToken         string                 `json:"session_token"`
+	SessionTokenCamel    string                 `json:"sessionToken"`
+	AccessToken          string                 `json:"access_token"`
+	IDToken              string                 `json:"id_token"`
+	AccountID            string                 `json:"account_id"`
+	ChatGPTAccountID     string                 `json:"chatgpt_account_id"`
+	ChatGPTUserID        string                 `json:"chatgpt_user_id"`
+	UserID               string                 `json:"user_id"`
+	ChatGPTAccountUserID string                 `json:"chatgpt_account_user_id"`
+	AccountUserID        string                 `json:"account_user_id"`
+	Email                string                 `json:"email"`
+	Name                 string                 `json:"name"`
+	PlanType             string                 `json:"plan_type"`
+	Codex7DUsedPercent   importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt       string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent   importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt       string                 `json:"codex_5h_reset_at"`
+	CodexUsageUpdatedAt  string                 `json:"codex_usage_updated_at"`
+	Expired              importJSONScalarString `json:"expired"`
+	ExpiresAt            importJSONScalarString `json:"expires_at"`
 }
 
 type sub2apiImportPayload struct {
@@ -2325,22 +2330,26 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
-	RefreshToken        string                 `json:"refresh_token"`
-	SessionToken        string                 `json:"session_token"`
-	SessionTokenCamel   string                 `json:"sessionToken"`
-	AccessToken         string                 `json:"access_token"`
-	IDToken             string                 `json:"id_token"`
-	AccountID           string                 `json:"account_id"`
-	ChatGPTAccountID    string                 `json:"chatgpt_account_id"`
-	Email               string                 `json:"email"`
-	PlanType            string                 `json:"plan_type"`
-	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
-	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
-	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
-	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
-	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
-	ExpiresAt           importJSONScalarString `json:"expires_at"`
-	Expired             importJSONScalarString `json:"expired"`
+	RefreshToken         string                 `json:"refresh_token"`
+	SessionToken         string                 `json:"session_token"`
+	SessionTokenCamel    string                 `json:"sessionToken"`
+	AccessToken          string                 `json:"access_token"`
+	IDToken              string                 `json:"id_token"`
+	AccountID            string                 `json:"account_id"`
+	ChatGPTAccountID     string                 `json:"chatgpt_account_id"`
+	ChatGPTUserID        string                 `json:"chatgpt_user_id"`
+	UserID               string                 `json:"user_id"`
+	ChatGPTAccountUserID string                 `json:"chatgpt_account_user_id"`
+	AccountUserID        string                 `json:"account_user_id"`
+	Email                string                 `json:"email"`
+	PlanType             string                 `json:"plan_type"`
+	Codex7DUsedPercent   importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt       string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent   importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt       string                 `json:"codex_5h_reset_at"`
+	CodexUsageUpdatedAt  string                 `json:"codex_usage_updated_at"`
+	ExpiresAt            importJSONScalarString `json:"expires_at"`
+	Expired              importJSONScalarString `json:"expired"`
 }
 
 type importJSONScalarString string
@@ -2429,6 +2438,7 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 				idToken:             strings.TrimSpace(entry.IDToken),
 				accountID:           strings.TrimSpace(entry.AccountID),
 				chatgptAccountID:    strings.TrimSpace(entry.ChatGPTAccountID),
+				userID:              firstNonEmpty(entry.ChatGPTUserID, entry.UserID, entry.ChatGPTAccountUserID, entry.AccountUserID),
 				planType:            strings.TrimSpace(entry.PlanType),
 				expiresAt:           firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
 				codex7DUsedPercent:  strings.TrimSpace(entry.Codex7DUsedPercent.String()),
@@ -2470,6 +2480,7 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 				idToken:             strings.TrimSpace(account.Credentials.IDToken),
 				accountID:           strings.TrimSpace(account.Credentials.AccountID),
 				chatgptAccountID:    strings.TrimSpace(account.Credentials.ChatGPTAccountID),
+				userID:              firstNonEmpty(account.Credentials.ChatGPTUserID, account.Credentials.UserID, account.Credentials.ChatGPTAccountUserID, account.Credentials.AccountUserID),
 				planType:            strings.TrimSpace(account.Credentials.PlanType),
 				expiresAt:           firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
 				codex7DUsedPercent:  strings.TrimSpace(account.Credentials.Codex7DUsedPercent.String()),
@@ -2705,6 +2716,82 @@ func setupSSE(c *gin.Context) {
 	c.Writer.Flush()
 }
 
+func importTokenHasFineIdentity(t importToken) bool {
+	return strings.TrimSpace(t.userID) != "" || strings.TrimSpace(t.email) != ""
+}
+
+func importTokenAccountScope(t importToken) string {
+	return firstNonEmpty(t.chatgptAccountID, t.accountID)
+}
+
+func importTokenScopedIdentity(prefix, scope, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	scope = strings.TrimSpace(scope)
+	if scope != "" {
+		return prefix + ":" + scope + "\x00" + value
+	}
+	return prefix + ":" + value
+}
+
+func importTokenDBScopedIdentity(scope, value string) string {
+	scope = strings.TrimSpace(scope)
+	value = strings.TrimSpace(value)
+	if scope == "" || value == "" {
+		return ""
+	}
+	return scope + "\x00" + value
+}
+
+func importTokenDBUserIdentityKey(t importToken) string {
+	return importTokenDBScopedIdentity(importTokenAccountScope(t), t.userID)
+}
+
+func importTokenDBEmailIdentityKey(t importToken) string {
+	return importTokenDBScopedIdentity(importTokenAccountScope(t), strings.ToLower(strings.TrimSpace(t.email)))
+}
+
+func importTokenDBIdentityExists(t importToken, existing *database.AccountIdentityIndex) bool {
+	if existing == nil {
+		return false
+	}
+	if key := importTokenDBUserIdentityKey(t); key != "" && existing.UserKeys[key] {
+		return true
+	}
+	if key := importTokenDBEmailIdentityKey(t); key != "" && existing.EmailKeys[key] {
+		return true
+	}
+	return false
+}
+
+func importTokenChatGPTDedupeKey(t importToken) string {
+	scope := firstNonEmpty(t.chatgptAccountID, t.accountID)
+	if key := importTokenScopedIdentity("user", scope, t.userID); key != "" {
+		return key
+	}
+	if key := importTokenScopedIdentity("email", scope, strings.ToLower(strings.TrimSpace(t.email))); key != "" {
+		return key
+	}
+	if scope != "" {
+		return "account_scope:" + scope
+	}
+	return ""
+}
+
+func markImportTokenSeen(t importToken, seenRT, seenST, seenAT map[string]bool) {
+	if t.refreshToken != "" {
+		seenRT[t.refreshToken] = true
+	}
+	if t.sessionToken != "" {
+		seenST[t.sessionToken] = true
+	}
+	if t.accessToken != "" {
+		seenAT[t.accessToken] = true
+	}
+}
+
 func sendSSEJSON(c *gin.Context, event any) {
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -2721,31 +2808,28 @@ func sendSSEJSON(c *gin.Context, event any) {
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
 	// 文件内去重：
-	// 1) 当条目带有 chatgpt_account_id 时，以它作为唯一键 —— 这是 ChatGPT 端真正的账号标识，
-	//    可以避免因导出工具误把同一 RT 复制给多个不同账号而被错误合并。
-	// 2) 没有 chatgpt_account_id 时，退回到 RT / ST / AT 顺序去重（兼容旧导出格式）。
-	// 3) 同一份文件内若出现"同一个 RT 对应多个不同 chatgpt_account_id"，
+	// 1) access_token 是硬重复键：同一份文件内 AT 相同只保留第一条。
+	// 2) 当条目带有 chatgpt_account_id/account_id 时，优先以 (workspace/account, user_id/email) 区分，
+	//    再退回 workspace/account，避免 Sub2Api 同一 workspace 下不同用户被合并。
+	// 3) 没有 workspace/account 时，退回到 RT / ST / AT 顺序去重（兼容旧导出格式）。
+	// 4) 同一份文件内若出现"同一个 RT 对应多个不同 chatgpt_account_id"，
 	//    会被全部保留为独立账号；数据库层面 refresh_token 没有 UNIQUE 约束，因此安全。
-	seenChatGPTID := make(map[string]bool)
+	seenChatGPTIdentity := make(map[string]bool)
 	seenRT := make(map[string]bool)
 	seenST := make(map[string]bool)
 	seenAT := make(map[string]bool)
 	var unique []importToken
 	for _, t := range tokens {
-		if t.chatgptAccountID != "" {
-			if seenChatGPTID[t.chatgptAccountID] {
+		if t.accessToken != "" && seenAT[t.accessToken] {
+			continue
+		}
+		if importTokenAccountScope(t) != "" {
+			key := importTokenChatGPTDedupeKey(t)
+			if seenChatGPTIdentity[key] {
 				continue
 			}
-			seenChatGPTID[t.chatgptAccountID] = true
-			if t.refreshToken != "" {
-				seenRT[t.refreshToken] = true
-			}
-			if t.sessionToken != "" {
-				seenST[t.sessionToken] = true
-			}
-			if t.accessToken != "" {
-				seenAT[t.accessToken] = true
-			}
+			seenChatGPTIdentity[key] = true
+			markImportTokenSeen(t, seenRT, seenST, seenAT)
 			unique = append(unique, t)
 			continue
 		}
@@ -2808,10 +2892,28 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 	}
 
-	// 当导入条目带 chatgpt_account_id 时，按它查数据库已有账号 —— 这是 ChatGPT 端真实的账号唯一标识。
+	// 有 workspace/account + user/email 时，按复合身份查数据库已有账号；缺少 user/email 时才退回 workspace/account 旧逻辑。
+	hasScopedIdentity := false
+	for _, t := range unique {
+		if importTokenAccountScope(t) != "" && importTokenHasFineIdentity(t) {
+			hasScopedIdentity = true
+			break
+		}
+	}
+	var existingIdentities *database.AccountIdentityIndex
+	if hasScopedIdentity {
+		existingIdentities, err = h.db.GetActiveAccountIdentityIndex(dedupeCtx)
+		if err != nil {
+			log.Printf("查询已有账号复合身份失败: %v", err)
+			writeError(c, http.StatusInternalServerError, "查询已有账号身份失败，请稍后重试")
+			return
+		}
+	}
+
+	// 只有导入条目缺少 user/email 这类更细粒度身份时，才按 chatgpt_account_id/account_id 查数据库已有账号。
 	hasChatGPTID := false
 	for _, t := range unique {
-		if t.chatgptAccountID != "" {
+		if importTokenAccountScope(t) != "" && !importTokenHasFineIdentity(t) {
 			hasChatGPTID = true
 			break
 		}
@@ -2828,27 +2930,30 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var newTokens []importToken
 	duplicateCount := 0
 	for _, t := range unique {
-		// 优先按 chatgpt_account_id 判定数据库内是否已存在该账号；
-		// 命中则跳过，避免同一账号被重复导入。
-		if t.chatgptAccountID != "" && existingChatGPTIDs[t.chatgptAccountID] {
+		if importTokenDBIdentityExists(t, existingIdentities) {
+			duplicateCount++
+			continue
+		}
+		// 仅在没有 user/email 细粒度身份时，按 chatgpt_account_id/account_id 判定数据库内是否已存在该账号。
+		if scope := importTokenAccountScope(t); scope != "" && !importTokenHasFineIdentity(t) && existingChatGPTIDs[scope] {
 			duplicateCount++
 			continue
 		}
 		switch {
 		case t.refreshToken != "":
-			// 已经按 chatgpt_account_id 排除过重复账号；此处仅当条目没有 chatgpt_account_id 时才回退到 RT 去重，
+			// 已经按 workspace/account 排除过重复账号；此处仅当条目没有 workspace/account 时才回退到 RT 去重，
 			// 否则当多个不同账号共享同一 RT（部分导出工具的常见格式）时会被错误判定为重复。
-			if t.chatgptAccountID == "" && existingRTs[t.refreshToken] {
+			if importTokenAccountScope(t) == "" && existingRTs[t.refreshToken] {
 				duplicateCount++
-			} else if t.chatgptAccountID == "" && t.sessionToken != "" && existingSTs[t.sessionToken] {
+			} else if importTokenAccountScope(t) == "" && t.sessionToken != "" && existingSTs[t.sessionToken] {
 				duplicateCount++
-			} else if t.chatgptAccountID == "" && t.accessToken != "" && existingATs[t.accessToken] {
+			} else if t.accessToken != "" && existingATs[t.accessToken] {
 				duplicateCount++
 			} else {
 				newTokens = append(newTokens, t)
 			}
 		case t.sessionToken != "":
-			if existingSTs[t.sessionToken] {
+			if importTokenAccountScope(t) == "" && existingSTs[t.sessionToken] {
 				duplicateCount++
 			} else if t.accessToken != "" && existingATs[t.accessToken] {
 				duplicateCount++
@@ -2944,6 +3049,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					accessToken:         tok.accessToken,
 					idToken:             tok.idToken,
 					accountID:           firstNonEmpty(tok.accountID, tok.chatgptAccountID),
+					userID:              tok.userID,
 					email:               tok.email,
 					planType:            tok.planType,
 					expiresAtRaw:        tok.expiresAt,
@@ -2979,7 +3085,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 						sessionToken:        tok.sessionToken,
 						accessToken:         tok.accessToken,
 						idToken:             tok.idToken,
-						accountID:           tok.accountID,
+						accountID:           firstNonEmpty(tok.accountID, tok.chatgptAccountID),
+						userID:              tok.userID,
 						email:               tok.email,
 						planType:            tok.planType,
 						expiresAtRaw:        tok.expiresAt,
@@ -3009,7 +3116,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					sessionToken:        tok.sessionToken,
 					accessToken:         tok.accessToken,
 					idToken:             tok.idToken,
-					accountID:           tok.accountID,
+					accountID:           firstNonEmpty(tok.accountID, tok.chatgptAccountID),
+					userID:              tok.userID,
 					email:               tok.email,
 					planType:            tok.planType,
 					expiresAtRaw:        tok.expiresAt,

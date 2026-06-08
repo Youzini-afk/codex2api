@@ -125,6 +125,50 @@ func TestParseImportJSONTokensSupportsSub2API(t *testing.T) {
 	}
 }
 
+func TestParseImportJSONTokensSupportsSub2APISharedAccountDifferentUsers(t *testing.T) {
+	data := []byte(`{
+		"exported_at": "2026-04-03T14:49:53Z",
+		"accounts": [
+			{
+				"name": "Team User One",
+				"credentials": {
+					"chatgpt_account_id": "team-workspace",
+					"chatgpt_user_id": "user-one",
+					"email": "one@example.com",
+					"access_token": "at-one"
+				}
+			},
+			{
+				"name": "Team User Two",
+				"credentials": {
+					"chatgpt_account_id": "team-workspace",
+					"user_id": "user-two",
+					"email": "two@example.com",
+					"access_token": "at-two"
+				}
+			}
+		]
+	}`)
+
+	tokens, err := parseImportJSONTokens(data)
+	if err != nil {
+		t.Fatalf("parseImportJSONTokens returned error: %v", err)
+	}
+
+	if len(tokens) != 2 {
+		t.Fatalf("tokens len = %d, want 2", len(tokens))
+	}
+	if tokens[0].chatgptAccountID != "team-workspace" || tokens[1].chatgptAccountID != "team-workspace" {
+		t.Fatalf("chatgptAccountID = %q/%q, want shared workspace", tokens[0].chatgptAccountID, tokens[1].chatgptAccountID)
+	}
+	if tokens[0].userID != "user-one" || tokens[1].userID != "user-two" {
+		t.Fatalf("userID = %q/%q, want distinct imported user ids", tokens[0].userID, tokens[1].userID)
+	}
+	if tokens[0].accessToken != "at-one" || tokens[1].accessToken != "at-two" {
+		t.Fatalf("accessToken = %q/%q, want distinct ATs", tokens[0].accessToken, tokens[1].accessToken)
+	}
+}
+
 func TestParseImportJSONTokensSupportsSub2APINumericExpiresAt(t *testing.T) {
 	data := []byte(`{
 		"accounts": [
@@ -149,6 +193,62 @@ func TestParseImportJSONTokensSupportsSub2APINumericExpiresAt(t *testing.T) {
 	}
 	if tokens[0].expiresAt != "1779071020" {
 		t.Fatalf("expiresAt = %q, want numeric value preserved", tokens[0].expiresAt)
+	}
+}
+
+func TestFetchSub2APISummariesDefaultsMissingDataPlatformToOpenAI(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/admin/accounts":
+			_ = json.NewEncoder(w).Encode(sub2apiEnvelope{
+				Data: json.RawMessage(`{
+					"items": [{"name":"Team User","platform":" OpenAI ","status":"active"}],
+					"total": 1,
+					"page": 1,
+					"page_size": 200
+				}`),
+			})
+		case "/api/v1/admin/accounts/data":
+			_ = json.NewEncoder(w).Encode(sub2apiEnvelope{
+				Data: json.RawMessage(`{
+					"accounts": [{
+						"name":"Team User",
+						"credentials": {
+							"chatgpt_account_id":"team-workspace",
+							"chatgpt_user_id":"user-one",
+							"email":"one@example.com",
+							"access_token":"at-one"
+						}
+					}]
+				}`),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	summaries, err := fetchSub2APISummaries(context.Background(), server.URL, "test-key")
+	if err != nil {
+		t.Fatalf("fetchSub2APISummaries returned error: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("summaries len = %d, want 1", len(summaries))
+	}
+	if summaries[0].Platform != "openai" || summaries[0].Status != "active" {
+		t.Fatalf("summary platform/status = %q/%q, want openai/active", summaries[0].Platform, summaries[0].Status)
+	}
+	if summaries[0].ChatGPTAccountID != "team-workspace" || summaries[0].Email != "one@example.com" {
+		t.Fatalf("summary identity = %+v, want workspace/email preserved", summaries[0])
+	}
+
+	tok, ok := sub2apiAccountToImportToken(summaries[0])
+	if !ok {
+		t.Fatal("sub2apiAccountToImportToken returned !ok")
+	}
+	if tok.userID != "user-one" || tok.accessToken != "at-one" {
+		t.Fatalf("token = %+v, want user id and access token preserved", tok)
 	}
 }
 
@@ -396,6 +496,320 @@ func TestImportAccountsCommonTriggersUsageProbeForImportedAccountWithAccessToken
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("usage probe was not triggered for imported account with access token")
+	}
+}
+
+func TestImportAccountsCommonKeepsSub2APISharedAccountDifferentUsers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", LazyMode: true})
+	store.SetLazyMode(true)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{
+			accessToken:      "at-sub2api-one",
+			name:             "Team User One",
+			email:            "one@example.com",
+			chatgptAccountID: "team-workspace",
+			userID:           "user-one",
+		},
+		{
+			accessToken:      "at-sub2api-two",
+			name:             "Team User Two",
+			email:            "two@example.com",
+			chatgptAccountID: "team-workspace",
+			userID:           "user-two",
+		},
+	}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	payload := recorder.Body.String()
+	if !strings.Contains(payload, `"type":"complete"`) || !strings.Contains(payload, `"success":2`) || !strings.Contains(payload, `"duplicate":0`) {
+		t.Fatalf("SSE payload = %q, want complete success=2 duplicate=0", payload)
+	}
+
+	existingATs, err := db.GetAllAccessTokens(context.Background())
+	if err != nil {
+		t.Fatalf("GetAllAccessTokens: %v", err)
+	}
+	if !existingATs["at-sub2api-one"] || !existingATs["at-sub2api-two"] {
+		t.Fatalf("existing ATs = %#v, want both imported", existingATs)
+	}
+}
+
+func TestImportAccountsCommonDedupesSameAccessTokenDifferentFineIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", LazyMode: true})
+	store.SetLazyMode(true)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{
+			accessToken:      "at-same-hard-duplicate",
+			name:             "Same AT User One",
+			email:            "one@example.com",
+			chatgptAccountID: "team-workspace",
+			userID:           "user-one",
+		},
+		{
+			accessToken:      "at-same-hard-duplicate",
+			name:             "Same AT User Two",
+			email:            "two@example.com",
+			chatgptAccountID: "team-workspace",
+			userID:           "user-two",
+		},
+	}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	payload := recorder.Body.String()
+	if !strings.Contains(payload, `"type":"complete"`) || !strings.Contains(payload, `"success":1`) || !strings.Contains(payload, `"total":1`) {
+		t.Fatalf("SSE payload = %q, want complete success=1 total=1", payload)
+	}
+}
+
+func TestImportAccountsCommonKeepsAccountIDDifferentUsers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", LazyMode: true})
+	store.SetLazyMode(true)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{
+			accessToken: "at-account-id-one",
+			name:        "Account ID User One",
+			email:       "one@example.com",
+			accountID:   "legacy-workspace",
+			userID:      "user-one",
+		},
+		{
+			accessToken: "at-account-id-two",
+			name:        "Account ID User Two",
+			email:       "two@example.com",
+			accountID:   "legacy-workspace",
+			userID:      "user-two",
+		},
+	}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	payload := recorder.Body.String()
+	if !strings.Contains(payload, `"type":"complete"`) || !strings.Contains(payload, `"success":2`) || !strings.Contains(payload, `"duplicate":0`) {
+		t.Fatalf("SSE payload = %q, want complete success=2 duplicate=0", payload)
+	}
+}
+
+func TestImportAccountsCommonSkipsExistingScopedUserIDWithChangedAccessToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "existing-user", map[string]interface{}{
+		"chatgpt_account_id": "team-workspace",
+		"chatgpt_user_id":    "same-user",
+		"access_token":       "at-existing-user",
+	}, ""); err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		accessToken:      "at-new-user",
+		name:             "Existing User Duplicate",
+		chatgptAccountID: "team-workspace",
+		userID:           "same-user",
+	}}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["success"]; got != float64(0) {
+		t.Fatalf("success = %v, want 0", got)
+	}
+	if got := payload["duplicate"]; got != float64(1) {
+		t.Fatalf("duplicate = %v, want 1", got)
+	}
+}
+
+func TestImportAccountsCommonSkipsExistingScopedEmailWithChangedAccessToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "existing-email", map[string]interface{}{
+		"account_id":   "team-workspace",
+		"email":        "Same@Example.com",
+		"access_token": "at-existing-email",
+	}, ""); err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		accessToken: "at-new-email",
+		name:        "Existing Email Duplicate",
+		accountID:   "team-workspace",
+		email:       "same@example.com",
+	}}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["success"]; got != float64(0) {
+		t.Fatalf("success = %v, want 0", got)
+	}
+	if got := payload["duplicate"]; got != float64(1) {
+		t.Fatalf("duplicate = %v, want 1", got)
+	}
+}
+
+func TestImportAccountsCommonSavesUserIDCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", LazyMode: true})
+	store.SetLazyMode(true)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		accessToken:      "at-save-user-id",
+		name:             "Save User ID",
+		chatgptAccountID: "team-workspace",
+		userID:           "saved-user-id",
+		email:            "saved@example.com",
+	}}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListActive returned %d rows, want 1", len(rows))
+	}
+	if got := rows[0].GetCredential("user_id"); got != "saved-user-id" {
+		t.Fatalf("user_id credential = %q, want saved-user-id", got)
+	}
+	if got := rows[0].GetCredential("chatgpt_user_id"); got != "saved-user-id" {
+		t.Fatalf("chatgpt_user_id credential = %q, want saved-user-id", got)
+	}
+}
+
+func TestImportAccountsCommonDedupesSharedChatGPTAccountWithoutFineIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", LazyMode: true})
+	store.SetLazyMode(true)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{refreshToken: "rt-no-fine-1", name: "No Fine One", chatgptAccountID: "same-workspace"},
+		{refreshToken: "rt-no-fine-2", name: "No Fine Two", chatgptAccountID: "same-workspace"},
+	}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	payload := recorder.Body.String()
+	if !strings.Contains(payload, `"type":"complete"`) || !strings.Contains(payload, `"success":1`) {
+		t.Fatalf("SSE payload = %q, want complete success=1", payload)
+	}
+	if !strings.Contains(payload, `"total":1`) {
+		t.Fatalf("SSE payload = %q, want file-level duplicate collapsed to total=1", payload)
+	}
+}
+
+func TestImportAccountsCommonSkipsExistingChatGPTAccountWithoutFineIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	existingID, err := db.InsertAccount(context.Background(), "existing-workspace", "rt-existing-workspace", "")
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), existingID, map[string]interface{}{
+		"chatgpt_account_id": "existing-workspace",
+	}); err != nil {
+		t.Fatalf("UpdateCredentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken:     "rt-new-workspace",
+		name:             "Existing Workspace Duplicate",
+		chatgptAccountID: "existing-workspace",
+	}}, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["success"]; got != float64(0) {
+		t.Fatalf("success = %v, want 0", got)
+	}
+	if got := payload["duplicate"]; got != float64(1) {
+		t.Fatalf("duplicate = %v, want 1", got)
+	}
+	if got := payload["total"]; got != float64(1) {
+		t.Fatalf("total = %v, want 1", got)
 	}
 }
 

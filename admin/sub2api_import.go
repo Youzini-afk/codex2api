@@ -54,13 +54,13 @@ type sub2apiDataPayload struct {
 
 // sub2api 分页 list 返回的账号状态条目
 type sub2apiListAccount struct {
-	ID               int64      `json:"id"`
-	Name             string     `json:"name"`
-	Platform         string     `json:"platform"`
-	Status           string     `json:"status"`
-	ErrorMessage     string     `json:"error_message"`
-	RateLimitedAt    *time.Time `json:"rate_limited_at"`
-	RateLimitResetAt *time.Time `json:"rate_limit_reset_at"`
+	ID               int64                  `json:"id"`
+	Name             string                 `json:"name"`
+	Platform         string                 `json:"platform"`
+	Status           string                 `json:"status"`
+	ErrorMessage     string                 `json:"error_message"`
+	RateLimitedAt    *time.Time             `json:"rate_limited_at"`
+	RateLimitResetAt *time.Time             `json:"rate_limit_reset_at"`
 	Credentials      map[string]interface{} `json:"credentials"`
 }
 
@@ -123,7 +123,7 @@ func (h *Handler) PreviewSub2APIAccounts(c *gin.Context) {
 }
 
 // ImportFromSub2API 从 sub2api 拉取账号并按 scope 导入到本系统。
-// 复用 importAccountsCommon 的 SSE 进度推送、chatgpt_account_id 去重等逻辑。
+// 复用 importAccountsCommon 的 SSE 进度推送与导入去重逻辑。
 func (h *Handler) ImportFromSub2API(c *gin.Context) {
 	var req sub2apiImportRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -194,7 +194,7 @@ type sub2apiAccountInternal struct {
 	Credentials      map[string]interface{}
 }
 
-// fetchSub2APISummaries 同时调 list 接口拿状态和 data 接口拿明文凭证，按 chatgpt_account_id 合并。
+// fetchSub2APISummaries 同时调 list 接口拿状态和 data 接口拿明文凭证，按规范化后的 (name, platform) 合并。
 func fetchSub2APISummaries(ctx context.Context, baseURL, apiKey string) ([]sub2apiAccountInternal, error) {
 	listAccounts, err := sub2apiFetchAllList(ctx, baseURL, apiKey)
 	if err != nil {
@@ -206,7 +206,7 @@ func fetchSub2APISummaries(ctx context.Context, baseURL, apiKey string) ([]sub2a
 		return nil, fmt.Errorf("拉取 sub2api 账号明文凭证失败: %w", err)
 	}
 
-	// list 是按 ID 主键的；data 不带 status。我们按 (name, platform) 关联，
+	// list 是按 ID 主键的；data 不带 status。我们按规范化后的 (name, platform) 关联，
 	// 因为 sub2api 的 name 在同 platform 内是唯一键。
 	type listKey struct {
 		name     string
@@ -214,15 +214,30 @@ func fetchSub2APISummaries(ctx context.Context, baseURL, apiKey string) ([]sub2a
 	}
 	listIndex := make(map[listKey]sub2apiListAccount, len(listAccounts))
 	for _, a := range listAccounts {
-		listIndex[listKey{a.Name, a.Platform}] = a
+		listIndex[listKey{strings.TrimSpace(a.Name), strings.ToLower(strings.TrimSpace(a.Platform))}] = a
 	}
 
 	now := time.Now()
 	out := make([]sub2apiAccountInternal, 0, len(dataPayload.Accounts))
 	for _, dataAcc := range dataPayload.Accounts {
+		nameKey := strings.TrimSpace(dataAcc.Name)
+		platformKey := strings.ToLower(strings.TrimSpace(dataAcc.Platform))
+		if platformKey == "" {
+			// /accounts/data?platform=openai 返回的导出条目有时不带 platform；
+			// list 接口按 name 能唯一匹配时优先用 list 的平台，否则按请求语义默认 openai。
+			for key := range listIndex {
+				if key.name == nameKey {
+					platformKey = key.platform
+					break
+				}
+			}
+			if platformKey == "" {
+				platformKey = "openai"
+			}
+		}
 		merged := sub2apiAccountInternal{
 			Name:        dataAcc.Name,
-			Platform:    strings.ToLower(strings.TrimSpace(dataAcc.Platform)),
+			Platform:    platformKey,
 			Credentials: dataAcc.Credentials,
 		}
 		if dataAcc.Credentials != nil {
@@ -231,7 +246,7 @@ func fetchSub2APISummaries(ctx context.Context, baseURL, apiKey string) ([]sub2a
 			merged.PlanType = stringFromMap(dataAcc.Credentials, "plan_type")
 		}
 
-		if listAcc, ok := listIndex[listKey{dataAcc.Name, dataAcc.Platform}]; ok {
+		if listAcc, ok := listIndex[listKey{nameKey, platformKey}]; ok {
 			merged.Status = listAcc.Status
 			merged.ErrorMessage = listAcc.ErrorMessage
 			if listAcc.RateLimitResetAt != nil && now.Before(*listAcc.RateLimitResetAt) {
@@ -316,6 +331,7 @@ func sub2apiAccountToImportToken(a sub2apiAccountInternal) (importToken, bool) {
 		idToken:             stringFromMap(c, "id_token"),
 		accountID:           stringFromMap(c, "account_id"),
 		chatgptAccountID:    a.ChatGPTAccountID,
+		userID:              stringFromMap(c, "chatgpt_user_id", "user_id", "chatgpt_account_user_id", "account_user_id", "accountUserID"),
 		planType:            a.PlanType,
 		expiresAt:           stringFromMap(c, "expires_at"),
 		codex7DUsedPercent:  stringFromMap(c, "codex_7d_used_percent"),
