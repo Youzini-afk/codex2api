@@ -191,9 +191,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				auto_clean_unauthorized INTEGER DEFAULT 0,
 				auto_clean_rate_limited INTEGER DEFAULT 0,
 				background_refresh_interval_minutes INTEGER DEFAULT 2,
-				usage_probe_max_age_minutes INTEGER DEFAULT 10,
-				usage_probe_concurrency INTEGER DEFAULT 16,
-				recovery_probe_interval_minutes INTEGER DEFAULT 30,
+					usage_probe_max_age_minutes INTEGER DEFAULT 10,
+					usage_probe_concurrency INTEGER DEFAULT 16,
+					usage_probe_responses_fallback_enabled INTEGER DEFAULT 1,
+					recovery_probe_interval_minutes INTEGER DEFAULT 30,
 				admin_secret TEXT DEFAULT '',
 				auto_clean_full_usage INTEGER DEFAULT 0,
 				auto_clean_error INTEGER DEFAULT 0,
@@ -212,15 +213,19 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
 				stream_flush_policy TEXT DEFAULT 'immediate',
 				stream_flush_interval_ms INTEGER DEFAULT 20,
+				first_token_mode TEXT DEFAULT 'strict',
 				first_token_timeout_seconds INTEGER DEFAULT 0,
 				image_storage_config TEXT DEFAULT '{}',
 				show_full_usage_numbers INTEGER DEFAULT 0,
 				scheduler_mode TEXT DEFAULT 'round_robin',
-				affinity_mode TEXT DEFAULT 'bounded',
-				codex_force_websocket INTEGER DEFAULT 0,
-				codex_ws_keepalive_enabled INTEGER DEFAULT 0,
-				codex_ws_keepalive_interval_sec INTEGER DEFAULT 60
-			);`,
+					affinity_mode TEXT DEFAULT 'bounded',
+					codex_force_websocket INTEGER DEFAULT 0,
+					codex_ws_keepalive_enabled INTEGER DEFAULT 0,
+					codex_ws_keepalive_interval_sec INTEGER DEFAULT 60,
+					codex_ws_hide_upstream_errors INTEGER DEFAULT 1,
+					codex_ws_silent_retry_enabled INTEGER DEFAULT 1,
+					codex_ws_silent_max_retries INTEGER DEFAULT 2
+				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
 			enabled INTEGER DEFAULT 1,
@@ -391,6 +396,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "background_refresh_interval_minutes", "INTEGER DEFAULT 2"},
 		{"system_settings", "usage_probe_max_age_minutes", "INTEGER DEFAULT 10"},
 		{"system_settings", "usage_probe_concurrency", "INTEGER DEFAULT 16"},
+		{"system_settings", "usage_probe_responses_fallback_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "recovery_probe_interval_minutes", "INTEGER DEFAULT 30"},
 		{"system_settings", "admin_secret", "TEXT DEFAULT ''"},
 		{"system_settings", "auto_clean_full_usage", "INTEGER DEFAULT 0"},
@@ -402,6 +408,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_force_websocket", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_keepalive_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_keepalive_interval_sec", "INTEGER DEFAULT 60"},
+		{"system_settings", "codex_ws_hide_upstream_errors", "INTEGER DEFAULT 1"},
+		{"system_settings", "codex_ws_silent_retry_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "codex_ws_silent_max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
@@ -426,6 +435,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "usage_log_flush_interval_seconds", "INTEGER DEFAULT 5"},
 		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
 		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
+		{"system_settings", "first_token_mode", "TEXT DEFAULT 'strict'"},
 		{"system_settings", "first_token_timeout_seconds", "INTEGER DEFAULT 0"},
 		{"system_settings", "billing_tier_policy", "TEXT DEFAULT 'actual'"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
@@ -457,6 +467,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_accounts_cooldown_until ON accounts(cooldown_until);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
@@ -851,8 +862,8 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 
 		stats.TodayRequests++
 		stats.TodayTokens += totalTokens
-		stats.TotalPrompt += promptTokens
-		stats.TotalCompletion += completionTokens
+		stats.TodayPrompt += promptTokens
+		stats.TodayCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
 		stats.TodayCachedTokens += cachedTokens
 		stats.TodayAccountBilled += accountBilled
@@ -935,11 +946,11 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
 	}
-	stats.ModelStats, err = db.getUsageModelStats(ctx, 10)
+	stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.populateUsageBreakdownStats(ctx, stats); err != nil {
+	if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd); err != nil {
 		return nil, err
 	}
 

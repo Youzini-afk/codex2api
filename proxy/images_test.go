@@ -43,6 +43,56 @@ func TestBuildImagesResponsesRequestMatchesReferenceChain(t *testing.T) {
 	}
 }
 
+func TestResponsesBodyHasImageGenerationTool(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"tool", []byte(`{"tools":[{"type":"image_generation","model":"gpt-image-2"}]}`), true},
+		{"object_choice", []byte(`{"tool_choice":{"type":"image_generation"}}`), true},
+		{"string_choice", []byte(`{"tool_choice":"image_generation"}`), true},
+		{"function_tool", []byte(`{"tools":[{"type":"function","name":"lookup"}]}`), false},
+		{"empty", []byte(`{}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responsesBodyHasImageGenerationTool(tc.body); got != tc.want {
+				t.Fatalf("responsesBodyHasImageGenerationTool() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResponsesBodyRequestsImageGenerationIgnoresDefaultInjectedTool(t *testing.T) {
+	prepared, _ := PrepareResponsesBody([]byte(`{"model":"gpt-5.5","input":"hello"}`))
+	if !responsesBodyHasImageGenerationTool(prepared) {
+		t.Fatalf("test setup expected prepared body to include default image tool: %s", prepared)
+	}
+	if responsesBodyRequestsImageGeneration(prepared) {
+		t.Fatalf("default injected image tool should not force HTTP image path: %s", prepared)
+	}
+}
+
+func TestResponsesBodyRequestsImageGenerationDetectsExplicitIntent(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"object_choice", []byte(`{"model":"gpt-5.5","tool_choice":{"type":"image_generation"}}`)},
+		{"string_choice", []byte(`{"model":"gpt-5.5","tool_choice":"image_generation"}`)},
+		{"image_model", []byte(`{"model":"gpt-image-2","prompt":"draw a cat"}`)},
+		{"top_level_option", []byte(`{"model":"gpt-5.5","input":"draw a cat","size":"1024x1024"}`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !responsesBodyRequestsImageGeneration(tc.body) {
+				t.Fatalf("responsesBodyRequestsImageGeneration() = false, want true for %s", tc.body)
+			}
+		})
+	}
+}
+
 func TestNextImageAccountPrefersPlusOrHigherPlan(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "free-token", PlanType: "free"})

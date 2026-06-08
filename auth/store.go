@@ -1701,40 +1701,41 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
-	mu                        sync.RWMutex
-	accounts                  []*Account
-	accountsByID              map[int64]*Account // DBID -> Account 索引，与 accounts 同步维护，供 O(1) 查找
-	globalProxy               string
-	maxConcurrency            int64        // 每账号最大并发数
-	testConcurrency           int64        // 批量测试并发数
-	testModel                 atomic.Value // 测试连接使用的模型（string）
-	db                        *database.DB
-	tokenCache                cache.TokenCache
-	apiKeyGroupsMu            sync.RWMutex
-	apiKeyAllowedGroups       map[int64][]int64
-	apiKeyAllowedGroupSets    map[int64]map[int64]struct{}
-	usageProbeMu              sync.RWMutex
-	usageProbe                func(context.Context, *Account) error
-	usageProbeBatch           atomic.Bool
-	recoveryProbeBatch        atomic.Bool
-	autoCleanUnauthorized     atomic.Bool
-	autoCleanRateLimited      atomic.Bool
-	autoCleanFullUsage        atomic.Bool
-	autoCleanError            atomic.Bool
-	autoCleanExpired          atomic.Bool
-	lazyMode                  atomic.Bool
-	autoCleanupBatch          atomic.Bool
-	maxRetries                int64 // 请求失败最大重试次数（换号重试）
-	maxRateLimitRetries       int64 // 429 最大换号重试次数
-	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
-	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
-	usageProbeConcurrency     int64 // 用量探针并行度
-	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
-	backgroundRefreshWakeCh   chan struct{}
-	lazyRefreshInFlight       sync.Map
-	stopCh                    chan struct{}
-	stopOnce                  sync.Once
-	wg                        sync.WaitGroup
+	mu                                 sync.RWMutex
+	accounts                           []*Account
+	accountsByID                       map[int64]*Account // DBID -> Account 索引，与 accounts 同步维护，供 O(1) 查找
+	globalProxy                        string
+	maxConcurrency                     int64        // 每账号最大并发数
+	testConcurrency                    int64        // 批量测试并发数
+	testModel                          atomic.Value // 测试连接使用的模型（string）
+	db                                 *database.DB
+	tokenCache                         cache.TokenCache
+	apiKeyGroupsMu                     sync.RWMutex
+	apiKeyAllowedGroups                map[int64][]int64
+	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
+	usageProbeMu                       sync.RWMutex
+	usageProbe                         func(context.Context, *Account) error
+	usageProbeBatch                    atomic.Bool
+	recoveryProbeBatch                 atomic.Bool
+	autoCleanUnauthorized              atomic.Bool
+	autoCleanRateLimited               atomic.Bool
+	autoCleanFullUsage                 atomic.Bool
+	autoCleanError                     atomic.Bool
+	autoCleanExpired                   atomic.Bool
+	lazyMode                           atomic.Bool
+	autoCleanupBatch                   atomic.Bool
+	maxRetries                         int64 // 请求失败最大重试次数（换号重试）
+	maxRateLimitRetries                int64 // 429 最大换号重试次数
+	backgroundRefreshInterval          int64 // 后台刷新/探针巡检间隔（ns）
+	usageProbeMaxAge                   int64 // 用量探针快照最大缓存时长（ns）
+	usageProbeConcurrency              int64 // 用量探针并行度
+	usageProbeResponsesFallbackEnabled atomic.Bool
+	recoveryProbeInterval              int64 // 恢复探测最小间隔（ns）
+	backgroundRefreshWakeCh            chan struct{}
+	lazyRefreshInFlight                sync.Map
+	stopCh                             chan struct{}
+	stopOnce                           sync.Once
+	wg                                 sync.WaitGroup
 
 	// 代理池
 	proxyPool        []string // 已启用的代理 URL 列表
@@ -1749,6 +1750,9 @@ type Store struct {
 	codexForceWebsocket         atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
 	codexWSKeepaliveEnabled     atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
 	codexWSKeepaliveIntervalSec atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
+	codexWSHideUpstreamErrors   atomic.Bool  // 隐藏上游 WS 原始错误，默认开启
+	codexWSSilentRetryEnabled   atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
+	codexWSSilentMaxRetries     atomic.Int64 // WS 静默换号最大重试次数，默认 2
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -2124,17 +2128,21 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:                   2,
-			TestConcurrency:                  50,
-			TestModel:                        "gpt-5.4",
-			BackgroundRefreshIntervalMinutes: 2,
-			UsageProbeMaxAgeMinutes:          10,
-			UsageProbeConcurrency:            defaultUsageProbeConcurrency,
-			RecoveryProbeIntervalMinutes:     30,
-			LazyMode:                         false,
-			ProxyURL:                         "",
-			MaxRateLimitRetries:              1,
-			SchedulerMode:                    "round_robin",
+			MaxConcurrency:                     2,
+			TestConcurrency:                    50,
+			TestModel:                          "gpt-5.4",
+			BackgroundRefreshIntervalMinutes:   2,
+			UsageProbeMaxAgeMinutes:            10,
+			UsageProbeConcurrency:              defaultUsageProbeConcurrency,
+			UsageProbeResponsesFallbackEnabled: true,
+			RecoveryProbeIntervalMinutes:       30,
+			LazyMode:                           false,
+			ProxyURL:                           "",
+			MaxRateLimitRetries:                1,
+			SchedulerMode:                      "round_robin",
+			CodexWSHideUpstreamErrors:          true,
+			CodexWSSilentRetryEnabled:          true,
+			CodexWSSilentMaxRetries:            2,
 		}
 	}
 	s := &Store{
@@ -2152,6 +2160,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
 	s.SetUsageProbeConcurrency(settings.UsageProbeConcurrency)
+	s.SetUsageProbeResponsesFallbackEnabled(settings.UsageProbeResponsesFallbackEnabled)
 	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
@@ -2194,6 +2203,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexForceWebsocket.Store(settings.CodexForceWebsocket)
 	s.codexWSKeepaliveEnabled.Store(settings.CodexWSKeepaliveEnabled)
 	s.codexWSKeepaliveIntervalSec.Store(normalizeWSKeepaliveInterval(settings.CodexWSKeepaliveIntervalSec))
+	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
+	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
+	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -2295,6 +2307,17 @@ func normalizeWSKeepaliveInterval(sec int) int64 {
 	return int64(sec)
 }
 
+// normalizeWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
+func normalizeWSSilentMaxRetries(retries int) int64 {
+	if retries < 0 {
+		return 0
+	}
+	if retries > 10 {
+		return 10
+	}
+	return int64(retries)
+}
+
 // SetCodexForceWebsocket 设置"强制 Codex 上游走 WebSocket"开关（运行时热更新）。
 func (s *Store) SetCodexForceWebsocket(enabled bool) {
 	if s == nil {
@@ -2345,6 +2368,54 @@ func (s *Store) CodexWSKeepaliveIntervalSec() int {
 		return 60
 	}
 	return int(v)
+}
+
+// SetCodexWSHideUpstreamErrors 设置是否向客户端隐藏上游 WS 原始错误。
+func (s *Store) SetCodexWSHideUpstreamErrors(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSHideUpstreamErrors.Store(enabled)
+}
+
+// CodexWSHideUpstreamErrors 返回是否向客户端隐藏上游 WS 原始错误。
+func (s *Store) CodexWSHideUpstreamErrors() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexWSHideUpstreamErrors.Load()
+}
+
+// SetCodexWSSilentRetryEnabled 设置首包前 WS 上游错误是否静默换号重试。
+func (s *Store) SetCodexWSSilentRetryEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSSilentRetryEnabled.Store(enabled)
+}
+
+// CodexWSSilentRetryEnabled 返回首包前 WS 上游错误是否静默换号重试。
+func (s *Store) CodexWSSilentRetryEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexWSSilentRetryEnabled.Load()
+}
+
+// SetCodexWSSilentMaxRetries 设置 WS 静默换号最大重试次数。
+func (s *Store) SetCodexWSSilentMaxRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(retries))
+}
+
+// CodexWSSilentMaxRetries 返回 WS 静默换号最大重试次数。
+func (s *Store) CodexWSSilentMaxRetries() int {
+	if s == nil {
+		return 2
+	}
+	return int(s.codexWSSilentMaxRetries.Load())
 }
 
 // GetProxyURL 获取全局代理地址
@@ -2573,6 +2644,19 @@ func (s *Store) GetUsageProbeConcurrency() int {
 		return defaultUsageProbeConcurrency
 	}
 	return n
+}
+
+// SetUsageProbeResponsesFallbackEnabled 设置 wham 失败后是否允许发送真实 /responses 探针。
+func (s *Store) SetUsageProbeResponsesFallbackEnabled(enabled bool) {
+	s.usageProbeResponsesFallbackEnabled.Store(enabled)
+}
+
+// UsageProbeResponsesFallbackEnabled 获取 wham 失败后是否允许发送真实 /responses 探针。
+func (s *Store) UsageProbeResponsesFallbackEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.usageProbeResponsesFallbackEnabled.Load()
 }
 
 // UsageProbeRunning reports whether a batch usage probe is currently active.
@@ -2859,7 +2943,9 @@ func (s *Store) StartBackgroundRefresh() {
 		for {
 			select {
 			case <-refreshTimer.C:
-				if !s.GetLazyMode() {
+				if s.GetLazyMode() {
+					s.TriggerUsageProbeAsync()
+				} else {
 					s.parallelRefreshAll(context.Background())
 					s.TriggerUsageProbeAsync()
 					s.TriggerRecoveryProbeAsync()
@@ -4649,9 +4735,6 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 
 // TriggerUsageProbeAsync 异步触发一次批量用量探针
 func (s *Store) TriggerUsageProbeAsync() {
-	if s.GetLazyMode() {
-		return
-	}
 	if !s.usageProbeBatch.CompareAndSwap(false, true) {
 		return
 	}
@@ -4928,9 +5011,6 @@ func (s *Store) parallelProbeUsageWith(ctx context.Context, maxAge time.Duration
 // TriggerUsageProbeForceAsync 异步触发一次"无视缓存阈值"的批量用量探针。
 // 用于管理端手动刷新场景。
 func (s *Store) TriggerUsageProbeForceAsync() {
-	if s.GetLazyMode() {
-		return
-	}
 	if !s.usageProbeBatch.CompareAndSwap(false, true) {
 		return
 	}

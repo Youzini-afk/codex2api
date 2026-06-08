@@ -241,7 +241,7 @@ export const api = {
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   forceUsageProbe: () =>
-    request<{ triggered: boolean; concurrency: number; reason?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
+    request<{ triggered: boolean; concurrency: number; reason?: string; mode?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
@@ -259,8 +259,12 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
-  getAccountUsage: (id: number) =>
-    request<AccountUsageDetail>(`/accounts/${id}/usage`),
+  getAccountUsage: (id: number, days?: number) => {
+    const search = new URLSearchParams()
+    if (typeof days === 'number') search.set('days', String(days))
+    const qs = search.toString()
+    return request<AccountUsageDetail>(`/accounts/${id}/usage${qs ? `?${qs}` : ''}`)
+  },
   updateAccountCredit: (id: number, data: { credit_enabled: boolean; credit_skip_usage_window: boolean }) =>
     request<MessageResponse>(`/accounts/${id}/credit`, { method: 'PATCH', body: JSON.stringify(data) }),
   getHealth: () => request<HealthResponse>('/health'),
@@ -341,7 +345,7 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; fast?: string; stream?: string }) => {
+  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
@@ -351,6 +355,7 @@ export const api = {
     if (params.model) searchParams.set('model', params.model)
     if (params.endpoint) searchParams.set('endpoint', params.endpoint)
     if (params.apiKeyId) searchParams.set('api_key_id', params.apiKeyId)
+    if (params.accountId) searchParams.set('account_id', params.accountId)
     if (params.fast) searchParams.set('fast', params.fast)
     if (params.stream) searchParams.set('stream', params.stream)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)

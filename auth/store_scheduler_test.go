@@ -254,13 +254,13 @@ func TestNeedsUsageProbeAllowsReadyAccount(t *testing.T) {
 func TestUsageReserveThresholdStopsAvailability(t *testing.T) {
 	now := time.Now()
 	acc := &Account{
-		AccessToken:            "token",
-		Status:                 StatusReady,
-		UsageReservePercent5h:  int64Ptr(10),
-		UsagePercent5h:         91,
-		UsagePercent5hValid:    true,
-		Reset5hAt:              now.Add(time.Hour),
-		UsageUpdatedAt:         now,
+		AccessToken:           "token",
+		Status:                StatusReady,
+		UsageReservePercent5h: int64Ptr(10),
+		UsagePercent5h:        91,
+		UsagePercent5hValid:   true,
+		Reset5hAt:             now.Add(time.Hour),
+		UsageUpdatedAt:        now,
 	}
 
 	if acc.IsAvailableWithUsageProbeMaxAge(10 * time.Minute) {
@@ -278,17 +278,17 @@ func TestUsageReserveThresholdStopsAvailability(t *testing.T) {
 func TestUsageReserveThresholdsAreIndependent(t *testing.T) {
 	now := time.Now()
 	acc := &Account{
-		AccessToken:            "token",
-		Status:                 StatusReady,
-		UsageReservePercent5h:  int64Ptr(5),
-		UsageReservePercent7d:  int64Ptr(20),
-		UsagePercent5h:         90,
-		UsagePercent5hValid:    true,
-		Reset5hAt:              now.Add(time.Hour),
-		UsagePercent7d:         81,
-		UsagePercent7dValid:    true,
-		Reset7dAt:              now.Add(24 * time.Hour),
-		UsageUpdatedAt:         now,
+		AccessToken:           "token",
+		Status:                StatusReady,
+		UsageReservePercent5h: int64Ptr(5),
+		UsageReservePercent7d: int64Ptr(20),
+		UsagePercent5h:        90,
+		UsagePercent5hValid:   true,
+		Reset5hAt:             now.Add(time.Hour),
+		UsagePercent7d:        81,
+		UsagePercent7dValid:   true,
+		Reset7dAt:             now.Add(24 * time.Hour),
+		UsageUpdatedAt:        now,
 	}
 
 	windows := acc.GetUsageReserveActiveWindows(10 * time.Minute)
@@ -329,15 +329,15 @@ func TestUsageReserveUnknownOrStaleSnapshotAllowsAndNeedsProbe(t *testing.T) {
 func TestUsageReserveUsesPerWindowSnapshotFreshness(t *testing.T) {
 	now := time.Now()
 	acc := &Account{
-		AccessToken:            "token",
-		Status:                 StatusReady,
-		UsageReservePercent7d:  int64Ptr(10),
-		UsagePercent7d:         95,
-		UsagePercent7dValid:    true,
-		Reset7dAt:              now.Add(24 * time.Hour),
-		UsageUpdated7dAt:       now.Add(-30 * time.Minute),
-		UsageUpdated5hAt:       now,
-		UsageUpdatedAt:         now,
+		AccessToken:           "token",
+		Status:                StatusReady,
+		UsageReservePercent7d: int64Ptr(10),
+		UsagePercent7d:        95,
+		UsagePercent7dValid:   true,
+		Reset7dAt:             now.Add(24 * time.Hour),
+		UsageUpdated7dAt:      now.Add(-30 * time.Minute),
+		UsageUpdated5hAt:      now,
+		UsageUpdatedAt:        now,
 	}
 
 	if !acc.IsAvailableWithUsageProbeMaxAge(10 * time.Minute) {
@@ -351,17 +351,17 @@ func TestUsageReserveUsesPerWindowSnapshotFreshness(t *testing.T) {
 func TestStoreNextSkipsUsageReservedAccount(t *testing.T) {
 	now := time.Now()
 	reserved := &Account{
-		DBID:                  1,
-		AccessToken:           "token",
-		Status:                StatusReady,
-		HealthTier:            HealthTierHealthy,
-		DispatchScore:         200,
+		DBID:                    1,
+		AccessToken:             "token",
+		Status:                  StatusReady,
+		HealthTier:              HealthTierHealthy,
+		DispatchScore:           200,
 		DynamicConcurrencyLimit: 1,
-		UsageReservePercent5h: int64Ptr(10),
-		UsagePercent5h:        95,
-		UsagePercent5hValid:   true,
-		Reset5hAt:             now.Add(time.Hour),
-		UsageUpdatedAt:        now,
+		UsageReservePercent5h:   int64Ptr(10),
+		UsagePercent5h:          95,
+		UsagePercent5hValid:     true,
+		Reset5hAt:               now.Add(time.Hour),
+		UsageUpdatedAt:          now,
 	}
 	fallback := &Account{
 		DBID:                    2,
@@ -383,6 +383,46 @@ func TestStoreNextSkipsUsageReservedAccount(t *testing.T) {
 	defer store.Release(got)
 	if got.DBID != fallback.DBID {
 		t.Fatalf("Next() picked dbID=%d, want %d", got.DBID, fallback.DBID)
+	}
+}
+
+func TestTriggerUsageProbeAsyncRunsInLazyMode(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	store.AddAccount(&Account{DBID: 1, AccessToken: "token", Status: StatusReady})
+
+	called := make(chan struct{}, 1)
+	store.SetUsageProbeFunc(func(ctx context.Context, acc *Account) error {
+		called <- struct{}{}
+		return nil
+	})
+
+	store.TriggerUsageProbeAsync()
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered in lazy mode")
+	}
+}
+
+func TestTriggerUsageProbeForceAsyncRunsInLazyMode(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	store.AddAccount(&Account{DBID: 1, AccessToken: "token", Status: StatusReady})
+
+	called := make(chan struct{}, 1)
+	store.SetUsageProbeFunc(func(ctx context.Context, acc *Account) error {
+		called <- struct{}{}
+		return nil
+	})
+
+	store.TriggerUsageProbeForceAsync()
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forced usage probe was not triggered in lazy mode")
 	}
 }
 

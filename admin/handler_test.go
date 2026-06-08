@@ -1627,6 +1627,46 @@ func TestListAccountsPopulatesBilledWindows(t *testing.T) {
 	}
 }
 
+func TestForceUsageProbeTriggersInLazyMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token", Status: auth.StatusReady})
+
+	called := make(chan struct{}, 1)
+	store.SetUsageProbeFunc(func(ctx context.Context, acc *auth.Account) error {
+		called <- struct{}{}
+		return nil
+	})
+	handler := &Handler{store: store}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/usage/probe", nil)
+
+	handler.ForceUsageProbe(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload struct {
+		Triggered bool   `json:"triggered"`
+		Mode      string `json:"mode"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !payload.Triggered || payload.Mode != "wham_only" {
+		t.Fatalf("payload = %#v, want triggered wham_only", payload)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered")
+	}
+}
+
 func newTestAdminDB(t *testing.T) *database.DB {
 	t.Helper()
 

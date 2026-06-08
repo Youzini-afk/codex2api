@@ -203,9 +203,26 @@ export interface AccountModelStat {
   model: string
   requests: number
   tokens: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cached_tokens: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface AccountUsageDayStat {
+  date: string
+  label: string
+  requests: number
+  tokens: number
+  account_billed: number
+  user_billed: number
 }
 
 export interface AccountUsageDetail {
+  period_days: number
+  active_days: number
   total_requests: number
   total_tokens: number
   input_tokens: number
@@ -213,6 +230,27 @@ export interface AccountUsageDetail {
   reasoning_tokens: number
   cached_tokens: number
   cache_hit_rate: number
+  total_account_billed: number
+  total_user_billed: number
+  avg_daily_account_billed: number
+  avg_daily_user_billed: number
+  avg_daily_requests: number
+  avg_daily_tokens: number
+  avg_duration_ms: number
+  avg_first_token_ms: number
+  p95_duration_ms: number
+  error_requests: number
+  error_rate: number
+  retry_requests: number
+  first_token_samples: number
+  stream_requests: number
+  stream_rate: number
+  compact_requests: number
+  compact_rate: number
+  today: AccountUsageDayStat
+  highest_cost_day?: AccountUsageDayStat
+  highest_request_day?: AccountUsageDayStat
+  history: AccountUsageDayStat[]
   models: AccountModelStat[]
 }
 
@@ -386,9 +424,10 @@ export interface RuntimeStatusResponse {
     status: RuntimeHealthStatus
     lazy_mode: boolean
     background_refresh_interval_minutes: number
-    usage_probe_max_age_minutes: number
-    usage_probe_concurrency: number
-    recovery_probe_interval_minutes: number
+	    usage_probe_max_age_minutes: number
+	    usage_probe_concurrency: number
+	    usage_probe_responses_fallback_enabled: boolean
+	    recovery_probe_interval_minutes: number
     usage_probe_running: boolean
     recovery_probe_running: boolean
     auto_cleanup_running: boolean
@@ -533,9 +572,10 @@ export interface SystemSettings {
   test_model: string
   test_concurrency: number
   background_refresh_interval_minutes: number
-  usage_probe_max_age_minutes: number
-  usage_probe_concurrency: number
-  recovery_probe_interval_minutes: number
+	  usage_probe_max_age_minutes: number
+	  usage_probe_concurrency: number
+	  usage_probe_responses_fallback_enabled: boolean
+	  recovery_probe_interval_minutes: number
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number
@@ -553,6 +593,9 @@ export interface SystemSettings {
   codex_force_websocket: boolean
   codex_ws_keepalive_enabled: boolean
   codex_ws_keepalive_interval_sec: number
+  codex_ws_hide_upstream_errors: boolean
+  codex_ws_silent_retry_enabled: boolean
+  codex_ws_silent_max_retries: number
   scheduler_mode: string
   affinity_mode?: string
   max_retries: number
@@ -584,6 +627,7 @@ export interface SystemSettings {
   usage_log_flush_interval_seconds: number
   stream_flush_policy: 'immediate' | 'coalesce' | string
   stream_flush_interval_ms: number
+  first_token_mode: 'strict' | 'loose' | string
   first_token_timeout_seconds: number
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
@@ -745,6 +789,8 @@ export interface UsageStats {
   today_requests: number
   today_tokens: number
   today_input_tokens?: number
+  today_prompt_tokens?: number
+  today_completion_tokens?: number
   today_cached_tokens?: number
   today_cache_rate?: number
   today_account_billed: number
