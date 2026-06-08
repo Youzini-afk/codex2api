@@ -153,17 +153,68 @@ func wildcardModelPatternMatch(pattern string, model string) bool {
 	return true
 }
 
+func splitFastServiceTierModelAlias(model string) (string, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", false
+	}
+	const fastSuffix = "-fast"
+	if !strings.HasSuffix(strings.ToLower(model), fastSuffix) {
+		return model, false
+	}
+	baseModel := strings.TrimSpace(model[:len(model)-len(fastSuffix)])
+	if baseModel == "" {
+		return model, false
+	}
+	return baseModel, true
+}
+
+func hasExplicitServiceTier(body []byte) bool {
+	return gjson.GetBytes(body, "service_tier").Exists() || gjson.GetBytes(body, "serviceTier").Exists()
+}
+
+func applyFastServiceTierModelAliasToBody(rawBody []byte, model string, supportedModels []string) ([]byte, string, bool, error) {
+	baseModel, ok := splitFastServiceTierModelAlias(model)
+	if !ok {
+		return rawBody, model, false, nil
+	}
+	baseModel = canonicalizeCodexModel(baseModel, supportedModels)
+	updatedBody, err := sjson.SetBytes(rawBody, "model", baseModel)
+	if err != nil {
+		return rawBody, model, false, err
+	}
+	if !hasExplicitServiceTier(updatedBody) {
+		updatedBody, err = sjson.SetBytes(updatedBody, "service_tier", "fast")
+		if err != nil {
+			return rawBody, model, false, err
+		}
+	}
+	return updatedBody, baseModel, true, nil
+}
+
 func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedModels []string) ([]byte, string, string, bool) {
 	originalModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
 	effectiveModel := originalModel
-	if originalModel == "" || !gjson.ValidBytes(rawBody) || h == nil || h.store == nil {
+	if originalModel == "" || !gjson.ValidBytes(rawBody) {
 		return rawBody, originalModel, effectiveModel, false
 	}
 
 	updatedBody := rawBody
 	modelForMapping := originalModel
 	mappingApplied := false
-	if entry, ok := resolveReasoningEffortModelAlias(originalModel, h.store.GetReasoningEffortModels(), supportedModels); ok {
+	if fastBody, baseModel, ok, err := applyFastServiceTierModelAliasToBody(updatedBody, modelForMapping, supportedModels); err != nil {
+		return rawBody, originalModel, effectiveModel, false
+	} else if ok {
+		updatedBody = fastBody
+		modelForMapping = baseModel
+		effectiveModel = baseModel
+		mappingApplied = true
+	}
+
+	if h == nil || h.store == nil {
+		return updatedBody, originalModel, effectiveModel, mappingApplied
+	}
+	if entry, ok := resolveReasoningEffortModelAlias(modelForMapping, h.store.GetReasoningEffortModels(), supportedModels); ok {
 		var err error
 		updatedBody, err = sjson.SetBytes(updatedBody, "model", entry.Model)
 		if err != nil {
@@ -179,7 +230,7 @@ func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedMod
 		}
 		modelForMapping = entry.Model
 		effectiveModel = entry.Model
-		mappingApplied = !strings.EqualFold(originalModel, entry.Model)
+		mappingApplied = mappingApplied || !strings.EqualFold(originalModel, entry.Model)
 	}
 
 	mappedModel, ok := resolveConfiguredModelMapping(modelForMapping, h.store.GetCodexModelMapping(), supportedModels)

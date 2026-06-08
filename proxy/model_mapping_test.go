@@ -114,6 +114,185 @@ func TestApplyConfiguredModelMappingToBodyRewritesBeforeValidation(t *testing.T)
 	}
 }
 
+func TestApplyFastServiceTierModelAliasToBody(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-fast","input":"hello"}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped {
+		t.Fatal("expected fast model alias to be mapped")
+	}
+	if original != "gpt-5.5-fast" || effective != "gpt-5.5" {
+		t.Fatalf("original/effective = %q/%q, want gpt-5.5-fast/gpt-5.5", original, effective)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("body model = %q, want gpt-5.5; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "service_tier").String(); got != "fast" {
+		t.Fatalf("service_tier = %q, want fast; body=%s", got, body)
+	}
+}
+
+func TestApplyFastServiceTierModelAliasDoesNotOverrideExplicitTier(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	tests := []struct {
+		name            string
+		raw             string
+		wantServiceTier string
+		wantServiceAlt  string
+	}{
+		{name: "snake service tier", raw: `{"model":"gpt-5.5-fast","service_tier":"default"}`, wantServiceTier: "default"},
+		{name: "camel service tier", raw: `{"model":"gpt-5.5-fast","serviceTier":"flex"}`, wantServiceAlt: "flex"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _, effective, mapped := handler.applyConfiguredModelMappingToBody(
+				[]byte(tt.raw),
+				[]string{"gpt-5.5"},
+			)
+			if !mapped {
+				t.Fatal("expected fast model alias to be mapped")
+			}
+			if effective != "gpt-5.5" {
+				t.Fatalf("effective = %q, want gpt-5.5", effective)
+			}
+			if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.5" {
+				t.Fatalf("body model = %q, want gpt-5.5; body=%s", got, body)
+			}
+			if tt.wantServiceTier != "" {
+				if got := gjson.GetBytes(body, "service_tier").String(); got != tt.wantServiceTier {
+					t.Fatalf("service_tier = %q, want %q; body=%s", got, tt.wantServiceTier, body)
+				}
+			}
+			if tt.wantServiceAlt != "" {
+				if got := gjson.GetBytes(body, "serviceTier").String(); got != tt.wantServiceAlt {
+					t.Fatalf("serviceTier = %q, want %q; body=%s", got, tt.wantServiceAlt, body)
+				}
+				if gjson.GetBytes(body, "service_tier").Exists() {
+					t.Fatalf("service_tier should not be injected when serviceTier is explicit; body=%s", body)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyFastServiceTierModelAliasIsCaseInsensitive(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"GPT-5.4-MINI-FAST","input":"hello"}`),
+		[]string{"gpt-5.4-mini"},
+	)
+	if !mapped {
+		t.Fatal("expected uppercase fast suffix to be mapped")
+	}
+	if original != "GPT-5.4-MINI-FAST" || effective != "gpt-5.4-mini" {
+		t.Fatalf("original/effective = %q/%q, want GPT-5.4-MINI-FAST/gpt-5.4-mini", original, effective)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.4-mini" {
+		t.Fatalf("body model = %q, want gpt-5.4-mini; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "service_tier").String(); got != "fast" {
+		t.Fatalf("service_tier = %q, want fast; body=%s", got, body)
+	}
+}
+
+func TestFastModelAliasChatTranslationUsesPriorityTier(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	mappedBody, _, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-fast","messages":[{"role":"user","content":"hello"}]}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped || effective != "gpt-5.5" {
+		t.Fatalf("mapped/effective = %v/%q, want true/gpt-5.5", mapped, effective)
+	}
+	translated, err := TranslateRequest(mappedBody)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	if got := gjson.GetBytes(translated, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("translated model = %q, want gpt-5.5; body=%s", got, translated)
+	}
+	if got := gjson.GetBytes(translated, "service_tier").String(); got != "priority" {
+		t.Fatalf("translated service_tier = %q, want priority; body=%s", got, translated)
+	}
+}
+
+func TestFastModelAliasResponsesPrepareUsesPriorityTier(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	mappedBody, _, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-fast","input":"hello"}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped || effective != "gpt-5.5" {
+		t.Fatalf("mapped/effective = %v/%q, want true/gpt-5.5", mapped, effective)
+	}
+	prepared, _ := PrepareResponsesBody(mappedBody)
+	if got := gjson.GetBytes(prepared, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("prepared model = %q, want gpt-5.5; body=%s", got, prepared)
+	}
+	if got := gjson.GetBytes(prepared, "service_tier").String(); got != "priority" {
+		t.Fatalf("prepared service_tier = %q, want priority; body=%s", got, prepared)
+	}
+}
+
+func TestFastModelAliasOpenAIResponsesPrepareUsesPriorityTier(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	mappedBody, _, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-fast","input":"hello"}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped || effective != "gpt-5.5" {
+		t.Fatalf("mapped/effective = %v/%q, want true/gpt-5.5", mapped, effective)
+	}
+	prepared := PrepareOpenAIResponsesBody(mappedBody)
+	if got := gjson.GetBytes(prepared, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("prepared model = %q, want gpt-5.5; body=%s", got, prepared)
+	}
+	if got := gjson.GetBytes(prepared, "service_tier").String(); got != "priority" {
+		t.Fatalf("prepared service_tier = %q, want priority; body=%s", got, prepared)
+	}
+}
+
+func TestFastModelAliasOpenAIResponsesPreparePreservesExplicitTier(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	mappedBody, _, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-fast","input":"hello","serviceTier":"FAST"}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped || effective != "gpt-5.5" {
+		t.Fatalf("mapped/effective = %v/%q, want true/gpt-5.5", mapped, effective)
+	}
+	if gjson.GetBytes(mappedBody, "service_tier").Exists() {
+		t.Fatalf("fast suffix should not inject service_tier when serviceTier is explicit; body=%s", mappedBody)
+	}
+	prepared := PrepareOpenAIResponsesBody(mappedBody)
+	if got := gjson.GetBytes(prepared, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("prepared model = %q, want gpt-5.5; body=%s", got, prepared)
+	}
+	if got := gjson.GetBytes(prepared, "service_tier").String(); got != "priority" {
+		t.Fatalf("explicit FAST service_tier = %q, want priority; body=%s", got, prepared)
+	}
+	if gjson.GetBytes(prepared, "serviceTier").Exists() {
+		t.Fatalf("serviceTier should be removed after preparation; body=%s", prepared)
+	}
+}
+
 func TestApplyReasoningEffortModelAliasToBody(t *testing.T) {
 	store := auth.NewStore(nil, nil, nil)
 	store.SetReasoningEffortModels(`[{"model":"gpt-5.5","effort":"xhigh"}]`)

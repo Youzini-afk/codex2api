@@ -214,6 +214,64 @@ func TestPrepareResponsesBody_DropsUnsupportedClientServiceTier(t *testing.T) {
 	}
 }
 
+func TestPrepareOpenAIResponsesBody_NormalizesServiceTierForUpstream(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		want       string
+		wantExists bool
+	}{
+		{name: "snake fast", raw: `{"model":"gpt-4.1","input":"hello","service_tier":"fast"}`, want: "priority", wantExists: true},
+		{name: "camel fast", raw: `{"model":"gpt-4.1","input":"hello","serviceTier":"fast"}`, want: "priority", wantExists: true},
+		{name: "uppercase fast", raw: `{"model":"gpt-4.1","input":"hello","serviceTier":"FAST"}`, want: "priority", wantExists: true},
+		{name: "priority", raw: `{"model":"gpt-4.1","input":"hello","service_tier":"priority"}`, want: "priority", wantExists: true},
+		{name: "default omitted", raw: `{"model":"gpt-4.1","input":"hello","service_tier":"default"}`},
+		{name: "flex omitted", raw: `{"model":"gpt-4.1","input":"hello","serviceTier":"flex"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PrepareOpenAIResponsesBody([]byte(tt.raw))
+			tier := gjson.GetBytes(got, "service_tier")
+			if tt.wantExists {
+				if tier.String() != tt.want {
+					t.Fatalf("service_tier = %q, want %q; body=%s", tier.String(), tt.want, got)
+				}
+			} else if tier.Exists() {
+				t.Fatalf("service_tier should be omitted, got %s; body=%s", tier.Raw, got)
+			}
+			if gjson.GetBytes(got, "serviceTier").Exists() {
+				t.Fatalf("serviceTier should be removed, body=%s", got)
+			}
+		})
+	}
+}
+
+func TestPrepareOpenAIResponsesCompactBody_NormalizesServiceTierForUpstream(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-4.1",
+		"input":"hello",
+		"serviceTier":"FAST",
+		"include":["reasoning.encrypted_content"],
+		"store":true,
+		"stream":true
+	}`)
+
+	got := PrepareOpenAIResponsesCompactBody(raw)
+
+	if tier := gjson.GetBytes(got, "service_tier").String(); tier != "priority" {
+		t.Fatalf("service_tier = %q, want priority; body=%s", tier, got)
+	}
+	if gjson.GetBytes(got, "serviceTier").Exists() {
+		t.Fatalf("serviceTier should be removed, body=%s", got)
+	}
+	for _, field := range []string{"include", "store", "stream"} {
+		if gjson.GetBytes(got, field).Exists() {
+			t.Fatalf("expected %s to be removed for OpenAI Responses compact body, got %s", field, got)
+		}
+	}
+}
+
 func TestTranslateRequest_NormalizesReasoningEffortAliases(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

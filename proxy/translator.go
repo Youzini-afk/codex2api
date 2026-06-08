@@ -1171,7 +1171,7 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	if tier == "" {
 		tier = req.ServiceTierAlt
 	}
-	tier = strings.TrimSpace(tier)
+	tier = normalizeServiceTierValue(tier)
 	if isAllowedServiceTier(tier) {
 		if upstreamTier, ok := upstreamServiceTier(tier); ok {
 			out["service_tier"] = upstreamTier
@@ -1396,17 +1396,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 
 	// 4. service tier 清理（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
-	delete(body, "serviceTier")
-	if tier, ok := body["service_tier"].(string); ok {
-		tier = strings.TrimSpace(tier)
-		if !isAllowedServiceTier(tier) {
-			delete(body, "service_tier")
-		} else if upstreamTier, ok := upstreamServiceTier(tier); ok {
-			body["service_tier"] = upstreamTier
-		} else {
-			delete(body, "service_tier")
-		}
-	}
+	normalizeResponsesServiceTierForUpstream(body)
 	normalizeResponsesStructuredOutputFormat(body)
 	normalizeResponsesFunctionTools(body)
 	normalizeResponsesWebSearchTools(body)
@@ -1533,6 +1523,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 		}
 	}
 
+	normalizeResponsesServiceTierForUpstream(body)
 	normalizeResponsesStructuredOutputFormat(body)
 	normalizeResponsesFunctionTools(body)
 	normalizeResponsesContentPartTypes(body)
@@ -1587,8 +1578,49 @@ func normalizeReasoningEffort(effort string) string {
 	}
 }
 
+func normalizeResponsesServiceTierForUpstream(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	rawTier, hasSnake := body["service_tier"]
+	if tier := firstNonEmptyAnyString(rawTier); tier == "" {
+		if rawCamel, hasCamel := body["serviceTier"]; hasCamel {
+			rawTier = rawCamel
+		}
+	}
+
+	modified := false
+	if _, hasCamel := body["serviceTier"]; hasCamel {
+		delete(body, "serviceTier")
+		modified = true
+	}
+
+	tier := normalizeServiceTierValue(firstNonEmptyAnyString(rawTier))
+	if !isAllowedServiceTier(tier) {
+		if hasSnake {
+			delete(body, "service_tier")
+			modified = true
+		}
+		return modified
+	}
+	if upstreamTier, ok := upstreamServiceTier(tier); ok {
+		if body["service_tier"] != upstreamTier {
+			body["service_tier"] = upstreamTier
+			modified = true
+		}
+		return modified
+	}
+	if _, exists := body["service_tier"]; exists {
+		delete(body, "service_tier")
+		modified = true
+	}
+	return modified
+}
+
 // isAllowedServiceTier 判断 service_tier 是否在上游允许的范围内
 func isAllowedServiceTier(tier string) bool {
+	tier = normalizeServiceTierValue(tier)
 	switch tier {
 	case "auto", "default", "flex", "priority", "scale", "fast":
 		return true
@@ -1600,6 +1632,7 @@ func isAllowedServiceTier(tier string) bool {
 // upstreamServiceTier 将客户端 service_tier 映射为上游接受的值。
 // Codex 上游当前只接受 priority；auto/default/flex/scale 都不应显式转发。
 func upstreamServiceTier(tier string) (string, bool) {
+	tier = normalizeServiceTierValue(tier)
 	switch tier {
 	case "fast", "priority":
 		return "priority", true
