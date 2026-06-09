@@ -200,6 +200,41 @@ func TestTranslateRequest_DropsUnsupportedClientServiceTier(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_FastInterceptEnabledOmitsServiceTier(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	ApplyRuntimeSettings(RuntimeSettings{CodexFastTierInterceptEnabled: true})
+
+	tests := []struct {
+		name       string
+		raw        string
+		wantExists bool
+		want       string
+	}{
+		{name: "snake fast omitted", raw: `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"service_tier":"fast"}`},
+		{name: "camel FAST omitted", raw: `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"serviceTier":"FAST"}`},
+		{name: "priority preserved", raw: `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"serviceTier":"priority"}`, wantExists: true, want: "priority"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := TranslateRequest([]byte(tt.raw))
+			if err != nil {
+				t.Fatalf("TranslateRequest returned error: %v", err)
+			}
+			if tt.wantExists {
+				if tier := gjson.GetBytes(got, "service_tier").String(); tier != tt.want {
+					t.Fatalf("service_tier = %q, want %q; body=%s", tier, tt.want, got)
+				}
+			} else if gjson.GetBytes(got, "service_tier").Exists() {
+				t.Fatalf("service_tier should be omitted when intercept enabled; body=%s", got)
+			}
+			if gjson.GetBytes(got, "serviceTier").Exists() {
+				t.Fatal("serviceTier should not be present after translation")
+			}
+		})
+	}
+}
+
 func TestPrepareResponsesBody_DropsUnsupportedClientServiceTier(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -211,6 +246,25 @@ func TestPrepareResponsesBody_DropsUnsupportedClientServiceTier(t *testing.T) {
 
 	if gjson.GetBytes(got, "service_tier").Exists() {
 		t.Fatalf("unsupported client service_tier should be omitted for upstream, got body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_InterceptEnabledDeletesFast(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	ApplyRuntimeSettings(RuntimeSettings{CodexFastTierInterceptEnabled: true})
+
+	for _, raw := range []string{
+		`{"model":"gpt-4.1","input":"hello","service_tier":"fast"}`,
+		`{"model":"gpt-4.1","input":"hello","serviceTier":" FAST "}`,
+	} {
+		got, _ := PrepareResponsesBody([]byte(raw))
+		if gjson.GetBytes(got, "service_tier").Exists() {
+			t.Fatalf("service_tier should be omitted when intercept enabled; body=%s", got)
+		}
+		if gjson.GetBytes(got, "serviceTier").Exists() {
+			t.Fatalf("serviceTier should be removed; body=%s", got)
+		}
 	}
 }
 
@@ -247,6 +301,25 @@ func TestPrepareOpenAIResponsesBody_NormalizesServiceTierForUpstream(t *testing.
 	}
 }
 
+func TestPrepareOpenAIResponsesBody_InterceptEnabledDeletesFast(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	ApplyRuntimeSettings(RuntimeSettings{CodexFastTierInterceptEnabled: true})
+
+	for _, raw := range []string{
+		`{"model":"gpt-4.1","input":"hello","service_tier":"fast"}`,
+		`{"model":"gpt-4.1","input":"hello","serviceTier":"FAST"}`,
+	} {
+		got := PrepareOpenAIResponsesBody([]byte(raw))
+		if gjson.GetBytes(got, "service_tier").Exists() {
+			t.Fatalf("service_tier should be omitted when intercept enabled; body=%s", got)
+		}
+		if gjson.GetBytes(got, "serviceTier").Exists() {
+			t.Fatalf("serviceTier should be removed; body=%s", got)
+		}
+	}
+}
+
 func TestPrepareOpenAIResponsesCompactBody_NormalizesServiceTierForUpstream(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-4.1",
@@ -268,6 +341,49 @@ func TestPrepareOpenAIResponsesCompactBody_NormalizesServiceTierForUpstream(t *t
 	for _, field := range []string{"include", "store", "stream"} {
 		if gjson.GetBytes(got, field).Exists() {
 			t.Fatalf("expected %s to be removed for OpenAI Responses compact body, got %s", field, got)
+		}
+	}
+}
+
+func TestPrepareOpenAIResponsesCompactBody_InterceptEnabledDeletesFast(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	ApplyRuntimeSettings(RuntimeSettings{CodexFastTierInterceptEnabled: true})
+
+	for _, raw := range []string{
+		`{"model":"gpt-4.1","input":"hello","service_tier":"fast","include":["reasoning.encrypted_content"],"store":true,"stream":true}`,
+		`{"model":"gpt-4.1","input":"hello","serviceTier":"FAST","include":["reasoning.encrypted_content"],"store":true,"stream":true}`,
+	} {
+		got := PrepareOpenAIResponsesCompactBody([]byte(raw))
+		if gjson.GetBytes(got, "service_tier").Exists() {
+			t.Fatalf("service_tier should be omitted when intercept enabled; body=%s", got)
+		}
+		if gjson.GetBytes(got, "serviceTier").Exists() {
+			t.Fatalf("serviceTier should be removed; body=%s", got)
+		}
+		for _, field := range []string{"include", "store", "stream"} {
+			if gjson.GetBytes(got, field).Exists() {
+				t.Fatalf("expected %s removed for compact body, got %s", field, got)
+			}
+		}
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_InterceptEnabledDeletesFast(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	ApplyRuntimeSettings(RuntimeSettings{CodexFastTierInterceptEnabled: true})
+
+	for _, raw := range []string{
+		`{"model":"gpt-4.1","input":"hello","service_tier":"fast"}`,
+		`{"model":"gpt-4.1","input":"hello","serviceTier":"FAST"}`,
+	} {
+		got, _ := PrepareResponsesWebSocketBody([]byte(raw))
+		if gjson.GetBytes(got, "service_tier").Exists() {
+			t.Fatalf("service_tier should be omitted when intercept enabled; body=%s", got)
+		}
+		if gjson.GetBytes(got, "serviceTier").Exists() {
+			t.Fatalf("serviceTier should be removed; body=%s", got)
 		}
 	}
 }

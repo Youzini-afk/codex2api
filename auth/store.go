@@ -1747,12 +1747,14 @@ type Store struct {
 	fastSchedulerEnabled atomic.Bool
 
 	// Codex 上游 WebSocket 相关（默认全部关闭，不影响现有 HTTP 路径）
-	codexForceWebsocket         atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
-	codexWSKeepaliveEnabled     atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
-	codexWSKeepaliveIntervalSec atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
-	codexWSHideUpstreamErrors   atomic.Bool  // 隐藏上游 WS 原始错误，默认开启
-	codexWSSilentRetryEnabled   atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
-	codexWSSilentMaxRetries     atomic.Int64 // WS 静默换号最大重试次数，默认 2
+	codexForceWebsocket           atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
+	codexWSKeepaliveEnabled       atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
+	codexWSKeepaliveIntervalSec   atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
+	codexWSHideUpstreamErrors     atomic.Bool  // 隐藏上游 WS 原始错误，默认开启
+	codexWSSilentRetryEnabled     atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
+	codexWSSilentMaxRetries       atomic.Int64 // WS 静默换号最大重试次数，默认 2
+	codexFastModelAliasEnabled    atomic.Bool  // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
+	codexFastTierInterceptEnabled atomic.Bool  // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -2143,6 +2145,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSHideUpstreamErrors:          true,
 			CodexWSSilentRetryEnabled:          true,
 			CodexWSSilentMaxRetries:            2,
+			CodexFastModelAliasEnabled:         true,
+			CodexFastTierInterceptEnabled:      false,
 		}
 	}
 	s := &Store{
@@ -2206,6 +2210,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
 	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
+	s.codexFastModelAliasEnabled.Store(settings.CodexFastModelAliasEnabled)
+	s.codexFastTierInterceptEnabled.Store(settings.CodexFastTierInterceptEnabled)
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -2416,6 +2422,38 @@ func (s *Store) CodexWSSilentMaxRetries() int {
 		return 2
 	}
 	return int(s.codexWSSilentMaxRetries.Load())
+}
+
+// SetCodexFastModelAliasEnabled 设置 fast 后缀模型别名开关。
+func (s *Store) SetCodexFastModelAliasEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexFastModelAliasEnabled.Store(enabled)
+}
+
+// CodexFastModelAliasEnabled 返回 fast 后缀模型别名开关状态（默认 true）。
+func (s *Store) CodexFastModelAliasEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexFastModelAliasEnabled.Load()
+}
+
+// SetCodexFastTierInterceptEnabled 设置 fast tier 拦截开关。
+func (s *Store) SetCodexFastTierInterceptEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexFastTierInterceptEnabled.Store(enabled)
+}
+
+// CodexFastTierInterceptEnabled 返回 fast tier 拦截开关状态（默认 false）。
+func (s *Store) CodexFastTierInterceptEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexFastTierInterceptEnabled.Load()
 }
 
 // GetProxyURL 获取全局代理地址

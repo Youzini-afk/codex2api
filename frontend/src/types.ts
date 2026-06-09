@@ -596,6 +596,8 @@ export interface SystemSettings {
   codex_ws_hide_upstream_errors: boolean
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
+  codex_fast_model_alias_enabled: boolean
+  codex_fast_tier_intercept_enabled: boolean
   scheduler_mode: string
   affinity_mode?: string
   max_retries: number

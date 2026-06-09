@@ -680,6 +680,8 @@ export default function Settings() {
     codex_ws_hide_upstream_errors: true,
     codex_ws_silent_retry_enabled: true,
     codex_ws_silent_max_retries: 2,
+    codex_fast_model_alias_enabled: true,
+    codex_fast_tier_intercept_enabled: false,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
     max_retries: 2,
@@ -1452,6 +1454,20 @@ export default function Settings() {
                   max={600}
                   value={settingsForm.first_token_timeout_seconds}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, first_token_timeout_seconds: parseInt(e.target.value) || 0 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexFastModelAliasEnabled')} description={t('settings.codexFastModelAliasEnabledDesc')}>
+                <Select
+                  value={settingsForm.codex_fast_model_alias_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => autoSaveBooleanField('codex_fast_model_alias_enabled', value)}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexFastTierInterceptEnabled')} description={t('settings.codexFastTierInterceptEnabledDesc')}>
+                <Select
+                  value={settingsForm.codex_fast_tier_intercept_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => autoSaveBooleanField('codex_fast_tier_intercept_enabled', value)}
+                  options={booleanOptions}
                 />
               </SettingField>
             </div>

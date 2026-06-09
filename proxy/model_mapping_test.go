@@ -293,6 +293,50 @@ func TestFastModelAliasOpenAIResponsesPreparePreservesExplicitTier(t *testing.T)
 	}
 }
 
+func TestFastModelAliasDisabledDoesNotInjectTier(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.SetCodexFastModelAliasEnabled(false)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-fast","input":"hello"}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped {
+		t.Fatal("expected mapping=true even when alias injection is disabled (model should still be stripped)")
+	}
+	if original != "gpt-5.5-fast" || effective != "gpt-5.5" {
+		t.Fatalf("original/effective = %q/%q, want gpt-5.5-fast/gpt-5.5", original, effective)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("body model = %q, want gpt-5.5; body=%s", got, body)
+	}
+	if gjson.GetBytes(body, "service_tier").Exists() {
+		t.Fatalf("service_tier should not be injected when alias is disabled; body=%s", body)
+	}
+}
+
+func TestFastModelAliasDefaultsOnWithoutStore(t *testing.T) {
+	handler := NewHandler(nil, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-fast","input":"hello"}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped {
+		t.Fatal("expected fast alias to default on without store")
+	}
+	if original != "gpt-5.5-fast" || effective != "gpt-5.5" {
+		t.Fatalf("original/effective = %q/%q, want gpt-5.5-fast/gpt-5.5", original, effective)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("body model = %q, want gpt-5.5; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "service_tier").String(); got != "fast" {
+		t.Fatalf("service_tier = %q, want fast; body=%s", got, body)
+	}
+}
+
 func TestApplyReasoningEffortModelAliasToBody(t *testing.T) {
 	store := auth.NewStore(nil, nil, nil)
 	store.SetReasoningEffortModels(`[{"model":"gpt-5.5","effort":"xhigh"}]`)

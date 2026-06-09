@@ -4849,6 +4849,8 @@ type settingsResponse struct {
 	CodexWSHideUpstreamErrors          bool   `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled          bool   `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            int    `json:"codex_ws_silent_max_retries"`
+	CodexFastModelAliasEnabled         bool   `json:"codex_fast_model_alias_enabled"`
+	CodexFastTierInterceptEnabled      bool   `json:"codex_fast_tier_intercept_enabled"`
 	SchedulerMode                      string `json:"scheduler_mode"`
 	AffinityMode                       string `json:"affinity_mode"`
 	MaxRetries                         int    `json:"max_retries"`
@@ -4929,6 +4931,8 @@ type updateSettingsReq struct {
 	CodexWSHideUpstreamErrors          *bool   `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled          *bool   `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            *int    `json:"codex_ws_silent_max_retries"`
+	CodexFastModelAliasEnabled         *bool   `json:"codex_fast_model_alias_enabled"`
+	CodexFastTierInterceptEnabled      *bool   `json:"codex_fast_tier_intercept_enabled"`
 	SchedulerMode                      *string `json:"scheduler_mode"`
 	AffinityMode                       *string `json:"affinity_mode"`
 	MaxRetries                         *int    `json:"max_retries"`
@@ -5493,6 +5497,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexFastModelAliasEnabled:         h.store.CodexFastModelAliasEnabled(),
+		CodexFastTierInterceptEnabled:      h.store.CodexFastTierInterceptEnabled(),
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
@@ -5828,6 +5834,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_silent_max_retries = %d", v)
 	}
 
+	if req.CodexFastModelAliasEnabled != nil {
+		h.store.SetCodexFastModelAliasEnabled(*req.CodexFastModelAliasEnabled)
+		runtimeCfg.CodexFastModelAliasEnabled = *req.CodexFastModelAliasEnabled
+		log.Printf("设置已更新: codex_fast_model_alias_enabled = %t", *req.CodexFastModelAliasEnabled)
+	}
+
+	if req.CodexFastTierInterceptEnabled != nil {
+		h.store.SetCodexFastTierInterceptEnabled(*req.CodexFastTierInterceptEnabled)
+		runtimeCfg.CodexFastTierInterceptEnabled = *req.CodexFastTierInterceptEnabled
+		log.Printf("设置已更新: codex_fast_tier_intercept_enabled = %t", *req.CodexFastTierInterceptEnabled)
+	}
+
 	if req.SchedulerMode != nil {
 		h.store.SetSchedulerMode(*req.SchedulerMode)
 		log.Printf("设置已更新: scheduler_mode = %s", *req.SchedulerMode)
@@ -6117,6 +6135,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexFastModelAliasEnabled:         h.store.CodexFastModelAliasEnabled(),
+		CodexFastTierInterceptEnabled:      h.store.CodexFastTierInterceptEnabled(),
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
@@ -6206,6 +6226,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexFastModelAliasEnabled:         h.store.CodexFastModelAliasEnabled(),
+		CodexFastTierInterceptEnabled:      h.store.CodexFastTierInterceptEnabled(),
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),

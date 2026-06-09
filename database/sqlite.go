@@ -224,7 +224,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_ws_keepalive_interval_sec INTEGER DEFAULT 60,
 					codex_ws_hide_upstream_errors INTEGER DEFAULT 1,
 					codex_ws_silent_retry_enabled INTEGER DEFAULT 1,
-					codex_ws_silent_max_retries INTEGER DEFAULT 2
+					codex_ws_silent_max_retries INTEGER DEFAULT 2,
+					codex_fast_model_alias_enabled INTEGER DEFAULT 1,
+					codex_fast_tier_intercept_enabled INTEGER DEFAULT 0
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -411,6 +413,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_ws_hide_upstream_errors", "INTEGER DEFAULT 1"},
 		{"system_settings", "codex_ws_silent_retry_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "codex_ws_silent_max_retries", "INTEGER DEFAULT 2"},
+		{"system_settings", "codex_fast_model_alias_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "codex_fast_tier_intercept_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},

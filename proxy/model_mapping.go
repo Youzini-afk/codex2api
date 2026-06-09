@@ -173,7 +173,7 @@ func hasExplicitServiceTier(body []byte) bool {
 	return gjson.GetBytes(body, "service_tier").Exists() || gjson.GetBytes(body, "serviceTier").Exists()
 }
 
-func applyFastServiceTierModelAliasToBody(rawBody []byte, model string, supportedModels []string) ([]byte, string, bool, error) {
+func applyFastServiceTierModelAliasToBody(rawBody []byte, model string, supportedModels []string, injectTier bool) ([]byte, string, bool, error) {
 	baseModel, ok := splitFastServiceTierModelAlias(model)
 	if !ok {
 		return rawBody, model, false, nil
@@ -183,7 +183,7 @@ func applyFastServiceTierModelAliasToBody(rawBody []byte, model string, supporte
 	if err != nil {
 		return rawBody, model, false, err
 	}
-	if !hasExplicitServiceTier(updatedBody) {
+	if injectTier && !hasExplicitServiceTier(updatedBody) {
 		updatedBody, err = sjson.SetBytes(updatedBody, "service_tier", "fast")
 		if err != nil {
 			return rawBody, model, false, err
@@ -202,7 +202,11 @@ func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedMod
 	updatedBody := rawBody
 	modelForMapping := originalModel
 	mappingApplied := false
-	if fastBody, baseModel, ok, err := applyFastServiceTierModelAliasToBody(updatedBody, modelForMapping, supportedModels); err != nil {
+	injectFastTier := true
+	if h != nil && h.store != nil {
+		injectFastTier = h.store.CodexFastModelAliasEnabled()
+	}
+	if fastBody, baseModel, ok, err := applyFastServiceTierModelAliasToBody(updatedBody, modelForMapping, supportedModels, injectFastTier); err != nil {
 		return rawBody, originalModel, effectiveModel, false
 	} else if ok {
 		updatedBody = fastBody

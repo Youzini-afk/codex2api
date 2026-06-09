@@ -769,6 +769,8 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          4,
+		CodexFastModelAliasEnabled:       false,
+		CodexFastTierInterceptEnabled:    true,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -806,6 +808,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CodexWSSilentMaxRetries != 4 {
 		t.Fatalf("CodexWSSilentMaxRetries = %d, want 4", settings.CodexWSSilentMaxRetries)
+	}
+	if settings.CodexFastModelAliasEnabled {
+		t.Fatalf("CodexFastModelAliasEnabled = true, want false")
+	}
+	if !settings.CodexFastTierInterceptEnabled {
+		t.Fatalf("CodexFastTierInterceptEnabled = false, want true")
 	}
 }
 

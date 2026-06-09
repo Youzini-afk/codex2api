@@ -1172,7 +1172,7 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		tier = req.ServiceTierAlt
 	}
 	tier = normalizeServiceTierValue(tier)
-	if isAllowedServiceTier(tier) {
+	if !shouldInterceptFastServiceTier(tier) && isAllowedServiceTier(tier) {
 		if upstreamTier, ok := upstreamServiceTier(tier); ok {
 			out["service_tier"] = upstreamTier
 		}
@@ -1597,6 +1597,13 @@ func normalizeResponsesServiceTierForUpstream(body map[string]any) bool {
 	}
 
 	tier := normalizeServiceTierValue(firstNonEmptyAnyString(rawTier))
+	if shouldInterceptFastServiceTier(tier) {
+		if hasSnake {
+			delete(body, "service_tier")
+			modified = true
+		}
+		return modified
+	}
 	if !isAllowedServiceTier(tier) {
 		if hasSnake {
 			delete(body, "service_tier")
@@ -1627,6 +1634,15 @@ func isAllowedServiceTier(tier string) bool {
 	default:
 		return false
 	}
+}
+
+// shouldInterceptFastServiceTier 当 codex_fast_tier_intercept_enabled=true 且 tier 为 fast 时返回 true，
+// 用于统一删除显式 fast 请求，避免误计费。
+func shouldInterceptFastServiceTier(tier string) bool {
+	if !CurrentRuntimeSettings().CodexFastTierInterceptEnabled {
+		return false
+	}
+	return normalizeServiceTierValue(tier) == "fast"
 }
 
 // upstreamServiceTier 将客户端 service_tier 映射为上游接受的值。
@@ -1836,12 +1852,24 @@ func normalizeServiceTierField(body []byte) []byte {
 	}
 	body, _ = sjson.SetBytes(body, "service_tier", tier)
 	body, _ = sjson.DeleteBytes(body, "serviceTier")
+	if shouldInterceptFastServiceTier(tier) {
+		body, _ = sjson.DeleteBytes(body, "service_tier")
+	}
 	return body
 }
 
 func sanitizeServiceTierForUpstream(body []byte) []byte {
 	tier := strings.TrimSpace(gjson.GetBytes(body, "service_tier").String())
 	if tier == "" {
+		tier = strings.TrimSpace(gjson.GetBytes(body, "serviceTier").String())
+	}
+	if tier == "" {
+		body, _ = sjson.DeleteBytes(body, "serviceTier")
+		return body
+	}
+	tier = normalizeServiceTierValue(tier)
+	if shouldInterceptFastServiceTier(tier) {
+		body, _ = sjson.DeleteBytes(body, "service_tier")
 		body, _ = sjson.DeleteBytes(body, "serviceTier")
 		return body
 	}

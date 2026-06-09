@@ -39,17 +39,19 @@ const (
 )
 
 type RuntimeSettings struct {
-	ClientCompatMode      string
-	CodexMinCLIVersion    string
-	StreamFlushPolicy     string
-	StreamFlushIntervalMS int
-	FirstTokenMode        string
-	FirstTokenTimeoutSec  int
-	BillingTierPolicy     string
-	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
-	CodexWSHideErrors     bool // 隐藏 Codex WS 上游原始错误（默认 true）
-	CodexWSSilentRetry    bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
-	CodexWSSilentRetries  int  // Codex WS 静默换号最大重试次数（默认 2）
+	ClientCompatMode              string
+	CodexMinCLIVersion            string
+	StreamFlushPolicy             string
+	StreamFlushIntervalMS         int
+	FirstTokenMode                string
+	FirstTokenTimeoutSec          int
+	BillingTierPolicy             string
+	CodexForceWebsocket           bool // 强制 Codex 上游走 WebSocket（默认 false）
+	CodexWSHideErrors             bool // 隐藏 Codex WS 上游原始错误（默认 true）
+	CodexWSSilentRetry            bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
+	CodexWSSilentRetries          int  // Codex WS 静默换号最大重试次数（默认 2）
+	CodexFastModelAliasEnabled    bool // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
+	CodexFastTierInterceptEnabled bool // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -60,16 +62,18 @@ func init() {
 
 func DefaultRuntimeSettings() RuntimeSettings {
 	return RuntimeSettings{
-		ClientCompatMode:      defaultClientCompatMode,
-		CodexMinCLIVersion:    defaultCodexMinCLIVersion,
-		StreamFlushPolicy:     defaultStreamFlushPolicy,
-		StreamFlushIntervalMS: defaultStreamFlushIntervalMS,
-		FirstTokenMode:        defaultFirstTokenMode,
-		FirstTokenTimeoutSec:  defaultFirstTokenTimeoutSec,
-		BillingTierPolicy:     defaultBillingTierPolicy,
-		CodexWSHideErrors:     defaultCodexWSHideErrors,
-		CodexWSSilentRetry:    defaultCodexWSSilentRetry,
-		CodexWSSilentRetries:  defaultCodexWSSilentRetries,
+		ClientCompatMode:              defaultClientCompatMode,
+		CodexMinCLIVersion:            defaultCodexMinCLIVersion,
+		StreamFlushPolicy:             defaultStreamFlushPolicy,
+		StreamFlushIntervalMS:         defaultStreamFlushIntervalMS,
+		FirstTokenMode:                defaultFirstTokenMode,
+		FirstTokenTimeoutSec:          defaultFirstTokenTimeoutSec,
+		BillingTierPolicy:             defaultBillingTierPolicy,
+		CodexWSHideErrors:             defaultCodexWSHideErrors,
+		CodexWSSilentRetry:            defaultCodexWSSilentRetry,
+		CodexWSSilentRetries:          defaultCodexWSSilentRetries,
+		CodexFastModelAliasEnabled:    true,
+		CodexFastTierInterceptEnabled: false,
 	}
 }
 
@@ -165,6 +169,8 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSHideErrors = settings.CodexWSHideUpstreamErrors
 		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
+		next.CodexFastModelAliasEnabled = settings.CodexFastModelAliasEnabled
+		next.CodexFastTierInterceptEnabled = settings.CodexFastTierInterceptEnabled
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)
