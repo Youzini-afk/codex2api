@@ -226,7 +226,7 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 // Codex 上游常量
 const (
 	CodexBaseURL = "https://chatgpt.com/backend-api/codex"
-	Originator   = "codex_cli_rs"
+	Originator   = "codex-tui"
 )
 
 var codexAllowedForwardHeaders = []string{
@@ -237,7 +237,10 @@ var codexAllowedForwardHeaders = []string{
 }
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
-var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error)
+// poolRouteKey：本地连接池路由键（仅本地、永不发上游）。非空时 wsrelay 用它作 8 槽池的
+// baseKey，从而把"上游会话身份(每请求唯一)"与"连接复用(按 API Key 稳定)"解耦；空时沿用
+// headerSessionID 作 baseKey（显式会话 / per-api-key 模式的原有行为）。
+var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error)
 
 func IsolateCodexSessionID(apiKeyID int64, raw string) string {
 	raw = strings.TrimSpace(raw)
@@ -246,6 +249,25 @@ func IsolateCodexSessionID(apiKeyID int64, raw string) string {
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("api-key:%d:%s", apiKeyID, raw)))
 	return hex.EncodeToString(sum[:8])
+}
+
+// resolveUpstreamSessionID 决定传给上游的会话/缓存身份键。
+//   - 显式会话（用户带了 Session_id/Conversation_id/Idempotency-Key/prompt_cache_key）：
+//     保持 IsolateCodexSessionID 的确定性隔离行为，命中缓存、粘定会话。
+//   - 无显式会话 + 默认隔离(isolated)：HTTP 返回每请求唯一 UUID（隔离上游 prompt_cache_key/
+//     Session_id），WS 返回 ""（交给 ExecuteRequest 的 stateless 路径，连接池键单独稳定）。
+//   - 无显式会话 + per-api-key：WS 返回 ""、HTTP 走 IsolateCodexSessionID（恢复旧的按 Key 共享）。
+//
+// 注意：账号粘性键(affinityKey)在 handler 中由独立的 sessionID(ResolveSessionID) 派生，
+// 不经过本函数，因此隔离上游身份不会影响账号选择 / token 刷新行为。
+func resolveUpstreamSessionID(apiKeyID int64, sessionID, explicitSessionID string, useWebsocket bool) string {
+	if useWebsocket && explicitSessionID == "" {
+		return ""
+	}
+	if explicitSessionID == "" && CurrentRuntimeSettings().IsolateRequestsByDefault() {
+		return uuid.NewString()
+	}
+	return IsolateCodexSessionID(apiKeyID, sessionID)
 }
 
 // ExecuteRequest 向 Codex 上游发送请求
@@ -257,14 +279,37 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if len(useWebsocket) > 0 {
 		wantWebsocket = useWebsocket[0]
 	}
+	poolRouteKey := ""
 	if wantWebsocket {
 		sessionID = strings.TrimSpace(sessionID)
 		if sessionID == "" {
+			// stateless 连接 ID 仅用于 WS 连接池隔离，保证同一 API Key 的并发请求
+			// 不挤在一条连接上排队。
 			sessionID = statelessWebsocketSessionID()
+			if strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String()) == "" {
+				det := deterministicPromptCacheKey(apiKey, account)
+				if CurrentRuntimeSettings().IsolateRequestsByDefault() {
+					// 默认隔离：每请求唯一的 prompt_cache_key 写入 response.create 帧体，实现上游
+					// 身份隔离（互不串味）；连接池 baseKey 用稳定的确定性键单独传，保住 8 槽复用与
+					// 抗握手限流(503)。注意：上游会话隔离靠帧体 prompt_cache_key，而非握手头
+					// Session_id/Conversation_id（后者对复用连接是逐连接、非逐请求）。
+					requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", uuid.NewString())
+					poolRouteKey = det
+					if poolRouteKey == "" {
+						// det 仅在既无 API Key 又无账号 ID 时为空（生产路径不可达）；用固定哨兵兜底，
+						// 避免 baseKey 退化为每请求唯一键而触发握手风暴。
+						poolRouteKey = "ws-pool-default"
+					}
+				} else if det != "" {
+					// per-api-key：保留与 HTTP 路径同源的确定性 prompt cache key（既是上游身份也是
+					// baseKey），否则上游 prompt cache 每次请求都会 miss（v2.2.7 引入的回归）。
+					requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", det)
+				}
+			}
 		}
 	}
 	if wantWebsocket && WebsocketExecuteFunc != nil {
-		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers)
+		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	}
 	if wantWebsocket && WebsocketExecuteFunc == nil {
 		// 请求/配置要求走 WebSocket，但 WS 执行器未注册（如嵌入式调用或初始化顺序问题）。
@@ -371,16 +416,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	if err != nil {
 		return nil, ErrInternalError("创建请求失败", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	if headers != nil {
-		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key"} {
-			if value := strings.TrimSpace(headers.Get(key)); value != "" {
-				req.Header.Set(key, value)
-			}
-		}
-	}
+	applyOpenAIResponsesRequestHeaders(req, account, apiKey, headers)
 
 	resp, err := getPooledClient(account, proxyURL).Do(req)
 	if err != nil {
@@ -417,16 +453,7 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 	if err != nil {
 		return nil, ErrInternalError("创建请求失败", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	if headers != nil {
-		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key"} {
-			if value := strings.TrimSpace(headers.Get(key)); value != "" {
-				req.Header.Set(key, value)
-			}
-		}
-	}
+	applyOpenAIResponsesRequestHeaders(req, account, apiKey, headers)
 
 	resp, err := getPooledClient(account, proxyURL).Do(req)
 	if err != nil {
@@ -517,8 +544,8 @@ func codexVersionFromProfile(profile deviceProfile, fallback string) string {
 }
 
 func codexVersionFromUserAgent(userAgent, fallback string) string {
-	if version, ok := parseCodexCLIVersion(userAgent); ok {
-		return fmt.Sprintf("%d.%d.%d", version.major, version.minor, version.patch)
+	if _, rawVersion, ok := parseCodexClientVersionDetails(userAgent); ok {
+		return rawVersion
 	}
 	return strings.TrimSpace(fallback)
 }
@@ -528,10 +555,17 @@ func codexVersionFromString(raw string) (cliVersion, bool) {
 	if raw == "" {
 		return cliVersion{}, false
 	}
-	return parseCodexCLIVersion("codex_cli_rs/" + raw)
+	return parseCodexClientVersion("codex_cli_rs/" + raw)
 }
 
-func generatedCodexClientHeaders(account *auth.Account) (string, string) {
+func generatedCodexClientHeaders(account *auth.Account, settings RuntimeSettings) (string, string) {
+	versionFloor := ""
+	if settings.ClientCompatMode == ClientCompatModeAuto {
+		versionFloor = settings.CodexMinCLIVersion
+	}
+	if userAgent, version, ok := codexUserAgentFromConfig(settings.CodexUserAgentConfig, versionFloor); ok {
+		return userAgent, version
+	}
 	accountID := int64(0)
 	if account != nil {
 		accountID = account.ID()
@@ -540,11 +574,13 @@ func generatedCodexClientHeaders(account *auth.Account) (string, string) {
 	userAgent := strings.TrimSpace(profile.UserAgent)
 	version := strings.TrimSpace(profile.Version)
 	if userAgent == "" {
-		userAgent = latestCodexCLIUserAgentPrefix
+		userAgent = defaultCodexCLIUserAgent
 	}
 	if version == "" {
 		version = codexVersionFromUserAgent(userAgent, latestCodexCLIVersion)
 	}
+	version = effectiveCodexClientVersion(version, versionFloor)
+	userAgent = replaceCodexUserAgentVersion(userAgent, version)
 	return userAgent, version
 }
 
@@ -553,7 +589,7 @@ func shouldGenerateCodexClientHeaders(settings RuntimeSettings, userAgent, origi
 	case ClientCompatModeForce:
 		return true
 	case ClientCompatModeAuto:
-		version, ok := parseCodexCLIVersion(userAgent)
+		version, ok := parseCodexClientVersion(userAgent)
 		if !ok {
 			return false
 		}
@@ -561,10 +597,51 @@ func shouldGenerateCodexClientHeaders(settings RuntimeSettings, userAgent, origi
 		if !ok {
 			minVersion, _ = codexVersionFromString(defaultCodexMinCLIVersion)
 		}
-		return IsCodexOfficialClientByHeaders(userAgent, originator) && version.Compare(minVersion) < 0
+		return IsCodexStrictOfficialClientByHeaders(userAgent, originator) && version.Compare(minVersion) < 0
 	default:
 		return false
 	}
+}
+
+func resolveCodexOutboundClientHeaders(account *auth.Account, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) (userAgent, version string, usedGenerated bool) {
+	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
+		profile := ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
+		userAgent = strings.TrimSpace(profile.UserAgent)
+		version = codexVersionFromProfile(profile, strings.TrimSpace(deviceCfg.PackageVersion))
+		if userAgent == "" {
+			userAgent = defaultCodexCLIUserAgent
+		}
+		return userAgent, strings.TrimSpace(version), false
+	}
+
+	userAgent = strings.TrimSpace(downstreamHeaders.Get("User-Agent"))
+	originator := strings.TrimSpace(downstreamHeaders.Get("Originator"))
+	settings := CurrentRuntimeSettings()
+	if shouldGenerateCodexClientHeaders(settings, userAgent, originator) {
+		userAgent, version = generatedCodexClientHeaders(account, settings)
+		return userAgent, version, true
+	}
+	if IsCodexOfficialClientByHeaders(userAgent, originator) && userAgent != "" {
+		version = firstNonEmptyHeader(downstreamHeaders, "Version", codexVersionFromUserAgent(userAgent, latestCodexCLIVersion))
+		return userAgent, version, false
+	}
+	versionFloor := ""
+	if settings.ClientCompatMode == ClientCompatModeAuto {
+		versionFloor = settings.CodexMinCLIVersion
+	}
+	if userAgent, version, ok := codexUserAgentFromConfig(settings.CodexUserAgentConfig, versionFloor); ok {
+		return userAgent, version, true
+	}
+	return defaultCodexCLIUserAgent, latestCodexCLIVersion, false
+}
+
+func ResolveCodexOutboundClientHeaders(account *auth.Account, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) (userAgent, version string) {
+	userAgent, version, _ = ResolveCodexOutboundClientHeadersWithDecision(account, apiKey, deviceCfg, downstreamHeaders)
+	return userAgent, version
+}
+
+func ResolveCodexOutboundClientHeadersWithDecision(account *auth.Account, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) (userAgent, version string, usedGenerated bool) {
+	return resolveCodexOutboundClientHeaders(account, apiKey, deviceCfg, downstreamHeaders)
 }
 
 func applyCodexAllowedForwardHeaders(req *http.Request, downstreamHeaders http.Header) {
@@ -590,34 +667,8 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		account.Mu().RUnlock()
 	}
 
-	var profile deviceProfile
-	version := ""
-	usedGeneratedHeaders := false
-	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
-		profile = ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
-		version = codexVersionFromProfile(profile, strings.TrimSpace(deviceCfg.PackageVersion))
-		if strings.TrimSpace(profile.UserAgent) != "" {
-			req.Header.Set("User-Agent", profile.UserAgent)
-		}
-	} else {
-		userAgent := strings.TrimSpace(downstreamHeaders.Get("User-Agent"))
-		originator := strings.TrimSpace(downstreamHeaders.Get("Originator"))
-		if shouldGenerateCodexClientHeaders(CurrentRuntimeSettings(), userAgent, originator) {
-			generatedUA, generatedVersion := generatedCodexClientHeaders(account)
-			req.Header.Set("User-Agent", generatedUA)
-			version = generatedVersion
-			usedGeneratedHeaders = true
-		} else if IsCodexOfficialClientByHeaders(userAgent, originator) && userAgent != "" {
-			req.Header.Set("User-Agent", userAgent)
-			version = firstNonEmptyHeader(downstreamHeaders, "Version", codexVersionFromUserAgent(userAgent, latestCodexCLIVersion))
-		} else {
-			req.Header.Set("User-Agent", latestCodexCLIUserAgentPrefix)
-			version = latestCodexCLIVersion
-		}
-	}
-	if version == "" {
-		version = latestCodexCLIVersion
-	}
+	userAgent, version, usedGeneratedHeaders := resolveCodexOutboundClientHeaders(account, apiKey, deviceCfg, downstreamHeaders)
+	req.Header.Set("User-Agent", userAgent)
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -638,6 +689,27 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	if cacheKey != "" {
 		req.Header.Set("Session_id", cacheKey)
 		req.Header.Del("Conversation_id")
+	}
+}
+
+func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account, apiKey string, headers http.Header) {
+	if req == nil {
+		return
+	}
+	userAgent, version, _ := resolveCodexOutboundClientHeaders(account, "", nil, headers)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("User-Agent", userAgent)
+	if version != "" {
+		req.Header.Set("Version", version)
+	}
+	if headers != nil {
+		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key"} {
+			if value := firstNonEmptyHeader(headers, key, ""); value != "" {
+				req.Header.Set(key, value)
+			}
+		}
 	}
 }
 
@@ -688,8 +760,31 @@ func ResolveExplicitSessionID(headers http.Header, body []byte) string {
 	return ""
 }
 
+const statelessWebsocketSessionPrefix = "stateless-"
+
 func statelessWebsocketSessionID() string {
-	return "stateless-" + uuid.NewString()
+	return statelessWebsocketSessionPrefix + uuid.NewString()
+}
+
+// IsStatelessWebsocketSessionID 判断是否为 WS 路径生成的一次性连接 ID。
+// 这类 ID 只用于连接池隔离，不能当作 prompt cache key 发往上游。
+func IsStatelessWebsocketSessionID(sessionID string) bool {
+	return strings.HasPrefix(sessionID, statelessWebsocketSessionPrefix)
+}
+
+// deterministicPromptCacheKey 生成与 ResolveSessionID 兜底逻辑同源的确定性
+// prompt cache key：优先按下游 API Key 派生，无 API Key 时按账号派生。
+func deterministicPromptCacheKey(apiKey string, account *auth.Account) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey != "" {
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:prompt-cache:"+apiKey)).String()
+	}
+	if account != nil {
+		if id := account.ID(); id > 0 {
+			return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("codex2api:prompt-cache:auth:%d", id))).String()
+		}
+	}
+	return ""
 }
 
 // ReadSSEStream 从上游 SSE 响应读取事件流

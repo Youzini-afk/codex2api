@@ -579,6 +579,59 @@ func TestPrepareResponsesBody_DefaultsMissingFunctionToolParameters(t *testing.T
 	}
 }
 
+func TestTranslateRequest_InfersFunctionToolTypeWhenMissing(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"function":{"name":"get_weather","parameters":{"type":"object","properties":{}}}},
+			{"name":"lookup","parameters":{"type":"object","properties":{}}}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	first := gjson.GetBytes(got, "tools.0")
+	if toolType := first.Get("type").String(); toolType != "function" {
+		t.Fatalf("tools.0.type = %q, want function; body=%s", toolType, got)
+	}
+	if name := first.Get("name").String(); name != "get_weather" {
+		t.Fatalf("tools.0.name = %q, want get_weather; body=%s", name, got)
+	}
+	if first.Get("function").Exists() {
+		t.Fatalf("tools.0 nested function object should be expanded, got %s", got)
+	}
+	second := gjson.GetBytes(got, "tools.1")
+	if toolType := second.Get("type").String(); toolType != "function" {
+		t.Fatalf("tools.1.type = %q, want function; body=%s", toolType, got)
+	}
+	if name := second.Get("name").String(); name != "lookup" {
+		t.Fatalf("tools.1.name = %q, want lookup; body=%s", name, got)
+	}
+}
+
+func TestTranslateRequest_DropsTypelessUnrecognizedTool(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"foo":"bar"},{"type":null,"description":"no shape"}]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	for _, tool := range gjson.GetBytes(got, "tools").Array() {
+		if strings.TrimSpace(tool.Get("type").String()) == "" {
+			t.Fatalf("typeless tool should be dropped, got %s", got)
+		}
+	}
+}
+
 func TestTranslateRequest_DefaultsNullFunctionToolParameters(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -1100,6 +1153,49 @@ func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_MergesReasoningInclude(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"reasoning":{"effort":"high"},
+		"include":["file_search_call.results"]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	include := gjson.GetBytes(got, "include").Array()
+	if len(include) != 2 {
+		t.Fatalf("include length = %d, want 2; body=%s", len(include), got)
+	}
+	if include[0].String() != "file_search_call.results" {
+		t.Fatalf("existing include not preserved first, got %s; body=%s", include[0].Raw, got)
+	}
+	if include[1].String() != codexReasoningEncryptedContentInclude {
+		t.Fatalf("reasoning include not appended, got %s; body=%s", include[1].Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_DoesNotDuplicateReasoningInclude(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"reasoning":{"effort":"high"},
+		"include":["reasoning.encrypted_content","file_search_call.results"]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	var count int
+	for _, item := range gjson.GetBytes(got, "include").Array() {
+		if item.String() == codexReasoningEncryptedContentInclude {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("reasoning include count = %d, want 1; body=%s", count, got)
+	}
+}
+
 func TestPrepareResponsesBody_ToolChoiceImageGenerationAutoInjectsTool(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -1115,6 +1211,33 @@ func TestPrepareResponsesBody_ToolChoiceImageGenerationAutoInjectsTool(t *testin
 	}
 	if toolModel := gjson.GetBytes(got, "tools.0.model").String(); toolModel != defaultImagesToolModel {
 		t.Fatalf("tool model = %q, want %q; body=%s", toolModel, defaultImagesToolModel, got)
+	}
+}
+
+func TestPrepareResponsesBody_SparkModelSkipsDefaultImageGenerationTool(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.3-codex-spark","input":"hi"}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if gjson.GetBytes(got, "tools").Exists() {
+		t.Fatalf("did not expect default image_generation tool for spark model, got %s", string(got))
+	}
+	if instructions := gjson.GetBytes(got, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		t.Fatalf("did not expect image generation bridge instructions for spark model, got %q", instructions)
+	}
+}
+
+func TestPrepareResponsesBody_SparkModelKeepsExplicitImageGenerationTool(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.3-codex-spark",
+		"input":"draw a poster",
+		"tools":[{"type":"image_generation"}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if toolType := gjson.GetBytes(got, "tools.0.type").String(); toolType != "image_generation" {
+		t.Fatalf("explicit image_generation tool should be kept for spark model, got %s", string(got))
 	}
 }
 
@@ -1525,6 +1648,30 @@ func TestPrepareResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *t
 	}
 }
 
+func TestPrepareResponsesBody_PassesThroughCompactV2Items(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"compaction","encrypted_content":"opaque-blob"},
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	input := gjson.GetBytes(got, "input")
+	if gotType := input.Get("0.type").String(); gotType != "compaction" {
+		t.Fatalf("encrypted compaction item type = %q, want compaction (verbatim passthrough); input=%s", gotType, input.Raw)
+	}
+	if gotContent := input.Get("0.encrypted_content").String(); gotContent != "opaque-blob" {
+		t.Fatalf("encrypted compaction content = %q, want opaque-blob; input=%s", gotContent, input.Raw)
+	}
+	if gotType := input.Get("2.type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("compaction_trigger item type = %q, want compaction_trigger (verbatim passthrough); input=%s", gotType, input.Raw)
+	}
+}
+
 func TestPrepareCompactResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -1636,6 +1783,56 @@ func TestValidateResponsesFunctionNamesAllowsValidFunctionNames(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_InfersFunctionToolTypeWhenMissing(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hi",
+		"tools":[
+			{"name":"get_weather","parameters":{"type":"object","properties":{}}},
+			{"type":null,"function":{"name":"lookup"}}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	first := gjson.GetBytes(got, "tools.0")
+	if toolType := first.Get("type").String(); toolType != "function" {
+		t.Fatalf("tools.0.type = %q, want function; body=%s", toolType, got)
+	}
+	if name := first.Get("name").String(); name != "get_weather" {
+		t.Fatalf("tools.0.name = %q, want get_weather; body=%s", name, got)
+	}
+	second := gjson.GetBytes(got, "tools.1")
+	if toolType := second.Get("type").String(); toolType != "function" {
+		t.Fatalf("tools.1.type = %q, want function; body=%s", toolType, got)
+	}
+	if name := second.Get("name").String(); name != "lookup" {
+		t.Fatalf("tools.1.name = %q, want lookup; body=%s", name, got)
+	}
+	if second.Get("function").Exists() {
+		t.Fatalf("tools.1 nested function object should be removed, got %s", got)
+	}
+}
+
+func TestPrepareResponsesBody_DropsTypelessUnrecognizedTool(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hi",
+		"tools":[{"foo":"bar"}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	for _, tool := range gjson.GetBytes(got, "tools").Array() {
+		if strings.TrimSpace(tool.Get("type").String()) == "" {
+			t.Fatalf("typeless tool should be dropped, got %s", got)
+		}
+		if tool.Get("foo").Exists() {
+			t.Fatalf("unrecognized tool should be dropped, got %s", got)
+		}
+	}
+}
+
 func TestPrepareResponsesBodyNormalizesChatStyleFunctionTool(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -1668,6 +1865,75 @@ func TestPrepareResponsesBodyNormalizesChatStyleFunctionTool(t *testing.T) {
 	}
 	if strict := tool.Get("strict"); !strict.Bool() {
 		t.Fatalf("nested function strict should be promoted, got %s; body=%s", strict.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBodyNormalizesChatStyleFunctionToolChoice(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+		"tool_choice":{
+			"type":"function",
+			"function":{"name":"lookup"}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	choice := gjson.GetBytes(got, "tool_choice")
+	if choice.Get("type").String() != "function" {
+		t.Fatalf("tool_choice.type = %q, want function; body=%s", choice.Get("type").String(), got)
+	}
+	if choice.Get("name").String() != "lookup" {
+		t.Fatalf("tool_choice.name = %q, want lookup; body=%s", choice.Get("name").String(), got)
+	}
+	if choice.Get("function").Exists() {
+		t.Fatalf("tool_choice nested function object should be removed, got %s", got)
+	}
+}
+
+func TestPrepareResponsesBodyInfersFunctionToolChoiceTypeWhenMissing(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+		"tool_choice":{"function":{"name":"lookup"}}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	choice := gjson.GetBytes(got, "tool_choice")
+	if choice.Get("type").String() != "function" {
+		t.Fatalf("tool_choice.type = %q, want function; body=%s", choice.Get("type").String(), got)
+	}
+	if choice.Get("name").String() != "lookup" {
+		t.Fatalf("tool_choice.name = %q, want lookup; body=%s", choice.Get("name").String(), got)
+	}
+	if choice.Get("function").Exists() {
+		t.Fatalf("tool_choice nested function object should be removed, got %s", got)
+	}
+}
+
+func TestPrepareOpenAIResponsesBodyNormalizesChatStyleFunctionToolChoice(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+		"tool_choice":{
+			"type":"function",
+			"function":{"name":"lookup"}
+		}
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+	choice := gjson.GetBytes(got, "tool_choice")
+	if choice.Get("type").String() != "function" {
+		t.Fatalf("tool_choice.type = %q, want function; body=%s", choice.Get("type").String(), got)
+	}
+	if choice.Get("name").String() != "lookup" {
+		t.Fatalf("tool_choice.name = %q, want lookup; body=%s", choice.Get("name").String(), got)
+	}
+	if choice.Get("function").Exists() {
+		t.Fatalf("tool_choice nested function object should be removed, got %s", got)
 	}
 }
 
@@ -1755,6 +2021,18 @@ func TestInvalidEncryptedContentErrorDetection(t *testing.T) {
 	if isInvalidEncryptedContentError(http.StatusInternalServerError, body) {
 		t.Fatalf("non-400 response should not trigger encrypted content fallback")
 	}
+
+	missingBody := []byte(`{
+		"error":{
+			"message":"Missing required parameter: 'input[8].encrypted_content'.",
+			"type":"invalid_request_error",
+			"param":"input[8].encrypted_content",
+			"code":"missing_required_parameter"
+		}
+	}`)
+	if !isInvalidEncryptedContentError(http.StatusBadRequest, missingBody) {
+		t.Fatalf("missing encrypted_content error should trigger encrypted content fallback")
+	}
 }
 
 func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
@@ -1787,6 +2065,65 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 }
 
 // ==================== Function Calling 测试 ====================
+
+func TestStripInvalidEncryptedContentFromResponsesBodyDropsBareReasoning(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"stale"}]},
+			{"type":"reasoning"},
+			{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
+		]
+	}`)
+
+	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
+	if !changed {
+		t.Fatalf("expected body to be changed")
+	}
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("expected bare reasoning items to be removed, got %d items: %s", len(items), got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("first input should remain message, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call" {
+		t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"stale"}]},
+			{"type":"reasoning"},
+			{"type":"reasoning","encrypted_content":"opaque"},
+			{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
+		]
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesBody(raw)
+
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("expected bare reasoning items to be dropped before upstream, got %d items: %s", len(items), got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("first input should remain message, got %q; body=%s", typ, got)
+	}
+	if encrypted := gjson.GetBytes(got, "input.1.encrypted_content").String(); encrypted != "opaque" {
+		t.Fatalf("encrypted reasoning should be preserved, got %q; body=%s", encrypted, got)
+	}
+	if typ := gjson.GetBytes(got, "input.2.type").String(); typ != "function_call" {
+		t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+	}
+	if strings.Contains(expandedInputRaw, `"summary_text"`) {
+		t.Fatalf("expanded input cache should use cleaned input, got %s", expandedInputRaw)
+	}
+}
 
 func TestConvertMessagesToInput_ToolRole(t *testing.T) {
 	raw := []byte(`{
@@ -2012,6 +2349,73 @@ func TestStreamTranslator_FunctionCall(t *testing.T) {
 	}
 }
 
+func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
+
+	addedEvent := []byte(`{
+		"type":"response.output_item.added",
+		"output_index":0,
+		"item":{"type":"custom_tool_call","id":"ctc_001","call_id":"call_custom","name":"run_custom"}
+	}`)
+	chunk, done := st.Translate(addedEvent)
+	if done {
+		t.Fatal("should not be done after custom_tool_call added")
+	}
+	if chunk == nil {
+		t.Fatal("should emit chunk for custom_tool_call added")
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.id").String(); got != "call_custom" {
+		t.Fatalf("tool call id = %q, want call_custom; chunk=%s", got, chunk)
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.name").String(); got != "run_custom" {
+		t.Fatalf("tool call name = %q, want run_custom; chunk=%s", got, chunk)
+	}
+
+	deltaEvent := []byte(`{
+		"type":"response.custom_tool_call_input.delta",
+		"item_id":"ctc_001",
+		"delta":"{\"cmd\":"
+	}`)
+	chunk, done = st.Translate(deltaEvent)
+	if done {
+		t.Fatal("should not be done after custom_tool_call_input delta")
+	}
+	if chunk == nil {
+		t.Fatal("should emit chunk for custom_tool_call_input delta")
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `{"cmd":` {
+		t.Fatalf("custom tool input delta = %q, want arguments delta; chunk=%s", got, chunk)
+	}
+
+	callIDDeltaEvent := []byte(`{
+		"type":"response.custom_tool_call_input.delta",
+		"call_id":"call_custom",
+		"delta":"\"pwd\"}"
+	}`)
+	chunk, done = st.Translate(callIDDeltaEvent)
+	if done {
+		t.Fatal("should not be done after custom_tool_call_input call_id delta")
+	}
+	if chunk == nil {
+		t.Fatal("should emit chunk for custom_tool_call_input call_id delta")
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `"pwd"}` {
+		t.Fatalf("custom tool input call_id delta = %q, want arguments delta; chunk=%s", got, chunk)
+	}
+
+	completedEvent := []byte(`{
+		"type":"response.completed",
+		"response":{"usage":{"input_tokens":10,"output_tokens":5}}
+	}`)
+	chunk, done = st.Translate(completedEvent)
+	if !done {
+		t.Fatal("should be done after response.completed")
+	}
+	if finishReason := gjson.GetBytes(chunk, "choices.0.finish_reason").String(); finishReason != "tool_calls" {
+		t.Fatalf("expected finish_reason tool_calls, got %q", finishReason)
+	}
+}
+
 func TestStreamTranslator_TextOnly(t *testing.T) {
 	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 
@@ -2110,21 +2514,25 @@ func TestExtractToolCallsFromOutput(t *testing.T) {
 			"output":[
 				{"type":"message","content":[{"type":"output_text","text":"hi"}]},
 				{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"NYC\"}"},
-				{"type":"function_call","call_id":"call_2","name":"get_time","arguments":"{}"}
+				{"type":"function_call","call_id":"call_2","name":"get_time","arguments":"{}"},
+				{"type":"custom_tool_call","id":"call_3","name":"custom_exec","input":"{\"cmd\":\"pwd\"}"}
 			],
 			"usage":{"input_tokens":10,"output_tokens":5}
 		}
 	}`)
 
 	tcs := ExtractToolCallsFromOutput(event)
-	if len(tcs) != 2 {
-		t.Fatalf("expected 2 tool calls, got %d", len(tcs))
+	if len(tcs) != 3 {
+		t.Fatalf("expected 3 tool calls, got %d", len(tcs))
 	}
 	if tcs[0].ID != "call_1" || tcs[0].Name != "get_weather" {
 		t.Fatalf("first tool call mismatch: %+v", tcs[0])
 	}
 	if tcs[1].ID != "call_2" || tcs[1].Name != "get_time" {
 		t.Fatalf("second tool call mismatch: %+v", tcs[1])
+	}
+	if tcs[2].ID != "call_3" || tcs[2].Name != "custom_exec" || tcs[2].Arguments != `{"cmd":"pwd"}` {
+		t.Fatalf("custom tool call mismatch: %+v", tcs[2])
 	}
 }
 

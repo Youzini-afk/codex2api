@@ -178,7 +178,7 @@ func (h *Handler) ImportFromSub2API(c *gin.Context) {
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, "")
+	h.importAccountsCommon(c, tokens, "", false)
 }
 
 // sub2apiAccountInternal 后端聚合的中间结构，包含 credentials + 状态。
@@ -323,22 +323,23 @@ func sub2apiAccountToImportToken(a sub2apiAccountInternal) (importToken, bool) {
 		return importToken{}, false
 	}
 	tok := importToken{
-		refreshToken:        rt,
-		sessionToken:        st,
-		accessToken:         at,
-		name:                a.Name,
-		email:               a.Email,
-		idToken:             stringFromMap(c, "id_token"),
-		accountID:           stringFromMap(c, "account_id"),
-		chatgptAccountID:    a.ChatGPTAccountID,
-		userID:              stringFromMap(c, "chatgpt_user_id", "user_id", "chatgpt_account_user_id", "account_user_id", "accountUserID"),
-		planType:            a.PlanType,
-		expiresAt:           stringFromMap(c, "expires_at"),
-		codex7DUsedPercent:  stringFromMap(c, "codex_7d_used_percent"),
-		codex7DResetAt:      stringFromMap(c, "codex_7d_reset_at"),
-		codex5HUsedPercent:  stringFromMap(c, "codex_5h_used_percent"),
-		codex5HResetAt:      stringFromMap(c, "codex_5h_reset_at"),
-		codexUsageUpdatedAt: stringFromMap(c, "codex_usage_updated_at"),
+		refreshToken:          rt,
+		sessionToken:          st,
+		accessToken:           at,
+		name:                  a.Name,
+		email:                 a.Email,
+		idToken:               stringFromMap(c, "id_token"),
+		accountID:             stringFromMap(c, "account_id"),
+		chatgptAccountID:      a.ChatGPTAccountID,
+		userID:                stringFromMap(c, "chatgpt_user_id", "user_id", "chatgpt_account_user_id", "account_user_id", "accountUserID"),
+		planType:              a.PlanType,
+		expiresAt:             stringFromMap(c, "expires_at"),
+		codex7DUsedPercent:    stringFromMap(c, "codex_7d_used_percent"),
+		codex7DResetAt:        stringFromMap(c, "codex_7d_reset_at"),
+		codex5HUsedPercent:    stringFromMap(c, "codex_5h_used_percent"),
+		codex5HResetAt:        stringFromMap(c, "codex_5h_reset_at"),
+		codex5HUsageUpdatedAt: stringFromMap(c, "codex_5h_usage_updated_at"),
+		codexUsageUpdatedAt:   stringFromMap(c, "codex_usage_updated_at"),
 	}
 	if tok.name == "" {
 		tok.name = tok.email
@@ -435,7 +436,7 @@ func normalizeSub2APICreds(rawBaseURL, rawAPIKey string) (string, string, string
 	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		return "", "", "base_url 必须以 http:// 或 https:// 开头"
 	}
-	if _, err := url.Parse(baseURL); err != nil {
+	if parsed, err := url.Parse(baseURL); err != nil || parsed.Host == "" {
 		return "", "", "base_url 不是合法的 URL"
 	}
 	baseURL = strings.TrimRight(baseURL, "/")

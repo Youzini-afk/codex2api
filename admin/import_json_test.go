@@ -252,6 +252,29 @@ func TestFetchSub2APISummariesDefaultsMissingDataPlatformToOpenAI(t *testing.T) 
 	}
 }
 
+func TestConflictingImportChatGPTIDs(t *testing.T) {
+	tokens := []importToken{
+		{chatgptAccountID: "shared", refreshToken: "rt-1"},
+		{chatgptAccountID: "shared", refreshToken: "rt-2"},
+		{chatgptAccountID: "stable", refreshToken: "rt-3"},
+		{chatgptAccountID: "stable", refreshToken: "rt-3"},
+	}
+
+	conflicts := conflictingImportChatGPTIDs(tokens)
+	if !conflicts["shared"] {
+		t.Fatal("shared chatgpt_account_id should be marked conflicting")
+	}
+	if conflicts["stable"] {
+		t.Fatal("stable chatgpt_account_id should not be marked conflicting")
+	}
+	if got := reliableImportChatGPTID(tokens[0], conflicts); got != "" {
+		t.Fatalf("reliableImportChatGPTID(shared) = %q, want empty", got)
+	}
+	if got := reliableImportChatGPTID(tokens[2], conflicts); got != "stable" {
+		t.Fatalf("reliableImportChatGPTID(stable) = %q, want stable", got)
+	}
+}
+
 func TestParseCredentialExpiresAtSupportsUnixSeconds(t *testing.T) {
 	got := parseCredentialExpiresAt("1779071020").UTC()
 	want := time.Unix(1779071020, 0).UTC()
@@ -269,6 +292,7 @@ func TestParseImportJSONTokensPreservesCPAFields(t *testing.T) {
 		"codex_7d_reset_at": "2026-05-15T20:33:11+08:00",
 		"codex_5h_used_percent": 0,
 		"codex_5h_reset_at": "2026-05-11T11:39:07+08:00",
+		"codex_5h_usage_updated_at": "2026-05-11T10:39:07+08:00",
 		"codex_usage_updated_at": "2026-05-11T11:39:07+08:00",
 		"expired": "2026-04-25T12:00:00Z",
 		"id_token": "id-cpa",
@@ -301,6 +325,9 @@ func TestParseImportJSONTokensPreservesCPAFields(t *testing.T) {
 	if token.codex5HUsedPercent != "0" || token.codex5HResetAt != "2026-05-11T11:39:07+08:00" {
 		t.Fatalf("5h usage = %q/%q, want 0/reset", token.codex5HUsedPercent, token.codex5HResetAt)
 	}
+	if token.codex5HUsageUpdatedAt != "2026-05-11T10:39:07+08:00" {
+		t.Fatalf("5h usageUpdatedAt = %q, want timestamp", token.codex5HUsageUpdatedAt)
+	}
 	if token.codexUsageUpdatedAt != "2026-05-11T11:39:07+08:00" {
 		t.Fatalf("usageUpdatedAt = %q, want timestamp", token.codexUsageUpdatedAt)
 	}
@@ -311,12 +338,13 @@ func TestParseImportJSONTokensPreservesCPAFields(t *testing.T) {
 
 func TestAccountFromCredentialSeedRestoresUsageSnapshots(t *testing.T) {
 	account := accountFromCredentialSeed(42, "", tokenCredentialSeed{
-		planType:            "free",
-		codex7DUsedPercent:  "3",
-		codex7DResetAt:      "2026-05-15T20:33:11+08:00",
-		codex5HUsedPercent:  "0",
-		codex5HResetAt:      "2026-05-11T11:39:07+08:00",
-		codexUsageUpdatedAt: "2026-05-11T11:39:07+08:00",
+		planType:              "free",
+		codex7DUsedPercent:    "3",
+		codex7DResetAt:        "2026-05-15T20:33:11+08:00",
+		codex5HUsedPercent:    "0",
+		codex5HResetAt:        "2026-05-11T11:39:07+08:00",
+		codex5HUsageUpdatedAt: "2026-05-11T10:39:07+08:00",
+		codexUsageUpdatedAt:   "2026-05-11T11:39:07+08:00",
 	})
 
 	if got := account.GetPlanType(); got != "free" {
@@ -333,8 +361,27 @@ func TestAccountFromCredentialSeedRestoresUsageSnapshots(t *testing.T) {
 	if !ok || pct5h != 0 {
 		t.Fatalf("5h usage = %v/%t, want 0/true", pct5h, ok)
 	}
-	if account.GetReset5hAt().IsZero() {
-		t.Fatal("Reset5hAt is zero")
+	if account.GetUsageUpdatedAt5h().IsZero() {
+		t.Fatal("UsageUpdatedAt5h is zero")
+	}
+	if account.GetUsageUpdatedAt5h().Equal(account.GetUsageUpdatedAt()) {
+		t.Fatalf("UsageUpdatedAt5h = %s, want separate 5h timestamp from 7d", account.GetUsageUpdatedAt5h())
+	}
+}
+
+func TestAccountFromCredentialSeedDoesNotReuse7dFreshnessForMissing5hTimestamp(t *testing.T) {
+	account := accountFromCredentialSeed(42, "", tokenCredentialSeed{
+		codex7DUsedPercent:  "3",
+		codex5HUsedPercent:  "95",
+		codex5HResetAt:      time.Now().Add(time.Hour).Format(time.RFC3339),
+		codexUsageUpdatedAt: time.Now().Format(time.RFC3339),
+	})
+
+	if account.GetUsageUpdatedAt().IsZero() {
+		t.Fatal("UsageUpdatedAt is zero")
+	}
+	if !account.GetUsageUpdatedAt5h().IsZero() {
+		t.Fatalf("UsageUpdatedAt5h = %s, want zero when codex_5h_usage_updated_at is missing", account.GetUsageUpdatedAt5h())
 	}
 }
 
@@ -426,7 +473,7 @@ func TestImportAccountsJSONReturnsExistingNoTokenMessageForUnsupportedJSON(t *te
 	ctx.Request = req
 
 	handler := &Handler{}
-	handler.importAccountsJSON(ctx, "")
+	handler.importAccountsJSON(ctx, "", false)
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
@@ -450,7 +497,7 @@ func TestImportAccountsJSONRejectsInvalidJSONFile(t *testing.T) {
 	ctx.Request = req
 
 	handler := &Handler{}
-	handler.importAccountsJSON(ctx, "")
+	handler.importAccountsJSON(ctx, "", false)
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
@@ -462,6 +509,311 @@ func TestImportAccountsJSONRejectsInvalidJSONFile(t *testing.T) {
 	}
 	if got := payload["error"]; got != "文件 broken.json 不是有效的 JSON 格式" {
 		t.Fatalf("error = %q, want %q", got, "文件 broken.json 不是有效的 JSON 格式")
+	}
+}
+
+func TestImportAccountsCommonDoesNotCollapseConflictingChatGPTAccountID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{name: "sub2api-1", refreshToken: "rt-shared-id-1", accessToken: "at-shared-id-1", chatgptAccountID: "same-exported-id"},
+		{name: "sub2api-2", refreshToken: "rt-shared-id-2", accessToken: "at-shared-id-2", chatgptAccountID: "same-exported-id"},
+	}, "", false)
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("active rows = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if got := row.GetCredential("account_id"); got != "" {
+			t.Fatalf("account_id = %q, want empty for conflicting chatgpt_account_id", got)
+		}
+	}
+}
+
+func TestImportAccountsCommonUpdatesExistingOAuthIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	probed := make(chan int64, 1)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			probed <- acc.DBID
+			return nil
+		},
+	}
+
+	existingID, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-old",
+		"email":         "import@example.com",
+		"account_id":    "acc-import",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-new",
+		accessToken:  "at-new",
+		email:        "Import@Example.com",
+		accountID:    "acc-import",
+		planType:     "team",
+	}}, "", false)
+
+	select {
+	case id := <-probed:
+		if id != existingID {
+			t.Fatalf("probed account id = %d, want %d", id, existingID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered for updated OAuth identity")
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active rows = %d, want 1", len(rows))
+	}
+	row, err := db.GetAccountByID(context.Background(), existingID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("refresh_token"); got != "rt-new" {
+		t.Fatalf("refresh_token = %q, want rt-new", got)
+	}
+	if got := row.GetCredential("access_token"); got != "at-new" {
+		t.Fatalf("access_token = %q, want at-new", got)
+	}
+	if got := row.GetCredential("plan_type"); got != "team" {
+		t.Fatalf("plan_type = %q, want team", got)
+	}
+	if account := store.FindByID(existingID); account == nil {
+		t.Fatalf("runtime account %d not found after import update", existingID)
+	}
+}
+
+func TestImportAccountsCommonSkipsExistingOAuthIdentityWithSameCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			t.Fatal("usage probe should not run for unchanged duplicate import")
+			return nil
+		},
+	}
+
+	existingID, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-same",
+		"session_token": "st-same",
+		"access_token":  "at-same",
+		"email":         "same@example.com",
+		"account_id":    "acc-same",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-same",
+		sessionToken: "st-same",
+		accessToken:  "at-same",
+		email:        "Same@Example.com",
+		accountID:    "acc-same",
+	}}, "", false)
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, recorder.Body.String())
+	}
+	if got := int(payload["success"].(float64)); got != 0 {
+		t.Fatalf("success = %d, want 0", got)
+	}
+	if got := int(payload["duplicate"].(float64)); got != 1 {
+		t.Fatalf("duplicate = %d, want 1", got)
+	}
+	if got := int(payload["total"].(float64)); got != 1 {
+		t.Fatalf("total = %d, want 1", got)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != existingID {
+		t.Fatalf("active rows = %+v, want only existing id %d", rows, existingID)
+	}
+}
+
+func TestImportAccountsCommonSkipsAmbiguousOAuthIdentityWithExistingAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	existingID, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-old",
+		"email":         "ambiguous@example.com",
+		"account_id":    "acc-ambiguous",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{refreshToken: "rt-new-1", email: "ambiguous@example.com", accountID: "acc-ambiguous"},
+		{refreshToken: "rt-new-2", email: "Ambiguous@Example.com", accountID: "acc-ambiguous"},
+	}, "", false)
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, recorder.Body.String())
+	}
+	if got := int(payload["success"].(float64)); got != 0 {
+		t.Fatalf("success = %d, want 0", got)
+	}
+	if got := int(payload["duplicate"].(float64)); got != 2 {
+		t.Fatalf("duplicate = %d, want 2", got)
+	}
+	if got := int(payload["total"].(float64)); got != 2 {
+		t.Fatalf("total = %d, want 2", got)
+	}
+
+	row, err := db.GetAccountByID(context.Background(), existingID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("refresh_token"); got != "rt-old" {
+		t.Fatalf("refresh_token = %q, want rt-old", got)
+	}
+}
+
+func TestImportAccountsCommonSkipsAmbiguousOAuthIdentityWithoutExistingAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{refreshToken: "rt-new-1", email: "new-ambiguous@example.com", accountID: "acc-new-ambiguous"},
+		{refreshToken: "rt-new-2", email: "New-Ambiguous@Example.com", accountID: "acc-new-ambiguous"},
+	}, "", false)
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, recorder.Body.String())
+	}
+	if got := int(payload["success"].(float64)); got != 0 {
+		t.Fatalf("success = %d, want 0", got)
+	}
+	if got := int(payload["duplicate"].(float64)); got != 2 {
+		t.Fatalf("duplicate = %d, want 2", got)
+	}
+	if got := int(payload["total"].(float64)); got != 2 {
+		t.Fatalf("total = %d, want 2", got)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("active rows = %d, want 0", len(rows))
+	}
+}
+
+func TestImportAccountsCommonCollapsesIdenticalOAuthIdentityInFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{refreshToken: "rt-same-file", accessToken: "at-same-file", email: "same-file@example.com", accountID: "acc-same-file"},
+		{refreshToken: "rt-same-file", accessToken: "at-same-file", email: "Same-File@Example.com", accountID: "acc-same-file"},
+	}, "", false)
+
+	if !strings.Contains(recorder.Body.String(), `"type":"complete"`) ||
+		!strings.Contains(recorder.Body.String(), `"success":1`) ||
+		!strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("SSE payload = %q, want complete success=1 total=1", recorder.Body.String())
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active rows = %d, want 1", len(rows))
+	}
+	if got := rows[0].GetCredential("refresh_token"); got != "rt-same-file" {
+		t.Fatalf("refresh_token = %q, want rt-same-file", got)
 	}
 }
 
@@ -487,7 +839,7 @@ func TestImportAccountsCommonTriggersUsageProbeForImportedAccountWithAccessToken
 	handler.importAccountsCommon(ctx, []importToken{{
 		refreshToken: "rt-import-probe",
 		accessToken:  "at-import-probe",
-	}}, "")
+	}}, "", false)
 
 	select {
 	case id := <-probed:
@@ -526,7 +878,7 @@ func TestImportAccountsCommonKeepsSub2APISharedAccountDifferentUsers(t *testing.
 			chatgptAccountID: "team-workspace",
 			userID:           "user-two",
 		},
-	}, "")
+	}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -558,21 +910,9 @@ func TestImportAccountsCommonDedupesSameAccessTokenDifferentFineIdentity(t *test
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
 	handler.importAccountsCommon(ctx, []importToken{
-		{
-			accessToken:      "at-same-hard-duplicate",
-			name:             "Same AT User One",
-			email:            "one@example.com",
-			chatgptAccountID: "team-workspace",
-			userID:           "user-one",
-		},
-		{
-			accessToken:      "at-same-hard-duplicate",
-			name:             "Same AT User Two",
-			email:            "two@example.com",
-			chatgptAccountID: "team-workspace",
-			userID:           "user-two",
-		},
-	}, "")
+		{accessToken: "at-same-hard-duplicate", name: "Same AT User One", email: "one@example.com", chatgptAccountID: "team-workspace", userID: "user-one"},
+		{accessToken: "at-same-hard-duplicate", name: "Same AT User Two", email: "two@example.com", chatgptAccountID: "team-workspace", userID: "user-two"},
+	}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -596,21 +936,9 @@ func TestImportAccountsCommonKeepsAccountIDDifferentUsers(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
 	handler.importAccountsCommon(ctx, []importToken{
-		{
-			accessToken: "at-account-id-one",
-			name:        "Account ID User One",
-			email:       "one@example.com",
-			accountID:   "legacy-workspace",
-			userID:      "user-one",
-		},
-		{
-			accessToken: "at-account-id-two",
-			name:        "Account ID User Two",
-			email:       "two@example.com",
-			accountID:   "legacy-workspace",
-			userID:      "user-two",
-		},
-	}, "")
+		{accessToken: "at-account-id-one", name: "Account ID User One", email: "one@example.com", accountID: "legacy-workspace", userID: "user-one"},
+		{accessToken: "at-account-id-two", name: "Account ID User Two", email: "two@example.com", accountID: "legacy-workspace", userID: "user-two"},
+	}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -638,12 +966,7 @@ func TestImportAccountsCommonSkipsExistingScopedUserIDWithChangedAccessToken(t *
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{
-		accessToken:      "at-new-user",
-		name:             "Existing User Duplicate",
-		chatgptAccountID: "team-workspace",
-		userID:           "same-user",
-	}}, "")
+	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-new-user", name: "Existing User Duplicate", chatgptAccountID: "team-workspace", userID: "same-user"}}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -678,12 +1001,7 @@ func TestImportAccountsCommonSkipsExistingScopedEmailWithChangedAccessToken(t *t
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{
-		accessToken: "at-new-email",
-		name:        "Existing Email Duplicate",
-		accountID:   "team-workspace",
-		email:       "same@example.com",
-	}}, "")
+	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-new-email", name: "Existing Email Duplicate", accountID: "team-workspace", email: "same@example.com"}}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -713,13 +1031,7 @@ func TestImportAccountsCommonSavesUserIDCredentials(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{
-		accessToken:      "at-save-user-id",
-		name:             "Save User ID",
-		chatgptAccountID: "team-workspace",
-		userID:           "saved-user-id",
-		email:            "saved@example.com",
-	}}, "")
+	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-save-user-id", name: "Save User ID", chatgptAccountID: "team-workspace", userID: "saved-user-id", email: "saved@example.com"}}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -755,7 +1067,7 @@ func TestImportAccountsCommonDedupesSharedChatGPTAccountWithoutFineIdentity(t *t
 	handler.importAccountsCommon(ctx, []importToken{
 		{refreshToken: "rt-no-fine-1", name: "No Fine One", chatgptAccountID: "same-workspace"},
 		{refreshToken: "rt-no-fine-2", name: "No Fine Two", chatgptAccountID: "same-workspace"},
-	}, "")
+	}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -777,9 +1089,7 @@ func TestImportAccountsCommonSkipsExistingChatGPTAccountWithoutFineIdentity(t *t
 	if err != nil {
 		t.Fatalf("InsertAccount: %v", err)
 	}
-	if err := db.UpdateCredentials(context.Background(), existingID, map[string]interface{}{
-		"chatgpt_account_id": "existing-workspace",
-	}); err != nil {
+	if err := db.UpdateCredentials(context.Background(), existingID, map[string]interface{}{"chatgpt_account_id": "existing-workspace"}); err != nil {
 		t.Fatalf("UpdateCredentials: %v", err)
 	}
 
@@ -788,11 +1098,7 @@ func TestImportAccountsCommonSkipsExistingChatGPTAccountWithoutFineIdentity(t *t
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{
-		refreshToken:     "rt-new-workspace",
-		name:             "Existing Workspace Duplicate",
-		chatgptAccountID: "existing-workspace",
-	}}, "")
+	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-new-workspace", name: "Existing Workspace Duplicate", chatgptAccountID: "existing-workspace"}}, "", false)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -810,6 +1116,54 @@ func TestImportAccountsCommonSkipsExistingChatGPTAccountWithoutFineIdentity(t *t
 	}
 	if got := payload["total"]; got != float64(1) {
 		t.Fatalf("total = %v, want 1", got)
+	}
+}
+
+func TestImportAccountsCommonMarksImported7dUsageAsRateLimited(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	resetAt := time.Now().Add(6 * time.Hour).UTC().Truncate(time.Second)
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken:       "rt-import-limited",
+		accessToken:        "at-import-limited",
+		planType:           "team",
+		codex7DUsedPercent: "100",
+		codex7DResetAt:     resetAt.Format(time.RFC3339),
+	}}, "", false)
+
+	accounts := store.Accounts()
+	if len(accounts) != 1 {
+		t.Fatalf("store accounts = %d, want 1", len(accounts))
+	}
+	account := accounts[0]
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	}
+	reason, until := account.GetCooldownSnapshot()
+	if reason != "rate_limited" || !until.After(time.Now()) {
+		t.Fatalf("cooldown = (%q, %s), want active rate_limited", reason, until)
+	}
+
+	row, err := db.GetAccountByID(context.Background(), account.DBID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if row.CooldownReason != "rate_limited" || !row.CooldownUntil.Valid {
+		t.Fatalf("persisted cooldown = (%q, %v), want active rate_limited", row.CooldownReason, row.CooldownUntil)
 	}
 }
 
@@ -842,7 +1196,7 @@ func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-import-refresh-probe"}}, "")
+	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-import-refresh-probe"}}, "", false)
 
 	select {
 	case id := <-probed:
@@ -851,6 +1205,66 @@ func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("usage probe was not triggered after RT-only import refresh")
+	}
+}
+
+func TestImportAccountsCommonRefreshesOAuthIdentityRTOnlyImport(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	refreshed := make(chan int64, 2)
+	probed := make(chan int64, 1)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(_ context.Context, id int64) error {
+			refreshed <- id
+			acc := store.FindByID(id)
+			if acc == nil {
+				return fmt.Errorf("account %d not found", id)
+			}
+			acc.Mu().Lock()
+			acc.AccessToken = "at-oauth-identity-refreshed"
+			acc.Mu().Unlock()
+			return nil
+		},
+		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			probed <- acc.DBID
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-oauth-identity-refresh-probe",
+		email:        "identity-refresh@example.com",
+		accountID:    "acc-identity-refresh",
+	}}, "", false)
+
+	select {
+	case id := <-probed:
+		if id == 0 {
+			t.Fatal("probed account id is zero")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered after OAuth identity RT-only import refresh")
+	}
+	select {
+	case id := <-refreshed:
+		if id == 0 {
+			t.Fatal("refreshed account id is zero")
+		}
+	default:
+		t.Fatal("refresh was not triggered")
+	}
+	select {
+	case id := <-refreshed:
+		t.Fatalf("refresh triggered more than once, second id=%d", id)
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 
@@ -937,4 +1351,101 @@ func newMultipartRequest(t *testing.T, files map[string]string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	return req
+}
+
+// TestImportAccountsCommonAllowDuplicateBypassesDedup 验证：勾选"允许重复添加"后，
+// 同一 OAuth 身份会被作为独立账号新建，而不是更新已有账号。
+func TestImportAccountsCommonAllowDuplicateBypassesDedup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-dup",
+		"email":         "dup@example.com",
+		"account_id":    "acc-dup",
+	}, ""); err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-dup-2",
+		email:        "dup@example.com",
+		accountID:    "acc-dup",
+	}}, "", true)
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("active rows = %d, want 2 (duplicate allowed)", len(rows))
+	}
+}
+
+// TestAddAccountDedupsRefreshToken 验证：RT 单账号添加默认按 RT 原文对已有库去重。
+func TestAddAccountDedupsRefreshToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-existing",
+	}, ""); err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	doAdd := func(body string) map[string]interface{} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.AddAccount(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp
+	}
+
+	// 默认：重复 RT 应被跳过
+	resp := doAdd(`{"refresh_token":"rt-existing"}`)
+	if dup := resp["duplicate"]; dup != float64(1) {
+		t.Fatalf("duplicate = %v, want 1", dup)
+	}
+	if rows, _ := db.ListActive(context.Background()); len(rows) != 1 {
+		t.Fatalf("active rows = %d, want 1 (duplicate skipped)", len(rows))
+	}
+
+	// 勾选允许重复：同一 RT 应被新建
+	resp = doAdd(`{"refresh_token":"rt-existing","allow_duplicate":true}`)
+	if suc := resp["success"]; suc != float64(1) {
+		t.Fatalf("success = %v, want 1", suc)
+	}
+	if rows, _ := db.ListActive(context.Background()); len(rows) != 2 {
+		t.Fatalf("active rows = %d, want 2 (duplicate allowed)", len(rows))
+	}
 }

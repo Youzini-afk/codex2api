@@ -1,14 +1,21 @@
 package wsrelay
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
@@ -30,7 +37,7 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 		"Originator": []string{"custom-originator"},
 	}
 
-	headers := exec.prepareWebsocketHeaders("token-123", "42", "session-123", "api-key-1", cfg, ginHeaders)
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "session-123", "api-key-1", cfg, ginHeaders)
 
 	if got := headers.Get("Authorization"); got != "Bearer token-123" {
 		t.Fatalf("Authorization = %q", got)
@@ -61,7 +68,8 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 	}
 }
 
-func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
+func TestPrepareWebsocketHeadersSendsUserAgentByDefault(t *testing.T) {
+	t.Setenv("CODEX_WS_SEND_USER_AGENT", "")
 	exec := NewExecutor()
 	ginHeaders := http.Header{
 		"X-Codex-Turn-State":                    []string{"turn-state"},
@@ -70,13 +78,13 @@ func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
 		"X-Responsesapi-Include-Timing-Metrics": []string{"true"},
 	}
 
-	headers := exec.prepareWebsocketHeaders("token-123", "42", "session-123", "api-key-1", nil, ginHeaders)
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "session-123", "api-key-1", nil, ginHeaders)
 
-	if got := headers.Get("User-Agent"); got != "" {
-		t.Fatalf("User-Agent = %q, want empty", got)
+	if got := headers.Get("User-Agent"); got != proxy.MinimalCodexCLIUserAgentForHeaders() {
+		t.Fatalf("User-Agent = %q, want %q", got, proxy.MinimalCodexCLIUserAgentForHeaders())
 	}
-	if got := headers.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty", got)
+	if got := headers.Get("Version"); got != proxy.LatestCodexCLIVersionForHeaders() {
+		t.Fatalf("Version = %q, want %q", got, proxy.LatestCodexCLIVersionForHeaders())
 	}
 	if got := headers.Get("OpenAI-Beta"); got != responsesWebsocketBetaHeader {
 		t.Fatalf("OpenAI-Beta = %q", got)
@@ -91,6 +99,53 @@ func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
 	}
 	if got := headers.Get("Conversation_id"); got != "session-123" {
 		t.Fatalf("Conversation_id = %q", got)
+	}
+}
+
+func TestPrepareWebsocketHeadersCanOptOutOfUserAgent(t *testing.T) {
+	t.Setenv("CODEX_WS_SEND_USER_AGENT", "false")
+	exec := NewExecutor()
+
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "session-123", "api-key-1", nil, http.Header{})
+
+	if got := headers.Get("User-Agent"); got != "" {
+		t.Fatalf("User-Agent = %q, want empty", got)
+	}
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+}
+
+func TestPrepareWebsocketHeadersHonorsForcedGeneratedUserAgent(t *testing.T) {
+	t.Setenv("CODEX_WS_SEND_USER_AGENT", "true")
+	prev := proxy.CurrentRuntimeSettings()
+	proxy.ApplyRuntimeSettings(proxy.RuntimeSettings{ClientCompatMode: proxy.ClientCompatModeForce})
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(prev) })
+	exec := NewExecutor()
+	account := &auth.Account{DBID: 43, AccountID: "42"}
+	ginHeaders := http.Header{
+		"User-Agent": []string{"codex_vscode/1.2.3"},
+		"Originator": []string{"codex_vscode"},
+		"Version":    []string{"1.2.3"},
+	}
+
+	headers := exec.prepareWebsocketHeaders("token-123", account, "42", "session-123", "api-key-1", nil, ginHeaders)
+
+	got := headers.Get("User-Agent")
+	if got == ginHeaders.Get("User-Agent") {
+		t.Fatalf("User-Agent preserved client UA %q in forced mode", got)
+	}
+	if got != proxy.ProfileForAccount(account.DBID).UserAgent {
+		t.Fatalf("User-Agent = %q, want real account profile %q", got, proxy.ProfileForAccount(account.DBID).UserAgent)
+	}
+	if !strings.HasPrefix(got, "codex-tui/") || !strings.Contains(got, " (") {
+		t.Fatalf("User-Agent = %q, want generated full codex-tui profile", got)
+	}
+	if version := headers.Get("Version"); version != proxy.LatestCodexCLIVersionForHeaders() {
+		t.Fatalf("Version = %q, want %q", version, proxy.LatestCodexCLIVersionForHeaders())
+	}
+	if originator := headers.Get("Originator"); originator != proxy.Originator {
+		t.Fatalf("Originator = %q, want %q", originator, proxy.Originator)
 	}
 }
 
@@ -110,6 +165,26 @@ func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 	}
 	if !gjson.GetBytes(got, "stream").Bool() {
 		t.Fatalf("stream should be true; body=%s", got)
+	}
+}
+
+func TestPrepareWebsocketBodyKeepsCacheKeyForStatelessSession(t *testing.T) {
+	exec := NewExecutor()
+
+	got := exec.prepareWebsocketBody([]byte(`{"model":"gpt-5.4","prompt_cache_key":"deterministic-key","input":[]}`), "stateless-abc123")
+
+	if cacheKey := gjson.GetBytes(got, "prompt_cache_key").String(); cacheKey != "deterministic-key" {
+		t.Fatalf("prompt_cache_key = %q, want deterministic-key (stateless sessionID must not overwrite); body=%s", cacheKey, got)
+	}
+}
+
+func TestPrepareWebsocketBodyStatelessSessionWithoutCacheKey(t *testing.T) {
+	exec := NewExecutor()
+
+	got := exec.prepareWebsocketBody([]byte(`{"model":"gpt-5.4","input":[]}`), "stateless-abc123")
+
+	if cacheKey := gjson.GetBytes(got, "prompt_cache_key").String(); cacheKey != "" {
+		t.Fatalf("prompt_cache_key = %q, want empty (stateless sessionID must not be injected); body=%s", cacheKey, got)
 	}
 }
 
@@ -203,6 +278,81 @@ func TestWebsocketResponseToHTTPClosesBodyOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Body.Read stayed blocked after context cancellation")
+	}
+}
+
+func newClosedTestWebsocketConn(t *testing.T) *websocket.Conn {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	handshakeDone := make(chan struct{})
+	go func() {
+		defer close(handshakeDone)
+		defer serverConn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(serverConn))
+		if err != nil {
+			return
+		}
+		acceptHash := sha1.Sum([]byte(req.Header.Get("Sec-Websocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+		_, _ = fmt.Fprintf(serverConn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", base64.StdEncoding.EncodeToString(acceptHash[:]))
+	}()
+
+	wsURL, err := url.Parse("ws://example.test/responses")
+	if err != nil {
+		t.Fatalf("parse websocket URL: %v", err)
+	}
+	conn, _, err := websocket.NewClient(clientConn, wsURL, nil, 1024, 1024)
+	if err != nil {
+		t.Fatalf("create test websocket client: %v", err)
+	}
+	<-handshakeDone
+	return conn
+}
+
+func TestExecuteRequestViaWebsocketSendFailureRemovesEffectiveProxyConnection(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{
+		DBID:        42,
+		AccessToken: "token-123",
+		ProxyURL:    "http://account-proxy.test:8080",
+	}
+	sessionID := "session-1"
+	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
+	if err != nil {
+		t.Fatalf("buildWebsocketURL: %v", err)
+	}
+	effectiveProxy := effectiveProxyURL(account, "")
+	key := manager.poolKey(account.ID(), wsURL, sessionID, effectiveProxy)
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{
+		conn:    newClosedTestWebsocketConn(t),
+		session: session,
+		URL:     wsURL,
+		PoolKey: key,
+	}
+	conn.SetState(StateConnected)
+	conn.Touch()
+	manager.connections.Store(key, conn)
+	manager.sessions.Store(key, session)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	exec := NewExecutorWithManager(manager)
+	_, err = exec.ExecuteRequestViaWebsocket(ctx, account, []byte(`{"model":"gpt-5.4","input":"hi"}`), sessionID, "", "", nil, http.Header{}, "")
+	if err == nil {
+		t.Fatal("expected final send failure")
+	}
+	if _, ok := manager.connections.Load(key); ok {
+		t.Fatal("expected failed connection keyed by effective account proxy to be removed")
+	}
+	if _, ok := manager.sessions.Load(key); ok {
+		t.Fatal("expected failed session keyed by effective account proxy to be removed")
+	}
+	if conn.IsConnected() {
+		t.Fatal("expected failed connection to be closed")
 	}
 }
 

@@ -7,6 +7,8 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import StatCard from '../components/StatCard'
 import UsageStatsSummary from '../components/UsageStatsSummary'
+import TimeRangeSelector from '../components/TimeRangeSelector'
+import SystemHealthBar from '../components/SystemHealthBar'
 import type { StatsResponse, SystemSettings, UsageStats, ChartAggregation } from '../types'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { Card, CardContent } from '@/components/ui/card'
@@ -49,12 +51,15 @@ export default function Dashboard() {
   const [chartRefreshedAt, setChartRefreshedAt] = useState<number | null>(null)
   const [chartLoading, setChartLoading] = useState(true)
   const chartAbort = useRef<AbortController | null>(null)
+  const timeRangeRef = useRef<TimeRangeKey>(timeRange)
+  const usageStatsRangeInitialized = useRef(false)
 
   // 仅加载轻量级统计数据（秒级响应）
   const loadDashboardStats = useCallback(async () => {
+    const { start, end } = getTimeRangeISO(timeRangeRef.current)
     const [stats, usageStats, settings] = await Promise.all([
       api.getStats(),
-      api.getUsageStats(),
+      api.getUsageStats({ start, end }),
       api.getSettings().catch((): SystemSettings | null => null),
     ])
     return { stats, usageStats, settings }
@@ -68,6 +73,15 @@ export default function Dashboard() {
     initialData: { stats: null, usageStats: null, settings: null },
     load: loadDashboardStats,
   })
+
+  useEffect(() => {
+    timeRangeRef.current = timeRange
+    if (!usageStatsRangeInitialized.current) {
+      usageStatsRangeInitialized.current = true
+      return
+    }
+    void reloadSilently()
+  }, [timeRange, reloadSilently])
 
   // 加载服务端聚合的图表数据（12~48 个聚合点，非原始行）
   const loadChartData = useCallback(async () => {
@@ -148,6 +162,12 @@ export default function Dashboard() {
           title={t('dashboard.title')}
           description={t('dashboard.description')}
           onRefresh={() => { void reload(); void loadChartData() }}
+          actions={
+            <TimeRangeSelector
+              timeRange={timeRange}
+              onTimeRangeChange={setTimeRange}
+            />
+          }
         />
 
         {/* Account status */}
@@ -169,17 +189,25 @@ export default function Dashboard() {
           <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} />
         </div>
 
+        {/* System health */}
+        <div className="mb-6">
+          <SystemHealthBar chartData={chartData} timeRange={timeRange} loading={chartLoading} />
+        </div>
+
         {/* Usage stats */}
         {usageStats && (
           <div className="space-y-6">
-            <UsageStatsSummary stats={usageStats} showFullUsageNumbers={showFullUsageNumbers} />
+            <UsageStatsSummary
+              stats={usageStats}
+              rangeLabel={t(`dashboard.timeRange${timeRange.toUpperCase()}`)}
+              showFullUsageNumbers={showFullUsageNumbers}
+            />
             <Suspense fallback={<ChartsSkeleton />}>
               <DashboardUsageCharts
                 chartData={chartData}
                 refreshedAt={chartRefreshedAt}
                 refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
                 timeRange={timeRange}
-                onTimeRangeChange={setTimeRange}
                 emptyDescription={chartEmptyDescription}
                 loading={chartLoading}
               />

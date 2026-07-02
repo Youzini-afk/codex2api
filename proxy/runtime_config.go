@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,14 @@ const (
 	BillingTierPolicyActual    = "actual"
 	BillingTierPolicyRequested = "requested"
 
+	// RequestIsolationMode 取值：
+	//   isolated   —— 无显式会话的请求默认按"每请求"隔离上游身份（默认）；
+	//   per-api-key —— 无显式会话的请求按下游 API Key 共享上游身份（恢复 v2 旧行为，
+	//                  保留隐式 prompt cache 命中）。
+	// 用环境变量 CODEX_REQUEST_ISOLATION_MODE 覆盖默认值。
+	RequestIsolationModeIsolated  = "isolated"
+	RequestIsolationModePerAPIKey = "per-api-key"
+
 	defaultClientCompatMode      = ClientCompatModePreserve
 	defaultCodexMinCLIVersion    = "0.118.0"
 	defaultStreamFlushPolicy     = StreamFlushPolicyImmediate
@@ -41,6 +50,7 @@ const (
 type RuntimeSettings struct {
 	ClientCompatMode              string
 	CodexMinCLIVersion            string
+	CodexUserAgentConfig          string
 	StreamFlushPolicy             string
 	StreamFlushIntervalMS         int
 	FirstTokenMode                string
@@ -52,6 +62,14 @@ type RuntimeSettings struct {
 	CodexWSSilentRetries          int  // Codex WS 静默换号最大重试次数（默认 2）
 	CodexFastModelAliasEnabled    bool // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
 	CodexFastTierInterceptEnabled bool // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
+	// RequestIsolationMode 控制无显式会话请求的上游身份隔离粒度（isolated|per-api-key，默认 isolated）。
+	RequestIsolationMode string
+}
+
+// IsolateRequestsByDefault 返回是否对无显式会话的请求默认按每请求隔离上游身份。
+// 仅 per-api-key 模式返回 false（恢复按 API Key 共享缓存的旧行为）。
+func (s RuntimeSettings) IsolateRequestsByDefault() bool {
+	return NormalizeRequestIsolationMode(s.RequestIsolationMode) != RequestIsolationModePerAPIKey
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -64,6 +82,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 	return RuntimeSettings{
 		ClientCompatMode:              defaultClientCompatMode,
 		CodexMinCLIVersion:            defaultCodexMinCLIVersion,
+		CodexUserAgentConfig:          DefaultCodexUserAgentConfigJSON(),
 		StreamFlushPolicy:             defaultStreamFlushPolicy,
 		StreamFlushIntervalMS:         defaultStreamFlushIntervalMS,
 		FirstTokenMode:                defaultFirstTokenMode,
@@ -74,6 +93,24 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSilentRetries:          defaultCodexWSSilentRetries,
 		CodexFastModelAliasEnabled:    true,
 		CodexFastTierInterceptEnabled: false,
+		RequestIsolationMode:          defaultRequestIsolationMode(),
+	}
+}
+
+// defaultRequestIsolationMode 从环境变量解析默认隔离模式；缺省为按每请求隔离。
+// CODEX_REQUEST_ISOLATION_MODE=per-api-key（或 per_api_key / shared / cache）可切回旧的
+// 按 API Key 共享缓存行为，作为依赖隐式缓存命中的部署的逃生阀。
+func defaultRequestIsolationMode() string {
+	return NormalizeRequestIsolationMode(os.Getenv("CODEX_REQUEST_ISOLATION_MODE"))
+}
+
+// NormalizeRequestIsolationMode 归一化隔离模式，空/未知值回落到 isolated。
+func NormalizeRequestIsolationMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case RequestIsolationModePerAPIKey, "per_api_key", "per-apikey", "shared", "cache":
+		return RequestIsolationModePerAPIKey
+	default:
+		return RequestIsolationModeIsolated
 	}
 }
 
@@ -129,10 +166,16 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	settings.StreamFlushPolicy = NormalizeStreamFlushPolicy(settings.StreamFlushPolicy)
 	settings.FirstTokenMode = NormalizeFirstTokenMode(settings.FirstTokenMode)
 	settings.BillingTierPolicy = NormalizeBillingTierPolicy(settings.BillingTierPolicy)
+	settings.RequestIsolationMode = NormalizeRequestIsolationMode(settings.RequestIsolationMode)
 	if strings.TrimSpace(settings.CodexMinCLIVersion) == "" {
 		settings.CodexMinCLIVersion = defaults.CodexMinCLIVersion
 	} else {
 		settings.CodexMinCLIVersion = strings.TrimSpace(settings.CodexMinCLIVersion)
+	}
+	if normalized, err := NormalizeCodexUserAgentConfigJSON(settings.CodexUserAgentConfig); err == nil {
+		settings.CodexUserAgentConfig = normalized
+	} else {
+		settings.CodexUserAgentConfig = defaults.CodexUserAgentConfig
 	}
 	if settings.StreamFlushIntervalMS < minStreamFlushIntervalMS {
 		settings.StreamFlushIntervalMS = defaults.StreamFlushIntervalMS
@@ -160,6 +203,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 	if settings != nil {
 		next.ClientCompatMode = settings.ClientCompatMode
 		next.CodexMinCLIVersion = settings.CodexMinCLIVersion
+		next.CodexUserAgentConfig = settings.CodexUserAgentConfig
 		next.StreamFlushPolicy = settings.StreamFlushPolicy
 		next.StreamFlushIntervalMS = settings.StreamFlushIntervalMS
 		next.FirstTokenMode = settings.FirstTokenMode

@@ -35,6 +35,9 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	if got := cfg.MaxRequestBodySize; got != 48*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 48*1024*1024)
 	}
+	if got := strings.Join(cfg.TrustedProxies, ","); got != "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" {
+		t.Fatalf("TrustedProxies = %q, want loopback and private-network defaults", got)
+	}
 }
 
 func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
@@ -91,6 +94,58 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 
 	if got := cfg.MaxRequestBodySize; got != 64*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 64*1024*1024)
+	}
+}
+
+func TestLoadParsesTrustedProxiesEnv(t *testing.T) {
+	resetConfigEnv(t)
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12;192.168.1.10")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := strings.Join(cfg.TrustedProxies, ","); got != "10.0.0.0/8,172.16.0.0/12,192.168.1.10" {
+		t.Fatalf("TrustedProxies = %q", got)
+	}
+}
+
+func TestLoadCanDisableTrustedProxies(t *testing.T) {
+	resetConfigEnv(t)
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_TRUSTED_PROXIES", "none")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if cfg.TrustedProxies != nil {
+		t.Fatalf("TrustedProxies = %#v, want nil", cfg.TrustedProxies)
+	}
+}
+
+func TestLoadDefaultsCodexUpstreamTransportToHTTP(t *testing.T) {
+	resetConfigEnv(t)
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_UPSTREAM_TRANSPORT", "")
+	t.Setenv("USE_WEBSOCKET", "")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.CodexUpstreamTransport; got != "http" {
+		t.Fatalf("CodexUpstreamTransport = %q, want http", got)
 	}
 }
 

@@ -16,6 +16,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 	xproxy "golang.org/x/net/proxy"
+
+	"github.com/codex2api/security"
 )
 
 // ==================== utls RoundTripper（Chrome 指纹 + HTTP/2） ====================
@@ -29,10 +31,10 @@ import (
 // utlsRoundTripper 实现 http.RoundTripper 接口
 // 使用 utls 模拟 Chrome 浏览器的 TLS 指纹以绕过 TLS 指纹检测
 type utlsRoundTripper struct {
-	mu         sync.Mutex
+	mu          sync.Mutex
 	connections map[string]*http2.ClientConn // HTTP/2 连接池，按 host 索引
 	pending     map[string]*sync.Cond        // 防止重复连接创建
-	dialer     xproxy.Dialer                 // 底层拨号器（支持代理）
+	dialer      xproxy.Dialer                // 底层拨号器（支持代理）
 }
 
 // utlsSessionCache 在所有 uTLS 连接间共享 TLS 会话缓存，让重连走 TLS resumption。
@@ -71,7 +73,7 @@ func NewUTLSHttpClient(proxyURL string) *http.Client {
 
 // buildProxyDialer 根据代理 URL 创建拨号器
 func buildProxyDialer(proxyURL string) (xproxy.Dialer, error) {
-	u, err := url.Parse(proxyURL)
+	u, err := security.ParseProxyURL(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("解析代理 URL 失败: %w", err)
 	}
@@ -346,4 +348,3 @@ func (c *uTLSHTTPClientWrapper) Do(req *http.Request) (*http.Response, error) {
 func (c *uTLSHTTPClientWrapper) CloseIdleConnections() {
 	c.transport.CloseIdleConnections()
 }
-

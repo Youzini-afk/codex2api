@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,7 @@ type AccountRow struct {
 	Tags                    []string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
+	DeletedAt               sql.NullTime
 }
 
 type AccountModelCooldownRow struct {
@@ -75,6 +77,32 @@ type OptionalBool struct {
 type OptionalNullInt64 struct {
 	Set   bool
 	Value sql.NullInt64
+}
+
+type BatchAccountMetadataUpdate struct {
+	Enabled                 OptionalBool
+	Locked                  OptionalBool
+	ScoreBiasOverride       OptionalNullInt64
+	BaseConcurrencyOverride OptionalNullInt64
+	SkipWarmTier            OptionalBool
+	AllowedAPIKeyIDs        OptionalInt64Slice
+	Tags                    OptionalStringSlice
+	GroupIDs                OptionalInt64Slice
+	ProxyURL                OptionalString
+	CredentialUpdates       map[string]interface{}
+}
+
+func (u BatchAccountMetadataUpdate) HasChanges() bool {
+	return u.Enabled.Set ||
+		u.Locked.Set ||
+		u.ScoreBiasOverride.Set ||
+		u.BaseConcurrencyOverride.Set ||
+		u.SkipWarmTier.Set ||
+		u.AllowedAPIKeyIDs.Set ||
+		u.Tags.Set ||
+		u.GroupIDs.Set ||
+		u.ProxyURL.Set ||
+		len(u.CredentialUpdates) > 0
 }
 
 // AccountCredentialIndex holds pre-built sets of existing credentials for fast import dedup.
@@ -121,6 +149,35 @@ func (a *AccountRow) GetCredentialInt64Slice(key string) []int64 {
 	return int64SliceFromValue(value)
 }
 
+func (a *AccountRow) GetCredentialInt64(key string) (int64, bool) {
+	if a.Credentials == nil {
+		return 0, false
+	}
+	value, ok := a.Credentials[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case int64:
+		return typed, true
+	case int:
+		return int64(typed), true
+	case float64:
+		if math.Trunc(typed) != typed {
+			return 0, false
+		}
+		return int64(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
 func (a *AccountRow) GetCredentialStringSlice(key string) []string {
 	if a.Credentials == nil {
 		return []string{}
@@ -130,6 +187,10 @@ func (a *AccountRow) GetCredentialStringSlice(key string) []string {
 		return []string{}
 	}
 	return stringSliceFromValue(value)
+}
+
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 }
 
 // DB PostgreSQL 数据库操作
@@ -204,6 +265,7 @@ func NormalizeUsageLogFlushIntervalSeconds(n int) int {
 // usageLogEntry 日志缓冲条目
 type usageLogEntry struct {
 	AccountID            int64
+	ClientIP             string
 	Endpoint             string
 	Model                string
 	EffectiveModel       string
@@ -635,6 +697,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_id INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_name VARCHAR(255) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_masked VARCHAR(64) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS client_ip VARCHAR(64) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_count INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_width INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_height INT DEFAULT 0;
@@ -663,6 +726,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS quota_used DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
 	CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
+
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS total_used DOUBLE PRECISION NOT NULL DEFAULT 0;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS reset_count INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_reset_at TIMESTAMPTZ;
 
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS allowed_group_ids JSONB DEFAULT '[]'::jsonb;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS limits JSONB DEFAULT '{}'::jsonb;
@@ -737,8 +804,15 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_sensitive_words TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_custom_patterns TEXT DEFAULT '[]';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_disabled_patterns TEXT DEFAULT '[]';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_api_key TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_base_url TEXT DEFAULT 'https://api.openai.com';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_model TEXT DEFAULT 'omni-moderation-latest';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_timeout_seconds INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_fail_closed BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_mode VARCHAR(20) DEFAULT 'full';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_batch_size INT DEFAULT 200;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_flush_interval_seconds INT DEFAULT 5;
@@ -749,6 +823,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS billing_tier_policy VARCHAR(20) DEFAULT 'actual';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS image_storage_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS show_full_usage_numbers BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_key_usage_page_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_force_websocket BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_interval_sec INT DEFAULT 60;
@@ -757,6 +832,13 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_model_alias_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_tier_intercept_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_concurrency INT DEFAULT 1;
+
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 
 			CREATE TABLE IF NOT EXISTS prompt_filter_logs (
 				id               SERIAL PRIMARY KEY,
@@ -774,8 +856,16 @@ func (db *DB) migrate(ctx context.Context) error {
 				api_key_name     VARCHAR(255) DEFAULT '',
 				api_key_masked   VARCHAR(64) DEFAULT '',
 				client_ip        VARCHAR(64) DEFAULT '',
-				error_code       VARCHAR(100) DEFAULT ''
+				error_code       VARCHAR(100) DEFAULT '',
+				review_model     VARCHAR(100) DEFAULT '',
+				review_flagged   BOOLEAN DEFAULT FALSE,
+				review_error     TEXT DEFAULT '',
+				full_text        TEXT DEFAULT ''
 			);
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_model VARCHAR(100) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_error TEXT DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS full_text TEXT DEFAULT '';
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);
 
@@ -904,8 +994,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	`
 	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer migrateCancel()
-	_, err = db.conn.ExecContext(migrateCtx, migrateQuery)
-	return err
+	if _, err = db.conn.ExecContext(migrateCtx, migrateQuery); err != nil {
+		return err
+	}
+	return db.runDataMigrationsWithTimeout()
 }
 
 // ==================== API Keys ====================
@@ -917,6 +1009,9 @@ type APIKeyRow struct {
 	Key             string       `json:"key"`
 	QuotaLimit      float64      `json:"quota_limit"`
 	QuotaUsed       float64      `json:"quota_used"`
+	TotalUsed       float64      `json:"total_used"`
+	ResetCount      int          `json:"reset_count"`
+	LastResetAt     sql.NullTime `json:"last_reset_at"`
 	ExpiresAt       sql.NullTime `json:"expires_at"`
 	AllowedGroupIDs []int64      `json:"allowed_group_ids"`
 	Limits          APIKeyLimits `json:"limits"`
@@ -929,25 +1024,29 @@ type APIKeyRow struct {
 // - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
 // - RPM: 每分钟请求数 (滑动 60s 窗口)。
 // - RPD: 每天请求数 (滑动 24h 窗口)。
+// - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
 // - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
 // - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
 type APIKeyLimits struct {
-	ModelAllow   []string `json:"model_allow,omitempty"`
-	ModelDeny    []string `json:"model_deny,omitempty"`
-	RPM          int      `json:"rpm,omitempty"`
-	RPD          int      `json:"rpd,omitempty"`
-	CostLimit5h  float64  `json:"cost_limit_5h,omitempty"`
-	CostLimit7d  float64  `json:"cost_limit_7d,omitempty"`
-	TokenLimit5h int64    `json:"token_limit_5h,omitempty"`
-	TokenLimit7d int64    `json:"token_limit_7d,omitempty"`
+	ModelAllow     []string `json:"model_allow,omitempty"`
+	ModelDeny      []string `json:"model_deny,omitempty"`
+	RPM            int      `json:"rpm,omitempty"`
+	RPD            int      `json:"rpd,omitempty"`
+	MaxConcurrency int      `json:"max_concurrency,omitempty"`
+	CostLimit5h    float64  `json:"cost_limit_5h,omitempty"`
+	CostLimit7d    float64  `json:"cost_limit_7d,omitempty"`
+	CostLimit30d   float64  `json:"cost_limit_30d,omitempty"`
+	TokenLimit5h   int64    `json:"token_limit_5h,omitempty"`
+	TokenLimit7d   int64    `json:"token_limit_7d,omitempty"`
+	TokenLimit30d  int64    `json:"token_limit_30d,omitempty"`
 }
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
 	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
-		l.RPM == 0 && l.RPD == 0 &&
-		l.CostLimit5h == 0 && l.CostLimit7d == 0 &&
-		l.TokenLimit5h == 0 && l.TokenLimit7d == 0
+		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
+		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
+		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0
 }
 
 type APIKeyInput struct {
@@ -965,6 +1064,7 @@ type APIKeyUpdate struct {
 	NameSet            bool
 	QuotaLimit         float64
 	QuotaLimitSet      bool
+	ResetQuota         bool
 	ExpiresAt          sql.NullTime
 	ExpiresAtSet       bool
 	AllowedGroupIDs    []int64
@@ -973,7 +1073,7 @@ type APIKeyUpdate struct {
 	LimitsSet          bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
+const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
@@ -1188,6 +1288,15 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 		}
 		sets = append(sets, "quota_limit = "+setArg(quotaLimit))
 	}
+	if update.ResetQuota {
+		sets = append(sets, "quota_used = 0")
+		sets = append(sets, "reset_count = COALESCE(reset_count, 0) + 1")
+		if db.isSQLite() {
+			sets = append(sets, "last_reset_at = CURRENT_TIMESTAMP")
+		} else {
+			sets = append(sets, "last_reset_at = NOW()")
+		}
+	}
 	if update.ExpiresAtSet {
 		sets = append(sets, "expires_at = "+setArg(nullableTimeArg(update.ExpiresAt)))
 	}
@@ -1215,6 +1324,24 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 	idPlaceholder := placeholder()
 	args[len(args)-1] = id
 	res, err := db.conn.ExecContext(ctx, "UPDATE api_keys SET "+strings.Join(sets, ", ")+" WHERE id = "+idPlaceholder, args...)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ResetAPIKeyQuota resets the current period usage (quota_used) to 0 while preserving
+// total_used (cumulative history). Increments reset_count and sets last_reset_at.
+func (db *DB) ResetAPIKeyQuota(ctx context.Context, id int64) error {
+	res, err := db.conn.ExecContext(ctx,
+		`UPDATE api_keys SET quota_used = 0, reset_count = COALESCE(reset_count, 0) + 1, last_reset_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		return err
 	}
@@ -1289,8 +1416,15 @@ type SystemSettings struct {
 	PromptFilterSensitiveWords         string
 	PromptFilterCustomPatterns         string
 	PromptFilterDisabledPatterns       string
+	PromptFilterReviewEnabled          bool
+	PromptFilterReviewAPIKey           string
+	PromptFilterReviewBaseURL          string
+	PromptFilterReviewModel            string
+	PromptFilterReviewTimeoutSeconds   int
+	PromptFilterReviewFailClosed       bool
 	ClientCompatMode                   string
 	CodexMinCLIVersion                 string
+	CodexUserAgentConfig               string
 	UsageLogMode                       string
 	UsageLogBatchSize                  int
 	UsageLogFlushIntervalSeconds       int
@@ -1301,6 +1435,7 @@ type SystemSettings struct {
 	BillingTierPolicy                  string
 	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
 	ShowFullUsageNumbers               bool
+	PublicKeyUsagePageEnabled          bool
 	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
 	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
 	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
@@ -1309,6 +1444,10 @@ type SystemSettings struct {
 	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
 	CodexFastModelAliasEnabled         bool // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
 	CodexFastTierInterceptEnabled      bool // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
+	AutoPause5hThreshold               float64
+	AutoPause7dThreshold               float64
+	AutoPause5hGuardBandPercent        float64
+	AutoPause5hGuardConcurrency        int
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1364,8 +1503,15 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_sensitive_words, ''),
 		       COALESCE(prompt_filter_custom_patterns, '[]'),
 		       COALESCE(prompt_filter_disabled_patterns, '[]'),
+		       COALESCE(prompt_filter_review_enabled, false),
+		       COALESCE(prompt_filter_review_api_key, ''),
+		       COALESCE(prompt_filter_review_base_url, 'https://api.openai.com'),
+		       COALESCE(prompt_filter_review_model, 'omni-moderation-latest'),
+		       COALESCE(prompt_filter_review_timeout_seconds, 10),
+		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
 		       COALESCE(codex_min_cli_version, '0.118.0'),
+		       COALESCE(codex_user_agent_config, '{}'),
 		       COALESCE(usage_log_mode, 'full'),
 		       COALESCE(usage_log_batch_size, 200),
 		       COALESCE(usage_log_flush_interval_seconds, 5),
@@ -1377,6 +1523,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(image_storage_config, '{}'),
 		       COALESCE(background_config, '{}'),
 		       COALESCE(show_full_usage_numbers, false),
+		       COALESCE(public_key_usage_page_enabled, true),
 			       COALESCE(reasoning_effort_models, '[]'),
 			       COALESCE(codex_force_websocket, false),
 			       COALESCE(codex_ws_keepalive_enabled, false),
@@ -1385,7 +1532,11 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_ws_silent_retry_enabled, true),
 			       COALESCE(codex_ws_silent_max_retries, 2),
 			       COALESCE(codex_fast_model_alias_enabled, true),
-			       COALESCE(codex_fast_tier_intercept_enabled, false)
+			       COALESCE(codex_fast_tier_intercept_enabled, false),
+			       COALESCE(auto_pause_5h_threshold, 0),
+			       COALESCE(auto_pause_7d_threshold, 0),
+			       COALESCE(auto_pause_5h_guard_band_percent, 5),
+			       COALESCE(auto_pause_5h_guard_concurrency, 1)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1400,7 +1551,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PromptFilterEnabled, &s.PromptFilterMode, &s.PromptFilterThreshold, &s.PromptFilterStrictThreshold,
 		&s.PromptFilterLogMatches, &s.PromptFilterMaxTextLength, &s.PromptFilterSensitiveWords,
 		&s.PromptFilterCustomPatterns, &s.PromptFilterDisabledPatterns,
-		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.UsageLogMode, &s.UsageLogBatchSize,
+		&s.PromptFilterReviewEnabled, &s.PromptFilterReviewAPIKey, &s.PromptFilterReviewBaseURL,
+		&s.PromptFilterReviewModel, &s.PromptFilterReviewTimeoutSeconds, &s.PromptFilterReviewFailClosed,
+		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.CodexUserAgentConfig, &s.UsageLogMode, &s.UsageLogBatchSize,
 		&s.UsageLogFlushIntervalSeconds, &s.StreamFlushPolicy, &s.StreamFlushIntervalMS,
 		&s.FirstTokenMode,
 		&s.FirstTokenTimeoutSeconds,
@@ -1408,6 +1561,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ImageStorageConfig,
 		&s.BackgroundConfig,
 		&s.ShowFullUsageNumbers,
+		&s.PublicKeyUsagePageEnabled,
 		&s.ReasoningEffortModels,
 		&s.CodexForceWebsocket,
 		&s.CodexWSKeepaliveEnabled,
@@ -1417,6 +1571,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexWSSilentMaxRetries,
 		&s.CodexFastModelAliasEnabled,
 		&s.CodexFastTierInterceptEnabled,
+		&s.AutoPause5hThreshold,
+		&s.AutoPause7dThreshold,
+		&s.AutoPause5hGuardBandPercent,
+		&s.AutoPause5hGuardConcurrency,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1425,6 +1583,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.SiteLogo = strings.TrimSpace(s.SiteLogo)
 	if strings.TrimSpace(s.ReasoningEffortModels) == "" {
 		s.ReasoningEffortModels = "[]"
+	}
+	if strings.TrimSpace(s.CodexUserAgentConfig) == "" {
+		s.CodexUserAgentConfig = "{}"
 	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
@@ -1436,6 +1597,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	reasoningEffortModels := strings.TrimSpace(s.ReasoningEffortModels)
 	if reasoningEffortModels == "" {
 		reasoningEffortModels = "[]"
+	}
+	codexUserAgentConfig := strings.TrimSpace(s.CodexUserAgentConfig)
+	if codexUserAgentConfig == "" {
+		codexUserAgentConfig = "{}"
 	}
 	firstTokenMode := normalizeFirstTokenMode(s.FirstTokenMode)
 	billingTierPolicy := normalizeBillingTierPolicy(s.BillingTierPolicy)
@@ -1449,7 +1614,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
-				client_compat_mode, codex_min_cli_version, usage_log_mode, usage_log_batch_size,
+				prompt_filter_review_enabled, prompt_filter_review_api_key, prompt_filter_review_base_url,
+				prompt_filter_review_model, prompt_filter_review_timeout_seconds, prompt_filter_review_fail_closed,
+				client_compat_mode, codex_min_cli_version, codex_user_agent_config, usage_log_mode, usage_log_batch_size,
 					usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
 					first_token_timeout_seconds,
 					first_token_mode,
@@ -1459,6 +1626,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				affinity_mode,
 				background_config,
 				show_full_usage_numbers,
+				public_key_usage_page_enabled,
 					reasoning_effort_models,
 					codex_force_websocket,
 					codex_ws_keepalive_enabled,
@@ -1467,9 +1635,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_silent_retry_enabled,
 					codex_ws_silent_max_retries,
 					codex_fast_model_alias_enabled,
-					codex_fast_tier_intercept_enabled
+					codex_fast_tier_intercept_enabled,
+					auto_pause_5h_threshold,
+					auto_pause_7d_threshold,
+					auto_pause_5h_guard_band_percent,
+					auto_pause_5h_guard_concurrency
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1510,8 +1682,15 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
 				prompt_filter_custom_patterns = EXCLUDED.prompt_filter_custom_patterns,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
+				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
+				prompt_filter_review_api_key = EXCLUDED.prompt_filter_review_api_key,
+				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
+				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
+				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
+				prompt_filter_review_fail_closed = EXCLUDED.prompt_filter_review_fail_closed,
 				client_compat_mode = EXCLUDED.client_compat_mode,
 				codex_min_cli_version = EXCLUDED.codex_min_cli_version,
+				codex_user_agent_config = EXCLUDED.codex_user_agent_config,
 				usage_log_mode = EXCLUDED.usage_log_mode,
 				usage_log_batch_size = EXCLUDED.usage_log_batch_size,
 				usage_log_flush_interval_seconds = EXCLUDED.usage_log_flush_interval_seconds,
@@ -1525,6 +1704,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				affinity_mode = EXCLUDED.affinity_mode,
 				background_config = EXCLUDED.background_config,
 				show_full_usage_numbers = EXCLUDED.show_full_usage_numbers,
+				public_key_usage_page_enabled = EXCLUDED.public_key_usage_page_enabled,
 					reasoning_effort_models = EXCLUDED.reasoning_effort_models,
 					codex_force_websocket = EXCLUDED.codex_force_websocket,
 					codex_ws_keepalive_enabled = EXCLUDED.codex_ws_keepalive_enabled,
@@ -1533,7 +1713,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_silent_retry_enabled = EXCLUDED.codex_ws_silent_retry_enabled,
 					codex_ws_silent_max_retries = EXCLUDED.codex_ws_silent_max_retries,
 					codex_fast_model_alias_enabled = EXCLUDED.codex_fast_model_alias_enabled,
-					codex_fast_tier_intercept_enabled = EXCLUDED.codex_fast_tier_intercept_enabled
+					codex_fast_tier_intercept_enabled = EXCLUDED.codex_fast_tier_intercept_enabled,
+					auto_pause_5h_threshold = EXCLUDED.auto_pause_5h_threshold,
+					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold,
+					auto_pause_5h_guard_band_percent = EXCLUDED.auto_pause_5h_guard_band_percent,
+					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1543,12 +1727,15 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
-		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
+		s.PromptFilterReviewEnabled, s.PromptFilterReviewAPIKey, s.PromptFilterReviewBaseURL,
+		s.PromptFilterReviewModel, s.PromptFilterReviewTimeoutSeconds, s.PromptFilterReviewFailClosed,
+		s.ClientCompatMode, s.CodexMinCLIVersion, codexUserAgentConfig, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
-		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers, reasoningEffortModels,
+		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
-		s.CodexFastModelAliasEnabled, s.CodexFastTierInterceptEnabled)
+		s.CodexFastModelAliasEnabled, s.CodexFastTierInterceptEnabled,
+		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency)
 	return err
 }
 
@@ -1806,6 +1993,7 @@ func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location 
 type UsageLog struct {
 	ID                   int64     `json:"id"`
 	AccountID            int64     `json:"account_id"`
+	ClientIP             string    `json:"client_ip"`
 	Endpoint             string    `json:"endpoint"`
 	Model                string    `json:"model"`
 	EffectiveModel       string    `json:"effective_model"`
@@ -1896,6 +2084,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 	db.logMu.Lock()
 	db.logBuf = append(db.logBuf, usageLogEntry{
 		AccountID:            log.AccountID,
+		ClientIP:             log.ClientIP,
 		Endpoint:             log.Endpoint,
 		Model:                log.Model,
 		EffectiveModel:       log.EffectiveModel,
@@ -1948,6 +2137,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 // UsageLogInput 日志写入参数
 type UsageLogInput struct {
 	AccountID            int64
+	ClientIP             string
 	Endpoint             string
 	Model                string
 	EffectiveModel       string
@@ -2070,54 +2260,17 @@ func (db *DB) flushLogs() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
+	var err error
 	// 使用批处理插入优化性能
 	if db.driver == "postgres" {
-		err := db.batchInsertLogs(ctx, batch)
-		if err != nil {
-			log.Printf("批量写入日志失败: %v", err)
-		}
-		return
+		err = db.batchInsertLogs(ctx, batch)
+	} else {
+		err = db.insertSQLiteUsageLogBatch(ctx, batch)
 	}
-
-	// SQLite 使用事务插入
-	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
-		log.Printf("批量写入日志失败（开始事务）: %v", err)
+		log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
+		db.requeueUsageLogBatch(batch)
 		return
-	}
-
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO usage_logs (account_id, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
-			  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, cached_tokens, service_tier,
-			  requested_service_tier, actual_service_tier, billing_service_tier,
-			  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
-			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)`)
-	if err != nil {
-		tx.Rollback()
-		log.Printf("批量写入日志失败（准备语句）: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	for _, e := range batch {
-		if _, err := stmt.ExecContext(ctx, e.AccountID, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
-			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.CachedTokens, e.ServiceTier,
-			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
-			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
-			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket); err != nil {
-			tx.Rollback()
-			log.Printf("批量写入日志失败（执行）: %v", err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		log.Printf("批量写入日志失败（提交）: %v", err)
-		return
-	}
-	if err := db.applyAPIKeyQuotaUsage(ctx, batch); err != nil {
-		log.Printf("更新 API Key 额度用量失败: %v", err)
 	}
 
 	if len(batch) > 10 {
@@ -2125,14 +2278,83 @@ func (db *DB) flushLogs() {
 	}
 }
 
+func (db *DB) requeueUsageLogBatch(batch []usageLogEntry) {
+	if len(batch) == 0 {
+		return
+	}
+	db.logMu.Lock()
+	defer db.logMu.Unlock()
+
+	if len(db.logBuf) == 0 {
+		requeued := make([]usageLogEntry, len(batch), len(batch)+db.GetUsageLogBatchSize())
+		copy(requeued, batch)
+		db.logBuf = requeued
+		return
+	}
+
+	requeued := make([]usageLogEntry, 0, len(batch)+len(db.logBuf))
+	requeued = append(requeued, batch...)
+	requeued = append(requeued, db.logBuf...)
+	db.logBuf = requeued
+}
+
+func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// SQLite 使用事务插入
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO usage_logs (account_id, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+			  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, cached_tokens, service_tier,
+			  requested_service_tier, actual_service_tier, billing_service_tier,
+			  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
+			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)`)
+	if err != nil {
+		return fmt.Errorf("准备语句: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, e := range batch {
+		if _, err := stmt.ExecContext(ctx, e.AccountID, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.CachedTokens, e.ServiceTier,
+			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
+			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
+			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket); err != nil {
+			return fmt.Errorf("执行插入: %w", err)
+		}
+	}
+
+	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
+		return fmt.Errorf("更新 API Key 额度用量: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务: %w", err)
+	}
+	return nil
+}
+
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行 38 个参数，每批最多 1700 行）
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行 40 个参数）。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
-	const maxRowsPerBatch = 1700
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务: %w", err)
+	}
+	defer tx.Rollback()
+
+	const maxRowsPerBatch = 1600
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -2142,54 +2364,64 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 		}
 		subBatch := batch[start:end]
 
-		if err := db.batchInsertLogsChunk(ctx, subBatch); err != nil {
+		if err := db.batchInsertLogsChunk(ctx, tx, subBatch); err != nil {
 			return err
 		}
-		if err := db.applyAPIKeyQuotaUsage(ctx, subBatch); err != nil {
-			return err
-		}
+	}
+	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务: %w", err)
 	}
 	return nil
 }
 
 // batchInsertLogsChunk 插入单批日志（内部辅助函数）
-func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) error {
+func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
 	valueStrings := make([]string, 0, len(batch))
-	valueArgs := make([]interface{}, 0, len(batch)*39)
+	valueArgs := make([]interface{}, 0, len(batch)*40)
 	argIdx := 1
 
 	for _, e := range batch {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
 			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
 			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19,
 			argIdx+20, argIdx+21, argIdx+22, argIdx+23, argIdx+24, argIdx+25, argIdx+26, argIdx+27, argIdx+28, argIdx+29,
-			argIdx+30, argIdx+31, argIdx+32, argIdx+33, argIdx+34, argIdx+35, argIdx+36, argIdx+37, argIdx+38))
-		valueArgs = append(valueArgs, e.AccountID, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+			argIdx+30, argIdx+31, argIdx+32, argIdx+33, argIdx+34, argIdx+35, argIdx+36, argIdx+37, argIdx+38, argIdx+39))
+		valueArgs = append(valueArgs, e.AccountID, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.CachedTokens, e.ServiceTier,
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket)
-		argIdx += 39
+		argIdx += 40
 	}
 
-	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, cached_tokens, service_tier,
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
-	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
+	_, err := execer.ExecContext(ctx, query, valueArgs...)
 	return err
 }
 
 func (db *DB) applyAPIKeyQuotaUsage(ctx context.Context, batch []usageLogEntry) error {
-	if db == nil || len(batch) == 0 {
+	if db == nil {
+		return nil
+	}
+	return db.applyAPIKeyQuotaUsageWithExec(ctx, db.conn, batch)
+}
+
+func (db *DB) applyAPIKeyQuotaUsageWithExec(ctx context.Context, execer sqlExecer, batch []usageLogEntry) error {
+	if db == nil || execer == nil || len(batch) == 0 {
 		return nil
 	}
 	usageByKey := make(map[int64]float64)
@@ -2203,7 +2435,7 @@ func (db *DB) applyAPIKeyQuotaUsage(ctx context.Context, batch []usageLogEntry) 
 		if amount <= 0 {
 			continue
 		}
-		if _, err := db.conn.ExecContext(ctx, `UPDATE api_keys SET quota_used = COALESCE(quota_used, 0) + $1 WHERE id = $2`, amount, id); err != nil {
+		if _, err := execer.ExecContext(ctx, `UPDATE api_keys SET quota_used = COALESCE(quota_used, 0) + $1, total_used = COALESCE(total_used, 0) + $1 WHERE id = $2`, amount, id); err != nil {
 			return err
 		}
 	}
@@ -2666,7 +2898,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	if limit <= 0 || limit > 5000 {
 		limit = 50
 	}
-	query := `SELECT u.id, u.account_id, u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
@@ -2692,7 +2924,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		l := &UsageLog{}
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
+		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
@@ -3124,7 +3356,7 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days in
 // ListUsageLogsByTimeRange 按时间范围查询请求日志
 func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time) ([]*UsageLog, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
-	query := `SELECT u.id, u.account_id, u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
@@ -3151,7 +3383,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		l := &UsageLog{}
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
+		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
@@ -3216,7 +3448,7 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 	}
 	if f.Email != "" {
 		p := addArg("%" + f.Email + "%")
-		parts = append(parts, fmt.Sprintf(`LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%s)`, p))
+		parts = append(parts, fmt.Sprintf(`(LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s) OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s))`, p))
 	}
 	if f.Model != "" {
 		p := addArg(f.Model)
@@ -3268,10 +3500,11 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 			OR LOWER(COALESCE(u.model, '')) LIKE LOWER(%[1]s)
 			OR LOWER(COALESCE(u.effective_model, '')) LIKE LOWER(%[1]s)
 			OR LOWER(COALESCE(u.inbound_endpoint, '')) LIKE LOWER(%[1]s)
-			OR LOWER(COALESCE(u.upstream_endpoint, '')) LIKE LOWER(%[1]s)
-			OR LOWER(COALESCE(u.api_key_name, '')) LIKE LOWER(%[1]s)
-			OR LOWER(COALESCE(u.api_key_masked, '')) LIKE LOWER(%[1]s)
-			OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(u.upstream_endpoint, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(u.api_key_name, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(u.api_key_masked, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
 		)`, p))
 	}
 
@@ -3334,7 +3567,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	if f.Page < 1 {
 		f.Page = 1
 	}
-	if f.PageSize < 1 || f.PageSize > 200 {
+	if f.PageSize < 1 || f.PageSize > 500 {
 		f.PageSize = 20
 	}
 
@@ -3344,7 +3577,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)
 	args = append(args, f.PageSize, offset)
 
-	query := `SELECT u.id, u.account_id, u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
@@ -3371,7 +3604,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		l := &UsageLog{}
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
+		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
 			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
@@ -3396,7 +3629,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 	where, args := db.buildUsageLogWhere(f)
 	where += ` ORDER BY u.created_at DESC`
 
-	query := `SELECT u.id, u.account_id, u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 			COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 			COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 			COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
@@ -3422,7 +3655,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 		l := &UsageLog{}
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
+		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
 			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
@@ -3808,10 +4041,24 @@ func (db *DB) ClearExpiredModelCooldowns(ctx context.Context) error {
 
 // GetAccountByID 获取未删除账号的完整数据库行。
 func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error) {
+	return db.getAccountByID(ctx, id, false)
+}
+
+// GetAccountByIDIncludingDeleted 获取账号（包含回收站中的已删除账号），
+// 用于回收站测试连接等不依赖运行时池的场景。
+func (db *DB) GetAccountByIDIncludingDeleted(ctx context.Context, id int64) (*AccountRow, error) {
+	return db.getAccountByID(ctx, id, true)
+}
+
+func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool) (*AccountRow, error) {
+	deletedFilter := "AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'"
+	if includeDeleted {
+		deletedFilter = ""
+	}
 	query := `
 		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, usage_reserve_percent_5h, usage_reserve_percent_7d, COALESCE(tags, '[]'), created_at, updated_at
 		FROM accounts
-		WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
+		WHERE id = $1 ` + deletedFilter + `
 		LIMIT 1
 	`
 	a := &AccountRow{}
@@ -4083,6 +4330,227 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 	return tx.Commit()
 }
 
+func (db *DB) BatchUpdateAccountMetadata(ctx context.Context, ids []int64, update BatchAccountMetadataUpdate) ([]int64, error) {
+	ids = normalizeIDSlice(ids)
+	if len(ids) == 0 || !update.HasChanges() {
+		return nil, nil
+	}
+
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	credentialUpdates := cloneCredentialUpdates(update.CredentialUpdates)
+	if update.AllowedAPIKeyIDs.Set {
+		if credentialUpdates == nil {
+			credentialUpdates = make(map[string]interface{}, 1)
+		}
+		credentialUpdates["allowed_api_key_ids"] = normalizePositiveInt64Slice(update.AllowedAPIKeyIDs.Values)
+	}
+
+	active, err := db.selectBatchAccounts(ctx, tx, ids, len(credentialUpdates) > 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(active.ids) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	if err := db.batchUpdateAccountColumns(ctx, tx, active.ids, update); err != nil {
+		return nil, err
+	}
+	if len(credentialUpdates) > 0 {
+		if err := db.batchUpdateAccountCredentials(ctx, tx, active.credentials, credentialUpdates); err != nil {
+			return nil, err
+		}
+	}
+	if update.GroupIDs.Set {
+		if err := db.batchReplaceAccountGroups(ctx, tx, active.ids, update.GroupIDs.Values); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return active.ids, nil
+}
+
+type batchAccountCredentials struct {
+	ids         []int64
+	credentials map[int64]map[string]interface{}
+}
+
+func (db *DB) selectBatchAccounts(ctx context.Context, tx *sql.Tx, ids []int64, includeCredentials bool) (batchAccountCredentials, error) {
+	placeholders := dbPlaceholders(db.isSQLite(), 1, len(ids))
+	columns := "id"
+	if includeCredentials {
+		columns = "id, credentials"
+	}
+	query := fmt.Sprintf(`SELECT %s FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted' AND id IN (%s)`, columns, strings.Join(placeholders, ","))
+	if !db.isSQLite() {
+		query += ` FOR UPDATE`
+	}
+	rows, err := tx.QueryContext(ctx, query, argsFromInt64s(ids)...)
+	if err != nil {
+		return batchAccountCredentials{}, err
+	}
+	defer rows.Close()
+
+	out := batchAccountCredentials{
+		ids:         make([]int64, 0, len(ids)),
+		credentials: make(map[int64]map[string]interface{}, len(ids)),
+	}
+	for rows.Next() {
+		var id int64
+		if includeCredentials {
+			var raw interface{}
+			if err := rows.Scan(&id, &raw); err != nil {
+				return batchAccountCredentials{}, err
+			}
+			out.credentials[id] = decodeCredentials(raw)
+		} else if err := rows.Scan(&id); err != nil {
+			return batchAccountCredentials{}, err
+		}
+		out.ids = append(out.ids, id)
+	}
+	return out, rows.Err()
+}
+
+func cloneCredentialUpdates(updates map[string]interface{}) map[string]interface{} {
+	if len(updates) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(updates))
+	for key, value := range updates {
+		out[key] = value
+	}
+	return out
+}
+
+func (db *DB) batchUpdateAccountColumns(ctx context.Context, tx *sql.Tx, ids []int64, update BatchAccountMetadataUpdate) error {
+	sets := make([]string, 0, 8)
+	args := make([]interface{}, 0, 10+len(ids))
+	touchUpdatedAt := false
+	add := func(column string, value interface{}, touch bool) {
+		args = append(args, value)
+		ph := "?"
+		if !db.isSQLite() {
+			ph = fmt.Sprintf("$%d", len(args))
+		}
+		sets = append(sets, column+" = "+ph)
+		touchUpdatedAt = touchUpdatedAt || touch
+	}
+	if update.Enabled.Set {
+		add("enabled", update.Enabled.Value, true)
+	}
+	if update.Locked.Set {
+		add("locked", update.Locked.Value, false)
+	}
+	if update.ScoreBiasOverride.Set {
+		add("score_bias_override", nullableInt64Value(update.ScoreBiasOverride.Value), true)
+	}
+	if update.BaseConcurrencyOverride.Set {
+		add("base_concurrency_override", nullableInt64Value(update.BaseConcurrencyOverride.Value), true)
+	}
+	if update.SkipWarmTier.Set {
+		add("skip_warm_tier", update.SkipWarmTier.Value, true)
+	}
+	if update.Tags.Set {
+		if db.isSQLite() {
+			add("tags", encodeTagsJSON(update.Tags.Values), true)
+		} else {
+			args = append(args, encodeTagsJSON(update.Tags.Values))
+			sets = append(sets, fmt.Sprintf("tags = $%d::jsonb", len(args)))
+			touchUpdatedAt = true
+		}
+	}
+	if update.ProxyURL.Set {
+		add("proxy_url", strings.TrimSpace(update.ProxyURL.Value), true)
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+
+	if touchUpdatedAt {
+		sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
+	}
+	start := len(args) + 1
+	placeholders := dbPlaceholders(db.isSQLite(), start, len(ids))
+	args = append(args, argsFromInt64s(ids)...)
+	query := fmt.Sprintf("UPDATE accounts SET %s WHERE id IN (%s)", strings.Join(sets, ", "), strings.Join(placeholders, ","))
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, current map[int64]map[string]interface{}, updates map[string]interface{}) error {
+	query := `UPDATE accounts SET credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	if !db.isSQLite() {
+		query = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+	}
+	for id, credentials := range current {
+		merged := mergeCredentialMaps(credentials, updates)
+		credJSON, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("序列化 credentials 失败: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, query, credJSON, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) batchReplaceAccountGroups(ctx context.Context, tx *sql.Tx, accountIDs []int64, groupIDs []int64) error {
+	placeholders := dbPlaceholders(db.isSQLite(), 1, len(accountIDs))
+	args := argsFromInt64s(accountIDs)
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM account_group_members WHERE account_id IN (%s)", strings.Join(placeholders, ",")), args...); err != nil {
+		return err
+	}
+
+	groupIDs = normalizeIDSlice(groupIDs)
+	if len(groupIDs) == 0 {
+		return nil
+	}
+	insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
+	if db.isSQLite() {
+		insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+	}
+	for _, accountID := range accountIDs {
+		for _, groupID := range groupIDs {
+			if _, err := tx.ExecContext(ctx, insertQ, accountID, groupID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func dbPlaceholders(sqlite bool, start, n int) []string {
+	placeholders := make([]string, n)
+	for i := 0; i < n; i++ {
+		if sqlite {
+			placeholders[i] = "?"
+		} else {
+			placeholders[i] = fmt.Sprintf("$%d", start+i)
+		}
+	}
+	return placeholders
+}
+
+func argsFromInt64s(ids []int64) []interface{} {
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
+}
+
 func nullableInt64Value(v sql.NullInt64) interface{} {
 	if !v.Valid {
 		return nil
@@ -4311,6 +4779,47 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	return tx.Commit()
 }
 
+func (db *DB) UpdateOAuthAccountCredentials(ctx context.Context, id int64, credentials map[string]interface{}, proxyURL string) error {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	selectQuery := `SELECT credentials FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
+	if !db.isSQLite() {
+		selectQuery += ` FOR UPDATE`
+	}
+
+	var currentRaw interface{}
+	if err := tx.QueryRowContext(ctx, selectQuery, id).Scan(&currentRaw); err != nil {
+		return err
+	}
+
+	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	credJSON, err := json.Marshal(merged)
+	if err != nil {
+		return fmt.Errorf("序列化 credentials 失败: %w", err)
+	}
+
+	updateQuery := `UPDATE accounts SET credentials = $1, proxy_url = $2, platform = 'openai', type = 'oauth', updated_at = CURRENT_TIMESTAMP WHERE id = $3`
+	if !db.isSQLite() {
+		updateQuery = `UPDATE accounts SET credentials = $1::jsonb, proxy_url = $2, platform = 'openai', type = 'oauth', updated_at = CURRENT_TIMESTAMP WHERE id = $3`
+	}
+	res, err := tx.ExecContext(ctx, updateQuery, credJSON, proxyURL, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 // UpdateUsageSnapshot 持久化账号用量快照（7d + 5h）
 func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, updatedAt time.Time) error {
 	return db.UpdateCredentials(ctx, id, map[string]interface{}{
@@ -4321,15 +4830,15 @@ func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, 
 }
 
 // UpdateUsageSnapshotFull 持久化完整用量快照（5h + 7d + 重置时间）
-func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float64, reset7dAt time.Time, pct5h float64, reset5hAt time.Time, updatedAt time.Time) error {
+func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float64, reset7dAt time.Time, pct5h float64, reset5hAt time.Time, updatedAt7d time.Time, updatedAt5h time.Time) error {
 	fields := map[string]interface{}{
 		"codex_7d_used_percent":     pct7d,
 		"codex_7d_reset_at":         reset7dAt.Format(time.RFC3339),
-		"codex_7d_usage_updated_at": updatedAt.Format(time.RFC3339),
+		"codex_7d_usage_updated_at": updatedAt7d.Format(time.RFC3339),
 		"codex_5h_used_percent":     pct5h,
 		"codex_5h_reset_at":         reset5hAt.Format(time.RFC3339),
-		"codex_5h_usage_updated_at": updatedAt.Format(time.RFC3339),
-		"codex_usage_updated_at":    updatedAt.Format(time.RFC3339),
+		"codex_usage_updated_at":    updatedAt7d.Format(time.RFC3339),
+		"codex_5h_usage_updated_at": updatedAt5h.Format(time.RFC3339),
 	}
 	return db.UpdateCredentials(ctx, id, fields)
 }
@@ -4406,6 +4915,129 @@ func (db *DB) SoftDeleteAccount(ctx context.Context, id int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ListDeleted 获取回收站中的账号（被软删除、尚未彻底清除的账号）。
+func (db *DB) ListDeleted(ctx context.Context) ([]*AccountRow, error) {
+	query := `
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at, deleted_at
+		FROM accounts
+		WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted'
+		ORDER BY deleted_at DESC, id DESC
+	`
+	rows, err := db.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("查询回收站账号失败: %w", err)
+	}
+	defer rows.Close()
+
+	var accounts []*AccountRow
+	for rows.Next() {
+		a := &AccountRow{}
+		var credRaw interface{}
+		var cooldownUntilRaw interface{}
+		var tagsRaw interface{}
+		var createdAtRaw interface{}
+		var updatedAtRaw interface{}
+		var deletedAtRaw interface{}
+		if err := rows.Scan(
+			&a.ID,
+			&a.Name,
+			&a.Platform,
+			&a.Type,
+			&credRaw,
+			&a.ProxyURL,
+			&a.Status,
+			&a.CooldownReason,
+			&cooldownUntilRaw,
+			&a.ErrorMessage,
+			&a.Enabled,
+			&a.Locked,
+			&a.CreditEnabled,
+			&a.CreditSkipUsageWindow,
+			&a.SkipWarmTier,
+			&a.ScoreBiasOverride,
+			&a.BaseConcurrencyOverride,
+			&tagsRaw,
+			&createdAtRaw,
+			&updatedAtRaw,
+			&deletedAtRaw,
+		); err != nil {
+			return nil, fmt.Errorf("扫描回收站账号行失败: %w", err)
+		}
+		a.Credentials = decodeCredentials(credRaw)
+		a.Tags = decodeTagsValue(tagsRaw)
+		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+		}
+		a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 created_at 失败: %w", err)
+		}
+		a.UpdatedAt, err = parseDBTimeValue(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 updated_at 失败: %w", err)
+		}
+		a.DeletedAt, err = parseDBNullTimeValue(deletedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 deleted_at 失败: %w", err)
+		}
+		accounts = append(accounts, a)
+	}
+	return accounts, rows.Err()
+}
+
+// RestoreAccount 将回收站中的账号恢复为 active 状态。
+func (db *DB) RestoreAccount(ctx context.Context, id int64) error {
+	query := `
+		UPDATE accounts
+		SET status = 'active',
+			error_message = '',
+			cooldown_reason = '',
+			cooldown_until = NULL,
+			deleted_at = NULL,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')
+	`
+	res, err := db.conn.ExecContext(ctx, query, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// PurgeAccount 从回收站彻底删除账号（物理删除，不可恢复）。
+func (db *DB) PurgeAccount(ctx context.Context, id int64) error {
+	query := `DELETE FROM accounts WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
+	res, err := db.conn.ExecContext(ctx, query, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// PurgeDeletedAccounts 清空回收站，返回被彻底删除的账号数量。
+func (db *DB) PurgeDeletedAccounts(ctx context.Context) (int64, error) {
+	res, err := db.conn.ExecContext(ctx, `DELETE FROM accounts WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // BatchSoftDeleteAccounts 批量软删除账号，分批执行避免 SQL 参数过多。
@@ -4689,6 +5321,52 @@ func (db *DB) GetActiveAccountIdentityIndex(ctx context.Context) (*AccountIdenti
 		}
 	}
 	return index, rows.Err()
+}
+
+// FindActiveAccountByOAuthIdentity returns the first non-deleted account with
+// the same email and ChatGPT account id. It accepts both historical credential
+// key names: account_id and chatgpt_account_id.
+func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accountID string, excludeIDs ...int64) (int64, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	accountID = strings.TrimSpace(accountID)
+	if email == "" || accountID == "" {
+		return 0, sql.ErrNoRows
+	}
+	excluded := make(map[int64]struct{}, len(excludeIDs))
+	for _, id := range excludeIDs {
+		if id > 0 {
+			excluded[id] = struct{}{}
+		}
+	}
+
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, credentials FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var raw interface{}
+		if err := rows.Scan(&id, &raw); err != nil {
+			return 0, err
+		}
+		if _, ok := excluded[id]; ok {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(credentialString(raw, "email"))) != email {
+			continue
+		}
+		if strings.TrimSpace(credentialString(raw, "account_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "chatgpt_account_id")) == accountID {
+			return id, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return 0, sql.ErrNoRows
+
 }
 
 func (db *DB) GetAllOpenAIAPIKeys(ctx context.Context) (map[string]bool, error) {

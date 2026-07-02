@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,15 +11,19 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -50,7 +55,15 @@ const (
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
 	MaxImageEditInputCount = 10
+
+	imageStreamConnectedComment = ": connected\n\n"
+	imageStreamKeepaliveComment = ": keepalive\n\n"
+
+	// imageCloudURLTTL 控制 response_format=url 时返回的预签名云直链有效期。
+	imageCloudURLTTL = time.Hour
 )
+
+var imageStreamKeepaliveInterval = 15 * time.Second
 
 type imageCallResult struct {
 	Result        string
@@ -546,6 +559,281 @@ func responsesBodyRequestsImageGeneration(body []byte) bool {
 	return false
 }
 
+// rawResponsesBodyShouldForceHTTPForImageGeneration 判断请求是否"真的要生图"，
+// 从而必须改走 HTTP 上游——WebSocket 上游传输大体积图片数据会卡死（issue #220）。
+//
+// 只在"真实生图意图"时强制 HTTP：image-only 模型、tool_choice=image_generation、
+// 顶层图片选项字段（responsesBodyRequestsImageGeneration），或 prompt 中的自然语言
+// 生图意图（issue #288）。它刻意**不**因 tools[] 里单纯存在 image_generation 工具而
+// 触发：客户端把生图工具无差别注入到每个请求时（issue #304），否则会把普通请求也全部
+// 打到 HTTP、丢掉 WebSocket。这类"注入但未使用"的工具改由 WS 路径上的
+// stripResponsesImageGenerationTool 剥离。
+//
+// /v1/responses 路径须传入下游 raw body（PrepareResponsesBody 注入默认工具之前）；
+// chat 路径传入翻译后的 Codex body（TranslateRequest 不会自动注入图片工具）。两者都
+// 不应含自动注入的 tool_choice=image_generation，否则普通请求会被误判。
+func rawResponsesBodyShouldForceHTTPForImageGeneration(body []byte) bool {
+	return responsesBodyRequestsImageGeneration(body) || responsesBodyHasNaturalImageGenerationIntent(body)
+}
+
+func responsesBodyHasNaturalImageGenerationIntent(body []byte) bool {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false
+	}
+	return promptTextRequestsImageGeneration(extractResponsesPromptText(parsed))
+}
+
+func promptTextRequestsImageGeneration(text string) bool {
+	normalized := normalizeImageIntentText(text)
+	if normalized == "" {
+		return false
+	}
+	if containsAnyPhrase(normalized, imageIntentFalsePositivePhrases) {
+		return false
+	}
+	return containsAnyPhrase(normalized, imageIntentPositivePhrases)
+}
+
+func normalizeImageIntentText(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"\r", " ",
+		"\n", " ",
+		"\t", " ",
+		"，", " ",
+		"。", " ",
+		"！", " ",
+		"？", " ",
+		"；", " ",
+		"：", " ",
+		",", " ",
+		".", " ",
+		"!", " ",
+		"?", " ",
+		";", " ",
+		":", " ",
+		"\"", " ",
+		"'", " ",
+		"`", " ",
+	)
+	return strings.Join(strings.Fields(replacer.Replace(text)), " ")
+}
+
+func containsAnyPhrase(text string, phrases []string) bool {
+	for _, phrase := range phrases {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+var imageIntentFalsePositivePhrases = []string{
+	"生成图片的代码",
+	"生成图片代码",
+	"生成图片的脚本",
+	"生成图片脚本",
+	"生成图片的函数",
+	"生成图片函数",
+	"图片生成函数",
+	"写一个生成图片",
+	"写个生成图片",
+	"代码",
+	"脚本",
+	"函数",
+	"接口",
+	"教程",
+	"示例",
+	"文档",
+	"提示词",
+	"生成图片接口",
+	"生图接口",
+	"生成图片 api",
+	"生图 api",
+	"生成图片 sdk",
+	"生图 sdk",
+	"生成图片教程",
+	"生图教程",
+	"生成图片示例",
+	"生图示例",
+	"生成图片的提示词",
+	"生图提示词",
+	"生成一张表格",
+	"生成一张清单",
+	"生成一张列表",
+	"生成一张报告",
+	"生成一张计划",
+	"如何生成图片",
+	"怎么生成图片",
+	"如何生图",
+	"怎么生图",
+	"how to generate an image",
+	"how do i generate an image",
+	"generate an image with python",
+	"generate images with python",
+	"image generation code",
+	"image generation api",
+	"image generation sdk",
+	"image generation tutorial",
+	"image generation example",
+	"image prompt",
+	"write code",
+	"write a script",
+	" code",
+	"code ",
+	"script",
+	"function",
+	"tutorial",
+	"example",
+	"documentation",
+	"mermaid",
+	"python script",
+	"javascript",
+	"typescript",
+	"html canvas",
+	"svg",
+}
+
+var imageIntentPositivePhrases = []string{
+	"生图",
+	"文生图",
+	"图生图",
+	"生成一张",
+	"生成一幅",
+	"生成图片",
+	"生成照片",
+	"生成海报",
+	"生成封面",
+	"生成头像",
+	"生成壁纸",
+	"生成插画",
+	"生成漫画",
+	"生成表情包",
+	"生成一张表情包",
+	"生成图标",
+	"生成logo",
+	"生成 logo",
+	"画一张",
+	"画一幅",
+	"画一个",
+	"画个",
+	"帮我画",
+	"请画",
+	"绘制一张",
+	"绘制一幅",
+	"做一张图",
+	"做张图",
+	"做一张图片",
+	"做个图",
+	"出一张图",
+	"出图",
+	"设计一张海报",
+	"设计一个海报",
+	"设计一个logo",
+	"设计一个 logo",
+	"设计图标",
+	"修图",
+	"改图",
+	"编辑图片",
+	"编辑照片",
+	"修改图片",
+	"修改照片",
+	"把这张图",
+	"将这张图",
+	"把图片",
+	"把照片",
+	"换背景",
+	"背景换",
+	"去背景",
+	"抠图",
+	"扩图",
+	"重绘",
+	"局部重绘",
+	"generate an image",
+	"generate a picture",
+	"generate a photo",
+	"create an image",
+	"create a picture",
+	"create a photo",
+	"make an image",
+	"make a picture",
+	"make a photo",
+	"draw me",
+	"draw a",
+	"draw an",
+	"paint a",
+	"paint an",
+	"illustrate a",
+	"illustrate an",
+	"design a poster",
+	"design a logo",
+	"edit this image",
+	"edit the image",
+	"modify this image",
+	"modify the image",
+	"retouch this photo",
+	"retouch the photo",
+	"turn this image",
+	"make this image",
+}
+
+// stripResponsesImageGenerationTool 移除请求体中的 image_generation 工具及指向它的
+// tool_choice。仅在 WebSocket 上游模式下使用：此时 body 中的 image_generation 工具
+// 要么是 PrepareResponsesBody 自动注入的，要么是客户端无差别注入的（issue #304）——
+// 两者都未表达真实生图意图（真实意图已被 rawResponsesBodyShouldForceHTTPForImageGeneration
+// 判定为强制 HTTP，不会走到这里）。移除后可防止模型自主调用图片工具产生大体积数据导致
+// WS 流卡死（issue #220）。
+func stripResponsesImageGenerationTool(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() {
+		kept := make([]interface{}, 0, len(tools.Array()))
+		removed := false
+		for _, tool := range tools.Array() {
+			if strings.TrimSpace(tool.Get("type").String()) == "image_generation" {
+				removed = true
+				continue
+			}
+			kept = append(kept, tool.Value())
+		}
+		if removed {
+			if len(kept) == 0 {
+				body, _ = sjson.DeleteBytes(body, "tools")
+			} else {
+				body, _ = sjson.SetBytes(body, "tools", kept)
+			}
+		}
+	}
+	choice := gjson.GetBytes(body, "tool_choice")
+	if choice.Exists() {
+		isImageChoice := false
+		if choice.Type == gjson.String {
+			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation")
+		} else {
+			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation")
+		}
+		if isImageChoice {
+			body, _ = sjson.DeleteBytes(body, "tool_choice")
+		}
+	}
+	// 移除与图片工具配套注入的桥接 instructions（引导模型调用 image_generation
+	// 工具）；保留用户自带的 instructions 内容。
+	if instructions := gjson.GetBytes(body, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		cleaned := strings.ReplaceAll(instructions, "\n\n"+codexImageGenerationBridgeText, "")
+		cleaned = strings.ReplaceAll(cleaned, codexImageGenerationBridgeText, "")
+		cleaned = strings.TrimSpace(cleaned)
+		if cleaned == "" {
+			body, _ = sjson.DeleteBytes(body, "instructions")
+		} else {
+			body, _ = sjson.SetBytes(body, "instructions", cleaned)
+		}
+	}
+	return body
+}
+
 func validateImagesModel(model string) error {
 	if !isImageOnlyModel(model) {
 		return fmt.Errorf("images endpoint requires an image model, got %q", strings.TrimSpace(model))
@@ -642,7 +930,7 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 }
 
 func (h *Handler) ImagesGenerations(c *gin.Context) {
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -688,6 +976,13 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
+	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
 	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
@@ -803,6 +1098,13 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
@@ -830,7 +1132,7 @@ func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string)
 }
 
 func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -907,6 +1209,13 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
+	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
 	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
@@ -988,6 +1297,14 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
+
+	// 仅在 response_format=url 且配置了云存储时启用：上传图片到对象存储、
+	// 登记进图库并返回预签名直链。否则 urlFor 为 nil，沿用 base64/data URL。
+	persister := h.newImageGalleryPersister(c, responseFormat, requestModel, responsesBody)
+	var urlFor imageURLBuilder
+	if persister != nil {
+		urlFor = persister.buildURL
+	}
 
 	for attempt := 0; attempt < maxImageAttempts; attempt++ {
 		if err := c.Request.Context().Err(); err != nil {
@@ -1087,8 +1404,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start)
 		} else {
 			var out []byte
-			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(resp.Body, responseFormat, requestModel)
+			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(c.Request.Context(), resp.Body, responseFormat, requestModel, urlFor)
 			if readErr == nil {
+				persister.finalize(c.Request.Context())
 				c.Data(http.StatusOK, "application/json", out)
 			} else {
 				// Check retryability BEFORE writing error response to avoid
@@ -1096,19 +1414,16 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				resp.Body.Close()
 				h.store.Release(account)
 				excludeAccounts[account.ID()] = true
-				if shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) {
+				willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
+				// Always record the failed attempt so it appears in usage stats,
+				// matching the chat completions error path.
+				h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+				if willRetry {
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(readErr.Error())
 					continue
 				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
-				h.logUsageForRequest(c, &database.UsageLogInput{
-					AccountID:      account.ID(),
-					Endpoint:       inboundEndpoint,
-					Model:          logModel,
-					EffectiveModel: logEffectiveModel,
-					StatusCode:     http.StatusBadGateway,
-				})
 				return
 			}
 		}
@@ -1122,24 +1437,19 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
-			if shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) {
+			// Only retry when nothing has been written to the client yet.
+			willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) && !c.Writer.Written()
+			// Always record the failed attempt so it appears in usage stats.
+			h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+			if willRetry {
 				lastStatusCode = statusCode
 				lastBody = []byte(readErr.Error())
-				if !c.Writer.Written() {
-					continue
-				}
+				continue
 			}
 			// Non-retryable -- deliver error response if nothing written yet.
 			if !c.Writer.Written() {
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
 			}
-			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:      account.ID(),
-				Endpoint:       inboundEndpoint,
-				Model:          logModel,
-				EffectiveModel: logEffectiveModel,
-				StatusCode:     http.StatusBadGateway,
-			})
 			return
 		}
 		logInput := &database.UsageLogInput{
@@ -1153,9 +1463,6 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			InboundEndpoint:  inboundEndpoint,
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           stream,
-		}
-		if readErr != nil {
-			logInput.ErrorMessage = usageLogErrorMessage(statusCode, []byte(readErr.Error()))
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -1176,12 +1483,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
-		if readErr != nil {
-			h.store.ReportRequestFailure(account, "transport", time.Duration(logInput.DurationMs)*time.Millisecond)
-		} else {
-			h.store.ClearModelCooldown(account, requestModel)
-			h.store.ReportRequestSuccess(account, time.Duration(logInput.DurationMs)*time.Millisecond)
-		}
+		h.store.ClearModelCooldown(account, requestModel)
+		h.store.ReportRequestSuccess(account, time.Duration(logInput.DurationMs)*time.Millisecond)
 		h.store.Release(account)
 		return
 	}
@@ -1191,6 +1494,38 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		return
 	}
 	c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
+}
+
+// buildImageErrorUsageLog builds a usage log entry for a failed image request
+// so that failures -- including retried attempts -- still appear in usage stats.
+// Previously the read-error retry paths called continue without logging, so
+// failed image requests were silently missing from the statistics.
+func buildImageErrorUsageLog(account *auth.Account, inboundEndpoint, logModel, logEffectiveModel string, stream bool, durationMs, attempt int, willRetry bool, readErr error, usage *UsageInfo, imageLogInfo imageUsageLogInfo) *database.UsageLogInput {
+	logInput := &database.UsageLogInput{
+		AccountID:        account.ID(),
+		Endpoint:         inboundEndpoint,
+		Model:            logModel,
+		EffectiveModel:   logEffectiveModel,
+		StatusCode:       http.StatusBadGateway,
+		DurationMs:       durationMs,
+		InboundEndpoint:  inboundEndpoint,
+		UpstreamEndpoint: "/v1/responses",
+		Stream:           stream,
+		IsRetryAttempt:   willRetry,
+		AttemptIndex:     attempt + 1,
+		ErrorMessage:     usageLogErrorMessage(http.StatusBadGateway, []byte(readErr.Error())),
+	}
+	if usage != nil {
+		logInput.PromptTokens = usage.PromptTokens
+		logInput.CompletionTokens = usage.CompletionTokens
+		logInput.TotalTokens = usage.TotalTokens
+		logInput.InputTokens = usage.InputTokens
+		logInput.OutputTokens = usage.OutputTokens
+		logInput.ReasoningTokens = usage.ReasoningTokens
+		logInput.CachedTokens = usage.CachedTokens
+	}
+	applyImageUsageLogInfo(logInput, imageLogInfo)
+	return logInput
 }
 
 // shouldRetryImageStreamError determines whether an image generation stream
@@ -1219,7 +1554,7 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 	return true
 }
 
-func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
+func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, fallbackModel string, urlFor imageURLBuilder) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
 	var (
 		out            []byte
 		usage          *UsageInfo
@@ -1265,7 +1600,7 @@ func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string)
 				readErr = fmt.Errorf("upstream did not return image output")
 				return false
 			}
-			out, readErr = buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
+			out, readErr = buildImagesAPIResponse(ctx, results, createdAt, usageRaw, firstMeta, responseFormat, urlFor)
 			imageLogInfo = imageUsageLogInfoFromImages(results)
 			return false
 		case "error":
@@ -1288,7 +1623,7 @@ func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string)
 			for i := range pendingResults {
 				mergeImageMeta(&pendingResults[i], firstMeta)
 			}
-			out, readErr = buildImagesAPIResponse(pendingResults, createdAt, nil, firstMeta, responseFormat)
+			out, readErr = buildImagesAPIResponse(ctx, pendingResults, createdAt, nil, firstMeta, responseFormat, urlFor)
 			if readErr != nil {
 				return nil, usage, 0, imageLogInfo, readErr
 			}
@@ -1322,6 +1657,51 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		readErr        error
 	)
 	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	var (
+		writeMu   sync.Mutex
+		closeOnce sync.Once
+	)
+	closeUpstream := func() {
+		if closer, ok := body.(io.Closer); ok {
+			closeOnce.Do(func() {
+				_ = closer.Close()
+			})
+		}
+	}
+	getReadErr := func() error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return readErr
+	}
+	setReadErr := func(err error) {
+		if err == nil {
+			return
+		}
+		writeMu.Lock()
+		if readErr == nil {
+			readErr = err
+		}
+		writeMu.Unlock()
+	}
+	writeRaw := func(data string, forceFlush bool) error {
+		var err error
+		writeMu.Lock()
+		if readErr == nil {
+			if err = streamWriter.WriteString(data); err == nil && forceFlush {
+				err = streamWriter.Flush()
+			}
+			if err != nil && readErr == nil {
+				readErr = err
+			}
+		} else {
+			err = readErr
+		}
+		writeMu.Unlock()
+		if err != nil {
+			closeUpstream()
+		}
+		return err
+	}
 	writeEvent := func(eventName string, payload []byte) {
 		var builder strings.Builder
 		if strings.TrimSpace(eventName) != "" {
@@ -1332,13 +1712,18 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		builder.WriteString("data: ")
 		builder.Write(payload)
 		builder.WriteString("\n\n")
-		if err := streamWriter.WriteString(builder.String()); err != nil && readErr == nil {
-			readErr = err
-		}
+		_ = writeRaw(builder.String(), true)
 	}
+	if err := writeRaw(imageStreamConnectedComment, true); err != nil {
+		return nil, 0, 0, imageUsageLogInfo{}, err
+	}
+	stopKeepalive := startImageStreamKeepalive(c.Request.Context(), imageStreamKeepaliveInterval, func() bool {
+		return writeRaw(imageStreamKeepaliveComment, true) == nil
+	})
+	defer stopKeepalive()
 
 	err := ReadSSEStream(body, func(data []byte) bool {
-		if readErr != nil {
+		if getReadErr() != nil {
 			return false
 		}
 		if firstTokenMs == 0 {
@@ -1371,8 +1756,8 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		case "response.completed":
 			results, completedAt, usageRaw, firstMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, fallbackModel)
 			if err != nil {
-				readErr = err
 				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				setReadErr(err)
 				return false
 			}
 			if completedUsage != nil {
@@ -1386,8 +1771,9 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				results = pendingResults
 			}
 			if len(results) == 0 {
-				readErr = fmt.Errorf("upstream did not return image output")
-				writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+				err := fmt.Errorf("upstream did not return image output")
+				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				setReadErr(err)
 				return false
 			}
 			eventName := streamPrefix + ".completed"
@@ -1399,23 +1785,29 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			}
 			return false
 		case "error":
-			readErr = imageGenerationFailureError(data)
-			writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+			err := imageGenerationFailureError(data)
+			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			setReadErr(err)
 			return false
 		case "response.failed":
-			readErr = imageGenerationFailureError(data)
-			writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+			err := imageGenerationFailureError(data)
+			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			setReadErr(err)
 			return false
 		}
 		return true
 	})
+	stopKeepalive()
 	if err != nil {
+		if streamErr := getReadErr(); streamErr != nil {
+			return usage, imageCount, firstTokenMs, imageLogInfo, streamErr
+		}
 		return usage, imageCount, firstTokenMs, imageLogInfo, err
 	}
-	if readErr == nil {
-		readErr = streamWriter.Flush()
+	if getReadErr() == nil {
+		_ = writeRaw("", true)
 	}
-	if imageCount == 0 && len(pendingResults) > 0 && readErr == nil {
+	if imageCount == 0 && len(pendingResults) > 0 && getReadErr() == nil {
 		eventName := streamPrefix + ".completed"
 		for _, image := range pendingResults {
 			mergeImageMeta(&image, streamMeta)
@@ -1424,11 +1816,44 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			imageCount++
 		}
 	}
-	if imageCount == 0 && readErr == nil {
-		readErr = fmt.Errorf("stream disconnected before image generation completed")
-		writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+	if imageCount == 0 && getReadErr() == nil {
+		err := fmt.Errorf("stream disconnected before image generation completed")
+		writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+		setReadErr(err)
 	}
-	return usage, imageCount, firstTokenMs, imageLogInfo, readErr
+	return usage, imageCount, firstTokenMs, imageLogInfo, getReadErr()
+}
+
+func startImageStreamKeepalive(ctx context.Context, interval time.Duration, writeKeepalive func() bool) func() {
+	if interval <= 0 || writeKeepalive == nil {
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !writeKeepalive() {
+					return
+				}
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		stopOnce.Do(func() {
+			close(done)
+		})
+	}
 }
 
 func imageGenerationFailureError(payload []byte) error {
@@ -1596,7 +2021,11 @@ func mergeImageMeta(target *imageCallResult, source imageCallResult) {
 	}
 }
 
-func buildImagesAPIResponse(results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, responseFormat string) ([]byte, error) {
+// imageURLBuilder 接收一张生成图，返回其托管直链。返回 ok=false 表示
+// 应回退到 base64 data URL。为 nil 时表示未启用云存储直链。
+type imageURLBuilder func(ctx context.Context, image imageCallResult, idx int) (string, bool)
+
+func buildImagesAPIResponse(ctx context.Context, results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, responseFormat string, urlFor imageURLBuilder) ([]byte, error) {
 	if createdAt <= 0 {
 		createdAt = time.Now().Unix()
 	}
@@ -1607,11 +2036,16 @@ func buildImagesAPIResponse(results []imageCallResult, createdAt int64, usageRaw
 	if format == "" {
 		format = "b64_json"
 	}
-	for _, image := range results {
+	for idx, image := range results {
 		populateImageStats(&image)
 		item := []byte(`{}`)
 		if format == "url" {
-			item, _ = sjson.SetBytes(item, "url", "data:"+mimeTypeFromOutputFormat(image.OutputFormat)+";base64,"+image.Result)
+			// 已配置云存储直链时上传并返回托管 URL；失败或未配置则回退到 data URL。
+			if url, ok := buildImageURL(ctx, urlFor, image, idx); ok {
+				item, _ = sjson.SetBytes(item, "url", url)
+			} else {
+				item, _ = sjson.SetBytes(item, "url", "data:"+mimeTypeFromOutputFormat(image.OutputFormat)+";base64,"+image.Result)
+			}
 		} else {
 			item, _ = sjson.SetBytes(item, "b64_json", image.Result)
 		}
@@ -1648,6 +2082,209 @@ func buildImagesAPIResponse(results []imageCallResult, createdAt int64, usageRaw
 		out, _ = sjson.SetRawBytes(out, "usage", usageRaw)
 	}
 	return out, nil
+}
+
+// imageStorageIsCloud 报告当前图片存储后端是否为云端（S3 兼容）对象存储。
+func imageStorageIsCloud() bool {
+	return imagestore.CurrentConfig().Backend == imagestore.BackendS3
+}
+
+// cloudUploadImage 把单张生成图上传到已配置的云存储，返回存储 ref 与限时预签名直链。
+//
+// 任一步失败都返回 ok=false，由调用方回退到 base64/data URL，
+// 确保 API 不会因为对象存储配置或网络问题而整体失败。
+func cloudUploadImage(ctx context.Context, image imageCallResult, idx int) (ref, url string, ok bool) {
+	data, decoded := decodeImageBase64(image.Result)
+	if !decoded || len(data) == 0 {
+		return "", "", false
+	}
+	backend, err := imagestore.Primary()
+	if err != nil {
+		log.Printf("[images] 云存储未初始化，回退 base64: %v", err)
+		return "", "", false
+	}
+	mimeType := mimeTypeFromOutputFormat(image.OutputFormat)
+	key := fmt.Sprintf("api/%d-%02d-%s.%s", time.Now().UnixNano(), idx+1, uuid.NewString()[:8], imageExtFromOutputFormat(image.OutputFormat))
+	ref, err = backend.Save(ctx, key, data, mimeType)
+	if err != nil {
+		log.Printf("[images] 上传云存储失败，回退 base64: %v", err)
+		return "", "", false
+	}
+	url, err = imagestore.PresignURL(ctx, ref, imageCloudURLTTL)
+	if err != nil {
+		log.Printf("[images] 生成预签名直链失败，回退 base64: %v", err)
+		return "", "", false
+	}
+	return ref, url, true
+}
+
+// cloudImageURLOnly 仅上传 + 预签名，不写图库。供未接入 DB 的场景（如单测）使用。
+func cloudImageURLOnly(ctx context.Context, image imageCallResult, idx int) (string, bool) {
+	_, url, ok := cloudUploadImage(ctx, image, idx)
+	return url, ok
+}
+
+// buildImageURL 执行注入的 url 构造回调；回调为 nil 时返回 ok=false（回退 data URL）。
+func buildImageURL(ctx context.Context, urlFor imageURLBuilder, image imageCallResult, idx int) (string, bool) {
+	if urlFor == nil {
+		return "", false
+	}
+	return urlFor(ctx, image, idx)
+}
+
+// imageExtFromOutputFormat 把 output_format 归一为对象 key 用的文件扩展名。
+func imageExtFromOutputFormat(outputFormat string) string {
+	switch strings.ToLower(strings.TrimSpace(outputFormat)) {
+	case "jpg", "jpeg", "image/jpeg":
+		return "jpg"
+	case "webp", "image/webp":
+		return "webp"
+	default:
+		return "png"
+	}
+}
+
+// imageGalleryPersister 在 response_format=url 且配置了云存储时，把每张生成图
+// 上传到对象存储、登记进图库（懒创建 synthetic job + asset 记录），并返回预签名直链。
+//
+// 这样 API 生成的图与后台 Image Studio 生成的图共用同一套图库展示与删除逻辑：
+// 管理员可在图库中看到它们，删除时会级联删掉数据库记录与云端对象，不再无主堆积。
+type imageGalleryPersister struct {
+	h            *Handler
+	prompt       string
+	paramsJSON   string
+	apiKeyID     int64
+	apiKeyName   string
+	apiKeyMasked string
+	model        string
+	start        time.Time
+
+	jobID        int64 // 懒创建：第一张图上传成功时才建 job；0 表示尚未/无法创建
+	jobAttempted bool
+	saved        int
+}
+
+// newImageGalleryPersister 在 response_format=url 且已配置云存储时构造一个 persister，
+// 否则返回 nil（调用方据此回退到 data URL / base64）。
+func (h *Handler) newImageGalleryPersister(c *gin.Context, responseFormat, model string, responsesBody []byte) *imageGalleryPersister {
+	if !strings.EqualFold(strings.TrimSpace(responseFormat), "url") || !imageStorageIsCloud() {
+		return nil
+	}
+	prompt := gjson.GetBytes(responsesBody, "input.0.content.0.text").String()
+	paramsJSON := "{}"
+	if tool := gjson.GetBytes(responsesBody, "tools.0"); tool.Exists() {
+		paramsJSON = tool.Raw
+	}
+	p := &imageGalleryPersister{
+		h:          h,
+		prompt:     prompt,
+		paramsJSON: paramsJSON,
+		apiKeyID:   requestAPIKeyID(c),
+		model:      model,
+		start:      time.Now(),
+	}
+	if v, ok := c.Get(contextAPIKeyName); ok {
+		if name, ok := v.(string); ok {
+			p.apiKeyName = name
+		}
+	}
+	if v, ok := c.Get(contextAPIKeyMasked); ok {
+		if masked, ok := v.(string); ok {
+			p.apiKeyMasked = masked
+		}
+	}
+	return p
+}
+
+// buildURL 实现注入 buildImagesAPIResponse 的回调：上传 + 登记图库，返回直链。
+func (p *imageGalleryPersister) buildURL(ctx context.Context, image imageCallResult, idx int) (string, bool) {
+	ref, url, ok := cloudUploadImage(ctx, image, idx)
+	if !ok {
+		return "", false
+	}
+	p.recordAsset(ctx, image, ref)
+	return url, true
+}
+
+// recordAsset 尽力把已上传对象登记进图库（job + asset）。失败时删除已上传对象，
+// 保持「每个云端对象都有数据库记录」的不变式，避免产生无主文件。
+func (p *imageGalleryPersister) recordAsset(ctx context.Context, image imageCallResult, ref string) {
+	if p == nil || p.h == nil || p.h.db == nil {
+		return
+	}
+	jobID := p.ensureJob(ctx)
+	populateImageStats(&image)
+	input := database.ImageAssetInput{
+		JobID:         jobID,
+		Filename:      ref,
+		StoragePath:   ref,
+		MimeType:      mimeTypeFromOutputFormat(image.OutputFormat),
+		Bytes:         image.ByteSize,
+		Width:         image.Width,
+		Height:        image.Height,
+		Model:         firstNonEmptyImageStr(image.Model, p.model),
+		RequestedSize: image.Size,
+		ActualSize:    imageActualSize(image.Width, image.Height),
+		Quality:       image.Quality,
+		OutputFormat:  image.OutputFormat,
+		RevisedPrompt: image.RevisedPrompt,
+	}
+	if _, err := p.h.db.InsertImageAsset(ctx, input); err != nil {
+		log.Printf("[images] 登记图库 asset 失败，删除已上传对象避免无主: %v", err)
+		if backend, rerr := imagestore.Resolve(ref); rerr == nil {
+			_ = backend.Delete(ctx, ref)
+		}
+		return
+	}
+	p.saved++
+}
+
+// ensureJob 懒创建一条 synthetic job，返回 job_id；创建失败时返回 0（asset 仍可见于图库平铺视图）。
+func (p *imageGalleryPersister) ensureJob(ctx context.Context) int64 {
+	if p.jobAttempted {
+		return p.jobID
+	}
+	p.jobAttempted = true
+	id, err := p.h.db.InsertImageGenerationJob(ctx, database.ImageGenerationJobInput{
+		Prompt:       p.prompt,
+		ParamsJSON:   p.paramsJSON,
+		APIKeyID:     p.apiKeyID,
+		APIKeyName:   p.apiKeyName,
+		APIKeyMasked: p.apiKeyMasked,
+	})
+	if err != nil {
+		log.Printf("[images] 创建图库 job 失败，asset 将以 job_id=0 登记: %v", err)
+		return 0
+	}
+	p.jobID = id
+	return id
+}
+
+// finalize 把 synthetic job 标记为成功（含耗时）。无 job 或一张都没存成时跳过。
+func (p *imageGalleryPersister) finalize(ctx context.Context) {
+	if p == nil || p.h == nil || p.h.db == nil || p.jobID == 0 || p.saved == 0 {
+		return
+	}
+	durationMs := int(time.Since(p.start).Milliseconds())
+	if err := p.h.db.MarkImageJobSucceeded(ctx, p.jobID, durationMs); err != nil {
+		log.Printf("[images] 标记图库 job 成功失败: %v", err)
+	}
+}
+
+func firstNonEmptyImageStr(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func imageActualSize(width, height int) string {
+	if width > 0 && height > 0 {
+		return fmt.Sprintf("%dx%d", width, height)
+	}
+	return ""
 }
 
 func buildImagesStreamPartialPayload(eventType, b64 string, partialImageIndex int64, responseFormat string, createdAt int64, meta imageCallResult) []byte {

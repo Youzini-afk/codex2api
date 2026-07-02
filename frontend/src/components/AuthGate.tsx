@@ -12,7 +12,7 @@ import {
   Server,
   ShieldCheck,
 } from 'lucide-react'
-import { ADMIN_AUTH_REQUIRED_EVENT, api, clearAdminKey, resetAdminAuthState } from '../api'
+import { ADMIN_AUTH_REQUIRED_EVENT, api, clearAdminKey, getAdminKey, resetAdminAuthState, setAdminKey } from '../api'
 import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
 import type { SetupHintsResponse, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
@@ -373,14 +373,50 @@ export default function AuthGate({ children }: PropsWithChildren) {
         } else {
           setStatus('authenticated')
         }
+        if (!session.auth_required || session.auth_method === 'session') {
+          clearAdminKey()
+        }
+        return
+      }
+
+      const headers: Record<string, string> = {}
+      const key = getAdminKey()
+      if (!key) {
+        setStatus('need_login')
+        return
+      }
+      if (key) headers['X-Admin-Key'] = key
+      const res = await fetch('/api/admin/health', { headers })
+      if (res.status === 401) {
+        // 仅 401 才代表密钥确实无效，此时才清除并要求重新登录
+        clearAdminKey()
+        setStatus('need_login')
+      } else if (res.status === 503) {
+        setStatus('need_bootstrap')
+      } else if (!res.ok) {
+        // 5xx/网关错误等多为服务重启或反代瞬时故障，保留密钥不强制登出；
+        // 有密钥时乐观地维持登录态（下一轮轮询若返回 401 会纠正），
+        // 无密钥则停留在登录页。
+        if (key) {
+          setStatus('authenticated')
+        } else {
+          setStatus('need_login')
+        }
+      } else {
+        if (shouldShowSetupReview()) {
+          await loadSetupReview()
+        } else {
+          setStatus('authenticated')
+        }
+      }
+    } catch {
+      // 网络异常（断网、连接中断、标签页休眠唤醒等）不应清除密钥；
+      // 有密钥时乐观维持登录态，无密钥则停留登录页。
+      if (getAdminKey()) {
+        setStatus('authenticated')
       } else {
         setStatus('need_login')
       }
-      if (!session.auth_required || session.auth_method === 'session') {
-        clearAdminKey()
-      }
-    } catch {
-      setStatus('authenticated')
     }
   }, [loadSetupReview])
 
@@ -515,12 +551,52 @@ export default function AuthGate({ children }: PropsWithChildren) {
         } else {
           setStatus('authenticated')
         }
-      } else {
-        setStatus('need_login')
+        return
+      }
+
+      const res = await fetch('/api/admin/health', {
+        headers: { 'X-Admin-Key': inputKey.trim() },
+      })
+      if (res.status === 401) {
         setError(copy.loginError)
+      } else if (res.status === 503) {
+        setStatus('need_bootstrap')
+      } else if (!res.ok) {
+        setError(copy.loginError)
+      } else {
+        setAdminKey(inputKey.trim())
+        setInputKey('')
+        setAuthRequired(true)
+        if (shouldShowSetupReview()) {
+          await loadSetupReview()
+        } else {
+          setStatus('authenticated')
+        }
       }
     } catch (loginError) {
-      setError(getErrorMessage(loginError) || t('auth.error'))
+      try {
+        const res = await fetch('/api/admin/health', {
+          headers: { 'X-Admin-Key': inputKey.trim() },
+        })
+        if (res.status === 401) {
+          setError(copy.loginError)
+        } else if (res.status === 503) {
+          setStatus('need_bootstrap')
+        } else if (!res.ok) {
+          setError(getErrorMessage(loginError) || t('auth.error'))
+        } else {
+          setAdminKey(inputKey.trim())
+          setInputKey('')
+          setAuthRequired(true)
+          if (shouldShowSetupReview()) {
+            await loadSetupReview()
+          } else {
+            setStatus('authenticated')
+          }
+        }
+      } catch {
+        setError(getErrorMessage(loginError) || t('auth.error'))
+      }
     } finally {
       setSubmitting(false)
     }
@@ -573,9 +649,10 @@ export default function AuthGate({ children }: PropsWithChildren) {
       }
       try {
         await api.loginAdminSession(secret)
-      } catch {
-        // 会话登录失败时仍展示检测结果，后续请求会触发重新登录。
         clearAdminKey()
+      } catch {
+        // 会话登录失败时回退到旧的 X-Admin-Key 方式，仍展示检测结果。
+        setAdminKey(secret)
       }
       setAuthRequired(true)
       if (typeof window !== 'undefined' && serviceUrl) {

@@ -12,6 +12,7 @@ type tokenCredentialSeed struct {
 	refreshToken          string
 	sessionToken          string
 	accessToken           string
+	accessTokenType       string
 	idToken               string
 	accountID             string
 	userID                string
@@ -25,6 +26,7 @@ type tokenCredentialSeed struct {
 	codex7DResetAt        string
 	codex5HUsedPercent    string
 	codex5HResetAt        string
+	codex5HUsageUpdatedAt string
 	codexUsageUpdatedAt   string
 }
 
@@ -32,6 +34,7 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	seed.refreshToken = strings.TrimSpace(seed.refreshToken)
 	seed.sessionToken = strings.TrimSpace(seed.sessionToken)
 	seed.accessToken = strings.TrimSpace(seed.accessToken)
+	seed.accessTokenType = strings.TrimSpace(seed.accessTokenType)
 	seed.idToken = strings.TrimSpace(seed.idToken)
 	seed.accountID = strings.TrimSpace(seed.accountID)
 	seed.userID = strings.TrimSpace(seed.userID)
@@ -42,9 +45,17 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	seed.codex7DResetAt = strings.TrimSpace(seed.codex7DResetAt)
 	seed.codex5HUsedPercent = strings.TrimSpace(seed.codex5HUsedPercent)
 	seed.codex5HResetAt = strings.TrimSpace(seed.codex5HResetAt)
+	seed.codex5HUsageUpdatedAt = strings.TrimSpace(seed.codex5HUsageUpdatedAt)
 	seed.codexUsageUpdatedAt = strings.TrimSpace(seed.codexUsageUpdatedAt)
+	if seed.accessTokenType == "" {
+		seed.accessTokenType = accessTokenTypeForToken(seed.accessToken)
+	}
 
-	if info := accountInfoFromTokens(seed.idToken, seed.accessToken); info != nil {
+	accessTokenForJWT := seed.accessToken
+	if seed.accessTokenType == accessTokenTypeCodexAT {
+		accessTokenForJWT = ""
+	}
+	if info := accountInfoFromTokens(seed.idToken, accessTokenForJWT); info != nil {
 		if seed.accountID == "" {
 			seed.accountID = info.ChatGPTAccountID
 		}
@@ -62,7 +73,7 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	if seed.expiresAt.IsZero() && seed.expiresIn > 0 {
 		seed.expiresAt = time.Now().Add(time.Duration(seed.expiresIn) * time.Second)
 	}
-	if seed.expiresAt.IsZero() && seed.accessToken != "" {
+	if seed.expiresAt.IsZero() && seed.accessToken != "" && seed.accessTokenType != accessTokenTypeCodexAT {
 		if info := auth.ParseAccessToken(seed.accessToken); info != nil && !info.ExpiresAt.IsZero() {
 			seed.expiresAt = info.ExpiresAt
 		}
@@ -75,6 +86,15 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	}
 
 	return seed
+}
+
+const accessTokenTypeCodexAT = "codex_at"
+
+func accessTokenTypeForToken(accessToken string) string {
+	if strings.HasPrefix(strings.TrimSpace(accessToken), "at-") {
+		return accessTokenTypeCodexAT
+	}
+	return ""
 }
 
 func accountInfoFromTokens(idToken, accessToken string) *auth.AccountInfo {
@@ -111,6 +131,9 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	if seed.accessToken != "" {
 		credentials["access_token"] = seed.accessToken
 	}
+	if seed.accessTokenType != "" {
+		credentials["access_token_type"] = seed.accessTokenType
+	}
 	if seed.idToken != "" {
 		credentials["id_token"] = seed.idToken
 	}
@@ -146,6 +169,9 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	if seed.codex5HResetAt != "" {
 		credentials["codex_5h_reset_at"] = seed.codex5HResetAt
 	}
+	if seed.codex5HUsageUpdatedAt != "" {
+		credentials["codex_5h_usage_updated_at"] = seed.codex5HUsageUpdatedAt
+	}
 	if seed.codexUsageUpdatedAt != "" {
 		credentials["codex_usage_updated_at"] = seed.codexUsageUpdatedAt
 	}
@@ -175,7 +201,7 @@ func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSe
 		}
 	}
 	if pct, ok := parseSeedUsagePercent(seed.codex5HUsedPercent); ok {
-		account.SetUsageSnapshot5h(pct, parseSeedRFC3339(seed.codex5HResetAt))
+		account.SetUsageSnapshot5hAt(pct, parseSeedRFC3339(seed.codex5HResetAt), parseSeedRFC3339(seed.codex5HUsageUpdatedAt))
 	}
 	return account
 }

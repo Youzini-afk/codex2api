@@ -11,6 +11,5 @@ func (db *DB) UpdateUsageSnapshot5h(ctx context.Context, id int64, pct5h float64
 		"codex_5h_used_percent":     pct5h,
 		"codex_5h_reset_at":         reset5hAt.Format(time.RFC3339),
 		"codex_5h_usage_updated_at": updatedAt.Format(time.RFC3339),
-		"codex_usage_updated_at":    updatedAt.Format(time.RFC3339),
 	})
 }

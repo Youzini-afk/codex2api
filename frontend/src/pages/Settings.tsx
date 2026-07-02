@@ -35,6 +35,15 @@ type ReasoningEffortModelEntry = {
   effort: string
 }
 type AutoSaveStatus = 'idle' | 'saving' | 'saved' | 'error'
+type CodexUserAgentConfig = {
+  raw_user_agent?: string
+  client_name?: string
+  client_version?: string
+  os_name?: string
+  os_version?: string
+  arch?: string
+  terminal?: string
+}
 
 const EMPTY_REASONING_EFFORT_MODEL_ENTRIES: ReasoningEffortModelEntry[] = []
 const REASONING_EFFORT_OPTIONS = ['low', 'medium', 'high', 'xhigh'].map((effort) => ({
@@ -43,6 +52,15 @@ const REASONING_EFFORT_OPTIONS = ['low', 'medium', 'high', 'xhigh'].map((effort)
 }))
 const AUTO_SAVE_STATUS_RESET_MS = 1800
 const AUTO_SAVE_TOAST_MS = 2000
+const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
+  raw_user_agent: '',
+  client_name: 'codex-tui',
+  client_version: '0.142.3',
+  os_name: 'Mac OS',
+  os_version: '15.5.0',
+  arch: 'arm64',
+  terminal: 'xterm-256color',
+}
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
@@ -130,6 +148,120 @@ const reasoningEffortAlias = (entry: ReasoningEffortModelEntry) => {
   const model = entry.model.trim()
   const effort = normalizeReasoningEffortValue(entry.effort)
   return model ? `${model}(${effort})` : ''
+}
+
+const parseCodexUserAgentConfig = (value?: string): CodexUserAgentConfig => {
+  try {
+    const parsed = JSON.parse(value || '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return {
+      raw_user_agent: typeof parsed.raw_user_agent === 'string' ? parsed.raw_user_agent : '',
+      client_name: typeof parsed.client_name === 'string' ? parsed.client_name : '',
+      client_version: typeof parsed.client_version === 'string' ? parsed.client_version : '',
+      os_name: typeof parsed.os_name === 'string' ? parsed.os_name : '',
+      os_version: typeof parsed.os_version === 'string' ? parsed.os_version : '',
+      arch: typeof parsed.arch === 'string' ? parsed.arch : '',
+      terminal: typeof parsed.terminal === 'string' ? parsed.terminal : '',
+    }
+  } catch {
+    return {}
+  }
+}
+
+const serializeCodexUserAgentConfig = (config: CodexUserAgentConfig) => {
+  const normalized: CodexUserAgentConfig = {}
+  for (const key of ['raw_user_agent', 'client_name', 'client_version', 'os_name', 'os_version', 'arch', 'terminal'] as const) {
+    const value = (config[key] ?? '').trim()
+    if (value) normalized[key] = key === 'client_version' ? normalizeVersionText(value) : value
+  }
+  return JSON.stringify(normalized)
+}
+
+type ParsedVersion = {
+  core: [number, number, number]
+  prerelease: string
+}
+
+const normalizeVersionText = (version?: string) => (version ?? '').trim().replace(/^v/i, '')
+
+const parseVersion = (version?: string): ParsedVersion | null => {
+  const match = normalizeVersionText(version).match(/^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9][A-Za-z0-9.-]*))?$/)
+  if (!match) return null
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease: match[4] ?? '',
+  }
+}
+
+const isNumericVersionIdentifier = (value: string) => /^\d+$/.test(value)
+
+const compareNumericVersionIdentifier = (a: string, b: string) => {
+  const av = a.replace(/^0+/, '') || '0'
+  const bv = b.replace(/^0+/, '') || '0'
+  if (av.length !== bv.length) return av.length > bv.length ? 1 : -1
+  if (av !== bv) return av > bv ? 1 : -1
+  return 0
+}
+
+const comparePrerelease = (a: string, b: string) => {
+  if (!a && !b) return 0
+  if (!a) return 1
+  if (!b) return -1
+  const av = a.split('.')
+  const bv = b.split('.')
+  for (let i = 0; i < av.length && i < bv.length; i += 1) {
+    const ai = av[i]
+    const bi = bv[i]
+    const an = isNumericVersionIdentifier(ai)
+    const bn = isNumericVersionIdentifier(bi)
+    if (an && bn) {
+      const cmp = compareNumericVersionIdentifier(ai, bi)
+      if (cmp !== 0) return cmp
+    } else if (an) {
+      return -1
+    } else if (bn) {
+      return 1
+    } else if (ai !== bi) {
+      return ai > bi ? 1 : -1
+    }
+  }
+  if (av.length !== bv.length) return av.length > bv.length ? 1 : -1
+  return 0
+}
+
+const compareVersions = (a?: string, b?: string) => {
+  const av = parseVersion(a)
+  const bv = parseVersion(b)
+  if (!av || !bv) return 0
+  for (let i = 0; i < 3; i += 1) {
+    if (av.core[i] !== bv.core[i]) return av.core[i] > bv.core[i] ? 1 : -1
+  }
+  return comparePrerelease(av.prerelease, bv.prerelease)
+}
+
+const effectiveGeneratedCodexClientVersion = (version: string, minVersion: string, compatMode: string) => {
+  const cleanVersion = normalizeVersionText(version) || DEFAULT_CODEX_UA_CONFIG.client_version
+  const cleanMinVersion = normalizeVersionText(minVersion)
+  if (compatMode === 'auto' && cleanMinVersion && compareVersions(cleanVersion, cleanMinVersion) < 0) {
+    return cleanMinVersion
+  }
+  return cleanVersion
+}
+
+const buildCodexUserAgentPreview = (config: CodexUserAgentConfig, minVersion: string, compatMode: string) => {
+  const raw = (config.raw_user_agent ?? '').trim()
+  if (raw) return raw
+  const clientName = (config.client_name ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.client_name
+  const clientVersion = effectiveGeneratedCodexClientVersion(
+    (config.client_version ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.client_version,
+    minVersion,
+    compatMode,
+  )
+  const osName = (config.os_name ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.os_name
+  const osVersion = (config.os_version ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.os_version
+  const arch = (config.arch ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.arch
+  const terminal = (config.terminal ?? '').trim() || DEFAULT_CODEX_UA_CONFIG.terminal
+  return `${clientName}/${clientVersion} (${osName} ${osVersion}; ${arch}) ${terminal} (${clientName}; ${clientVersion})`
 }
 
 // 模型映射编辑器组件
@@ -502,8 +634,13 @@ function textToBase64(value: string) {
 }
 
 function minifySVG(value: string) {
-  return value
-    .replace(/<!--[\s\S]*?-->/g, '')
+  // 循环剥离注释直到不动点：单次替换可能因相邻片段重新拼出 "<!--" 而残留
+  let out = value
+  for (let prev = ''; prev !== out; ) {
+    prev = out
+    out = out.replace(/<!--[\s\S]*?-->/g, '').replace(/<!--/g, '')
+  }
+  return out
     .replace(/>\s+</g, '><')
     .replace(/\s{2,}/g, ' ')
     .trim()
@@ -705,8 +842,16 @@ export default function Settings() {
     prompt_filter_sensitive_words: '',
     prompt_filter_custom_patterns: '[]',
     prompt_filter_disabled_patterns: '[]',
+    prompt_filter_review_enabled: false,
+    prompt_filter_review_api_key: '',
+    prompt_filter_review_api_key_configured: false,
+    prompt_filter_review_base_url: 'https://api.openai.com',
+    prompt_filter_review_model: 'omni-moderation-latest',
+    prompt_filter_review_timeout_seconds: 10,
+    prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
     codex_min_cli_version: '0.118.0',
+    codex_user_agent_config: '{}',
     usage_log_mode: 'full',
     usage_log_batch_size: 200,
     usage_log_flush_interval_seconds: 5,
@@ -716,6 +861,7 @@ export default function Settings() {
     first_token_timeout_seconds: 0,
     billing_tier_policy: 'actual',
     show_full_usage_numbers: false,
+    public_key_usage_page_enabled: true,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',
@@ -724,6 +870,10 @@ export default function Settings() {
     image_s3_secret_key: '',
     image_s3_prefix: '',
     image_s3_force_path_style: false,
+    auto_pause_5h_threshold: 0,
+    auto_pause_7d_threshold: 0,
+    auto_pause_5h_guard_band_percent: 5,
+    auto_pause_5h_guard_concurrency: 1,
   })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
@@ -1128,6 +1278,26 @@ export default function Settings() {
   const enabledModelCount = visibleModelItems.filter((model) => model.enabled).length
   const modelsLastSyncedLabel = modelsLastSyncedAt ? formatBeijingTime(modelsLastSyncedAt) : t('settings.modelsNeverSynced')
   const modelsSourceLabel = modelsSourceURL || 'https://developers.openai.com/codex/models'
+  const codexUserAgentConfig = useMemo(
+    () => parseCodexUserAgentConfig(settingsForm.codex_user_agent_config),
+    [settingsForm.codex_user_agent_config],
+  )
+  const codexUserAgentPreview = useMemo(
+    () => buildCodexUserAgentPreview(codexUserAgentConfig, settingsForm.codex_min_cli_version, settingsForm.client_compat_mode),
+    [codexUserAgentConfig, settingsForm.client_compat_mode, settingsForm.codex_min_cli_version],
+  )
+  const updateCodexUserAgentConfig = useCallback((patch: Partial<CodexUserAgentConfig>) => {
+    setSettingsForm((form) => {
+      const current = parseCodexUserAgentConfig(form.codex_user_agent_config)
+      return {
+        ...form,
+        codex_user_agent_config: serializeCodexUserAgentConfig({ ...current, ...patch }),
+      }
+    })
+  }, [])
+  const saveCodexUserAgentConfig = useCallback(() => {
+    void autoSaveSettingsPatch({ codex_user_agent_config: settingsForm.codex_user_agent_config })
+  }, [autoSaveSettingsPatch, settingsForm.codex_user_agent_config])
   const renderSaveButton = (className?: string) => (
     <Button className={className} onClick={() => void handleSaveSettings()} disabled={savingSettings || autoSaveStatus === 'saving'}>
       <Save className="size-4" />
@@ -1326,6 +1496,98 @@ export default function Settings() {
             </SettingsCard>
           </div>
 
+          <SettingsCard title={t('settings.globalAutoPauseTitle')} description={t('settings.globalAutoPauseDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
+              <SettingField label={t('settings.globalAutoPause5h')} description={t('settings.globalAutoPauseHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.globalAutoPausePlaceholder')}
+                  value={settingsForm.auto_pause_5h_threshold > 0 ? (settingsForm.auto_pause_5h_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_threshold: isNaN(ratio) ? 0 : ratio }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_5h_threshold: settingsForm.auto_pause_5h_threshold })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.globalAutoPause7d')} description={t('settings.globalAutoPauseHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.globalAutoPausePlaceholder')}
+                  value={settingsForm.auto_pause_7d_threshold > 0 ? (settingsForm.auto_pause_7d_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                    setSettingsForm(f => ({ ...f, auto_pause_7d_threshold: isNaN(ratio) ? 0 : ratio }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_7d_threshold: settingsForm.auto_pause_7d_threshold })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.autoPause5hGuardBand')} description={t('settings.autoPause5hGuardBandHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.autoPause5hGuardBandPlaceholder')}
+                  value={settingsForm.auto_pause_5h_guard_band_percent > 0 ? settingsForm.auto_pause_5h_guard_band_percent : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    if (raw === '') {
+                      setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: 0 }))
+                      return
+                    }
+                    const parsed = parseFloat(raw)
+                    if (Number.isNaN(parsed)) return
+                    const value = Math.max(0, Math.min(100, parsed))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: value }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_5h_guard_band_percent: settingsForm.auto_pause_5h_guard_band_percent })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.autoPause5hGuardConcurrency')} description={t('settings.autoPause5hGuardConcurrencyHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  step={1}
+                  inputMode="numeric"
+                  value={settingsForm.auto_pause_5h_guard_concurrency ?? 1}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    if (raw === '') {
+                      setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: 0 }))
+                      return
+                    }
+                    const parsed = Number.parseInt(raw, 10)
+                    if (Number.isNaN(parsed)) return
+                    const value = Math.max(0, Math.min(1000, parsed))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: value }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_5h_guard_concurrency: settingsForm.auto_pause_5h_guard_concurrency })
+                  }}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')}>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
               <SettingField label={t('settings.codexForceWebsocket')} description={t('settings.codexForceWebsocketDesc')}>
@@ -1392,6 +1654,67 @@ export default function Settings() {
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_min_cli_version: e.target.value }))}
                 />
               </SettingField>
+              <SettingField label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
+                <Input
+                  className="font-mono text-xs"
+                  value={codexUserAgentConfig.raw_user_agent ?? ''}
+                  placeholder="codex-tui/0.142.3 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.142.3)"
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ raw_user_agent: e.target.value })}
+                  onBlur={saveCodexUserAgentConfig}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexUAClientName')} description={t('settings.codexUAClientNameDesc')}>
+                <Input
+                  value={codexUserAgentConfig.client_name ?? ''}
+                  placeholder={DEFAULT_CODEX_UA_CONFIG.client_name}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ client_name: e.target.value })}
+                  onBlur={saveCodexUserAgentConfig}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexUAClientVersion')} description={t('settings.codexUAClientVersionDesc')}>
+                <Input
+                  value={codexUserAgentConfig.client_version ?? ''}
+                  placeholder={DEFAULT_CODEX_UA_CONFIG.client_version}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ client_version: e.target.value })}
+                  onBlur={saveCodexUserAgentConfig}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexUAOSName')} description={t('settings.codexUAOSNameDesc')}>
+                <Input
+                  value={codexUserAgentConfig.os_name ?? ''}
+                  placeholder={DEFAULT_CODEX_UA_CONFIG.os_name}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ os_name: e.target.value })}
+                  onBlur={saveCodexUserAgentConfig}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexUAOSVersion')} description={t('settings.codexUAOSVersionDesc')}>
+                <Input
+                  value={codexUserAgentConfig.os_version ?? ''}
+                  placeholder={DEFAULT_CODEX_UA_CONFIG.os_version}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ os_version: e.target.value })}
+                  onBlur={saveCodexUserAgentConfig}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexUAArch')} description={t('settings.codexUAArchDesc')}>
+                <Input
+                  value={codexUserAgentConfig.arch ?? ''}
+                  placeholder={DEFAULT_CODEX_UA_CONFIG.arch}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ arch: e.target.value })}
+                  onBlur={saveCodexUserAgentConfig}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexUATerminal')} description={t('settings.codexUATerminalDesc')}>
+                <Input
+                  value={codexUserAgentConfig.terminal ?? ''}
+                  placeholder={DEFAULT_CODEX_UA_CONFIG.terminal}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ terminal: e.target.value })}
+                  onBlur={saveCodexUserAgentConfig}
+                />
+              </SettingField>
+              <div className="min-w-0 rounded-md border border-border/70 bg-muted/30 p-3 text-xs text-muted-foreground sm:col-span-2 lg:col-span-3">
+                <div className="mb-1 font-medium text-foreground">{t('settings.codexUAPreview')}</div>
+                <div className="break-all font-mono text-[11px] leading-5 text-foreground">{codexUserAgentPreview}</div>
+              </div>
               <SettingField label={t('settings.usageLogMode')} description={t('settings.usageLogModeDesc')}>
                 <Select
                   value={settingsForm.usage_log_mode}

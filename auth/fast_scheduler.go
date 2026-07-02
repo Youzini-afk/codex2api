@@ -43,6 +43,7 @@ type FastScheduler struct {
 	provenBounds  [3]int           // 每个 tier 桶中验证过的账号数量（排在前面）
 	provenCurs    [3]atomic.Uint64 // 验证账号专用 round-robin 游标
 	groupCheck    func(apiKeyID int64, account *Account) bool
+	acquire       func(account *Account, concurrencyLimit int64) bool
 }
 
 func NewFastScheduler(baseLimit int64, modeOrUsageMaxAge interface{}, usageMaxAge ...time.Duration) *FastScheduler {
@@ -82,6 +83,15 @@ func (s *FastScheduler) SetGroupCheck(check func(apiKeyID int64, account *Accoun
 	}
 	s.mu.Lock()
 	s.groupCheck = check
+	s.mu.Unlock()
+}
+
+func (s *FastScheduler) SetAcquireFunc(acquire func(account *Account, concurrencyLimit int64) bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.acquire = acquire
 	s.mu.Unlock()
 }
 
@@ -146,6 +156,7 @@ func (s *Store) BuildFastScheduler() *FastScheduler {
 		return NewFastScheduler(1, "round_robin")
 	}
 	scheduler := NewFastScheduler(atomic.LoadInt64(&s.maxConcurrency), s.GetSchedulerMode(), s.GetUsageProbeMaxAge())
+	s.configureFastScheduler(scheduler)
 
 	s.mu.RLock()
 	accounts := make([]*Account, len(s.accounts))
@@ -364,7 +375,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		if !available || limit <= 0 {
 			continue
 		}
-		if !tryAcquireAccount(entry.acc, limit) {
+		if !s.tryAcquireAccount(entry.acc, limit) {
 			continue
 		}
 		return entry.acc, false
@@ -377,6 +388,13 @@ func (s *FastScheduler) Release(acc *Account) {
 		return
 	}
 	atomic.AddInt64(&acc.ActiveRequests, -1)
+}
+
+func (s *FastScheduler) tryAcquireAccount(acc *Account, limit int64) bool {
+	if s != nil && s.acquire != nil {
+		return s.acquire(acc, limit)
+	}
+	return tryAcquireAccount(acc, limit)
 }
 
 func (s *FastScheduler) BucketSizes() map[AccountHealthTier]int {
@@ -534,7 +552,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, args ...interface{}) (A
 		if baseConcurrencyEffective <= 0 {
 			baseConcurrencyEffective = a.effectiveBaseConcurrencyLocked(baseLimit)
 		}
-		limit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
+		limit = a.quotaAutoPause5hGuardConcurrencyLimitLocked(concurrencyLimitForTier(baseConcurrencyEffective, tier), now)
 	}
 
 	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
