@@ -172,6 +172,41 @@ func TestClassifyResponseFailedOutcomeUsageLimit(t *testing.T) {
 	}
 }
 
+// issue #310: context_length_exceeded 是确定性客户端错误（换号重试必然失败），
+// 不得归为 500 触发透明重试并惩罚账号健康度。
+func TestClassifyResponseFailedOutcomeContextLengthExceeded(t *testing.T) {
+	// 上游真实形态：code 在 response.error.code，无显式 status_code
+	payload := []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}`)
+
+	outcome := classifyResponseFailedOutcome(payload)
+
+	if outcome.logStatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusBadRequest)
+	}
+	if outcome.failureKind != "client" {
+		t.Fatalf("failure kind = %q, want client", outcome.failureKind)
+	}
+	if outcome.penalize {
+		t.Fatal("context_length_exceeded must not penalize the account")
+	}
+	if shouldTransparentRetryStream(outcome, 0, 2, false, nil, nil) {
+		t.Fatal("context_length_exceeded must not trigger transparent account-rotation retry")
+	}
+}
+
+func TestClassifyResponseFailedOutcomeDeterministicClientErrors(t *testing.T) {
+	for _, code := range []string{"context_window_exceeded", "string_above_max_length", "model_not_found", "unsupported_parameter"} {
+		payload := []byte(`{"type":"response.failed","response":{"error":{"code":"` + code + `","message":"boom"}}}`)
+		outcome := classifyResponseFailedOutcome(payload)
+		if outcome.logStatusCode != http.StatusBadRequest {
+			t.Errorf("code %s: status = %d, want %d", code, outcome.logStatusCode, http.StatusBadRequest)
+		}
+		if outcome.penalize {
+			t.Errorf("code %s: deterministic client error must not penalize", code)
+		}
+	}
+}
+
 func TestShouldRecyclePooledClient(t *testing.T) {
 	tests := []struct {
 		name string
@@ -280,6 +315,60 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 		if got := req.Header.Get(name); got != "" {
 			t.Fatalf("%s = %q, want empty", name, got)
 		}
+	}
+}
+
+func TestApplyCodexRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	acc := &auth.Account{
+		DBID:      42,
+		AccountID: "acct-default",
+		CustomHeaders: map[string]string{
+			"Authorization":      "Bearer upstream-override",
+			"Chatgpt-Account-Id": "acct-override",
+			"X-Custom-Header":    "custom-value",
+		},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", nil, http.Header{})
+
+	if got := req.Header.Get("Authorization"); got != "Bearer upstream-override" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-override" {
+		t.Fatalf("Chatgpt-Account-Id = %q", got)
+	}
+	if got := req.Header.Get("X-Custom-Header"); got != "custom-value" {
+		t.Fatalf("X-Custom-Header = %q", got)
+	}
+}
+
+func TestApplyOpenAIResponsesRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	acc := &auth.Account{
+		DBID: 42,
+		CustomHeaders: map[string]string{
+			"Authorization":       "Bearer upstream-override",
+			"OpenAI-Organization": "org-override",
+		},
+	}
+	downstreamHeaders := http.Header{"OpenAI-Organization": []string{"org-downstream"}}
+
+	applyOpenAIResponsesRequestHeaders(req, acc, "api-key-1", downstreamHeaders)
+
+	if got := req.Header.Get("Authorization"); got != "Bearer upstream-override" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := req.Header.Get("OpenAI-Organization"); got != "org-override" {
+		t.Fatalf("OpenAI-Organization = %q", got)
 	}
 }
 

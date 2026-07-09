@@ -45,6 +45,10 @@ const (
 	defaultCodexWSSilentRetry    = true
 	defaultCodexWSSilentRetries  = 2
 	maxCodexWSSilentRetries      = 10
+
+	defaultCodexContinueMaxRounds = 8
+	minCodexContinueMaxRounds     = 1
+	maxCodexContinueMaxRounds     = 32
 )
 
 type RuntimeSettings struct {
@@ -62,6 +66,9 @@ type RuntimeSettings struct {
 	CodexWSSilentRetries          int  // Codex WS 静默换号最大重试次数（默认 2）
 	CodexFastModelAliasEnabled    bool // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
 	CodexFastTierInterceptEnabled bool // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
+	// CodexContinueThinking 检测到上游按 518n-2 指纹截断思考时自动续想并折叠成单响应（默认 false）。
+	CodexContinueThinking  bool
+	CodexContinueMaxRounds int // 单次请求最大续想轮数，含首轮（默认 8，范围 1-32）
 	// RequestIsolationMode 控制无显式会话请求的上游身份隔离粒度（isolated|per-api-key，默认 isolated）。
 	RequestIsolationMode string
 }
@@ -93,6 +100,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSilentRetries:          defaultCodexWSSilentRetries,
 		CodexFastModelAliasEnabled:    true,
 		CodexFastTierInterceptEnabled: false,
+		CodexContinueMaxRounds:        defaultCodexContinueMaxRounds,
 		RequestIsolationMode:          defaultRequestIsolationMode(),
 	}
 }
@@ -195,6 +203,12 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexWSSilentRetries > maxCodexWSSilentRetries {
 		settings.CodexWSSilentRetries = maxCodexWSSilentRetries
 	}
+	if settings.CodexContinueMaxRounds < minCodexContinueMaxRounds {
+		settings.CodexContinueMaxRounds = defaults.CodexContinueMaxRounds
+	}
+	if settings.CodexContinueMaxRounds > maxCodexContinueMaxRounds {
+		settings.CodexContinueMaxRounds = maxCodexContinueMaxRounds
+	}
 	return settings
 }
 
@@ -215,6 +229,8 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
 		next.CodexFastModelAliasEnabled = settings.CodexFastModelAliasEnabled
 		next.CodexFastTierInterceptEnabled = settings.CodexFastTierInterceptEnabled
+		next.CodexContinueThinking = settings.CodexContinueThinkingEnabled
+		next.CodexContinueMaxRounds = settings.CodexContinueMaxRounds
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)
@@ -252,4 +268,10 @@ func currentFirstTokenTimeout() time.Duration {
 
 func currentFirstTokenMode() string {
 	return CurrentRuntimeSettings().FirstTokenMode
+}
+
+// codexContinueThinkingSettings 返回续想折叠开关与最大轮数（一次快照读取）。
+func codexContinueThinkingSettings() (bool, int) {
+	s := CurrentRuntimeSettings()
+	return s.CodexContinueThinking, s.CodexContinueMaxRounds
 }

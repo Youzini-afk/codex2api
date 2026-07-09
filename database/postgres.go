@@ -742,6 +742,7 @@ func (db *DB) migrate(ctx context.Context) error {
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
+			test_content       TEXT DEFAULT 'hi',
 			test_concurrency   INT DEFAULT 50,
 			proxy_url          VARCHAR(500) DEFAULT '',
 			pg_max_conns       INT DEFAULT 50,
@@ -769,6 +770,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'CodexProxy';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS test_content TEXT DEFAULT 'hi';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -830,12 +832,19 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_hide_upstream_errors BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_retry_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_max_retries INT DEFAULT 2;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_model_alias_enabled BOOLEAN DEFAULT TRUE;
+ 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_model_alias_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_tier_intercept_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_continue_thinking_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_continue_max_rounds INT DEFAULT 8;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_concurrency INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_min_concurrency INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -1021,15 +1030,18 @@ type APIKeyRow struct {
 // APIKeyLimits 是 API Key 级别的细粒度限流/配额配置。
 // 0 或空字段表示该项不限。落库为 JSON,允许平滑扩展字段。
 //
-// - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
-// - RPM: 每分钟请求数 (滑动 60s 窗口)。
-// - RPD: 每天请求数 (滑动 24h 窗口)。
-// - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
-// - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
-// - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
+//   - RPM: 每分钟请求数 (滑动 60s 窗口)。
+//   - RPD: 每天请求数 (滑动 24h 窗口)。
+//   - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
+//   - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
+//   - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - PlanAllow: 账号套餐白名单(plus/pro/team/...)。非空时该 Key 仅调度命中其一的账号,
+//     语义与 AllowedGroupIDs 类似,均在账号选择阶段过滤。空表示不限套餐。
 type APIKeyLimits struct {
 	ModelAllow     []string `json:"model_allow,omitempty"`
 	ModelDeny      []string `json:"model_deny,omitempty"`
+	PlanAllow      []string `json:"plan_allow,omitempty"`
 	RPM            int      `json:"rpm,omitempty"`
 	RPD            int      `json:"rpd,omitempty"`
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
@@ -1043,7 +1055,7 @@ type APIKeyLimits struct {
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
-	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
+	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 && len(l.PlanAllow) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0
@@ -1379,6 +1391,7 @@ type SystemSettings struct {
 	MaxConcurrency                     int
 	GlobalRPM                          int
 	TestModel                          string
+	TestContent                        string
 	TestConcurrency                    int
 	ProxyURL                           string
 	PgMaxConns                         int
@@ -1444,10 +1457,17 @@ type SystemSettings struct {
 	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
 	CodexFastModelAliasEnabled         bool // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
 	CodexFastTierInterceptEnabled      bool // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
+	CodexContinueThinkingEnabled       bool // 检测到上游截断思考时自动续想并折叠成单响应，默认 false
+	CodexContinueMaxRounds             int  // 单次请求最大续想轮数（含首轮），默认 8
 	AutoPause5hThreshold               float64
 	AutoPause7dThreshold               float64
 	AutoPause5hGuardBandPercent        float64
 	AutoPause5hGuardConcurrency        int
+	SmartPacingEnabled                 bool   // issue #312 智能配速总开关
+	SmartPacingMinConcurrency          int    // 配速并发下限
+	SmartPacingWindows                 string // "5h,7d" / "5h" / "7d"
+	RetryIntervalMS                    int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
+	TransportRetryPolicy               string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1468,12 +1488,46 @@ func normalizeFirstTokenMode(mode string) string {
 	}
 }
 
+// normalizeSmartPacingMinConcurrencyDB 归一化智能配速并发下限（1..1000，默认 1）。
+func normalizeSmartPacingMinConcurrencyDB(value int) int {
+	if value < 1 {
+		return 1
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
+// normalizeSmartPacingWindowsDB 归一化配速窗口为 "5h,7d" / "5h" / "7d"，非法回退 "5h,7d"。
+func normalizeSmartPacingWindowsDB(raw string) string {
+	var w5h, w7d bool
+	for _, part := range strings.Split(strings.ToLower(strings.TrimSpace(raw)), ",") {
+		switch strings.TrimSpace(part) {
+		case "5h":
+			w5h = true
+		case "7d":
+			w7d = true
+		}
+	}
+	switch {
+	case w5h && w7d:
+		return "5h,7d"
+	case w5h:
+		return "5h"
+	case w7d:
+		return "7d"
+	default:
+		return "5h,7d"
+	}
+}
+
 // GetSystemSettings 加载全局设置
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT COALESCE(site_name, 'CodexProxy'), COALESCE(site_logo, ''),
-		       max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+		       max_concurrency, global_rpm, test_model, COALESCE(test_content, 'hi'), test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),
 		       COALESCE(fast_scheduler_enabled, false),
@@ -1531,16 +1585,23 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_ws_hide_upstream_errors, true),
 			       COALESCE(codex_ws_silent_retry_enabled, true),
 			       COALESCE(codex_ws_silent_max_retries, 2),
-			       COALESCE(codex_fast_model_alias_enabled, true),
+ 			       COALESCE(codex_fast_model_alias_enabled, true),
 			       COALESCE(codex_fast_tier_intercept_enabled, false),
+			       COALESCE(codex_continue_thinking_enabled, false),
+			       COALESCE(codex_continue_max_rounds, 8),
 			       COALESCE(auto_pause_5h_threshold, 0),
 			       COALESCE(auto_pause_7d_threshold, 0),
 			       COALESCE(auto_pause_5h_guard_band_percent, 5),
-			       COALESCE(auto_pause_5h_guard_concurrency, 1)
+			       COALESCE(auto_pause_5h_guard_concurrency, 1),
+			       COALESCE(smart_pacing_enabled, false),
+			       COALESCE(smart_pacing_min_concurrency, 1),
+			       COALESCE(smart_pacing_windows, '5h,7d'),
+			       COALESCE(retry_interval_ms, 0),
+			       COALESCE(NULLIF(TRIM(transport_retry_policy), ''), 'rotate')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
-		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
+		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestContent, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
@@ -1571,16 +1632,27 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexWSSilentMaxRetries,
 		&s.CodexFastModelAliasEnabled,
 		&s.CodexFastTierInterceptEnabled,
+		&s.CodexContinueThinkingEnabled,
+		&s.CodexContinueMaxRounds,
 		&s.AutoPause5hThreshold,
 		&s.AutoPause7dThreshold,
 		&s.AutoPause5hGuardBandPercent,
 		&s.AutoPause5hGuardConcurrency,
+		&s.SmartPacingEnabled,
+		&s.SmartPacingMinConcurrency,
+		&s.SmartPacingWindows,
+		&s.RetryIntervalMS,
+		&s.TransportRetryPolicy,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	s.SiteName = NormalizeSiteName(s.SiteName)
 	s.SiteLogo = strings.TrimSpace(s.SiteLogo)
+	s.TestContent = strings.TrimSpace(s.TestContent)
+	if s.TestContent == "" {
+		s.TestContent = "hi"
+	}
 	if strings.TrimSpace(s.ReasoningEffortModels) == "" {
 		s.ReasoningEffortModels = "[]"
 	}
@@ -1604,9 +1676,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	}
 	firstTokenMode := normalizeFirstTokenMode(s.FirstTokenMode)
 	billingTierPolicy := normalizeBillingTierPolicy(s.BillingTierPolicy)
+	testContent := strings.TrimSpace(s.TestContent)
+	if testContent == "" {
+		testContent = "hi"
+	}
 	_, err := db.conn.ExecContext(ctx, `
 			INSERT INTO system_settings (
-				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_content, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, lazy_mode, model_mapping, codex_model_mapping,
 					background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
@@ -1639,21 +1715,29 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_pause_5h_threshold,
 					auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent,
-					auto_pause_5h_guard_concurrency
+					auto_pause_5h_guard_concurrency,
+					smart_pacing_enabled,
+					smart_pacing_min_concurrency,
+					smart_pacing_windows,
+					retry_interval_ms,
+					transport_retry_policy,
+					codex_continue_thinking_enabled,
+					codex_continue_max_rounds
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75)
+					VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
 				test_model              = EXCLUDED.test_model,
-				test_concurrency        = EXCLUDED.test_concurrency,
-				proxy_url               = EXCLUDED.proxy_url,
-			pg_max_conns            = EXCLUDED.pg_max_conns,
-			redis_pool_size         = EXCLUDED.redis_pool_size,
-			auto_clean_unauthorized = EXCLUDED.auto_clean_unauthorized,
-			auto_clean_rate_limited = EXCLUDED.auto_clean_rate_limited,
+				test_content            = EXCLUDED.test_content,
+				test_concurrency       = EXCLUDED.test_concurrency,
+				proxy_url              = EXCLUDED.proxy_url,
+				pg_max_conns           = EXCLUDED.pg_max_conns,
+				redis_pool_size        = EXCLUDED.redis_pool_size,
+				auto_clean_unauthorized = EXCLUDED.auto_clean_unauthorized,
+				auto_clean_rate_limited = EXCLUDED.auto_clean_rate_limited,
 				admin_secret            = EXCLUDED.admin_secret,
 				auto_clean_full_usage   = EXCLUDED.auto_clean_full_usage,
 				proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled,
@@ -1717,9 +1801,16 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_pause_5h_threshold = EXCLUDED.auto_pause_5h_threshold,
 					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent = EXCLUDED.auto_pause_5h_guard_band_percent,
-					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency
+					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency,
+					smart_pacing_enabled = EXCLUDED.smart_pacing_enabled,
+					smart_pacing_min_concurrency = EXCLUDED.smart_pacing_min_concurrency,
+					smart_pacing_windows = EXCLUDED.smart_pacing_windows,
+					retry_interval_ms = EXCLUDED.retry_interval_ms,
+					transport_retry_policy = EXCLUDED.transport_retry_policy,
+					codex_continue_thinking_enabled = EXCLUDED.codex_continue_thinking_enabled,
+					codex_continue_max_rounds = EXCLUDED.codex_continue_max_rounds
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
-		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
+		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
@@ -1735,7 +1826,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
 		s.CodexFastModelAliasEnabled, s.CodexFastTierInterceptEnabled,
-		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency)
+		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency,
+		s.SmartPacingEnabled, normalizeSmartPacingMinConcurrencyDB(s.SmartPacingMinConcurrency), normalizeSmartPacingWindowsDB(s.SmartPacingWindows),
+		normalizeRetryIntervalMSDB(s.RetryIntervalMS), NormalizeTransportRetryPolicy(s.TransportRetryPolicy),
+		s.CodexContinueThinkingEnabled, NormalizeCodexContinueMaxRounds(s.CodexContinueMaxRounds))
 	return err
 }
 
@@ -1747,6 +1841,26 @@ func normalizeCodexWSKeepaliveInterval(sec int) int {
 	return sec
 }
 
+func normalizeRetryIntervalMSDB(ms int) int {
+	if ms < 0 {
+		return 0
+	}
+	if ms > 30000 {
+		return 30000
+	}
+	return ms
+}
+
+// NormalizeTransportRetryPolicy 归一化传输错误重试策略,空/未知值回落到 rotate(换号,旧行为)。
+func NormalizeTransportRetryPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "sticky":
+		return "sticky"
+	default:
+		return "rotate"
+	}
+}
+
 // normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
 func normalizeCodexWSSilentMaxRetries(retries int) int {
 	if retries < 0 {
@@ -1756,6 +1870,17 @@ func normalizeCodexWSSilentMaxRetries(retries int) int {
 		return 10
 	}
 	return retries
+}
+
+// NormalizeCodexContinueMaxRounds 把续想最大轮数限制在 1-32,非正值回落默认 8。
+func NormalizeCodexContinueMaxRounds(rounds int) int {
+	if rounds <= 0 {
+		return 8
+	}
+	if rounds > 32 {
+		return 32
+	}
+	return rounds
 }
 
 // normalizeAffinityMode 把 SystemSettings.AffinityMode 落库前归一,空字符串 → "bounded"。
@@ -2026,6 +2151,7 @@ type UsageLog struct {
 	ImageBytes           int       `json:"image_bytes"`
 	ImageFormat          string    `json:"image_format"`
 	ImageSize            string    `json:"image_size"`
+	AccountName          string    `json:"account_name"`
 	AccountEmail         string    `json:"account_email"`
 	CreatedAt            time.Time `json:"created_at"`
 	AccountBilled        float64   `json:"account_billed"`
@@ -2908,7 +3034,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+		            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.status_code <> 499
@@ -2928,7 +3054,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
-			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
+			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -3366,7 +3492,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+		            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
 	           WHERE u.created_at >= $1 AND u.created_at <= $2
@@ -3387,7 +3513,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
-			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
+			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -3448,7 +3574,7 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 	}
 	if f.Email != "" {
 		p := addArg("%" + f.Email + "%")
-		parts = append(parts, fmt.Sprintf(`(LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s) OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s))`, p))
+		parts = append(parts, fmt.Sprintf(`(LOWER(COALESCE(a.name, '')) LIKE LOWER(%[1]s) OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s) OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s))`, p))
 	}
 	if f.Model != "" {
 		p := addArg(f.Model)
@@ -3504,6 +3630,7 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 				OR LOWER(COALESCE(u.api_key_name, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(u.api_key_masked, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(a.name, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
 		)`, p))
 	}
@@ -3587,7 +3714,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-			            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
+			            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -3607,7 +3734,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -3639,7 +3766,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 			COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-			COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+			COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 		FROM usage_logs u
 		LEFT JOIN accounts a ON u.account_id = a.id
 		WHERE ` + where
@@ -3658,7 +3785,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -5324,8 +5451,13 @@ func (db *DB) GetActiveAccountIdentityIndex(ctx context.Context) (*AccountIdenti
 }
 
 // FindActiveAccountByOAuthIdentity returns the first non-deleted account with
-// the same email and ChatGPT account id. It accepts both historical credential
-// key names: account_id and chatgpt_account_id.
+// the same email and OAuth identity. The identity matches when either the
+// ChatGPT workspace id (credential keys account_id / chatgpt_account_id) or
+// the OpenAI user id (credential key user_id, "user-...") equals accountID —
+// personal-plan JWTs may lack a workspace id, and legacy rows may have had
+// account_id polluted with a user_id by the old wham backfill, so matching
+// user_id against account_id keys (and vice versa) keeps dedup working for
+// both shapes.
 func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accountID string, excludeIDs ...int64) (int64, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	accountID = strings.TrimSpace(accountID)
@@ -5354,11 +5486,21 @@ func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accou
 		if _, ok := excluded[id]; ok {
 			continue
 		}
+		// 勾选"允许重复添加"强制导入的副本不作为判重锚点：后续正常导入
+		// 应命中/更新主账号，而不是把凭证写进用户故意保留的副本。
+		if strings.EqualFold(strings.TrimSpace(credentialString(raw, "allow_duplicate")), "true") {
+			continue
+		}
 		if strings.ToLower(strings.TrimSpace(credentialString(raw, "email"))) != email {
 			continue
 		}
 		if strings.TrimSpace(credentialString(raw, "account_id")) == accountID ||
-			strings.TrimSpace(credentialString(raw, "chatgpt_account_id")) == accountID {
+			strings.TrimSpace(credentialString(raw, "chatgpt_account_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "user_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "chatgpt_user_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "chatgpt_account_user_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "account_user_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "accountUserID")) == accountID {
 			return id, nil
 		}
 	}
