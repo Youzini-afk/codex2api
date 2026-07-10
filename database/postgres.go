@@ -836,6 +836,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_tier_intercept_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_continue_thinking_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_continue_max_rounds INT DEFAULT 8;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_synced_cli_version TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_interval_hours INT DEFAULT 12;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
@@ -1051,6 +1054,9 @@ type APIKeyLimits struct {
 	TokenLimit5h   int64    `json:"token_limit_5h,omitempty"`
 	TokenLimit7d   int64    `json:"token_limit_7d,omitempty"`
 	TokenLimit30d  int64    `json:"token_limit_30d,omitempty"`
+	// DisableImageGeneration 为 true 时，该 Key 禁止访问生图模型(gpt-image-*)与
+	// 生图工具链路(image_generation 工具 / /v1/images 端点)，命中一律 403。
+	DisableImageGeneration bool `json:"disable_image_generation,omitempty"`
 }
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
@@ -1058,7 +1064,8 @@ func (l APIKeyLimits) IsZero() bool {
 	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 && len(l.PlanAllow) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
-		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0
+		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0 &&
+		!l.DisableImageGeneration
 }
 
 type APIKeyInput struct {
@@ -1468,6 +1475,13 @@ type SystemSettings struct {
 	SmartPacingWindows                 string // "5h,7d" / "5h" / "7d"
 	RetryIntervalMS                    int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
 	TransportRetryPolicy               string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
+	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本缓存，
+	// 用于抬升出站 UA / manifest 的模拟版本（绝不低于内置常量），空表示尚未同步。
+	CodexSyncedCLIVersion string
+	// CodexCLIVersionSyncEnabled 控制是否后台定时自动同步 Codex CLI 版本（默认 true）。
+	CodexCLIVersionSyncEnabled bool
+	// CodexCLIVersionSyncIntervalHours 是定时同步间隔（小时，默认 12，范围 1-720）。
+	CodexCLIVersionSyncIntervalHours int
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1597,7 +1611,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(smart_pacing_min_concurrency, 1),
 			       COALESCE(smart_pacing_windows, '5h,7d'),
 			       COALESCE(retry_interval_ms, 0),
-			       COALESCE(NULLIF(TRIM(transport_retry_policy), ''), 'rotate')
+			       COALESCE(NULLIF(TRIM(transport_retry_policy), ''), 'rotate'),
+			       COALESCE(codex_synced_cli_version, ''),
+			       COALESCE(codex_cli_version_sync_enabled, true),
+			       COALESCE(codex_cli_version_sync_interval_hours, 12)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1643,6 +1660,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SmartPacingWindows,
 		&s.RetryIntervalMS,
 		&s.TransportRetryPolicy,
+		&s.CodexSyncedCLIVersion,
+		&s.CodexCLIVersionSyncEnabled,
+		&s.CodexCLIVersionSyncIntervalHours,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1722,9 +1742,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					retry_interval_ms,
 					transport_retry_policy,
 					codex_continue_thinking_enabled,
-					codex_continue_max_rounds
+					codex_continue_max_rounds,
+					codex_synced_cli_version,
+					codex_cli_version_sync_enabled,
+					codex_cli_version_sync_interval_hours
 					)
-					VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83)
+					VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1808,7 +1831,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					retry_interval_ms = EXCLUDED.retry_interval_ms,
 					transport_retry_policy = EXCLUDED.transport_retry_policy,
 					codex_continue_thinking_enabled = EXCLUDED.codex_continue_thinking_enabled,
-					codex_continue_max_rounds = EXCLUDED.codex_continue_max_rounds
+					codex_continue_max_rounds = EXCLUDED.codex_continue_max_rounds,
+					codex_synced_cli_version = EXCLUDED.codex_synced_cli_version,
+					codex_cli_version_sync_enabled = EXCLUDED.codex_cli_version_sync_enabled,
+					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1829,8 +1855,21 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency,
 		s.SmartPacingEnabled, normalizeSmartPacingMinConcurrencyDB(s.SmartPacingMinConcurrency), normalizeSmartPacingWindowsDB(s.SmartPacingWindows),
 		normalizeRetryIntervalMSDB(s.RetryIntervalMS), NormalizeTransportRetryPolicy(s.TransportRetryPolicy),
-		s.CodexContinueThinkingEnabled, NormalizeCodexContinueMaxRounds(s.CodexContinueMaxRounds))
+		s.CodexContinueThinkingEnabled, NormalizeCodexContinueMaxRounds(s.CodexContinueMaxRounds),
+		strings.TrimSpace(s.CodexSyncedCLIVersion),
+		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours))
 	return err
+}
+
+// NormalizeCodexCLIVersionSyncIntervalHours 把定时同步间隔(小时)限制在 1-720，非正值回落默认 12。
+func NormalizeCodexCLIVersionSyncIntervalHours(hours int) int {
+	if hours <= 0 {
+		return 12
+	}
+	if hours > 720 {
+		return 720
+	}
+	return hours
 }
 
 // normalizeCodexWSKeepaliveInterval 把 WS 保活间隔(秒)归一,非正值 → 默认 60。
