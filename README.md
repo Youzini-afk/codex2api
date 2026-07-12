@@ -82,6 +82,13 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
+<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> provides cost-effective AI model API access with support for mainstream models including OpenAI, Claude, and Gemini. Top-up ratio of ¥0.2 = $1 credit, bringing per-call costs down to under 10% of official pricing. Plans start at ¥25/28 days; the Premium plan (¥129/28 days) includes about $4,752 in model credit (plans cover OpenAI models only), with high-concurrency support and 95%+ SLA stability.</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> is a high-availability AI model API relay platform for individual developers and enterprise teams. Supports Codex/Claude Code at ~1/10 official pricing. Register using the link and promo code <code>CODEX2API</code> to get $3 test credit. </td>
 </tr>
@@ -111,6 +118,7 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 - [Core Capabilities](#core-capabilities)
 - [Project Structure](#project-structure)
 - [Notes](#notes)
+- [Community](#community)
 - [Disclaimer and License](#disclaimer-and-license)
 - [Star History](#star-history)
 - [Links](#links)
@@ -532,6 +540,15 @@ codex2api/
 - Before manually building the Go binary, run `npm run build` in `frontend/`.
 - `.env` controls physical runtime settings such as port, database, and Redis. Business settings are stored in the database and managed from the admin dashboard.
 - API keys are stored in the database and configured through the admin dashboard.
+
+---
+
+## Community
+
+- QQ group: [Join the "codex2api" group chat](https://qun.qq.com/universal-share/share?ac=1&authKey=6vwawW4MeqdACT7PajnHlf2lLkjfuNXEMSos67l9FBiAJ8t%2BKeaXJXB0dgsnhFa1&busi_data=eyJncm91cENvZGUiOiI4MTY3Mzk4NDIiLCJ0b2tlbiI6ImU1YW1KR3dNaXZoUXZDUWpYTWVncmdmMXhQV1RwQ21tbEhkdjB5VW45aWVPSjhFM2grMkRHNGdhWnhEU29oS08iLCJ1aW4iOiIxMTYzNDc2OTQ5In0%3D&data=adSomD6r40Al25rBr8PocFCKumQR5oxi1kq5jXjXxeJ49Z5cj4QLzbNf6vfIQKWMORrJntrZtcoyQuHg2ksUeA&svctype=4&tempid=h5_group_info) (group ID: 816739842)
+- Telegram group: [Join the Telegram group](https://t.me/+9hJAA3ZWQxxmMzE5)
+
+Join the group to discuss deployment, usage, and development questions.
 
 ---
 

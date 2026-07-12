@@ -23,6 +23,7 @@ import type {
   AddAccountRequest,
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
+  CodexClientMetadataMode,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
   OpsOverviewResponse,
@@ -32,12 +33,14 @@ import type {
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
+import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
 import { formatLongUsageWindowLabel } from "../lib/usageFormat";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -121,6 +124,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "email",
   "tags",
   "groups",
+  "priority",
   "plan",
   "status",
   "requests",
@@ -167,6 +171,7 @@ type AccountGroupDraft = {
   name: string;
   description: string;
   color: string;
+  baseConcurrencyInput: string;
   auto_pause_5h_threshold: number;
   auto_pause_7d_threshold: number;
 };
@@ -560,6 +565,27 @@ function dispatchCountLimitInputToValue(value: string): number | null {
   return parsed;
 }
 
+function formatSchedulerPriorityInput(value?: number | null): string {
+  if (typeof value !== "number" || value === 0) return "";
+  return String(Math.trunc(value));
+}
+
+function isSchedulerPriorityInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (!/^-?\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < -100 || parsed > 100;
+}
+
+function schedulerPriorityInputToValue(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed === 0) return null;
+  return parsed;
+}
+
 function getMediaQueryMatch(query: string): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return false;
@@ -701,7 +727,7 @@ export default function Accounts() {
     "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | null
+    "requests" | "usage" | "importTime" | "schedulerPriority" | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -763,7 +789,11 @@ export default function Accounts() {
     useState(false);
   const [editAutoPause7dDisabled, setEditAutoPause7dDisabled] =
     useState(false);
+  const [editIgnoreUsageLimitStatusMode, setEditIgnoreUsageLimitStatusMode] =
+    useState<"inherit" | "enabled" | "disabled">("inherit");
   const [editDispatchCountLimitInput, setEditDispatchCountLimitInput] =
+    useState("");
+  const [editSchedulerPriorityInput, setEditSchedulerPriorityInput] =
     useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
@@ -777,6 +807,7 @@ export default function Accounts() {
       base_url: "https://api.openai.com",
       api_key: "",
       models: [],
+      codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
   const [openAIModelDraft, setOpenAIModelDraft] = useState("");
@@ -846,6 +877,7 @@ export default function Accounts() {
       base_url: "https://api.openai.com",
       api_key: "",
       models: [],
+      codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
@@ -880,6 +912,11 @@ export default function Accounts() {
   const [editOAuthUpdating, setEditOAuthUpdating] = useState(false);
   const [editTags, setEditTags] = useState<string[]>([]);
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
+  const [quickGroupAccount, setQuickGroupAccount] = useState<AccountRow | null>(
+    null,
+  );
+  const [quickGroupIds, setQuickGroupIds] = useState<number[]>([]);
+  const [quickGroupSubmitting, setQuickGroupSubmitting] = useState(false);
   const [tagFilter, setTagFilter] = useState<string>("");
   const [domainFilter, setDomainFilter] = useState<string>("");
   const [groupFilter, setGroupFilter] = useState<AccountGroupFilterValue>(
@@ -892,12 +929,16 @@ export default function Accounts() {
     name: "",
     description: "",
     color: ACCOUNT_GROUP_COLORS[0],
+    baseConcurrencyInput: "",
     auto_pause_5h_threshold: 0,
     auto_pause_7d_threshold: 0,
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
+  const [batchMetaMode, setBatchMetaMode] = useState<"all" | "groups">("all");
+  const [batchUpdateTags, setBatchUpdateTags] = useState(false);
   const [batchTags, setBatchTags] = useState<string[]>([]);
+  const [batchUpdateGroups, setBatchUpdateGroups] = useState(false);
   const [batchGroupIds, setBatchGroupIds] = useState<number[]>([]);
   const [batchMetaSubmitting, setBatchMetaSubmitting] = useState(false);
   const [showBatchQuotaAutoPauseEditor, setShowBatchQuotaAutoPauseEditor] =
@@ -1711,6 +1752,9 @@ export default function Accounts() {
         diff =
           new Date(a.created_at || 0).getTime() -
           new Date(b.created_at || 0).getTime();
+      } else if (sortKey === "schedulerPriority") {
+        diff = getSchedulerPriority(a) - getSchedulerPriority(b);
+        if (diff === 0) return a.id - b.id;
       }
       return sortDir === "asc" ? diff : -diff;
     });
@@ -2046,6 +2090,7 @@ export default function Accounts() {
         base_url: "https://api.openai.com",
         api_key: "",
         models: [],
+        codex_client_metadata_mode: "auto",
         proxy_url: "",
       });
       setOpenAIModelDraft("");
@@ -3094,30 +3139,63 @@ export default function Accounts() {
   };
 
   const openBatchMetaEditor = () => {
-    const selectedAccounts = accounts.filter((account) =>
-      selected.has(account.id),
-    );
-    const tagSet = new Set<string>();
-    const groupSet = new Set<number>();
-    for (const account of selectedAccounts) {
-      for (const tag of account.tags ?? []) tagSet.add(tag);
-      for (const id of account.group_ids ?? []) groupSet.add(id);
-    }
-    setBatchTags(Array.from(tagSet).sort());
-    setBatchGroupIds(Array.from(groupSet).sort((a, b) => a - b));
+    setBatchMetaMode("all");
+    setBatchUpdateTags(false);
+    setBatchTags([]);
+    setBatchUpdateGroups(false);
+    setBatchGroupIds([]);
     setShowBatchMetaEditor(true);
+  };
+
+  const openBatchGroupEditor = () => {
+    setBatchMetaMode("groups");
+    setBatchUpdateTags(false);
+    setBatchTags([]);
+    setBatchUpdateGroups(true);
+    setBatchGroupIds([]);
+    setShowBatchMetaEditor(true);
+  };
+
+  const openQuickGroupEditor = (account: AccountRow) => {
+    setQuickGroupAccount(account);
+    setQuickGroupIds([...(account.group_ids ?? [])]);
+  };
+
+  const handleQuickGroupSave = async () => {
+    if (!quickGroupAccount) return;
+    setQuickGroupSubmitting(true);
+    try {
+      await api.updateAccountScheduler(quickGroupAccount.id, {
+        group_ids: quickGroupIds,
+      });
+      showToast(t("accounts.groupQuickSaveDone"));
+      await Promise.all([reload(), reloadGroups()]);
+      setQuickGroupAccount(null);
+      setQuickGroupIds([]);
+    } catch (error) {
+      showToast(
+        t("accounts.groupQuickSaveFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setQuickGroupSubmitting(false);
+    }
   };
 
   const handleBatchSaveMeta = async () => {
     const ids = Array.from(selected);
-    if (ids.length === 0) return;
+    if (ids.length === 0 || (!batchUpdateTags && !batchUpdateGroups)) return;
     setBatchMetaSubmitting(true);
     try {
-      const result = await api.batchUpdateAccounts({
-        ids,
-        tags: batchTags,
-        group_ids: batchGroupIds,
-      });
+      const result = await api.batchUpdateAccounts(
+        buildBatchMetadataUpdate({
+          ids,
+          updateTags: batchUpdateTags,
+          tags: batchTags,
+          updateGroups: batchUpdateGroups,
+          groupIds: batchGroupIds,
+        }),
+      );
       showToast(
         t("accounts.batchMetaDone", {
           success: result.success,
@@ -3342,8 +3420,18 @@ export default function Accounts() {
     );
     setEditAutoPause5hDisabled(account.auto_pause_5h_disabled ?? false);
     setEditAutoPause7dDisabled(account.auto_pause_7d_disabled ?? false);
+    setEditIgnoreUsageLimitStatusMode(
+      account.ignore_usage_limit_status_override === true
+        ? "enabled"
+        : account.ignore_usage_limit_status_override === false
+          ? "disabled"
+          : "inherit",
+    );
     setEditDispatchCountLimitInput(
       formatDispatchCountLimitInput(account.dispatch_count_limit),
+    );
+    setEditSchedulerPriorityInput(
+      formatSchedulerPriorityInput(account.scheduler_priority),
     );
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
@@ -3357,6 +3445,8 @@ export default function Accounts() {
       base_url: account.base_url || "https://api.openai.com",
       api_key: "",
       models: account.models ?? [],
+      codex_client_metadata_mode:
+        account.codex_client_metadata_mode ?? "auto",
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
@@ -3393,7 +3483,9 @@ export default function Accounts() {
     setEditAutoPause7dThresholdInput("");
     setEditAutoPause5hDisabled(false);
     setEditAutoPause7dDisabled(false);
+    setEditIgnoreUsageLimitStatusMode("inherit");
     setEditDispatchCountLimitInput("");
+    setEditSchedulerPriorityInput("");
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditCustomHeadersText("");
@@ -3404,6 +3496,7 @@ export default function Accounts() {
       base_url: "https://api.openai.com",
       api_key: "",
       models: [],
+      codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
@@ -3450,6 +3543,9 @@ export default function Accounts() {
   );
   const editDispatchCountLimitInvalid = isDispatchCountLimitInputInvalid(
     editDispatchCountLimitInput,
+  );
+  const editSchedulerPriorityInvalid = isSchedulerPriorityInputInvalid(
+    editSchedulerPriorityInput,
   );
   const editDispatchCountLimitPreview =
     editDispatchCountLimitInvalid
@@ -3531,7 +3627,8 @@ export default function Accounts() {
       reserve7dInputInvalid ||
       editAutoPause5hThresholdInvalid ||
       editAutoPause7dThresholdInvalid ||
-      editDispatchCountLimitInvalid
+      editDispatchCountLimitInvalid ||
+      editSchedulerPriorityInvalid
     ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
       return;
@@ -3565,8 +3662,15 @@ export default function Accounts() {
         ),
         auto_pause_5h_disabled: editAutoPause5hDisabled,
         auto_pause_7d_disabled: editAutoPause7dDisabled,
+        ignore_usage_limit_status_override:
+          editIgnoreUsageLimitStatusMode === "inherit"
+            ? null
+            : editIgnoreUsageLimitStatusMode === "enabled",
         dispatch_count_limit: dispatchCountLimitInputToValue(
           editDispatchCountLimitInput,
+        ),
+        scheduler_priority: schedulerPriorityInputToValue(
+          editSchedulerPriorityInput,
         ),
         custom_headers: parsedCustomHeaders.value,
       };
@@ -3601,12 +3705,22 @@ export default function Accounts() {
     setAllGroups(res.groups ?? []);
   };
 
+  const parsedGroupBaseConcurrency = parseIntegerInput(
+    groupDraft.baseConcurrencyInput,
+  );
+  const groupBaseConcurrencyInvalid =
+    groupDraft.baseConcurrencyInput.trim() !== "" &&
+    (parsedGroupBaseConcurrency === null ||
+      parsedGroupBaseConcurrency < 1 ||
+      parsedGroupBaseConcurrency > 50);
+
   const resetGroupDraft = () => {
     setGroupDraft({
       id: null,
       name: "",
       description: "",
       color: ACCOUNT_GROUP_COLORS[0],
+      baseConcurrencyInput: "",
       auto_pause_5h_threshold: 0,
       auto_pause_7d_threshold: 0,
     });
@@ -3618,6 +3732,11 @@ export default function Accounts() {
       name: group.name,
       description: group.description ?? "",
       color: group.color || ACCOUNT_GROUP_COLORS[0],
+      baseConcurrencyInput:
+        typeof group.base_concurrency_override === "number" &&
+        group.base_concurrency_override > 0
+          ? String(group.base_concurrency_override)
+          : "",
       auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
       auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
     });
@@ -3629,12 +3748,20 @@ export default function Accounts() {
       showToast(t("accounts.groupNameRequired"), "error");
       return;
     }
+    if (groupBaseConcurrencyInvalid) {
+      showToast(t("accounts.groupBaseConcurrencyRange"), "error");
+      return;
+    }
     setGroupSubmitting(true);
     try {
       const payload = {
         name,
         description: groupDraft.description.trim(),
         color: groupDraft.color.trim() || ACCOUNT_GROUP_COLORS[0],
+        base_concurrency_override:
+          groupDraft.baseConcurrencyInput.trim() === ""
+            ? null
+            : parsedGroupBaseConcurrency,
         auto_pause_5h_threshold: groupDraft.auto_pause_5h_threshold,
         auto_pause_7d_threshold: groupDraft.auto_pause_7d_threshold,
       };
@@ -4262,6 +4389,35 @@ export default function Accounts() {
                   variant="outline"
                   size="sm"
                   className="min-w-0"
+                  aria-pressed={sortKey === "schedulerPriority"}
+                  title={t("accounts.schedulerPrioritySortHint")}
+                  onClick={() => {
+                    if (sortKey === "schedulerPriority") {
+                      setSortDir((current) =>
+                        current === "desc" ? "asc" : "desc",
+                      );
+                    } else {
+                      setSortKey("schedulerPriority");
+                      setSortDir("desc");
+                    }
+                    setPage(1);
+                  }}
+                >
+                  <SlidersHorizontal className="size-3.5" />
+                  <span className="truncate">
+                    {t("accounts.schedulerPrioritySort")}
+                  </span>
+                  {sortKey === "schedulerPriority" ? (
+                    <span aria-hidden="true">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                  ) : null}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-w-0"
                   aria-pressed={showEmailDomainTags}
                   onClick={() => setShowEmailDomainTags((visible) => !visible)}
                 >
@@ -4340,6 +4496,7 @@ export default function Accounts() {
                       plan: t("accounts.plan"),
                       tags: t("accounts.tagsLabel"),
                       groups: t("accounts.groupsLabel"),
+                      priority: t("accounts.schedulerPriorityColumn"),
                       status: t("accounts.status"),
                       requests: t("accounts.requests"),
                       usage: t("accounts.usage"),
@@ -4510,6 +4667,17 @@ export default function Accounts() {
                   <PowerOff className="size-3.5" />
                   <span className="hidden sm:inline">{t("accounts.disable")}</span>
                 </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={batchLoading || batchTesting}
+                  onClick={openBatchGroupEditor}
+                >
+                  <FolderOpen className="size-3.5" />
+                  <span className="hidden sm:inline">
+                    {t("accounts.batchGroupEdit")}
+                  </span>
+                </Button>
                 <HeaderActionMenu
                   label={t("accounts.batchMore")}
                   icon={<MoreHorizontal className="size-3.5" />}
@@ -4615,6 +4783,7 @@ export default function Accounts() {
                           onToggleSelect={() => toggleSelect(account.id)}
                           onOpenDetail={() => openAccountDetail(account)}
                           onEdit={() => openSchedulerEditor(account)}
+                          onEditGroups={() => openQuickGroupEditor(account)}
                           onUsage={() => setUsageAccount(account)}
                           onTest={() => setTestingAccount(account)}
                           onRefresh={() => void handleRefresh(account)}
@@ -4673,6 +4842,29 @@ export default function Accounts() {
                         {visibleColumns.groups && (
                           <TableHead className="text-[13px] font-semibold">
                             {t("accounts.groupsLabel")}
+                          </TableHead>
+                        )}
+                        {visibleColumns.priority && (
+                          <TableHead
+                            className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                            onClick={() => {
+                              if (sortKey === "schedulerPriority") {
+                                setSortDir((current) =>
+                                  current === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("schedulerPriority");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.schedulerPriorityColumn")}{" "}
+                            {sortKey === "schedulerPriority"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.plan && (
@@ -4923,7 +5115,14 @@ export default function Accounts() {
                                     account.group_ids ?? [],
                                     allGroups,
                                   )}
+                                  onClick={() => openQuickGroupEditor(account)}
+                                  emptyLabel={t("accounts.groupQuickEdit")}
                                 />
+                              </TableCell>
+                            )}
+                            {visibleColumns.priority && (
+                              <TableCell>
+                                <SchedulerPriorityBadge account={account} />
                               </TableCell>
                             )}
                             {visibleColumns.plan && (
@@ -5545,6 +5744,37 @@ export default function Accounts() {
                         api_key: event.target.value,
                       }))
                     }
+                  />
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.codexClientMetadataMode")}
+                  </label>
+                  <Select
+                    value={
+                      openAIForm.codex_client_metadata_mode ?? "auto"
+                    }
+                    onValueChange={(value) =>
+                      setOpenAIForm((form) => ({
+                        ...form,
+                        codex_client_metadata_mode:
+                          value as CodexClientMetadataMode,
+                      }))
+                    }
+                    options={[
+                      {
+                        value: "auto",
+                        label: t("accounts.codexClientMetadataAuto"),
+                      },
+                      {
+                        value: "always",
+                        label: t("accounts.codexClientMetadataAlways"),
+                      },
+                      {
+                        value: "off",
+                        label: t("accounts.codexClientMetadataOff"),
+                      },
+                    ]}
                   />
                 </div>
                 <div>
@@ -6263,7 +6493,8 @@ export default function Accounts() {
                           reserve7dInputInvalid ||
                           editAutoPause5hThresholdInvalid ||
                           editAutoPause7dThresholdInvalid ||
-                          editDispatchCountLimitInvalid)) ||
+                          editDispatchCountLimitInvalid ||
+                          editSchedulerPriorityInvalid)) ||
                       openAIAccountInputInvalid
                     }
                   >
@@ -6361,6 +6592,37 @@ export default function Accounts() {
                             api_key: event.target.value,
                           }))
                         }
+                      />
+                    </div>
+                    <div>
+                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                        {t("accounts.codexClientMetadataMode")}
+                      </label>
+                      <Select
+                        value={
+                          editOpenAIForm.codex_client_metadata_mode ?? "auto"
+                        }
+                        onValueChange={(value) =>
+                          setEditOpenAIForm((form) => ({
+                            ...form,
+                            codex_client_metadata_mode:
+                              value as CodexClientMetadataMode,
+                          }))
+                        }
+                        options={[
+                          {
+                            value: "auto",
+                            label: t("accounts.codexClientMetadataAuto"),
+                          },
+                          {
+                            value: "always",
+                            label: t("accounts.codexClientMetadataAlways"),
+                          },
+                          {
+                            value: "off",
+                            label: t("accounts.codexClientMetadataOff"),
+                          },
+                        ]}
                       />
                     </div>
                     <div>
@@ -6833,10 +7095,68 @@ export default function Accounts() {
 
                       <div className="rounded-xl border border-border p-4 md:col-span-2">
                         <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.schedulerPriorityTitle")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.schedulerPriorityHint")}
+                        </div>
+                        <div className="mt-3">
+                          <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
+                            {t("accounts.schedulerPriorityLabel")}
+                          </label>
+                          <Input
+                            inputMode="numeric"
+                            value={editSchedulerPriorityInput}
+                            placeholder={t(
+                              "accounts.schedulerPriorityPlaceholder",
+                            )}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                              setEditSchedulerPriorityInput(event.target.value)
+                            }
+                          />
+                          <div
+                            className={`mt-1.5 text-xs ${editSchedulerPriorityInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                          >
+                            {editSchedulerPriorityInvalid
+                              ? t("accounts.schedulerPriorityRange")
+                              : t("accounts.schedulerPriorityDefault")}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <div className="text-sm font-semibold text-foreground">
                           {t("accounts.autoPauseTitle")}
                         </div>
                         <div className="mt-1 text-xs text-muted-foreground">
                           {t("accounts.autoPauseHint")}
+                        </div>
+                        <div className="mt-4 flex flex-col gap-3 border-b border-border pb-4 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-foreground">
+                              {t("accounts.ignoreUsageLimitStatus")}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("accounts.ignoreUsageLimitStatusHint")}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 flex-wrap gap-2">
+                            <TogglePill
+                              active={editIgnoreUsageLimitStatusMode === "inherit"}
+                              onClick={() => setEditIgnoreUsageLimitStatusMode("inherit")}
+                              label={t("accounts.ignoreUsageLimitStatusInherit")}
+                            />
+                            <TogglePill
+                              active={editIgnoreUsageLimitStatusMode === "enabled"}
+                              onClick={() => setEditIgnoreUsageLimitStatusMode("enabled")}
+                              label={t("common.enabled")}
+                            />
+                            <TogglePill
+                              active={editIgnoreUsageLimitStatusMode === "disabled"}
+                              onClick={() => setEditIgnoreUsageLimitStatusMode("disabled")}
+                              label={t("common.disabled")}
+                            />
+                          </div>
                         </div>
                         <div className="mt-4 grid gap-4 md:grid-cols-2">
                           <QuotaAutoPauseWindowEditor
@@ -7005,8 +7325,73 @@ export default function Accounts() {
           </Modal>
 
           <Modal
+            show={Boolean(quickGroupAccount)}
+            title={t("accounts.groupQuickTitle")}
+            contentClassName="sm:max-w-[520px]"
+            onClose={() => {
+              if (quickGroupSubmitting) return;
+              setQuickGroupAccount(null);
+              setQuickGroupIds([]);
+            }}
+            footer={
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={quickGroupSubmitting}
+                  onClick={() => {
+                    setQuickGroupAccount(null);
+                    setQuickGroupIds([]);
+                  }}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button
+                  type="button"
+                  disabled={quickGroupSubmitting}
+                  onClick={() => void handleQuickGroupSave()}
+                >
+                  {quickGroupSubmitting
+                    ? t("common.saving")
+                    : quickGroupIds.length === 0
+                      ? t("accounts.groupQuickClear")
+                      : t("accounts.groupQuickSave")}
+                </Button>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
+                <div className="font-semibold text-foreground">
+                  {quickGroupAccount
+                    ? formatAccountName(quickGroupAccount)
+                    : ""}
+                </div>
+                <div className="mt-1">{t("accounts.groupQuickDesc")}</div>
+              </div>
+              <AccountGroupMultiSelect
+                groups={allGroups}
+                value={quickGroupIds}
+                onChange={setQuickGroupIds}
+                allLabel={t("accounts.groupsUnbound")}
+                selectedLabel={t("accounts.groupsSelected", {
+                  count: quickGroupIds.length,
+                })}
+                placeholder={t("accounts.groupsPlaceholder")}
+                emptyLabel={t("accounts.groupsNone")}
+                emptyHint={t("accounts.groupsSelectHint")}
+                disabled={quickGroupSubmitting}
+              />
+            </div>
+          </Modal>
+
+          <Modal
             show={showBatchMetaEditor}
-            title={t("accounts.batchMetaTitle")}
+            title={t(
+              batchMetaMode === "groups"
+                ? "accounts.batchGroupTitle"
+                : "accounts.batchMetaTitle",
+            )}
             contentClassName="sm:max-w-[560px]"
             onClose={() => {
               if (batchMetaSubmitting) return;
@@ -7025,45 +7410,127 @@ export default function Accounts() {
                 <Button
                   type="button"
                   onClick={() => void handleBatchSaveMeta()}
-                  disabled={batchMetaSubmitting}
+                  disabled={
+                    batchMetaSubmitting ||
+                    (!batchUpdateTags && !batchUpdateGroups)
+                  }
                 >
-                  {batchMetaSubmitting ? t("common.saving") : t("common.save")}
+                  {batchMetaSubmitting
+                    ? t("common.saving")
+                    : batchMetaMode === "groups"
+                      ? batchGroupIds.length === 0
+                        ? t("accounts.batchGroupClear")
+                        : t("accounts.batchGroupReplace")
+                      : t("common.save")}
                 </Button>
               </>
             }
           >
             <div className="space-y-4">
               <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
-                {t("accounts.batchMetaDesc", { count: selected.size })}
+                {t(
+                  batchMetaMode === "groups"
+                    ? "accounts.batchGroupDesc"
+                    : "accounts.batchMetaDesc",
+                  { count: selected.size },
+                )}
               </div>
-              <div className="rounded-xl border border-border p-4">
-                <div className="text-sm font-semibold text-foreground">
-                  {t("accounts.tagsLabel")}
+              {batchMetaMode === "all" ? (
+                <div className="rounded-xl border border-border p-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-foreground">
+                        {t("accounts.tagsLabel")}
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {t("accounts.batchMetaFieldHint")}
+                      </div>
+                    </div>
+                    <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                      <span>
+                        {t(
+                          batchUpdateTags
+                            ? "common.enabled"
+                            : "common.disabled",
+                        )}
+                      </span>
+                      <Switch
+                        checked={batchUpdateTags}
+                        onCheckedChange={setBatchUpdateTags}
+                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.tagsLabel")}`}
+                      />
+                    </label>
+                  </div>
+                  <ChipInput
+                    className="mt-3"
+                    value={batchTags}
+                    onChange={setBatchTags}
+                    placeholder={t(
+                      batchUpdateTags
+                        ? "accounts.tagsPlaceholder"
+                        : "accounts.batchMetaFieldHint",
+                    )}
+                    disabled={!batchUpdateTags}
+                    maxVisible={6}
+                  />
                 </div>
-                <ChipInput
-                  className="mt-3"
-                  value={batchTags}
-                  onChange={setBatchTags}
-                  placeholder={t("accounts.tagsPlaceholder")}
-                  maxVisible={6}
-                />
-              </div>
+              ) : null}
               <div className="rounded-xl border border-border p-4">
-                <div className="text-sm font-semibold text-foreground">
-                  {t("accounts.groupsLabel")}
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-foreground">
+                      {t("accounts.groupsLabel")}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {t(
+                        batchMetaMode === "groups"
+                          ? "accounts.batchGroupFieldHint"
+                          : "accounts.batchMetaFieldHint",
+                      )}
+                    </div>
+                  </div>
+                  {batchMetaMode === "all" ? (
+                    <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                      <span>
+                        {t(
+                          batchUpdateGroups
+                            ? "common.enabled"
+                            : "common.disabled",
+                        )}
+                      </span>
+                      <Switch
+                        checked={batchUpdateGroups}
+                        onCheckedChange={setBatchUpdateGroups}
+                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
+                      />
+                    </label>
+                  ) : null}
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
                     groups={allGroups}
                     value={batchGroupIds}
                     onChange={setBatchGroupIds}
-                    allLabel={t("accounts.groupsUnbound")}
+                    allLabel={t(
+                      batchUpdateGroups
+                        ? "accounts.groupsUnbound"
+                        : "accounts.batchMetaFieldHint",
+                    )}
                     selectedLabel={t("accounts.groupsSelected", {
                       count: batchGroupIds.length,
                     })}
-                    placeholder={t("accounts.groupsPlaceholder")}
+                    placeholder={t(
+                      batchUpdateGroups
+                        ? "accounts.groupsPlaceholder"
+                        : "accounts.batchMetaFieldHint",
+                    )}
                     emptyLabel={t("accounts.groupsNone")}
-                    emptyHint={t("accounts.groupsSelectHint")}
+                    emptyHint={t(
+                      batchUpdateGroups
+                        ? "accounts.groupsSelectHint"
+                        : "accounts.batchMetaFieldHint",
+                    )}
+                    disabled={!batchUpdateGroups}
                   />
                 </div>
               </div>
@@ -7169,7 +7636,11 @@ export default function Accounts() {
                 <Button
                   type="button"
                   onClick={() => void handleSaveGroup()}
-                  disabled={groupSubmitting || !groupDraft.name.trim()}
+                  disabled={
+                    groupSubmitting ||
+                    !groupDraft.name.trim() ||
+                    groupBaseConcurrencyInvalid
+                  }
                 >
                   {groupSubmitting
                     ? t("common.saving")
@@ -7239,6 +7710,14 @@ export default function Accounts() {
                               <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground">
                                 {t("accounts.groupMembers")}{" "}
                                 {group.member_count}
+                              </span>
+                              <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground">
+                                {typeof group.base_concurrency_override === "number" &&
+                                group.base_concurrency_override > 0
+                                  ? t("accounts.groupBaseConcurrencyValue", {
+                                      value: group.base_concurrency_override,
+                                    })
+                                  : t("accounts.groupBaseConcurrencyInherited")}
                               </span>
                             </div>
                             <div className="mt-0.5 truncate text-xs text-muted-foreground">
@@ -7359,6 +7838,35 @@ export default function Accounts() {
                       maxLength={20}
                     />
                   </div>
+                  <label className="block space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupBaseConcurrencyLabel")}
+                    </span>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={50}
+                      step={1}
+                      inputMode="numeric"
+                      value={groupDraft.baseConcurrencyInput}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setGroupDraft((draft) => ({
+                          ...draft,
+                          baseConcurrencyInput: event.target.value,
+                        }))
+                      }
+                      placeholder={t(
+                        "accounts.groupBaseConcurrencyPlaceholder",
+                      )}
+                    />
+                    <p
+                      className={`text-[11px] ${groupBaseConcurrencyInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                    >
+                      {groupBaseConcurrencyInvalid
+                        ? t("accounts.groupBaseConcurrencyRange")
+                        : t("accounts.groupBaseConcurrencyHint")}
+                    </p>
+                  </label>
                   <div className="space-y-1.5">
                     <span className="text-xs font-semibold text-muted-foreground">
                       {t("accounts.groupAutoPause5hThreshold")}
@@ -7521,8 +8029,17 @@ function RecycleBinView({
     null,
   );
   const [planFilter, setPlanFilter] = useState<
-    "all" | "pro" | "prolite" | "plus" | "team" | "free" | "api" | "unknown"
+    | "all"
+    | "pro"
+    | "prolite"
+    | "plus"
+    | "team"
+    | "k12"
+    | "free"
+    | "api"
+    | "unknown"
   >("all");
+  const [exporting, setExporting] = useState(false);
   const [showEmptyConfirm, setShowEmptyConfirm] = useState(false);
   const [emptyConfirmText, setEmptyConfirmText] = useState("");
   const [autoRestore, setAutoRestore] = useState(() => {
@@ -7541,7 +8058,7 @@ function RecycleBinView({
     DEFAULT_PAGE_SIZE_OPTIONS,
   );
 
-  const busy = batchActing || emptying || batchTesting;
+  const busy = batchActing || emptying || batchTesting || exporting;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -7800,6 +8317,65 @@ function RecycleBinView({
     }
   };
 
+  const handleExport = async (
+    format: "json" | "txt",
+    scope: "selected" | "filtered",
+  ) => {
+    const ids =
+      scope === "selected"
+        ? [...selectedIds]
+        : filteredRows.map((row) => row.id);
+    if (ids.length === 0) {
+      showToast(t("accounts.exportNoAccounts"), "error");
+      return;
+    }
+    setExporting(true);
+    try {
+      const data = await api.exportRecycleBinAccounts(ids);
+      if (data.length === 0) {
+        showToast(t("accounts.exportNoAccounts"), "error");
+        return;
+      }
+      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      let exportedCount = data.length;
+      if (format === "json") {
+        const blob = new Blob([JSON.stringify(data, null, 2)], {
+          type: "application/json",
+        });
+        downloadBlob(blob, `codex2api-recycle-${ts}-${data.length}.json`);
+      } else {
+        // TXT：每行一个邮箱（无邮箱则用 account_id 兜底），不导出 token。
+        const lines = data
+          .map((e) => {
+            const email = (e.email || "").trim();
+            if (email) return email;
+            return (e.account_id || "").trim();
+          })
+          .filter(Boolean);
+        if (lines.length === 0) {
+          showToast(t("accounts.exportNoAccounts"), "error");
+          return;
+        }
+        exportedCount = lines.length;
+        const blob = new Blob([`${lines.join("\n")}\n`], {
+          type: "text/plain;charset=utf-8",
+        });
+        downloadBlob(
+          blob,
+          `codex2api-recycle-emails-${ts}-${lines.length}.txt`,
+        );
+      }
+      showToast(t("accounts.exportSuccess", { count: exportedCount }));
+    } catch (error) {
+      showToast(
+        `${t("accounts.exportFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const emptyKeyword = t("accounts.recycleBinEmptyKeyword");
   const emptyConfirmMatched = emptyConfirmText.trim() === emptyKeyword;
 
@@ -7852,6 +8428,32 @@ function RecycleBinView({
                 <ToggleLeft className="size-4 text-muted-foreground" />
               )}
               <span className="max-sm:hidden">{t("accounts.recycleBinAutoRestore")}</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy || loading || filteredRows.length === 0}
+              onClick={() => void handleExport("json", "filtered")}
+              title={t("accounts.recycleBinExportFilteredJson")}
+            >
+              <Download className="size-3.5" />
+              <span className="max-sm:hidden">
+                {exporting
+                  ? t("accounts.recycleBinExporting")
+                  : t("accounts.recycleBinExportFilteredJson")}
+              </span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy || loading || filteredRows.length === 0}
+              onClick={() => void handleExport("txt", "filtered")}
+              title={t("accounts.recycleBinExportFilteredTxt")}
+            >
+              <FileText className="size-3.5" />
+              <span className="max-sm:hidden">
+                {t("accounts.recycleBinExportFilteredTxt")}
+              </span>
             </Button>
             <Button
               variant="outline"
@@ -7925,6 +8527,7 @@ function RecycleBinView({
                     "prolite",
                     "plus",
                     "team",
+                    "k12",
                     "free",
                     "api",
                     "unknown",
@@ -7945,9 +8548,11 @@ function RecycleBinView({
                         ? t("accounts.recycleBinPlanUnknown")
                         : key === "prolite"
                           ? "ProLite"
-                          : key === "api"
-                            ? "API"
-                            : key.charAt(0).toUpperCase() + key.slice(1)}
+                          : key === "k12"
+                            ? "K12"
+                            : key === "api"
+                              ? "API"
+                              : key.charAt(0).toUpperCase() + key.slice(1)}
                   </button>
                 ))}
               </div>
@@ -7959,6 +8564,26 @@ function RecycleBinView({
                     count: selectedIds.size,
                   })}
                 </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void handleExport("json", "selected")}
+                  title={t("accounts.recycleBinExportSelectedJson")}
+                >
+                  <Download className="size-3.5" />
+                  {t("accounts.recycleBinExportSelectedJson")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void handleExport("txt", "selected")}
+                  title={t("accounts.recycleBinExportSelectedTxt")}
+                >
+                  <FileText className="size-3.5" />
+                  {t("accounts.recycleBinExportSelectedTxt")}
+                </Button>
                 <Button
                   size="sm"
                   variant="outline"
@@ -8624,6 +9249,34 @@ function getDispatchScore(account: AccountRow): number {
   return account.dispatch_score ?? account.scheduler_score ?? 0;
 }
 
+function getSchedulerPriority(account: AccountRow): number {
+  const value = account.scheduler_priority;
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.trunc(value)
+    : 0;
+}
+
+function SchedulerPriorityBadge({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  const priority = getSchedulerPriority(account);
+  const value = priority > 0 ? `+${priority}` : String(priority);
+  const tone =
+    priority > 0
+      ? "border-blue-500/25 bg-blue-500/10 text-blue-700 dark:text-blue-300"
+      : priority < 0
+        ? "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+        : "border-border bg-muted/40 text-muted-foreground";
+
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center rounded-md border px-1.5 py-0.5 text-[10px] font-semibold tabular-nums ${tone}`}
+      title={t("accounts.schedulerPriorityBadgeTitle", { value })}
+    >
+      P {value}
+    </span>
+  );
+}
+
 // OpenAI reports the $100 Pro tier as "prolite" — functionally a Pro plan with
 // a smaller usage cap. Keep behavioral comparisons (usage windows, plan filter,
 // scheduler bias) aligned with the Go side by folding it into "pro".
@@ -8720,11 +9373,16 @@ function getAccountRateLimitWindow(
     reason === "rate_limited" ||
     reason === "rate_limited_5h" ||
     reason === "rate_limited_7d";
-  const has7dLimit = isActiveUsageWindowExhausted(
-    account.usage_percent_7d,
-    account.reset_7d_at,
-  );
+  const usageWindowsAreInformational =
+    account.ignore_usage_limit_status_effective === true;
+  const has7dLimit =
+    !usageWindowsAreInformational &&
+    isActiveUsageWindowExhausted(
+      account.usage_percent_7d,
+      account.reset_7d_at,
+    );
   const has5hLimit =
+    !usageWindowsAreInformational &&
     isPremiumUsagePlan(account.plan_type) &&
     isActiveUsageWindowExhausted(account.usage_percent_5h, account.reset_5h_at);
   const has5hAutoPause = isActiveAutoPauseWindowReached(
@@ -9684,13 +10342,27 @@ function resolveAccountGroups(
   return ids.map((id) => byID.get(id)).filter(Boolean) as AccountGroup[];
 }
 
-function GroupChipList({ groups }: { groups: AccountGroup[] }) {
-  if (groups.length === 0) return null;
+function GroupChipList({
+  groups,
+  onClick,
+  emptyLabel,
+}: {
+  groups: AccountGroup[];
+  onClick?: () => void;
+  emptyLabel?: string;
+}) {
+  if (groups.length === 0 && !onClick) return null;
   const visible = groups.slice(0, 3);
   const hidden = groups.length - visible.length;
 
-  return (
-    <div className="mt-1.5 flex flex-wrap gap-1">
+  const content = (
+    <>
+      {groups.length === 0 ? (
+        <span className="inline-flex items-center gap-1 rounded-md border border-dashed border-border px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
+          <Plus className="size-2.5" />
+          {emptyLabel}
+        </span>
+      ) : null}
       {visible.map((group) => {
         const color = normalizeGroupColor(group.color);
         return (
@@ -9714,8 +10386,26 @@ function GroupChipList({ groups }: { groups: AccountGroup[] }) {
           +{hidden}
         </span>
       )}
-    </div>
+      {onClick && groups.length > 0 ? (
+        <Pencil className="mt-0.5 size-3 text-muted-foreground opacity-60 transition-opacity group-hover:opacity-100" />
+      ) : null}
+    </>
   );
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className="group mt-1.5 flex flex-wrap items-center gap-1 text-left"
+        onClick={onClick}
+        title={emptyLabel}
+      >
+        {content}
+      </button>
+    );
+  }
+
+  return <div className="mt-1.5 flex flex-wrap gap-1">{content}</div>;
 }
 
 function ColumnSettingsMenu({
@@ -9807,6 +10497,7 @@ function AccountMobileCard({
   onToggleSelect,
   onOpenDetail,
   onEdit,
+  onEditGroups,
   onUsage,
   onTest,
   onRefresh,
@@ -9833,6 +10524,7 @@ function AccountMobileCard({
   onToggleSelect: () => void;
   onOpenDetail: () => void;
   onEdit: () => void;
+  onEditGroups: () => void;
   onUsage: () => void;
   onTest: () => void;
   onRefresh: () => void;
@@ -9910,6 +10602,7 @@ function AccountMobileCard({
                 #{sequence}
               </span>
               <PlanBadge planType={account.plan_type} />
+              <SchedulerPriorityBadge account={account} />
               <AccountStatusCountdown account={account} />
               <ExpiryBadge
                 expiresAt={account.subscription_expires_at}
@@ -10109,12 +10802,14 @@ function AccountMobileCard({
           </div>
         </div>
 
-        {((account.tags ?? []).length > 0 || groups.length > 0) && (
-          <div className="mx-5 space-y-1.5 border-t border-border/70 py-3">
-            <ChipList items={account.tags ?? []} tone="purple" />
-            <GroupChipList groups={groups} />
-          </div>
-        )}
+        <div className="mx-5 space-y-1.5 border-t border-border/70 py-3">
+          <ChipList items={account.tags ?? []} tone="purple" />
+          <GroupChipList
+            groups={groups}
+            onClick={onEditGroups}
+            emptyLabel={t("accounts.groupQuickEdit")}
+          />
+        </div>
 
         <div className="mt-auto border-t border-border/70 bg-muted/15 p-4">
           <div className="flex flex-wrap items-center gap-2">
@@ -10180,6 +10875,7 @@ function AccountMobileCard({
                     #{sequence}
                   </span>
                   <PlanBadge planType={account.plan_type} />
+                  <SchedulerPriorityBadge account={account} />
                   <ExpiryBadge
                     expiresAt={account.subscription_expires_at}
                     planType={account.plan_type}
@@ -10331,19 +11027,19 @@ function AccountMobileCard({
         </AccountMobileMetric>
       </div>
 
-      {((account.tags ?? []).length > 0 ||
-        (!isPersonal && showEmailDomainTags && getAccountEmailDomain(account)) ||
-        groups.length > 0) && (
-        <div className="mt-3 space-y-1.5 border-t border-border pt-2">
-          <ChipList items={account.tags ?? []} tone="purple" />
-          {!isPersonal && showEmailDomainTags && getAccountEmailDomain(account) && (
-            <div className="mt-1.5 flex flex-wrap gap-1">
-              <EmailDomainBadge domain={getAccountEmailDomain(account)} t={t} />
-            </div>
-          )}
-          <GroupChipList groups={groups} />
-        </div>
-      )}
+      <div className="mt-3 space-y-1.5 border-t border-border pt-2">
+        <ChipList items={account.tags ?? []} tone="purple" />
+        {!isPersonal && showEmailDomainTags && getAccountEmailDomain(account) && (
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            <EmailDomainBadge domain={getAccountEmailDomain(account)} t={t} />
+          </div>
+        )}
+        <GroupChipList
+          groups={groups}
+          onClick={onEditGroups}
+          emptyLabel={t("accounts.groupQuickEdit")}
+        />
+      </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-1.5">
         <AccountMobileActionButton

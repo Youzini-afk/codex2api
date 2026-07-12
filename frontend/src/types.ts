@@ -7,6 +7,7 @@ export interface ToastState {
 }
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
+export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
 
 export interface StatsResponse {
   total: number
@@ -40,6 +41,7 @@ export interface AccountRow {
   base_url?: string
   models?: string[]
   model_mapping?: string
+  codex_client_metadata_mode?: CodexClientMetadataMode
   custom_headers?: Record<string, string> | null
   health_tier?: string
   scheduler_score?: number
@@ -91,7 +93,10 @@ export interface AccountRow {
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
   auto_pause_7d_disabled?: boolean
+  ignore_usage_limit_status_override?: boolean | null
+  ignore_usage_limit_status_effective?: boolean
   dispatch_count_limit?: number | null
+  scheduler_priority?: number | null
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
   dispatch_count_limited?: boolean
@@ -215,6 +220,7 @@ export interface AddOpenAIResponsesAccountRequest {
   api_key: string
   models: string[]
   model_mapping?: string
+  codex_client_metadata_mode?: CodexClientMetadataMode
   proxy_url: string
   custom_headers?: Record<string, string> | null
 }
@@ -225,6 +231,7 @@ export interface UpdateOpenAIResponsesAccountRequest {
   api_key?: string
   models: string[]
   model_mapping?: string
+  codex_client_metadata_mode?: CodexClientMetadataMode
   proxy_url: string
   custom_headers?: Record<string, string> | null
 }
@@ -255,7 +262,9 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
   auto_pause_7d_disabled?: boolean
+  ignore_usage_limit_status_override?: boolean | null
   dispatch_count_limit?: number | null
+  scheduler_priority?: number | null
   custom_headers?: Record<string, string> | null
 }
 
@@ -272,6 +281,7 @@ export interface AccountGroup {
   color: string
   sort_order: number
   member_count: number
+  base_concurrency_override: number | null
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
   created_at: ISODateString
@@ -287,6 +297,7 @@ export interface CreateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -296,6 +307,7 @@ export interface UpdateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -612,6 +624,8 @@ export interface SystemSettings {
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
   auto_clean_expired: boolean
+  auto_reset_credits_enabled: boolean
+  auto_reset_credits_before_expiry_min: number
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   codex_force_websocket: boolean
@@ -690,6 +704,7 @@ export interface SystemSettings {
   smart_pacing_enabled: boolean
   smart_pacing_min_concurrency: number
   smart_pacing_windows: string
+  ignore_usage_limit_status: boolean
 }
 
 export interface SetupHintsResponse {
@@ -1021,6 +1036,19 @@ export interface ChartModelPoint {
 export interface ChartAggregation {
   timeline: ChartTimelinePoint[]
   models: ChartModelPoint[]
+}
+
+export interface ModelPricingOverride {
+  source?: string
+  input?: number
+  cached_input?: number
+  output?: number
+  input_priority?: number
+  cached_input_priority?: number
+  output_priority?: number
+  input_long?: number
+  cached_input_long?: number
+  output_long?: number
 }
 
 export interface APIKeyLimits {

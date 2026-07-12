@@ -97,7 +97,15 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 	}
 
 	state := proxy.ApplyWhamUsage(h.store, account, usage)
+	// wham 不含订阅到期字段，按需从网页端 /subscriptions 补权威到期时间
+	// （带节流，best-effort，失败不影响探针结果）。(issue #360)
+	proxy.MaybeSyncSubscriptionExpiry(ctx, h.store, account, h.store.ResolveProxyForAccount(account))
 	if limited {
+		if state.UsageWindowLimitsIgnored {
+			// WHAM remains metadata-only in Responses-authoritative mode. It must
+			// not clear a cooldown established by a real Responses failure.
+			return nil
+		}
 		// 限流/冷却态下，用 wham 返回的权威用量窗口重新判定：
 		// 若上游已重置窗口、不再限流（例如官方提前重置了 5h/7d 用量），
 		// 则主动解除限流冷却，无需等待冷却到期或用户手动测试连接。

@@ -19,6 +19,7 @@ type fastSchedulerEntry struct {
 	dbID          int64
 	dispatchScore float64
 	proven        bool
+	priority      int64 // 账号调度优先级（issue #358）：全局降序选择，同优先级内再按健康桶调度
 }
 
 type fastSchedulerPosition struct {
@@ -30,7 +31,8 @@ type fastSchedulerPosition struct {
 // 它不在请求热路径内重算全量 score，而是直接复用 Account 上已缓存的
 // HealthTier / DispatchScore / DynamicConcurrencyLimit。
 //
-// 调度策略：按健康层级分桶，桶内按调度分排序后 round-robin。
+// 调度策略：调度优先级全局优先；同优先级内按健康层级分桶，
+// 桶内按调度分排序后 round-robin。
 // 验证过的账号只作为同分 tie-breaker，避免历史请求量盖过额度快重置优先级。
 type FastScheduler struct {
 	mu            sync.RWMutex
@@ -114,6 +116,9 @@ func (s *FastScheduler) SetSchedulerMode(mode string) {
 		}
 		if mode == "remaining_quota" {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				usageI := entries[i].acc.usagePercentForScheduling()
 				usageJ := entries[j].acc.usagePercentForScheduling()
 				if usageI == usageJ {
@@ -126,6 +131,9 @@ func (s *FastScheduler) SetSchedulerMode(mode string) {
 			})
 		} else {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				if entries[i].dispatchScore == entries[j].dispatchScore {
 					if entries[i].proven != entries[j].proven {
 						return entries[i].proven
@@ -200,6 +208,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 			dbID:          acc.DBID,
 			dispatchScore: dispatchScore,
 			proven:        proven,
+			priority:      acc.schedulerPriority(),
 		})
 	}
 
@@ -211,6 +220,9 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		}
 		if s.schedulerMode == "remaining_quota" {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				usageI := entries[i].acc.usagePercentForScheduling()
 				usageJ := entries[j].acc.usagePercentForScheduling()
 				if usageI == usageJ {
@@ -223,6 +235,9 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 			})
 		} else {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				if entries[i].dispatchScore == entries[j].dispatchScore {
 					if entries[i].proven != entries[j].proven {
 						return entries[i].proven
@@ -293,43 +308,77 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 
 	baseLimit := s.baseLimit
 	usageMaxAge := s.usageMaxAge
-	var zeroCursor atomic.Uint64
 	for {
 		changed := false
-		for tierIdx, tier := range fastSchedulerTierOrder {
-			bucket := s.buckets[tier]
-			if len(bucket) == 0 {
-				continue
-			}
-
-			// 阶段 1：优先在验证过的账号（桶前部 provenBound 个）中 round-robin
-			if s.schedulerMode != "remaining_quota" {
-				provenBound := s.provenBounds[tierIdx]
-				if provenBound > 0 {
-					acc, stale := s.scanRangeLocked(tier, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, usageMaxAge, now, apiKeyID, exclude, filter)
-					if acc != nil {
-						return acc
-					}
-					if stale {
-						changed = true
-						break
-					}
+		// 每个健康桶都已按 priority DESC 排序。用三路归并的方式逐级取全局
+		// 最高优先级，并在该优先级内按 healthy -> warm -> risky 扫描。
+		// 只有所有健康桶的当前优先级都不可用时，才会回落到下一优先级。
+		var segmentStarts [3]int
+	priorityLoop:
+		for {
+			var nextPriority int64
+			foundPriority := false
+			for tierIdx, tier := range fastSchedulerTierOrder {
+				bucket := s.buckets[tier]
+				start := segmentStarts[tierIdx]
+				if start >= len(bucket) {
+					continue
+				}
+				priority := bucket[start].priority
+				if !foundPriority || priority > nextPriority {
+					nextPriority = priority
+					foundPriority = true
 				}
 			}
-
-			// 阶段 2：回退到全量 round-robin
-			cursor := &s.cursors[tierIdx]
-			if s.schedulerMode == "remaining_quota" {
-				zeroCursor.Store(0)
-				cursor = &zeroCursor
-			}
-			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), cursor, baseLimit, usageMaxAge, now, apiKeyID, exclude, filter)
-			if acc != nil {
-				return acc
-			}
-			if stale {
-				changed = true
+			if !foundPriority {
 				break
+			}
+
+			for tierIdx, tier := range fastSchedulerTierOrder {
+				bucket := s.buckets[tier]
+				segStart := segmentStarts[tierIdx]
+				if segStart >= len(bucket) || bucket[segStart].priority != nextPriority {
+					continue
+				}
+				segEnd := segStart + 1
+				for segEnd < len(bucket) && bucket[segEnd].priority == nextPriority {
+					segEnd++
+				}
+
+				// 阶段 1：优先在 segment 内验证过的账号中 round-robin（非 remaining_quota 模式）
+				if s.schedulerMode != "remaining_quota" {
+					provenBound := s.provenBounds[tierIdx]
+					if provenBound > segStart {
+						provenEnd := provenBound
+						if provenEnd > segEnd {
+							provenEnd = segEnd
+						}
+						acc, stale := s.scanRangeLocked(tier, segStart, provenEnd, &s.provenCurs[tierIdx], baseLimit, usageMaxAge, now, apiKeyID, exclude, filter)
+						if acc != nil {
+							return acc
+						}
+						if stale {
+							changed = true
+							break priorityLoop
+						}
+					}
+				}
+
+				// 阶段 2：回退到 segment 内全量 round-robin
+				cursor := &s.cursors[tierIdx]
+				var zeroCursor atomic.Uint64
+				if s.schedulerMode == "remaining_quota" {
+					cursor = &zeroCursor
+				}
+				acc, stale := s.scanRangeLocked(tier, segStart, segEnd, cursor, baseLimit, usageMaxAge, now, apiKeyID, exclude, filter)
+				if acc != nil {
+					return acc
+				}
+				if stale {
+					changed = true
+					break priorityLoop
+				}
+				segmentStarts[tierIdx] = segEnd
 			}
 		}
 		if !changed {
@@ -429,9 +478,13 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		dbID:          acc.DBID,
 		dispatchScore: dispatchScore,
 		proven:        proven,
+		priority:      acc.schedulerPriority(),
 	})
 	if s.schedulerMode == "remaining_quota" {
 		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].priority != entries[j].priority {
+				return entries[i].priority > entries[j].priority
+			}
 			usageI := entries[i].acc.usagePercentForScheduling()
 			usageJ := entries[j].acc.usagePercentForScheduling()
 			if usageI == usageJ {
@@ -447,6 +500,9 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		// 这样同一个 round 里,用得少的账号被先轮到,自然把负载摊平到所有可用账号上,
 		// 避免出现"轮询模式仍然一直薅同一个号"的现象 (issue #150)。
 		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].priority != entries[j].priority {
+				return entries[i].priority > entries[j].priority
+			}
 			usageI := entries[i].acc.usagePercentForScheduling()
 			usageJ := entries[j].acc.usagePercentForScheduling()
 			if usageI == usageJ {
@@ -462,6 +518,9 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		})
 	} else {
 		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].priority != entries[j].priority {
+				return entries[i].priority > entries[j].priority
+			}
 			if entries[i].dispatchScore == entries[j].dispatchScore {
 				if entries[i].proven != entries[j].proven {
 					return entries[i].proven

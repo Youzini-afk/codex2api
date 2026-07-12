@@ -82,6 +82,13 @@
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
+<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> 提供高性价比 AI 模型 API 接入服务，支持 OpenAI、Claude、Gemini 等主流模型。充值比例仅 0.2 元 = 1 美元额度，调用成本低至官方价格 1 折以内。套餐 ¥25/28 天起，其中尊享套餐 ¥129/28 天，包含约 $4752 模型额度（套餐仅支持 OpenAI 模型），支持高并发请求及 95%+ SLA 稳定保障。</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex/Claude Code，价格大约是官方的 1 折不到！通过链接注册，使用优惠码 <code>CODEX2API</code> 即可获得 3$ 测试额度。</td>
 </tr>
@@ -112,6 +119,7 @@
 - [核心能力](#核心能力)
 - [目录结构](#目录结构)
 - [常见注意事项](#常见注意事项)
+- [交流群](#交流群)
 - [免责声明](#免责声明与开源协议)
 - [Star History](#star-history)
 - [友情链接](#友情链接)
@@ -587,6 +595,15 @@ codex2api/
 - 本地手动构建 Go 二进制前需先执行 `frontend/` 的 `npm run build`
 - `.env` 只负责端口、数据库、Redis 等物理层配置；业务参数在管理台数据库里维护
 - API Key 以数据库为准，在管理台中配置
+
+---
+
+## 交流群
+
+- QQ 交流群：[点击链接加入群聊【codex2api】](https://qun.qq.com/universal-share/share?ac=1&authKey=6vwawW4MeqdACT7PajnHlf2lLkjfuNXEMSos67l9FBiAJ8t%2BKeaXJXB0dgsnhFa1&busi_data=eyJncm91cENvZGUiOiI4MTY3Mzk4NDIiLCJ0b2tlbiI6ImU1YW1KR3dNaXZoUXZDUWpYTWVncmdmMXhQV1RwQ21tbEhkdjB5VW45aWVPSjhFM2grMkRHNGdhWnhEU29oS08iLCJ1aW4iOiIxMTYzNDc2OTQ5In0%3D&data=adSomD6r40Al25rBr8PocFCKumQR5oxi1kq5jXjXxeJ49Z5cj4QLzbNf6vfIQKWMORrJntrZtcoyQuHg2ksUeA&svctype=4&tempid=h5_group_info)（群号：816739842）
+- Telegram 群组：[加入 Telegram 群组](https://t.me/+9hJAA3ZWQxxmMzE5)
+
+欢迎加群交流部署、使用与二次开发相关问题。
 
 ---
 

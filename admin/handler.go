@@ -51,6 +51,9 @@ type Handler struct {
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
+	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	recordAccountEvent     func(int64, string, string)
 	cpuSampler             *cpuSampler
 	startedAt              time.Time
 	pgMaxConns             int
@@ -72,9 +75,20 @@ type Handler struct {
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
 
-	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
-	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
-	resetCreditLocks sync.Map
+	// 「主动重置次数」消耗操作的工作区级互斥锁（workspace -> *sync.Mutex），
+	// 串行化同一上游工作区的并发重置，避免重复消耗与次数计数竞态。
+	resetCreditLocks          sync.Map
+	resetCreditLastSuccess    sync.Map
+	resetCreditSuccessfulIDs  sync.Map
+	autoResetCreditsWake      chan struct{}
+	autoResetCreditsStartOnce sync.Once
+	autoResetCreditsWG        sync.WaitGroup
+	resetCreditPostMu         sync.Mutex
+	resetCreditPostWG         sync.WaitGroup
+	resetCreditPostCtx        context.Context
+	resetCreditPostCancel     context.CancelFunc
+	resetCreditPostClosed     bool
+	settingsUpdateMu          sync.Mutex
 
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
@@ -343,7 +357,11 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
+	handler.queryResetCredits = proxy.QueryWhamResetCredits
+	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
+	handler.autoResetCreditsWake = make(chan struct{}, 1)
 	if db != nil {
+		handler.recordAccountEvent = db.InsertAccountEventAsync
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
 			log.Printf("标记中断生图任务失败: %v", err)
 		}
@@ -395,6 +413,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
+	api.GET("/accounts/recycle-bin/export", h.ExportRecycleBinAccounts)
 	api.DELETE("/accounts/recycle-bin", h.EmptyRecycleBin)
 	api.POST("/accounts/recycle-bin/batch-test", h.RecycleBinBatchTest)
 	api.POST("/accounts/:id/restore", h.RestoreAccount)
@@ -459,6 +478,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
 	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
+	api.GET("/model-pricing", h.ListModelPricing)
+	api.PUT("/model-pricing", h.UpdateModelPricing)
+	api.POST("/model-pricing/sync", h.SyncModelPricing)
 	api.GET("/image-prompts", h.ListImagePromptTemplates)
 	api.POST("/image-prompts", h.CreateImagePromptTemplate)
 	api.PATCH("/image-prompts/:id", h.UpdateImagePromptTemplate)
@@ -657,6 +679,7 @@ type accountResponse struct {
 	BaseURL                   string                     `json:"base_url,omitempty"`
 	Models                    []string                   `json:"models,omitempty"`
 	ModelMapping              string                     `json:"model_mapping,omitempty"`
+	CodexClientMetadataMode   string                     `json:"codex_client_metadata_mode,omitempty"`
 	CustomHeaders             map[string]string          `json:"custom_headers,omitempty"`
 	HealthTier                string                     `json:"health_tier"`
 	SchedulerScore            float64                    `json:"scheduler_score"`
@@ -688,10 +711,13 @@ type accountResponse struct {
 	AutoPause7dThreshold      *float64                   `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled       bool                       `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled       bool                       `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride        *bool                      `json:"ignore_usage_limit_status_override"`
+	UsageLimitEffective       bool                       `json:"ignore_usage_limit_status_effective"`
 	DispatchCountLimit        *int64                     `json:"dispatch_count_limit"`
 	DispatchCountUsed         int64                      `json:"dispatch_count_used,omitempty"`
 	DispatchCountResetAt      string                     `json:"dispatch_count_reset_at,omitempty"`
 	DispatchCountLimited      bool                       `json:"dispatch_count_limited,omitempty"`
+	SchedulerPriority         *int64                     `json:"scheduler_priority"`
 	Usage5hDetail             *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
 	Usage7dDetail             *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                 string                     `json:"reset_5h_at,omitempty"`
@@ -811,6 +837,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if isOpenAIResponsesAccount && planType == "" {
 			planType = "api"
 		}
+		codexClientMetadataMode := ""
+		if isOpenAIResponsesAccount {
+			codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
+		}
+		ignoreUsageLimitStatusOverride := row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
+		ignoreUsageLimitStatusEffective := h.store.IgnoreUsageLimitStatus()
+		if ignoreUsageLimitStatusOverride != nil {
+			ignoreUsageLimitStatusEffective = *ignoreUsageLimitStatusOverride
+		}
 		resp := accountResponse{
 			ID:                        row.ID,
 			Name:                      row.Name,
@@ -831,6 +866,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			BaseURL:                   baseURL,
 			Models:                    row.GetCredentialStringSlice("models"),
 			ModelMapping:              row.GetCredential("model_mapping"),
+			CodexClientMetadataMode:   codexClientMetadataMode,
 			CustomHeaders:             row.GetCredentialStringMap("custom_headers"),
 			ProxyURL:                  row.ProxyURL,
 			Enabled:                   row.Enabled,
@@ -848,13 +884,18 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			UpdatedAt:                 row.UpdatedAt.Format(time.RFC3339),
 			CodexUsageUpdatedAt:       row.GetCredential("codex_usage_updated_at"),
 			Codex5HUsageUpdatedAt:     row.GetCredential("codex_5h_usage_updated_at"),
+			UsageLimitOverride:        ignoreUsageLimitStatusOverride,
+			UsageLimitEffective:       ignoreUsageLimitStatusEffective,
 		}
 		resp.AutoPause5hThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_5h_threshold")
 		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 		resp.DispatchCountLimit = accountDispatchCountLimit(row)
+		resp.SchedulerPriority = accountSchedulerPriority(row)
 		if acc, ok := accountMap[row.ID]; ok {
+			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
+			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
 			acc.Mu().RUnlock()
@@ -1036,7 +1077,9 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dThreshold    json.RawMessage `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled     json.RawMessage `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled     json.RawMessage `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride      json.RawMessage `json:"ignore_usage_limit_status_override"`
 	DispatchCountLimit      json.RawMessage `json:"dispatch_count_limit"`
+	SchedulerPriority       json.RawMessage `json:"scheduler_priority"`
 	ProxyURL                json.RawMessage `json:"proxy_url"`
 	CustomHeaders           json.RawMessage `json:"custom_headers"`
 }
@@ -1054,7 +1097,9 @@ type accountSchedulerUpdate struct {
 	AutoPause7dThreshold    optionalFloat64
 	AutoPause5hDisabled     database.OptionalBool
 	AutoPause7dDisabled     database.OptionalBool
+	UsageLimitOverride      optionalNullableBool
 	DispatchCountLimit      database.OptionalNullInt64
+	SchedulerPriority       database.OptionalNullInt64
 	ProxyURL                database.OptionalString
 	CustomHeaders           optionalCustomHeaders
 	CredentialUpdates       map[string]interface{}
@@ -1109,7 +1154,15 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	ignoreUsageLimitStatusOverride, err := parseOptionalNullableBoolField(req.UsageLimitOverride, "ignore_usage_limit_status_override")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 	dispatchCountLimit, err := parseOptionalIntegerField(req.DispatchCountLimit, "dispatch_count_limit", 0, 1000000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	schedulerPriority, err := parseOptionalIntegerField(req.SchedulerPriority, "scheduler_priority", -100, 100)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1138,11 +1191,25 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if autoPause7dDisabled.Set {
 		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
 	}
+	if ignoreUsageLimitStatusOverride.Set {
+		if ignoreUsageLimitStatusOverride.Value == nil {
+			credentialUpdates["ignore_usage_limit_status_override"] = nil
+		} else {
+			credentialUpdates["ignore_usage_limit_status_override"] = *ignoreUsageLimitStatusOverride.Value
+		}
+	}
 	if dispatchCountLimit.Set {
 		if dispatchCountLimit.Value.Valid {
 			credentialUpdates["dispatch_count_limit"] = dispatchCountLimit.Value.Int64
 		} else {
 			credentialUpdates["dispatch_count_limit"] = int64(0)
+		}
+	}
+	if schedulerPriority.Set {
+		if schedulerPriority.Value.Valid {
+			credentialUpdates["scheduler_priority"] = schedulerPriority.Value.Int64
+		} else {
+			credentialUpdates["scheduler_priority"] = int64(0)
 		}
 	}
 	if len(credentialUpdates) == 0 {
@@ -1162,7 +1229,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		AutoPause7dThreshold:    autoPause7dThreshold,
 		AutoPause5hDisabled:     autoPause5hDisabled,
 		AutoPause7dDisabled:     autoPause7dDisabled,
+		UsageLimitOverride:      ignoreUsageLimitStatusOverride,
 		DispatchCountLimit:      dispatchCountLimit,
+		SchedulerPriority:       schedulerPriority,
 		ProxyURL:                proxyURL,
 		CustomHeaders:           customHeaders,
 		CredentialUpdates:       credentialUpdates,
@@ -1182,7 +1251,9 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.AutoPause7dThreshold.Set ||
 		u.AutoPause5hDisabled.Set ||
 		u.AutoPause7dDisabled.Set ||
+		u.UsageLimitOverride.Set ||
 		u.DispatchCountLimit.Set ||
+		u.SchedulerPriority.Set ||
 		u.ProxyURL.Set
 }
 
@@ -1346,8 +1417,14 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			optionalBoolPtr(update.AutoPause7dDisabled),
 		)
 	}
+	if update.UsageLimitOverride.Set {
+		h.store.ApplyAccountIgnoreUsageLimitStatus(id, update.UsageLimitOverride.Value)
+	}
 	if update.DispatchCountLimit.Set {
 		h.store.ApplyAccountDispatchCountLimit(id, nullableInt64Pointer(update.DispatchCountLimit.Value))
+	}
+	if update.SchedulerPriority.Set {
+		h.store.ApplyAccountSchedulerPriority(id, nullableInt64Pointer(update.SchedulerPriority.Value))
 	}
 	if update.Tags.Set {
 		h.store.ApplyAccountTags(id, update.Tags.Values)
@@ -1366,6 +1443,11 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 type optionalCustomHeaders struct {
 	Set    bool
 	Values map[string]string
+}
+
+type optionalNullableBool struct {
+	Set   bool
+	Value *bool
 }
 
 func parseOptionalCustomHeadersField(raw json.RawMessage) (optionalCustomHeaders, error) {
@@ -1532,6 +1614,20 @@ func accountDispatchCountLimit(row *database.AccountRow) *int64 {
 	return &value
 }
 
+func accountSchedulerPriority(row *database.AccountRow) *int64 {
+	value, ok := row.GetCredentialInt64("scheduler_priority")
+	if !ok || value == 0 {
+		return nil
+	}
+	if value > 100 {
+		value = 100
+	}
+	if value < -100 {
+		value = -100
+	}
+	return &value
+}
+
 func parseOptionalStringSliceField(raw json.RawMessage, field string) (optionalStringSlice, error) {
 	if len(raw) == 0 {
 		return optionalStringSlice{}, nil
@@ -1658,6 +1754,21 @@ func parseOptionalIntegerPatchField(raw json.RawMessage, field string, minValue,
 		return database.OptionalNullInt64{}, err
 	}
 	return value, nil
+}
+
+func parseOptionalNullableBoolField(raw json.RawMessage, field string) (optionalNullableBool, error) {
+	if len(raw) == 0 {
+		return optionalNullableBool{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalNullableBool{Set: true}, nil
+	}
+
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return optionalNullableBool{}, fmt.Errorf("%s 必须是布尔值或 null", field)
+	}
+	return optionalNullableBool{Set: true, Value: &value}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
@@ -2644,13 +2755,14 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 }
 
 type addOpenAIResponsesAccountReq struct {
-	Name          string            `json:"name"`
-	BaseURL       string            `json:"base_url"`
-	APIKey        string            `json:"api_key"`
-	Models        []string          `json:"models"`
-	ModelMapping  string            `json:"model_mapping"`
-	ProxyURL      string            `json:"proxy_url"`
-	CustomHeaders map[string]string `json:"custom_headers"`
+	Name                    string            `json:"name"`
+	BaseURL                 string            `json:"base_url"`
+	APIKey                  string            `json:"api_key"`
+	Models                  []string          `json:"models"`
+	ModelMapping            string            `json:"model_mapping"`
+	CodexClientMetadataMode *string           `json:"codex_client_metadata_mode"`
+	ProxyURL                string            `json:"proxy_url"`
+	CustomHeaders           map[string]string `json:"custom_headers"`
 }
 
 type fetchOpenAIResponsesModelsReq struct {
@@ -2707,6 +2819,14 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	codexClientMetadataMode := auth.CodexClientMetadataModeAuto
+	if req.CodexClientMetadataMode != nil {
+		if !auth.IsValidCodexClientMetadataMode(*req.CodexClientMetadataMode) {
+			writeError(c, http.StatusBadRequest, "codex_client_metadata_mode 必须是 auto、always 或 off")
+			return
+		}
+		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(*req.CodexClientMetadataMode)
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -2732,13 +2852,14 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		name = "openai-responses"
 	}
 	credentials := map[string]interface{}{
-		"upstream_type": auth.UpstreamOpenAIResponses,
-		"base_url":      baseURL,
-		"api_key":       req.APIKey,
-		"models":        models,
-		"model_mapping": modelMapping,
-		"plan_type":     "api",
-		"email":         baseURL,
+		"upstream_type":              auth.UpstreamOpenAIResponses,
+		"base_url":                   baseURL,
+		"api_key":                    req.APIKey,
+		"models":                     models,
+		"model_mapping":              modelMapping,
+		"codex_client_metadata_mode": codexClientMetadataMode,
+		"plan_type":                  "api",
+		"email":                      baseURL,
 	}
 	if len(customHeaders) > 0 {
 		credentials["custom_headers"] = cloneCustomHeaders(customHeaders)
@@ -2751,17 +2872,18 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
 
 	h.store.AddAccount(&auth.Account{
-		DBID:          id,
-		ProxyURL:      req.ProxyURL,
-		HealthTier:    auth.HealthTierHealthy,
-		UpstreamType:  auth.UpstreamOpenAIResponses,
-		BaseURL:       baseURL,
-		APIKey:        req.APIKey,
-		Models:        models,
-		ModelMapping:  modelMapping,
-		CustomHeaders: customHeaders,
-		Email:         baseURL,
-		PlanType:      "api",
+		DBID:                    id,
+		ProxyURL:                req.ProxyURL,
+		HealthTier:              auth.HealthTierHealthy,
+		UpstreamType:            auth.UpstreamOpenAIResponses,
+		BaseURL:                 baseURL,
+		APIKey:                  req.APIKey,
+		Models:                  models,
+		ModelMapping:            modelMapping,
+		CodexClientMetadataMode: codexClientMetadataMode,
+		CustomHeaders:           customHeaders,
+		Email:                   baseURL,
+		PlanType:                "api",
 	})
 
 	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
@@ -2893,6 +3015,14 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	codexClientMetadataMode := auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
+	if req.CodexClientMetadataMode != nil {
+		if !auth.IsValidCodexClientMetadataMode(*req.CodexClientMetadataMode) {
+			writeError(c, http.StatusBadRequest, "codex_client_metadata_mode 必须是 auto、always 或 off")
+			return
+		}
+		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(*req.CodexClientMetadataMode)
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -2909,13 +3039,14 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	}
 
 	credentials := map[string]interface{}{
-		"upstream_type":  auth.UpstreamOpenAIResponses,
-		"base_url":       baseURL,
-		"models":         models,
-		"model_mapping":  modelMapping,
-		"plan_type":      "api",
-		"email":          baseURL,
-		"custom_headers": cloneCustomHeaders(customHeaders),
+		"upstream_type":              auth.UpstreamOpenAIResponses,
+		"base_url":                   baseURL,
+		"models":                     models,
+		"model_mapping":              modelMapping,
+		"codex_client_metadata_mode": codexClientMetadataMode,
+		"plan_type":                  "api",
+		"email":                      baseURL,
+		"custom_headers":             cloneCustomHeaders(customHeaders),
 	}
 	if req.APIKey != "" {
 		credentials["api_key"] = req.APIKey
@@ -2934,7 +3065,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, modelMapping, req.ProxyURL)
+		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, modelMapping, codexClientMetadataMode, req.ProxyURL)
 		h.store.ApplyAccountCustomHeaders(id, customHeaders)
 	}
 	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
@@ -6333,6 +6464,8 @@ type settingsResponse struct {
 	AutoCleanFullUsage                 bool    `json:"auto_clean_full_usage"`
 	AutoCleanError                     bool    `json:"auto_clean_error"`
 	AutoCleanExpired                   bool    `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled            bool    `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin    int     `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                   bool    `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled               bool    `json:"fast_scheduler_enabled"`
 	CodexForceWebsocket                bool    `json:"codex_force_websocket"`
@@ -6409,6 +6542,7 @@ type settingsResponse struct {
 	SmartPacingEnabled                 bool    `json:"smart_pacing_enabled"`
 	SmartPacingMinConcurrency          int     `json:"smart_pacing_min_concurrency"`
 	SmartPacingWindows                 string  `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus             bool    `json:"ignore_usage_limit_status"`
 }
 
 type updateSettingsReq struct {
@@ -6439,6 +6573,8 @@ type updateSettingsReq struct {
 	AutoCleanFullUsage                 *bool    `json:"auto_clean_full_usage"`
 	AutoCleanError                     *bool    `json:"auto_clean_error"`
 	AutoCleanExpired                   *bool    `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled            *bool    `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin    *int     `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                   *bool    `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled               *bool    `json:"fast_scheduler_enabled"`
 	CodexForceWebsocket                *bool    `json:"codex_force_websocket"`
@@ -6508,6 +6644,7 @@ type updateSettingsReq struct {
 	SmartPacingEnabled                 *bool    `json:"smart_pacing_enabled"`
 	SmartPacingMinConcurrency          *int     `json:"smart_pacing_min_concurrency"`
 	SmartPacingWindows                 *string  `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus             *bool    `json:"ignore_usage_limit_status"`
 }
 
 type brandingResponse struct {
@@ -7002,6 +7139,12 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
+	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	if dbSettings != nil {
+		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
+		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
+	}
 	imgCfg := imagestore.CurrentConfig()
 	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
 	bgCfg := defaultBackgroundConfig()
@@ -7037,6 +7180,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:                     h.store.GetAutoCleanError(),
 		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:            autoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:    autoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
@@ -7112,6 +7257,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
 		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
 		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:             h.store.IgnoreUsageLimitStatus(),
 	})
 }
 
@@ -7122,6 +7268,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
 	if req.AutoPause5hThreshold != nil {
 		if err := validateAutoPauseThreshold("auto_pause_5h_threshold", *req.AutoPause5hThreshold); err != nil {
 			writeError(c, http.StatusBadRequest, err.Error())
@@ -7161,6 +7309,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	}
+	if req.AutoResetCreditsBeforeExpiryMin != nil {
+		if *req.AutoResetCreditsBeforeExpiryMin < 10 || *req.AutoResetCreditsBeforeExpiryMin > 10080 {
+			writeError(c, http.StatusBadRequest, "auto_reset_credits_before_expiry_min 需在 10 到 10080 分钟之间")
+			return
+		}
+	}
 
 	currentAdminSecret := ""
 	previousAdminSecret := ""
@@ -7169,7 +7323,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
 	publicKeyUsagePageEnabled := true
-	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
+	modelPricingOverrides := "{}"
+	modelPricingSyncURL := ""
+	persistedAutoResetCreditsEnabled := false
+	persistedAutoResetCreditsBeforeExpiryMin := 60
+	existingSettings, settingsErr := h.db.GetSystemSettings(c.Request.Context())
+	if settingsErr != nil {
+		writeError(c, http.StatusInternalServerError, "读取现有设置失败："+settingsErr.Error())
+		return
+	}
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
 		previousAdminSecret = existingSettings.AdminSecret
@@ -7178,6 +7340,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
 		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
+		modelPricingOverrides = existingSettings.ModelPricingOverrides
+		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
+		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
+		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -7228,6 +7394,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	adminSecretChanged := h.adminSecretEnv == "" && req.AdminSecret != nil && strings.TrimSpace(currentAdminSecret) != strings.TrimSpace(previousAdminSecret)
 	runtimeCfg := proxy.CurrentRuntimeSettings()
+	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
+	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
+	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
+	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
+	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
+		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
 	usageLogMode := h.db.GetUsageLogMode()
 	usageLogBatchSize := h.db.GetUsageLogBatchSize()
 	usageLogFlushIntervalSeconds := h.db.GetUsageLogFlushIntervalSeconds()
@@ -7652,7 +7826,32 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetSmartPacingWindows(*req.SmartPacingWindows)
 		log.Printf("设置已更新: smart_pacing_windows = %s", h.store.GetSmartPacingWindows())
 	}
-	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
+	if req.IgnoreUsageLimitStatus != nil {
+		h.store.SetIgnoreUsageLimitStatus(*req.IgnoreUsageLimitStatus)
+		log.Printf("设置已更新: ignore_usage_limit_status = %t", *req.IgnoreUsageLimitStatus)
+	}
+	if req.AutoResetCreditsEnabled != nil {
+		runtimeCfg.AutoResetCreditsEnabled = *req.AutoResetCreditsEnabled
+		log.Printf("设置已更新: auto_reset_credits_enabled = %t", *req.AutoResetCreditsEnabled)
+	}
+	if req.AutoResetCreditsBeforeExpiryMin != nil {
+		runtimeCfg.AutoResetCreditsBeforeExpiryMin = *req.AutoResetCreditsBeforeExpiryMin
+		log.Printf("设置已更新: auto_reset_credits_before_expiry_min = %d", *req.AutoResetCreditsBeforeExpiryMin)
+	}
+	// 自动消费属于不可逆操作。先归一化待保存值，但在数据库确认保存成功前，
+	// 运行态继续使用旧的自动消费配置，避免持久化失败后后台任务仍然开始消费。
+	runtimeCfg = proxy.NormalizeRuntimeSettings(runtimeCfg)
+	effectiveRuntimeCfg := runtimeCfg
+	if autoResetCreditsChanged {
+		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
+		effectiveRuntimeCfg.AutoResetCreditsBeforeExpiryMin = previousAutoResetCreditsBeforeExpiryMin
+	}
+	effectiveRuntimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+		// CodexSyncedCLIVersion 由后台同步任务独立维护；管理员保存其他设置时
+		// 必须保留临界区内读到的最新值，避免反向回滚同步结果。
+		effectiveRuntimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+		return effectiveRuntimeCfg
+	})
 
 	usageLogChanged := false
 	if req.UsageLogMode != nil {
@@ -7873,6 +8072,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:                     h.store.GetAutoCleanError(),
 		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:            runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:    runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
@@ -7937,9 +8138,23 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
 		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
 		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:             h.store.IgnoreUsageLimitStatus(),
+		ModelPricingOverrides:              modelPricingOverrides,
+		ModelPricingSyncURL:                modelPricingSyncURL,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if autoResetCreditsChanged {
+			runtimeCfg = effectiveRuntimeCfg
+			writeError(c, http.StatusInternalServerError, "保存自动消耗设置失败，设置未生效")
+			return
+		}
+	} else if autoResetCreditsChanged {
+		runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+			runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+			return runtimeCfg
+		})
+		h.triggerAutoResetCreditsScan()
 	}
 	if adminSecretChanged && h.sessionStore != nil {
 		h.sessionStore.Clear()
@@ -7987,6 +8202,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:                     h.store.GetAutoCleanError(),
 		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:            runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:    runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
@@ -8060,6 +8277,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
 		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
 		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:             h.store.IgnoreUsageLimitStatus(),
 	})
 }
 
@@ -8205,6 +8423,59 @@ func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
 	})
 }
 
+// accountRowToCPAExportEntry 将数据库账号行转为 CPA 导出条目；无凭证时返回 false。
+func accountRowToCPAExportEntry(row *database.AccountRow) (cpaExportEntry, bool) {
+	if row == nil {
+		return cpaExportEntry{}, false
+	}
+	rt := row.GetCredential("refresh_token")
+	at := row.GetCredential("access_token")
+	// AT-only accounts (没有 refresh_token,只靠 access_token,常用于规避
+	// add-phone 的 Plus 号) 也需要可导出与可迁移。仅当两个凭证都缺失才跳过。
+	if rt == "" && at == "" {
+		return cpaExportEntry{}, false
+	}
+	// account_id 在凭据中存储为 chatgpt_account_id（新字段）或 account_id（历史字段）
+	accountID := row.GetCredential("chatgpt_account_id")
+	if accountID == "" {
+		accountID = row.GetCredential("account_id")
+	}
+	return cpaExportEntry{
+		Type:                  "codex",
+		Email:                 row.GetCredential("email"),
+		PlanType:              row.GetCredential("plan_type"),
+		Codex7DUsedPercent:    row.GetCredential("codex_7d_used_percent"),
+		Codex7DResetAt:        row.GetCredential("codex_7d_reset_at"),
+		Codex5HUsedPercent:    row.GetCredential("codex_5h_used_percent"),
+		Codex5HResetAt:        row.GetCredential("codex_5h_reset_at"),
+		Codex5HUsageUpdatedAt: row.GetCredential("codex_5h_usage_updated_at"),
+		CodexUsageUpdatedAt:   row.GetCredential("codex_usage_updated_at"),
+		Expired:               row.GetCredential("expires_at"),
+		IDToken:               row.GetCredential("id_token"),
+		AccountID:             accountID,
+		AccessToken:           at,
+		LastRefresh:           row.UpdatedAt.Format(time.RFC3339),
+		RefreshToken:          rt,
+	}, true
+}
+
+func parseExportIDSet(idsParam string) map[int64]bool {
+	idsParam = strings.TrimSpace(idsParam)
+	if idsParam == "" {
+		return nil
+	}
+	idSet := make(map[int64]bool)
+	for _, s := range strings.Split(idsParam, ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+			idSet[id] = true
+		}
+	}
+	if len(idSet) == 0 {
+		return nil
+	}
+	return idSet
+}
+
 // ExportAccounts 导出账号（CPA JSON 格式）
 func (h *Handler) ExportAccounts(c *gin.Context) {
 	filter := c.DefaultQuery("filter", "healthy")
@@ -8232,16 +8503,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 		return
 	}
 
-	// 按指定 ID 过滤
-	var idSet map[int64]bool
-	if idsParam != "" {
-		idSet = make(map[int64]bool)
-		for _, s := range strings.Split(idsParam, ",") {
-			if id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
-				idSet[id] = true
-			}
-		}
-	}
+	idSet := parseExportIDSet(idsParam)
 
 	// 构建运行时状态映射（用于健康过滤）
 	runtimeMap := make(map[int64]*auth.Account)
@@ -8262,39 +8524,43 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 				continue
 			}
 		}
-		rt := row.GetCredential("refresh_token")
-		at := row.GetCredential("access_token")
-		// AT-only accounts (没有 refresh_token,只靠 access_token,常用于规避
-		// add-phone 的 Plus 号) 也需要可导出与可迁移。仅当两个凭证都缺失才跳过。
-		if rt == "" && at == "" {
+		entry, ok := accountRowToCPAExportEntry(row)
+		if !ok {
 			continue
 		}
-		// account_id 在凭据中存储为 chatgpt_account_id（新字段）或 account_id（历史字段）
-		accountID := row.GetCredential("chatgpt_account_id")
-		if accountID == "" {
-			accountID = row.GetCredential("account_id")
-		}
-		entries = append(entries, cpaExportEntry{
-			Type:                  "codex",
-			Email:                 row.GetCredential("email"),
-			PlanType:              row.GetCredential("plan_type"),
-			Codex7DUsedPercent:    row.GetCredential("codex_7d_used_percent"),
-			Codex7DResetAt:        row.GetCredential("codex_7d_reset_at"),
-			Codex5HUsedPercent:    row.GetCredential("codex_5h_used_percent"),
-			Codex5HResetAt:        row.GetCredential("codex_5h_reset_at"),
-			Codex5HUsageUpdatedAt: row.GetCredential("codex_5h_usage_updated_at"),
-			CodexUsageUpdatedAt:   row.GetCredential("codex_usage_updated_at"),
-			Expired:               row.GetCredential("expires_at"),
-			IDToken:               row.GetCredential("id_token"),
-			AccountID:             accountID,
-			AccessToken:           at,
-			LastRefresh:           row.UpdatedAt.Format(time.RFC3339),
-			RefreshToken:          rt,
-		})
+		entries = append(entries, entry)
 	}
 
 	if entries == nil {
 		entries = []cpaExportEntry{}
+	}
+	c.JSON(http.StatusOK, entries)
+}
+
+// ExportRecycleBinAccounts 导出回收站账号（CPA JSON 格式）。
+// GET /api/admin/accounts/recycle-bin/export?ids=1,2,3
+// ids 可选：不传则导出回收站全部；传了则只导出指定 ID（须在回收站中）。
+func (h *Handler) ExportRecycleBinAccounts(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	rows, err := h.db.ListDeleted(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "查询回收站失败: "+err.Error())
+		return
+	}
+
+	idSet := parseExportIDSet(c.Query("ids"))
+	entries := make([]cpaExportEntry, 0, len(rows))
+	for _, row := range rows {
+		if idSet != nil && !idSet[row.ID] {
+			continue
+		}
+		entry, ok := accountRowToCPAExportEntry(row)
+		if !ok {
+			continue
+		}
+		entries = append(entries, entry)
 	}
 	c.JSON(http.StatusOK, entries)
 }

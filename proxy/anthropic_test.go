@@ -42,6 +42,56 @@ func TestSendAnthropicStreamErrorEscapesJSON(t *testing.T) {
 	}
 }
 
+func TestAnthropicStreamContentBlockStartPreservesEmptyFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		block anthropicContentBlock
+		field string
+	}{
+		{"thinking block", anthropicContentBlock{Type: "thinking"}, "thinking"},
+		{"text block", anthropicContentBlock{Type: "text"}, "text"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := 0
+			data, err := json.Marshal(anthropicStreamEvent{
+				Type:         "content_block_start",
+				Index:        &idx,
+				ContentBlock: &tc.block,
+			})
+			if err != nil {
+				t.Fatalf("marshal content_block_start: %v", err)
+			}
+
+			field := gjson.GetBytes(data, "content_block."+tc.field)
+			if !field.Exists() || field.String() != "" {
+				t.Fatalf("content_block.%s = %q, exists=%v; body=%s", tc.field, field.String(), field.Exists(), data)
+			}
+		})
+	}
+}
+
+func TestAnthropicStreamToolUseStartOmitsTextAndThinkingFields(t *testing.T) {
+	idx := 0
+	data, err := json.Marshal(anthropicStreamEvent{
+		Type:  "content_block_start",
+		Index: &idx,
+		ContentBlock: &anthropicContentBlock{
+			Type:  "tool_use",
+			ID:    "toolu_abc",
+			Name:  "Read",
+			Input: json.RawMessage("{}"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal content_block_start: %v", err)
+	}
+	if gjson.GetBytes(data, "content_block.text").Exists() || gjson.GetBytes(data, "content_block.thinking").Exists() {
+		t.Fatalf("tool_use content_block_start should not include text/thinking fields; body=%s", data)
+	}
+}
+
 func TestTranslateAnthropicToCodex_OutputConfigEffortTakesPrecedence(t *testing.T) {
 	raw := []byte(`{
 		"model":"claude-sonnet-4-5",
@@ -60,6 +110,30 @@ func TestTranslateAnthropicToCodex_OutputConfigEffortTakesPrecedence(t *testing.
 	}
 	if summary := gjson.GetBytes(got, "reasoning.summary").String(); summary != "auto" {
 		t.Fatalf("reasoning.summary = %q, want auto; body=%s", summary, got)
+	}
+}
+
+func TestTranslateAnthropicToCodex_OutputConfigMaxPreservedForGPT56(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{"role":"user","content":"hello"}],
+		"output_config":{"effort":"max"}
+	}`)
+
+	got, _, err := TranslateAnthropicToCodexWithModels(
+		raw,
+		`{"claude-sonnet-4-5":"gpt-5.6-sol"}`,
+		[]string{"gpt-5.6-sol"},
+	)
+	if err != nil {
+		t.Fatalf("TranslateAnthropicToCodexWithModels returned error: %v", err)
+	}
+
+	if model := gjson.GetBytes(got, "model").String(); model != "gpt-5.6-sol" {
+		t.Fatalf("model = %q, want gpt-5.6-sol; body=%s", model, got)
+	}
+	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "max" {
+		t.Fatalf("reasoning.effort = %q, want max; body=%s", effort, got)
 	}
 }
 

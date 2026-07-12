@@ -57,6 +57,39 @@ type anthropicContentBlock struct {
 	IsError   bool                  `json:"is_error,omitempty"`
 }
 
+func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
+	type contentBlock struct {
+		Type      string                `json:"type"`
+		Text      *string               `json:"text,omitempty"`
+		Thinking  *string               `json:"thinking,omitempty"`
+		Source    *anthropicImageSource `json:"source,omitempty"`
+		ID        string                `json:"id,omitempty"`
+		Name      string                `json:"name,omitempty"`
+		Input     json.RawMessage       `json:"input,omitempty"`
+		ToolUseID string                `json:"tool_use_id,omitempty"`
+		Content   json.RawMessage       `json:"content,omitempty"`
+		IsError   bool                  `json:"is_error,omitempty"`
+	}
+
+	out := contentBlock{
+		Type:      b.Type,
+		Source:    b.Source,
+		ID:        b.ID,
+		Name:      b.Name,
+		Input:     b.Input,
+		ToolUseID: b.ToolUseID,
+		Content:   b.Content,
+		IsError:   b.IsError,
+	}
+	if b.Type == "text" || b.Text != "" {
+		out.Text = &b.Text
+	}
+	if b.Type == "thinking" || b.Thinking != "" {
+		out.Thinking = &b.Thinking
+	}
+	return json.Marshal(out)
+}
+
 type anthropicImageSource struct {
 	Type      string `json:"type"`
 	MediaType string `json:"media_type"`
@@ -267,7 +300,7 @@ func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string
 
 	// reasoning effort: align Claude Code /v1/messages with the Responses reasoning shape.
 	out["reasoning"] = map[string]any{
-		"effort":  resolveReasoningEffort(req.OutputConfig),
+		"effort":  resolveReasoningEffort(req.OutputConfig, codexModel),
 		"summary": "auto",
 	}
 
@@ -466,9 +499,9 @@ func extractToolResultText(b anthropicContentBlock) string {
 // resolveReasoningEffort maps Claude output_config.effort to Responses reasoning.effort.
 // Claude thinking.type/budget_tokens only indicates that thinking mode exists; it
 // does not control effort on this OpenAI/Codex compatibility path.
-func resolveReasoningEffort(outputConfig *anthropicOutputConfig) string {
+func resolveReasoningEffort(outputConfig *anthropicOutputConfig, model string) string {
 	if outputConfig != nil && strings.TrimSpace(outputConfig.Effort) != "" {
-		return normalizeReasoningEffort(outputConfig.Effort)
+		return normalizeReasoningEffortForModel(outputConfig.Effort, model)
 	}
 	return "high"
 }

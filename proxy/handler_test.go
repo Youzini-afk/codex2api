@@ -228,6 +228,7 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	}
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetCodexModelMapping(`{"client-ws-alias":"gpt-5.4"}`)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
 	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
 
@@ -246,13 +247,16 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"gpt-5.4","previous_response_id":"resp_prev","input":"hello"}`)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"client-ws-alias","previous_response_id":"resp_prev","input":"hello"}`)); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
 	select {
 	case gotBody := <-bodyCh:
 		if gjson.GetBytes(gotBody, "type").String() != "response.create" {
 			t.Fatalf("upstream type missing: %s", gotBody)
+		}
+		if model := gjson.GetBytes(gotBody, "model").String(); model != "gpt-5.4" {
+			t.Fatalf("upstream model = %q, want mapped gpt-5.4; body=%s", model, gotBody)
 		}
 		if prev := gjson.GetBytes(gotBody, "previous_response_id").String(); prev != "resp_prev" {
 			t.Fatalf("previous_response_id = %q, want resp_prev; body=%s", prev, gotBody)
@@ -875,6 +879,7 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 		MaxRetries:          0,
 		MaxRateLimitRetries: 0,
 	})
+	store.SetCodexModelMapping(`{"client-compact-alias":"gpt-4.1-direct","gpt-4.1-direct":"gpt-4.1-second"}`)
 	store.AddAccount(&auth.Account{
 		DBID:         1,
 		UpstreamType: auth.UpstreamOpenAIResponses,
@@ -886,7 +891,7 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	handler := NewHandler(store, nil, nil, nil)
 
 	body := []byte(`{
-		"model":"gpt-4.1-direct",
+		"model":"client-compact-alias",
 		"input":"hello",
 		"include":["reasoning.encrypted_content"],
 		"store":true,
@@ -919,6 +924,58 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	}
 	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_compact_test" {
 		t.Fatalf("response id = %q, want resp_compact_test; body=%s", id, recorder.Body.String())
+	}
+}
+
+func TestResponsesCompactAppliesAccountMappingBeforeSuffixFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_compact_mapped",
+			"object":"response",
+			"model":"gpt-5.5",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.5"},
+		ModelMapping: `{"gpt-5.6-sol-openai-compact":"gpt-5.5"}`,
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`)
+	requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body)).WithContext(requestCtx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != "gpt-5.5" {
+		t.Fatalf("upstream model = %q, want gpt-5.5; body=%s", model, seenBody)
 	}
 }
 
@@ -1286,14 +1343,49 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 		}
 	})
 
-	t.Run("compaction input item", func(t *testing.T) {
+	t.Run("durable compaction history item", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(recorder)
 		ctx.Set("raw_body", []byte(`{
 			"model":"gpt-5.4",
 			"input":[
 				{"type":"message","role":"user","content":"hello"},
-				{"type":"compaction","summary":"previous context was compacted"}
+				{"type":"compaction","encrypted_content":"opaque-history"}
+			]
+		}`))
+		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if input.Compact {
+			t.Fatal("Compact = true, want false for durable compaction history item")
+		}
+	})
+
+	t.Run("durable context compaction history item", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Set("raw_body", []byte(`{
+			"model":"gpt-5.4",
+			"input":{"type":"context_compaction","id":"cmp_123"}
+		}`))
+		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if input.Compact {
+			t.Fatal("Compact = true, want false for durable context_compaction history item")
+		}
+	})
+
+	t.Run("top level compaction trigger array item", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Set("raw_body", []byte(`{
+			"model":"gpt-5.4",
+			"input":[
+				{"type":"message","role":"user","content":"hello"},
+				{"type":"compaction_trigger"}
 			]
 		}`))
 		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
@@ -1301,23 +1393,36 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 		populateCompactUsageMetaFromRequest(ctx, input)
 
 		if !input.Compact {
-			t.Fatal("Compact = false, want true for compaction input item")
+			t.Fatal("Compact = false, want true for top-level compaction_trigger array item")
 		}
 	})
 
-	t.Run("nested compaction input item", func(t *testing.T) {
+	t.Run("top level compaction trigger object", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Set("raw_body", []byte(`{
+			"model":"gpt-5.4",
+			"input":{"type":"compaction_trigger"}
+		}`))
+		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if !input.Compact {
+			t.Fatal("Compact = false, want true for top-level compaction_trigger object")
+		}
+	})
+
+	t.Run("nested compaction trigger in tool output", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(recorder)
 		ctx.Set("raw_body", []byte(`{
 			"model":"gpt-5.4",
 			"input":[
 				{
-					"type":"message",
-					"role":"developer",
-					"content":[
-						{"type":"input_text","text":"keep this context"},
-						{"type":"compaction","summary":"previous context was compacted"}
-					]
+					"type":"function_call_output",
+					"call_id":"call_123",
+					"output":{"type":"compaction_trigger","value":"ordinary tool data"}
 				}
 			]
 		}`))
@@ -1325,8 +1430,8 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 
 		populateCompactUsageMetaFromRequest(ctx, input)
 
-		if !input.Compact {
-			t.Fatal("Compact = false, want true for nested compaction input item")
+		if input.Compact {
+			t.Fatal("Compact = true, want false for nested compaction_trigger in tool output")
 		}
 	})
 
@@ -2659,10 +2764,150 @@ func TestResolveAPIKeyDistinguishesDBFailureFrom404(t *testing.T) {
 	}
 }
 
-// body-signal compact:中转账号池收到带 compaction_trigger 的普通 /responses
-// 请求时,必须整体提升到 compact 专用链路(上游命中 /v1/responses/compact),
-// 否则中转上游返回非压缩响应,客户端报 expected exactly one compaction output item。
-func TestResponses_BodySignalCompactPromotedOnRelayOnlyPool(t *testing.T) {
+// body-signal compact:中转账号池收到带 compaction_trigger 的流式 /responses
+// 请求时，必须保留 /responses 的 SSE 协议；compact 专用模型映射只能改写模型，
+// 不能把请求改道到返回一次性 JSON 的 /responses/compact（issue #361）。
+func TestResponses_BodySignalCompactStaysStreamingOnRelayOnlyPool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		if r.URL.Path == "/v1/responses/compact" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"id":"resp_compaction_test",
+				"object":"response.compaction",
+				"created_at":1710000000,
+				"model":"gpt-4.1-direct",
+				"output":[{"type":"compaction_summary","summary":"user likes blue"}],
+				"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+			}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_compaction_test"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_compaction_test","status":"completed","output":[{"type":"compaction_summary","summary":"user likes blue"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.SetCodexModelMapping(`{"client-body-signal-alias-openai-compact":"gpt-4.1-direct","gpt-4.1-direct":"gpt-4.1-second"}`)
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"client-body-signal-alias",
+		"stream":true,
+		"client_metadata":{"x-codex-window-id":"w-1","x-codex-installation-id":"i-1"},
+		"input":[
+			{"role":"user","content":"my favorite color is blue"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses to preserve streaming", seenPath)
+	}
+	if !gjson.GetBytes(seenBody, "stream").Bool() {
+		t.Fatalf("upstream body must preserve stream=true, got %s", seenBody)
+	}
+	if !requestBodyHasCompactionTrigger(seenBody) {
+		t.Fatalf("upstream body lost compaction_trigger: %s", seenBody)
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != "gpt-4.1-direct" {
+		t.Fatalf("streaming compact model = %q, want one-pass mapping to gpt-4.1-direct; body=%s", model, seenBody)
+	}
+	if contentType := recorder.Header().Get("Content-Type"); !strings.Contains(contentType, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream; body=%s", contentType, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"response.completed"`) {
+		t.Fatalf("downstream stream missing response.completed; body=%s", recorder.Body.String())
+	}
+}
+
+// 流式 body-signal 继续走 /responses 时，也必须保留账号级 compact 专用映射；
+// 否则 compact-only alias 无法选中中转账号，或会把错误模型发给上游（PR #350）。
+func TestResponses_BodySignalCompactStreamingUsesAccountCompactMapping(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_account_mapping","status":"completed","output":[{"type":"compaction_summary","summary":"mapped"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		ModelMapping: `{"gpt-5.4-openai-compact":"gpt-4.1-direct"}`,
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"stream":true,
+		"input":[{"type":"compaction_trigger"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != "gpt-4.1-direct" {
+		t.Fatalf("upstream model = %q, want account compact mapping target gpt-4.1-direct; body=%s", model, seenBody)
+	}
+}
+
+// 非流式 body-signal 没有 SSE 契约，继续使用 compact 专用端点以兼容只实现
+// /responses/compact 的中转账号。
+func TestResponses_NonStreamingBodySignalCompactStillUsesCompactEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var seenPath string
@@ -2672,11 +2917,9 @@ func TestResponses_BodySignalCompactPromotedOnRelayOnlyPool(t *testing.T) {
 		seenBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
-			"id":"resp_compaction_test",
+			"id":"resp_non_stream_compaction",
 			"object":"response.compaction",
-			"created_at":1710000000,
-			"model":"gpt-4.1-direct",
-			"output":[{"type":"compaction_summary","summary":"user likes blue"}],
+			"output":[{"type":"compaction_summary","summary":"done"}],
 			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
 		}`))
 	}))
@@ -2699,12 +2942,8 @@ func TestResponses_BodySignalCompactPromotedOnRelayOnlyPool(t *testing.T) {
 
 	body := []byte(`{
 		"model":"gpt-4.1-direct",
-		"stream":true,
-		"client_metadata":{"x-codex-window-id":"w-1","x-codex-installation-id":"i-1"},
-		"input":[
-			{"role":"user","content":"my favorite color is blue"},
-			{"type":"compaction_trigger"}
-		]
+		"stream":false,
+		"input":[{"type":"compaction_trigger"}]
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -2718,22 +2957,16 @@ func TestResponses_BodySignalCompactPromotedOnRelayOnlyPool(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	if seenPath != "/v1/responses/compact" {
-		t.Fatalf("upstream path = %q, want /v1/responses/compact (body-signal must be promoted)", seenPath)
+		t.Fatalf("upstream path = %q, want /v1/responses/compact", seenPath)
 	}
 	if gjson.GetBytes(seenBody, "stream").Exists() {
-		t.Fatalf("promoted upstream body should not carry stream, got %s", seenBody)
-	}
-	// compact 端点不认识 client_metadata,提升时必须剥除(issue #340)。
-	if gjson.GetBytes(seenBody, "client_metadata").Exists() {
-		t.Fatalf("promoted upstream body should not carry client_metadata, got %s", seenBody)
-	}
-	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_compaction_test" {
-		t.Fatalf("response id = %q, want resp_compaction_test; body=%s", id, recorder.Body.String())
+		t.Fatalf("compact upstream body should not carry stream, got %s", seenBody)
 	}
 }
 
-// 不带 compaction_trigger 的普通请求不受提升逻辑影响,仍走 /v1/responses。
-func TestResponses_PlainRequestNotPromotedOnRelayOnlyPool(t *testing.T) {
+// A durable compaction item is conversation history, not a request control. It must remain on the
+// normal Responses path even when the account pool contains only relay accounts.
+func TestResponses_CompactionHistoryNotPromotedOnRelayOnlyPool(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var seenPath string
@@ -2741,7 +2974,7 @@ func TestResponses_PlainRequestNotPromotedOnRelayOnlyPool(t *testing.T) {
 		seenPath = r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
-			"id":"resp_plain_test",
+			"id":"resp_history_test",
 			"object":"response",
 			"created_at":1710000000,
 			"model":"gpt-4.1-direct",
@@ -2766,7 +2999,67 @@ func TestResponses_PlainRequestNotPromotedOnRelayOnlyPool(t *testing.T) {
 	})
 	handler := NewHandler(store, nil, nil, nil)
 
-	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	body := []byte(`{
+		"model":"gpt-4.1-direct",
+		"input":[
+			{"type":"compaction","encrypted_content":"opaque-history"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses for durable compaction history", seenPath)
+	}
+}
+
+// 不带 compaction_trigger 的普通请求不受提升逻辑影响,仍走 /v1/responses。
+func TestResponses_PlainRequestNotPromotedOnRelayOnlyPool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_plain_test",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.SetCodexModelMapping(`{"client-response-alias":"gpt-4.1-direct"}`)
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"client-response-alias","input":"hello"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
@@ -2780,6 +3073,61 @@ func TestResponses_PlainRequestNotPromotedOnRelayOnlyPool(t *testing.T) {
 	}
 	if seenPath != "/v1/responses" {
 		t.Fatalf("upstream path = %q, want /v1/responses (no promotion for plain request)", seenPath)
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != "gpt-4.1-direct" {
+		t.Fatalf("upstream model = %q, want mapped gpt-4.1-direct; body=%s", model, seenBody)
+	}
+}
+
+func TestResponsesRelaySuccessClearsUsageLimitCooldown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var store *auth.Store
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		store.MarkCooldown(account, time.Hour, "usage_limit")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_success_clears_limit",
+			"object":"response",
+			"status":"completed",
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	account.BaseURL = upstream.URL
+	store = auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		MaxRetries:             0,
+		MaxRateLimitRetries:    0,
+		IgnoreUsageLimitStatus: true,
+	})
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if account.HasActiveCooldown() || !account.IsAvailable() {
+		t.Fatal("successful relay Responses request should clear a concurrent usage-limit cooldown")
 	}
 }
 
@@ -2813,5 +3161,111 @@ func TestBodySignalCompactFilters(t *testing.T) {
 	store.AddAccount(codex)
 	if !handler.storeHasAvailableCodexAccount() {
 		t.Fatal("pool with codex account should report available")
+	}
+}
+
+// 回归（PR #350）：中转账号映射里存在 suffixed→suffixed 的恒等规则时，
+// 客户端用基础名触发压缩，上游必须仍收到基础名 gpt-5.6-sol，
+// 而不是被合成别名命中规则后原样转发 gpt-5.6-sol-openai-compact。
+func TestResponsesCompactStaleSuffixIdentityRuleKeepsBaseModelUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_compact_identity",
+			"object":"response",
+			"model":"gpt-5.6-sol",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-sol", "gpt-5.6-sol-openai-compact"},
+		ModelMapping: `{"gpt-5.6-sol-openai-compact":"gpt-5.6-sol-openai-compact"}`,
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`)
+	requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body)).WithContext(requestCtx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != "gpt-5.6-sol" {
+		t.Fatalf("upstream model = %q, want base gpt-5.6-sol; body=%s", model, seenBody)
+	}
+}
+
+// 统计展示：客户端用 -openai-compact 别名请求压缩时，usage 上下文中的模型
+// 应折算为基础名，且"仅剥后缀"不算映射（不产生 effective_model 箭头）。
+func TestResponsesCompactSuffixOnlyRequestLogsBaseModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_compact_display",
+			"object":"response",
+			"model":"gpt-5.6-sol",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-sol"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol-openai-compact","input":"hello","stream":true}`)
+	requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body)).WithContext(requestCtx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := ctx.GetString("x-model"); got != "gpt-5.6-sol" {
+		t.Fatalf("x-model = %q, want base gpt-5.6-sol (suffix stripped for display)", got)
 	}
 }

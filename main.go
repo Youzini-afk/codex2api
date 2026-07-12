@@ -110,6 +110,7 @@ func main() {
 			AutoPause5hGuardConcurrency:      1,
 			SmartPacingMinConcurrency:        1,
 			SmartPacingWindows:               "5h,7d",
+			AutoResetCreditsBeforeExpiryMin:  60,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -156,6 +157,7 @@ func main() {
 			AutoPause5hGuardConcurrency:      1,
 			SmartPacingMinConcurrency:        1,
 			SmartPacingWindows:               "5h,7d",
+			AutoResetCreditsBeforeExpiryMin:  60,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -211,6 +213,9 @@ func main() {
 		log.Printf("%s 连接池: max_conns=%d", cfg.Database.Label(), settings.PgMaxConns)
 	}
 	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
+	if overrides, perr := database.ParseModelPricingOverridesJSON(settings.ModelPricingOverrides); perr == nil {
+		database.SetModelPricingOverrides(overrides)
+	}
 	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
 	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_mode=%s first_token_timeout=%ds billing_tier_policy=%s",
 		runtimeSettings.ClientCompatMode,
@@ -271,11 +276,14 @@ func main() {
 	store.TriggerRecoveryProbeAsync()
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
+	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	defer cancelBackground()
+	adminHandler.StartAutoResetCredits(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
 	// CODEX_DISABLE_CLI_VERSION_SYNC 为硬关闭。
-	proxy.StartCodexCLIVersionSync(context.Background(), db, store.GetProxyURL)
+	proxy.StartCodexCLIVersionSync(backgroundCtx, db, store.GetProxyURL)
 
 	log.Printf("账号就绪: %d/%d 可用", store.AvailableCount(), store.AccountCount())
 
@@ -436,11 +444,14 @@ func main() {
 	<-quit
 
 	log.Println("正在关闭...")
+	// 先停止会产生新副作用的后台任务，再等待现有 HTTP 请求排空。
+	cancelBackground()
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
 	}
+	adminHandler.WaitAutoResetCredits()
 	wsKeepalive.Stop()
 	store.Stop()
 	wsrelay.ShutdownExecutor()
