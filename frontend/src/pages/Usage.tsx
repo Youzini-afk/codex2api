@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
@@ -6,6 +6,9 @@ import { api } from '../api'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
+import ChannelFilter, { useUsageChannel } from '../components/ChannelFilter'
+import ChannelLogo from '../components/ChannelLogo'
+import ModelLogo from '../components/ModelLogo'
 import Modal from '../components/Modal'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
@@ -13,7 +16,7 @@ import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog } from '../types'
-import { formatCompactEmail } from '../lib/utils'
+import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -564,10 +567,13 @@ function ModelStatsPanel({
                 <div key={item.model} className="space-y-1.5">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.model}>
-                        {item.model}
+                      <div className="flex min-w-0 items-center gap-2">
+                        <ModelLogo model={item.model} variant="soft" size={22} className="shrink-0" />
+                        <div className="truncate text-sm font-semibold leading-tight tracking-tight text-foreground" title={item.model}>
+                          {item.model}
+                        </div>
                       </div>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted-foreground">
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 pl-[30px] text-xs text-muted-foreground">
                         <span className="tabular-nums">{t('usage.modelStatsRequests')} {formatTokens(item.requests, showFullUsageNumbers)}</span>
                         <span aria-hidden="true" className="text-border">·</span>
                         <span className="tabular-nums">{t('usage.modelStatsTokens')} {formatTokens(item.tokens, showFullUsageNumbers)}</span>
@@ -704,6 +710,8 @@ function EndpointStatsPanel({
       items={stats.map((item) => ({
         key: item.endpoint,
         label: item.endpoint,
+        // 端点是 URL 路径，用等宽字体更清晰
+        mono: true,
         requests: item.requests,
         tokens: item.tokens,
         errors: item.error_count,
@@ -761,7 +769,7 @@ function DistributionPanel({
   description: string
   emptyText: string
   icon: ReactNode
-  items: Array<{ key: string; label: string; requests: number; tokens: number; errors: number }>
+  items: Array<{ key: string; label: string; mono?: boolean; requests: number; tokens: number; errors: number }>
   limit?: number
   totalRequests: number
   showFullUsageNumbers: boolean
@@ -784,7 +792,14 @@ function DistributionPanel({
                 <div className="flex min-w-0 items-start gap-2.5">
                   <RankBadge accent={accent} rank={index + 1} />
                   <div className="min-w-0">
-                    <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.label}>
+                    <div
+                      className={cn(
+                        "truncate text-sm font-semibold leading-tight tracking-tight text-foreground",
+                        // 端点是路径（代码性质）保留等宽；密钥名等宽显糙，用常规字体
+                        item.mono && "font-geist-mono text-[13px]",
+                      )}
+                      title={item.label}
+                    >
                       {item.label}
                     </div>
                     <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[11px] text-muted-foreground">
@@ -887,6 +902,74 @@ function StatusCodeBadge({ log }: { log: UsageLog }) {
           <div className="font-semibold text-slate-300">{title}</div>
           <div className="font-geist-mono text-[11px] tabular-nums text-slate-400">HTTP {log.status_code}</div>
           <div className="whitespace-pre-wrap break-words leading-relaxed text-slate-50">{message}</div>
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolean }) {
+  const { t } = useTranslation()
+  const clientUserAgent = log.client_user_agent?.trim() || ''
+  const upstreamUserAgent = log.upstream_user_agent?.trim() || ''
+  const hasAudit = Boolean(clientUserAgent || upstreamUserAgent || log.user_agent_overridden)
+  const upstreamLabel = upstreamUserAgent || (hasAudit ? t('usage.userAgentNotSent') : '-')
+  const statusLabel = !hasAudit
+    ? t('usage.userAgentNotRecorded')
+    : log.user_agent_overridden
+      ? t('usage.userAgentOverridden')
+      : t('usage.userAgentPreserved')
+
+  const content = (
+    <div className={`${mobile ? 'w-full' : 'w-[260px] max-w-[28vw]'} space-y-1 font-mono text-[11px] leading-relaxed`}>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">C</span>
+        <span className="min-w-0 truncate text-foreground/80">{clientUserAgent || '-'}</span>
+      </div>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">U</span>
+        <span className="min-w-0 truncate text-foreground/80">{upstreamLabel}</span>
+        {hasAudit ? (
+          <Badge
+            variant="outline"
+            className={`ml-auto shrink-0 border-transparent px-1.5 py-0 text-[10px] font-semibold ${
+              log.user_agent_overridden
+                ? 'bg-amber-500/12 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300'
+                : 'bg-emerald-500/12 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'
+            }`}
+          >
+            {statusLabel}
+          </Badge>
+        ) : null}
+      </div>
+    </div>
+  )
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div
+          tabIndex={0}
+          aria-label={`${t('usage.clientUserAgent')}: ${clientUserAgent || '-'}; ${t('usage.upstreamUserAgent')}: ${upstreamLabel}; ${statusLabel}`}
+          className="cursor-help focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {content}
+        </div>
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={6} className="max-w-[440px] p-3">
+        <div className="space-y-2 text-xs">
+          <div>
+            <div className="font-semibold text-background/70">{t('usage.clientUserAgent')}</div>
+            <div className="mt-0.5 break-all font-mono leading-relaxed">{clientUserAgent || '-'}</div>
+          </div>
+          <div>
+            <div className="font-semibold text-background/70">{t('usage.upstreamUserAgent')}</div>
+            <div className="mt-0.5 break-all font-mono leading-relaxed">{upstreamLabel}</div>
+          </div>
+          <div className="font-semibold">{statusLabel}</div>
+          {log.via_websocket ? (
+            <div className="leading-relaxed text-background/70">{t('usage.userAgentWebSocketHint')}</div>
+          ) : null}
         </div>
       </TooltipContent>
     </Tooltip>
@@ -1142,7 +1225,7 @@ function EmptyPanel({ accent, icon, text }: { accent: PanelAccentKey; icon: Reac
   )
 }
 
-type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'tokensPerSec' | 'duration' | 'time'
+type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'wsAcquire' | 'tokensPerSec' | 'duration' | 'time'
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
@@ -1150,12 +1233,14 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
   { key: 'account', labelKey: 'usage.tableAccount' },
   { key: 'apiKey', labelKey: 'usage.tableApiKey' },
   { key: 'clientIp', labelKey: 'usage.tableClientIP' },
+  { key: 'userAgent', labelKey: 'usage.tableUserAgent' },
   { key: 'endpoint', labelKey: 'usage.tableEndpoint' },
   { key: 'type', labelKey: 'usage.tableType' },
   { key: 'token', labelKey: 'usage.tableToken' },
   { key: 'cost', labelKey: 'usage.tableCost' },
   { key: 'cached', labelKey: 'usage.tableCached' },
   { key: 'firstToken', labelKey: 'usage.tableFirstToken' },
+  { key: 'wsAcquire', labelKey: 'usage.tableWsAcquire' },
   { key: 'tokensPerSec', labelKey: 'usage.tableTokensPerSec' },
   { key: 'duration', labelKey: 'usage.tableDuration' },
   { key: 'time', labelKey: 'usage.tableTime' },
@@ -1168,12 +1253,15 @@ const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   account: true,
   apiKey: true,
   clientIp: true,
+  userAgent: true,
   endpoint: true,
   type: true,
   token: true,
   cost: true,
   cached: true,
   firstToken: true,
+  // 取得连接耗时属于深挖排障信息，默认隐藏，需在列设置中手动开启
+  wsAcquire: false,
   tokensPerSec: true,
   duration: true,
   time: true,
@@ -1327,6 +1415,7 @@ export default function Usage() {
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
@@ -1334,6 +1423,7 @@ export default function Usage() {
   const [visibleColumns, setVisibleColumns] = useState<Record<UsageTableColumn, boolean>>(getInitialUsageVisibleColumns)
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false)
   const [showAnalysis, setShowAnalysis] = useState(getInitialAnalysisVisibility)
+  const [channel, setChannel] = useUsageChannel()
 
   // 搜索防抖：输入停止 400ms 后触发查询
   const handleSearchChange = useCallback((value: string) => {
@@ -1350,14 +1440,14 @@ export default function Usage() {
     const { start, end } = resolveRangeISO(timeRange, customRange)
     const todayRange = getTodayRangeISO()
     const [stats, settings] = await Promise.all([
-      api.getUsageStats({ start, end }),
+      api.getUsageStats({ start, end, channel: channel || undefined }),
       api.getSettings().catch((): SystemSettings | null => null),
     ])
     const todayStats = timeRange === '1h'
-      ? await api.getUsageStats(todayRange).catch((): UsageStats | null => null)
+      ? await api.getUsageStats({ ...todayRange, channel: channel || undefined }).catch((): UsageStats | null => null)
       : null
     return { stats, settings, todayStats }
-  }, [timeRange, customRange])
+  }, [timeRange, customRange, channel])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -1393,6 +1483,7 @@ export default function Usage() {
         accountId: filterAccountId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
+        channel: channel || undefined,
       })
       setLogs(res.logs ?? [])
       setLogsTotal(res.total ?? 0)
@@ -1401,7 +1492,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream])
+  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream, channel])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -1422,8 +1513,12 @@ export default function Usage() {
           ? response.items.filter((item) => item.enabled).map((item) => item.id)
           : response.models ?? []
         setModelOptions(models)
+        setGrokModelOptions(response.grok_models ?? [])
       } catch {
-        if (active) setModelOptions([])
+        if (active) {
+          setModelOptions([])
+          setGrokModelOptions([])
+        }
       }
     }
     void loadModels()
@@ -1469,6 +1564,26 @@ export default function Usage() {
   const rangeAccountBilled = stats?.today_account_billed ?? 0
   const rangeUserBilled = stats?.today_user_billed ?? 0
   const modelStats = stats?.model_stats ?? []
+  // 下拉选项跟随渠道过滤：codex 只列 Codex manifest 目录，grok 只列 Grok 账号声明模型，
+  // 全部渠道两者都列；再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
+  const modelFilterOptions = useMemo(() => {
+    const seen = new Set<string>()
+    const merged: string[] = []
+    const catalog = channel === 'grok'
+      ? grokModelOptions
+      : channel === 'codex'
+        ? modelOptions
+        : [...modelOptions, ...grokModelOptions]
+    for (const m of catalog) {
+      const key = m.trim()
+      if (key && !seen.has(key)) { seen.add(key); merged.push(key) }
+    }
+    for (const item of modelStats) {
+      const key = (item.model || '').trim()
+      if (key && key !== 'unknown' && !seen.has(key)) { seen.add(key); merged.push(key) }
+    }
+    return merged
+  }, [modelOptions, grokModelOptions, modelStats, channel])
   const featureStats = stats?.feature_stats
   const endpointStats = stats?.endpoint_stats ?? []
   const apiKeyStats = stats?.api_key_stats ?? []
@@ -1518,6 +1633,7 @@ export default function Usage() {
           title={t('usage.title')}
           description={t('usage.description')}
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+          titleAdornment={<ChannelFilter value={channel} onChange={setChannel} />}
           actions={
             <Button
               variant="outline"
@@ -1530,7 +1646,7 @@ export default function Usage() {
           }
         />
 
-        <div className="space-y-6">
+        <div key={channel || 'all'} className="space-y-6 animate-channel-switch-in">
         {/* Stat overview: 6 metrics in a single row */}
         <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
           <Card className="min-w-0 py-0">
@@ -1771,7 +1887,7 @@ export default function Usage() {
                 placeholder={t('usage.allModels')}
                 options={[
                   { label: t('usage.allModels'), value: '' },
-                  ...modelOptions.map((m) => ({ label: m, value: m })),
+                  ...modelFilterOptions.map((m) => ({ label: m, value: m })),
                 ]}
               />
 
@@ -1937,6 +2053,9 @@ export default function Usage() {
                           <span className="font-sans font-semibold text-foreground/80">{t('usage.tableEndpoint')}: </span>
                           {log.inbound_endpoint || log.endpoint || '-'}
                         </div>
+                        <div className="border-t border-border/60 pt-2">
+                          <UserAgentCell log={log} mobile />
+                        </div>
                       </div>
 
                       <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
@@ -2009,12 +2128,14 @@ export default function Usage() {
                       {visibleColumns.account && <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>}
                       {visibleColumns.apiKey && <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>}
                       {visibleColumns.clientIp && <TableHead className={usageTableHeadClass}>{t('usage.tableClientIP')}</TableHead>}
+                      {visibleColumns.userAgent && <TableHead className={usageTableHeadClass}>{t('usage.tableUserAgent')}</TableHead>}
                       {visibleColumns.endpoint && <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>}
                       {visibleColumns.type && <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>}
                       {visibleColumns.token && <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>}
                       {visibleColumns.cost && <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>}
                       {visibleColumns.cached && <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>}
                       {visibleColumns.firstToken && <TableHead className={usageTableHeadClass}><span title={t('usage.tableFirstTokenHint')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableFirstToken')}</span></TableHead>}
+                      {visibleColumns.wsAcquire && <TableHead className={usageTableHeadClass}><span title={t('usage.wsAcquireTooltip')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableWsAcquire')}</span></TableHead>}
                       {visibleColumns.tokensPerSec && (
                         <TableHead className={usageTableHeadClass}>
                           <span
@@ -2051,6 +2172,14 @@ export default function Usage() {
                               </Badge>
                             )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
+                              {(log.channel === 'codex' || log.channel === 'grok') && (
+                                <ChannelLogo
+                                  channel={log.channel}
+                                  size={13}
+                                  className="mr-1"
+                                  title={log.channel === 'grok' ? 'Grok' : 'Codex'}
+                                />
+                              )}
                               {log.model || '-'}
                             </Badge>
                             {log.effective_model && log.effective_model !== log.model && (
@@ -2091,14 +2220,22 @@ export default function Usage() {
                             {log.client_ip || '-'}
                           </span>
                         </TableCell>}
+                        {visibleColumns.userAgent && <TableCell>
+                          <UserAgentCell log={log} />
+                        </TableCell>}
                         {visibleColumns.endpoint && <TableCell>
-                          <div className={`${usageTableMonoClass} leading-relaxed`}>
+                          <div
+                            className={`${usageTableMonoClass} leading-relaxed`}
+                            // 中转/Grok 账号的完整上游 URL 收进 tooltip，列内只显示入站端点
+                            title={
+                              log.upstream_endpoint && log.upstream_endpoint !== log.inbound_endpoint
+                                ? `→ ${log.upstream_endpoint}`
+                                : undefined
+                            }
+                          >
                             <span className="text-muted-foreground">
                               {log.inbound_endpoint || log.endpoint || '-'}
                             </span>
-                            {log.upstream_endpoint && log.upstream_endpoint !== log.inbound_endpoint && (
-                              <span className="text-muted-foreground"> → {log.upstream_endpoint}</span>
-                            )}
                           </div>
                         </TableCell>}
                         {visibleColumns.type && <TableCell>
@@ -2160,6 +2297,16 @@ export default function Usage() {
                           {log.first_token_ms > 0 ? (
                             <span className={`${usageTableMonoClass} ${log.first_token_ms > 5000 ? 'text-red-500' : log.first_token_ms > 2000 ? 'text-amber-500' : 'text-emerald-500'}`}>
                               {log.first_token_ms > 1000 ? `${(log.first_token_ms / 1000).toFixed(1)}s` : `${log.first_token_ms}ms`}
+                            </span>
+                          ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
+                        </TableCell>}
+                        {visibleColumns.wsAcquire && <TableCell>
+                          {(log.ws_acquire_ms ?? 0) > 0 ? (
+                            <span
+                              className={`${usageTableMonoClass} ${(log.ws_acquire_ms as number) > 5000 ? 'text-red-500' : (log.ws_acquire_ms as number) > 1000 ? 'text-amber-500' : 'text-muted-foreground'}`}
+                              title={t('usage.wsAcquireTooltip')}
+                            >
+                              {(log.ws_acquire_ms as number) > 1000 ? `${((log.ws_acquire_ms as number) / 1000).toFixed(1)}s` : `${log.ws_acquire_ms}ms`}
                             </span>
                           ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
                         </TableCell>}

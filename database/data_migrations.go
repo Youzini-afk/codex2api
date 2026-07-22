@@ -16,7 +16,10 @@ const (
 	// 去重，AT 轮换后产生的重复账号 v1 清不掉；v2 把 email+user_id 也纳入别名
 	// 后重跑一次合并。
 	dataMigrationOAuthIdentityDedupeV2 = "20260702_oauth_identity_dedupe_v2"
-	dataMigrationTimeout               = 5 * time.Minute
+	// usage_logs.channel 回填：按 accounts.platform 推导渠道（xai→grok，其余→codex）；
+	// 账号已删的历史行默认 codex（Grok 上线前的流量全部是 codex）。
+	dataMigrationUsageLogChannelV1 = "20260721_usage_log_channel_backfill_v1"
+	dataMigrationTimeout           = 5 * time.Minute
 )
 
 type oauthIdentityDedupeAccount struct {
@@ -35,7 +38,38 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV1, db.dedupeOAuthIdentityAccounts); err != nil {
 		return err
 	}
-	return db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts)
+	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts); err != nil {
+		return err
+	}
+	return db.runDataMigrationOnce(ctx, dataMigrationUsageLogChannelV1, db.backfillUsageLogChannel)
+}
+
+// backfillUsageLogChannel 给存量 usage_logs 回填 channel：先按现存账号的 platform
+// 标记 grok，其余空值统一置 codex（Grok 渠道上线前的历史流量全部走 Codex）。
+func (db *DB) backfillUsageLogChannel(ctx context.Context, tx *sql.Tx) error {
+	if db.isSQLite() {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE usage_logs SET channel = 'grok'
+			WHERE COALESCE(channel, '') = ''
+			  AND account_id IN (SELECT id FROM accounts WHERE platform = 'xai')`); err != nil {
+			return fmt.Errorf("回填 grok 渠道: %w", err)
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE usage_logs SET channel = 'grok'
+			FROM accounts a
+			WHERE COALESCE(usage_logs.channel, '') = ''
+			  AND usage_logs.account_id = a.id
+			  AND a.platform = 'xai'`); err != nil {
+			return fmt.Errorf("回填 grok 渠道: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE usage_logs SET channel = 'codex'
+		WHERE COALESCE(channel, '') = ''`); err != nil {
+		return fmt.Errorf("回填 codex 渠道: %w", err)
+	}
+	return nil
 }
 
 func (db *DB) runDataMigrationsWithTimeout() error {

@@ -11,6 +11,7 @@ import { api } from "../api";
 import APIKeyTokenUsagePanel from "../components/APIKeyTokenUsagePanel";
 import ChipInput from "../components/ChipInput";
 import Modal from "../components/Modal";
+import ChannelLogo from "../components/ChannelLogo";
 import PageHeader from "../components/PageHeader";
 import StateShell from "../components/StateShell";
 import StatCard from "../components/StatCard";
@@ -31,7 +32,6 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, type SelectOption } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -62,6 +62,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Waypoints,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -110,8 +111,21 @@ interface LimitsFormState {
   tokenLimit7dUnit: TokenLimitUnit;
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
-  disableImageGeneration: boolean;
+  imageGenerationPolicy: ImageGenerationPolicy;
+  upstreamChannel: UpstreamChannel;
 }
+
+type ImageGenerationPolicy = "allow" | "strip" | "block";
+type UpstreamChannel = "auto" | "codex" | "grok";
+
+// Grok 账号都未声明模型时的下拉兜底(与 Grok 账号页测试模型列表一致)。
+const DEFAULT_GROK_MODEL_OPTIONS = [
+  "grok-4.5",
+  "grok-4",
+  "grok-3-fast",
+  "grok-3",
+  "grok-2",
+];
 
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
   token: 1,
@@ -138,7 +152,8 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
-  disableImageGeneration: false,
+  imageGenerationPolicy: "allow",
+  upstreamChannel: "auto",
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -187,6 +202,10 @@ export default function APIKeys() {
   const [editDirty, setEditDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savingPublicUsagePage, setSavingPublicUsagePage] = useState(false);
+  const [savingPublicImageStudioPage, setSavingPublicImageStudioPage] =
+    useState(false);
+  const [savingPublicAccountPortalPage, setSavingPublicAccountPortalPage] =
+    useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const { showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
@@ -206,6 +225,7 @@ export default function APIKeys() {
         .getModels()
         .catch(() => ({ models: [] as string[] })) as Promise<{
         models?: string[];
+        grok_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
     ]);
@@ -213,6 +233,7 @@ export default function APIKeys() {
       keys: keysResponse.keys ?? [],
       groups: groupsResponse.groups ?? [],
       modelOptions: modelsResponse.models ?? [],
+      grokModelOptions: modelsResponse.grok_models ?? [],
       settings: settingsResponse,
     };
   }, []);
@@ -221,15 +242,44 @@ export default function APIKeys() {
     keys: APIKeyRow[];
     groups: AccountGroup[];
     modelOptions: string[];
+    grokModelOptions: string[];
     settings: SystemSettings | null;
   }>({
-    initialData: { keys: [], groups: [], modelOptions: [], settings: null },
+    initialData: {
+      keys: [],
+      groups: [],
+      modelOptions: [],
+      grokModelOptions: [],
+      settings: null,
+    },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+  // 模型下拉跟随渠道选择:grok 只列 Grok 模型(账号未声明时用常见兜底),
+  // codex 只列 Codex 目录,auto 合并两者。
+  const grokModelOptions =
+    data.grokModelOptions.length > 0
+      ? data.grokModelOptions
+      : DEFAULT_GROK_MODEL_OPTIONS;
+  const modelOptionsForChannel = useCallback(
+    (channel: UpstreamChannel): string[] => {
+      if (channel === "grok") return grokModelOptions;
+      if (channel === "codex") return modelOptions;
+      const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
+      return [
+        ...modelOptions,
+        ...grokModelOptions.filter((m) => !seen.has(m.toLowerCase())),
+      ];
+    },
+    [modelOptions, grokModelOptions],
+  );
   const publicUsagePageEnabled = data.settings?.public_key_usage_page_enabled ?? true;
+  const publicImageStudioPageEnabled =
+    data.settings?.public_image_studio_page_enabled ?? true;
+  const publicAccountPortalPageEnabled =
+    data.settings?.public_account_portal_page_enabled ?? false;
   const showInitialSkeleton = loading && keys.length === 0;
 
   const handleRefresh = useCallback(async () => {
@@ -244,6 +294,16 @@ export default function APIKeys() {
   const keyUsageUrl = useMemo(() => {
     if (typeof window === "undefined") return "/key-usage";
     return `${window.location.origin}/key-usage`;
+  }, []);
+
+  const imageStudioUrl = useMemo(() => {
+    if (typeof window === "undefined") return "/image-studio";
+    return `${window.location.origin}/image-studio`;
+  }, []);
+
+  const accountPortalUrl = useMemo(() => {
+    if (typeof window === "undefined") return "/account-portal";
+    return `${window.location.origin}/account-portal`;
   }, []);
 
   const statusCounts = useMemo(() => {
@@ -395,6 +455,66 @@ export default function APIKeys() {
       showToast(getErrorMessage(err), "error");
     } finally {
       setSavingPublicUsagePage(false);
+    }
+  };
+
+  const handleTogglePublicImageStudioPage = async () => {
+    const nextEnabled = !publicImageStudioPageEnabled;
+    setSavingPublicImageStudioPage(true);
+    try {
+      await api.updateSettings({
+        public_image_studio_page_enabled: nextEnabled,
+      });
+      showToast(
+        nextEnabled
+          ? t("apiKeys.publicImageStudioEnabledToast")
+          : t("apiKeys.publicImageStudioDisabledToast"),
+        "success",
+      );
+      setData((current) => ({
+        ...current,
+        settings: current.settings
+          ? {
+              ...current.settings,
+              public_image_studio_page_enabled: nextEnabled,
+            }
+          : current.settings,
+      }));
+      await reloadSilently();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setSavingPublicImageStudioPage(false);
+    }
+  };
+
+  const handleTogglePublicAccountPortalPage = async () => {
+    const nextEnabled = !publicAccountPortalPageEnabled;
+    setSavingPublicAccountPortalPage(true);
+    try {
+      await api.updateSettings({
+        public_account_portal_page_enabled: nextEnabled,
+      });
+      showToast(
+        nextEnabled
+          ? t("apiKeys.publicAccountPortalEnabledToast")
+          : t("apiKeys.publicAccountPortalDisabledToast"),
+        "success",
+      );
+      setData((current) => ({
+        ...current,
+        settings: current.settings
+          ? {
+              ...current.settings,
+              public_account_portal_page_enabled: nextEnabled,
+            }
+          : current.settings,
+      }));
+      await reloadSilently();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setSavingPublicAccountPortalPage(false);
     }
   };
 
@@ -1037,6 +1157,7 @@ export default function APIKeys() {
                                     status={getAPIKeyStatus(keyRow)}
                                     t={t}
                                   />
+                                  <KeyChannelBadge keyRow={keyRow} t={t} />
                                   {isBusy ? (
                                     <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                                   ) : null}
@@ -1217,10 +1338,13 @@ export default function APIKeys() {
                                         <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                                       ) : null}
                                     </div>
-                                    <KeyStatusBadge
-                                      status={getAPIKeyStatus(keyRow)}
-                                      t={t}
-                                    />
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <KeyStatusBadge
+                                        status={getAPIKeyStatus(keyRow)}
+                                        t={t}
+                                      />
+                                      <KeyChannelBadge keyRow={keyRow} t={t} />
+                                    </div>
                                   </div>
                                 </TableCell>
                                 <TableCell>
@@ -1483,6 +1607,120 @@ export default function APIKeys() {
                             : t("apiKeys.enablePublicUsage")}
                       </Button>
                     </div>
+                    <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("apiKeys.publicImageStudioTitle")}
+                        </div>
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          {t("apiKeys.publicImageStudioDesc")}
+                        </p>
+                        {publicImageStudioPageEnabled ? (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <code
+                              className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
+                              title={imageStudioUrl}
+                            >
+                              {imageStudioUrl}
+                            </code>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              onClick={() => void handleCopy(imageStudioUrl)}
+                              title={t("apiKeys.publicUsageCopyUrl")}
+                            >
+                              <Copy className="size-3.5" />
+                            </Button>
+                            <a
+                              href={imageStudioUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                            >
+                              <ExternalLink className="size-3.5" />
+                              {t("apiKeys.publicUsageOpen")}
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+                      <Button
+                        variant={
+                          publicImageStudioPageEnabled ? "outline" : "default"
+                        }
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => void handleTogglePublicImageStudioPage()}
+                        disabled={savingPublicImageStudioPage}
+                      >
+                        {publicImageStudioPageEnabled ? (
+                          <EyeOff className="size-3.5" />
+                        ) : (
+                          <Eye className="size-3.5" />
+                        )}
+                        {savingPublicImageStudioPage
+                          ? t("common.saving")
+                          : publicImageStudioPageEnabled
+                            ? t("apiKeys.disablePublicImageStudio")
+                            : t("apiKeys.enablePublicImageStudio")}
+                      </Button>
+                    </div>
+                    <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("apiKeys.publicAccountPortalTitle")}
+                        </div>
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          {t("apiKeys.publicAccountPortalDesc")}
+                        </p>
+                        {publicAccountPortalPageEnabled ? (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <code
+                              className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
+                              title={accountPortalUrl}
+                            >
+                              {accountPortalUrl}
+                            </code>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              onClick={() => void handleCopy(accountPortalUrl)}
+                              title={t("apiKeys.publicUsageCopyUrl")}
+                            >
+                              <Copy className="size-3.5" />
+                            </Button>
+                            <a
+                              href={accountPortalUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                            >
+                              <ExternalLink className="size-3.5" />
+                              {t("apiKeys.publicUsageOpen")}
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+                      <Button
+                        variant={
+                          publicAccountPortalPageEnabled ? "outline" : "default"
+                        }
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => void handleTogglePublicAccountPortalPage()}
+                        disabled={savingPublicAccountPortalPage}
+                      >
+                        {publicAccountPortalPageEnabled ? (
+                          <EyeOff className="size-3.5" />
+                        ) : (
+                          <Eye className="size-3.5" />
+                        )}
+                        {savingPublicAccountPortalPage
+                          ? t("common.saving")
+                          : publicAccountPortalPageEnabled
+                            ? t("apiKeys.disablePublicAccountPortal")
+                            : t("apiKeys.enablePublicAccountPortal")}
+                      </Button>
+                    </div>
                   </div>
                 ) : null}
               </div>
@@ -1559,6 +1797,21 @@ export default function APIKeys() {
               </FormField>
             </div>
 
+            <FormField
+              label={t("apiKeys.limits.upstreamChannel")}
+              icon={<Waypoints className="size-3.5" />}
+              as="div"
+            >
+              <UpstreamChannelPicker
+                value={createForm.limits.upstreamChannel}
+                onChange={(upstreamChannel) =>
+                  updateCreateForm({
+                    limits: { ...createForm.limits, upstreamChannel },
+                  })
+                }
+              />
+            </FormField>
+
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
                 label={t("apiKeys.quotaLimitLabel")}
@@ -1626,7 +1879,9 @@ export default function APIKeys() {
             <LimitsEditor
               value={createForm.limits}
               onChange={(limits) => updateCreateForm({ limits })}
-              modelOptions={modelOptions}
+              modelOptions={modelOptionsForChannel(
+                createForm.limits.upstreamChannel,
+              )}
             />
           </form>
         </Modal>
@@ -1735,6 +1990,21 @@ export default function APIKeys() {
                     </FormField>
                   </div>
 
+                  <FormField
+                    label={t("apiKeys.limits.upstreamChannel")}
+                    icon={<Waypoints className="size-3.5" />}
+                    as="div"
+                  >
+                    <UpstreamChannelPicker
+                      value={editForm.limits.upstreamChannel}
+                      onChange={(upstreamChannel) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, upstreamChannel },
+                        })
+                      }
+                    />
+                  </FormField>
+
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField
                       label={t("apiKeys.expireModeLabel")}
@@ -1796,7 +2066,9 @@ export default function APIKeys() {
                 <LimitsEditor
                   value={editForm.limits}
                   onChange={(limits) => updateEditForm({ limits })}
-                  modelOptions={modelOptions}
+                  modelOptions={modelOptionsForChannel(
+                    editForm.limits.upstreamChannel,
+                  )}
                   expanded
                 />
               )}
@@ -1958,8 +2230,87 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimit7dUnit: token7d.unit,
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
-    disableImageGeneration: limits.disable_image_generation === true,
+    imageGenerationPolicy: resolveImageGenerationPolicy(limits),
+    upstreamChannel:
+      limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
+        ? limits.upstream_channel
+        : "auto",
   };
+}
+
+// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
+// 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
+function UpstreamChannelPicker({
+  value,
+  onChange,
+}: {
+  value: UpstreamChannel;
+  onChange: (next: UpstreamChannel) => void;
+}) {
+  const { t } = useTranslation();
+  const options: Array<{
+    key: UpstreamChannel;
+    label: string;
+    icon: ReactNode;
+  }> = [
+    {
+      key: "auto",
+      label: t("apiKeys.limits.upstreamChannelAutoTab"),
+      icon: <Waypoints className="size-4 shrink-0" />,
+    },
+    {
+      key: "codex",
+      label: t("apiKeys.limits.upstreamChannelCodex"),
+      icon: <ChannelLogo channel="codex" size={18} />,
+    },
+    {
+      key: "grok",
+      label: t("apiKeys.limits.upstreamChannelGrok"),
+      icon: <ChannelLogo channel="grok" size={18} />,
+    },
+  ];
+  return (
+    <div>
+      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+        {options.map(({ key, label, icon }) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => onChange(key)}
+            aria-pressed={value === key}
+            className={cn(
+              "inline-flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold transition-all",
+              value === key
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground opacity-70 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
+            )}
+          >
+            {icon}
+            <span className="truncate">{label}</span>
+          </button>
+        ))}
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        {t(`apiKeys.limits.upstreamChannelHint.${value}`)}
+      </p>
+    </div>
+  );
+}
+
+// resolveImageGenerationPolicy 统一新旧两种后端配置：显式 image_generation_policy 优先，
+// 未设时旧的 disable_image_generation=true 视为 block，其余为 allow。
+function resolveImageGenerationPolicy(
+  limits: APIKeyLimits,
+): ImageGenerationPolicy {
+  switch (limits.image_generation_policy) {
+    case "strip":
+      return "strip";
+    case "block":
+      return "block";
+    case "allow":
+      return "allow";
+  }
+  return limits.disable_image_generation === true ? "block" : "allow";
 }
 
 function formatTokenLimitForForm(value?: number): {
@@ -2014,7 +2365,15 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
-    disable_image_generation: form.disableImageGeneration || undefined,
+    image_generation_policy:
+      form.imageGenerationPolicy === "allow"
+        ? undefined
+        : form.imageGenerationPolicy,
+    // 兼容旧字段：block 时同步置位，其余留空由后端按 policy 归一。
+    disable_image_generation:
+      form.imageGenerationPolicy === "block" || undefined,
+    upstream_channel:
+      form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
   };
 }
 
@@ -2108,6 +2467,52 @@ function KeyStatusBadge({
     >
       <span className={cn("size-1.5 rounded-full", config.dot)} />
       {t(`apiKeys.status.${status}`)}
+    </Badge>
+  );
+}
+
+// KeyChannelBadge 展示该 Key 的上游渠道限定（auto/codex/grok），一眼区分 Key 用途。
+function KeyChannelBadge({
+  keyRow,
+  t,
+}: {
+  keyRow: APIKeyRow;
+  t: Translator;
+}) {
+  const channel = keyRow.limits?.upstream_channel;
+  if (channel === "grok") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelGrok")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="grok" size={12} />
+        Grok
+      </Badge>
+    );
+  }
+  if (channel === "codex") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelCodex")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="codex" size={12} />
+        Codex
+      </Badge>
+    );
+  }
+  // auto：路由图标表示"不限渠道，按模型自动路由"
+  return (
+    <Badge
+      variant="outline"
+      title={t("apiKeys.limits.upstreamChannelHint.auto")}
+      className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-muted-foreground"
+    >
+      <Waypoints className="size-3" />
+      {t("apiKeys.limits.upstreamChannelAutoTab")}
     </Badge>
   );
 }
@@ -2336,7 +2741,7 @@ function LimitsEditor({
     value.tokenLimit5h !== "" ||
     value.tokenLimit7d !== "" ||
     value.tokenLimit30d !== "" ||
-    value.disableImageGeneration;
+    value.imageGenerationPolicy !== "allow";
   const [open, setOpen] = useState(hasAny || !!expanded);
   const tokenUnitOptions = useMemo(
     () =>
@@ -2409,19 +2814,37 @@ function LimitsEditor({
               {t("apiKeys.limits.planAllowHint")}
             </p>
           </div>
-          <div className="flex items-start justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
-            <div className="space-y-0.5">
-              <label className="text-xs font-medium text-foreground">
-                {t("apiKeys.limits.disableImageGeneration")}
-              </label>
-              <p className="text-[10px] text-muted-foreground">
-                {t("apiKeys.limits.disableImageGenerationHint")}
-              </p>
-            </div>
-            <Switch
-              checked={value.disableImageGeneration}
-              onCheckedChange={(disableImageGeneration) => patch({ disableImageGeneration })}
+          <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
+            <label className="text-xs font-medium text-foreground">
+              {t("apiKeys.limits.imageGenerationPolicy")}
+            </label>
+            <Select
+              value={value.imageGenerationPolicy}
+              onValueChange={(policy) =>
+                patch({
+                  imageGenerationPolicy: policy as ImageGenerationPolicy,
+                })
+              }
+              options={[
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyAllow"),
+                  value: "allow",
+                },
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyStrip"),
+                  value: "strip",
+                },
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyBlock"),
+                  value: "block",
+                },
+              ]}
             />
+            <p className="text-[10px] text-muted-foreground">
+              {t(
+                `apiKeys.limits.imageGenerationPolicyHint.${value.imageGenerationPolicy}`,
+              )}
+            </p>
           </div>
         </div>
       </LimitSection>

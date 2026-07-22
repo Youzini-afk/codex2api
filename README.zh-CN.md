@@ -461,6 +461,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | API 密钥 | `/admin/api-keys` | API Key 创建、查看、删除与调用凭据管理 |
 | 代理管理 | `/admin/proxies` | 代理池维护、账号代理分配与连通性管理 |
 | 生图工作台 | `/admin/images/studio` | 文生图、图生图、提示词模板、任务历史和服务器图库 |
+| 生图门户（非管理） | `/image-studio` | 用 API Key 登录的独立生图页，不进入管理后台；可在 API 密钥页开关 |
 | Prompt 检查 | `/admin/prompt-filter/overview` | Prompt 规则、触发日志、测试和处理模式配置 |
 | 使用统计 | `/admin/usage` | 请求日志、统计卡片、图表、日志清空 |
 | 运维概览 | `/admin/ops` | 运行态监控与系统概览 |
@@ -490,7 +491,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 
 ### 调度系统
 
-调度核心位于 `auth.Store`，将账号可用性、健康度、动态并发、历史错误和近期用量综合纳入选择。
+调度核心位于 `auth.Store`，将账号可用性、调度优先级、健康度、动态并发、历史错误和近期用量综合纳入选择。
 
 **运行时状态模型：**
 
@@ -498,14 +499,17 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 - `HealthTier`：`healthy` / `warm` / `risky` / `banned`
 - `SchedulerScore`：以 100 为基线的实时调度分
 - `DynamicConcurrencyLimit`：按健康层级动态收缩的并发上限
+- `SchedulerPriority`：严格的账号优先级；先比较优先级，再比较健康层级、调度分和当前负载
 
 **账号选择策略：**
 
 1. 过滤不可用账号（error / banned / 冷却中 / 无 AccessToken）
 2. 重算健康层级、调度分和动态并发
 3. 排除已达并发上限的账号
-4. 按 `healthy > warm > risky > banned` 排序，同层级按调度分和并发数择优
+4. 先按 `SchedulerPriority` 从高到低分层，再按 `healthy > warm > risky > banned` 排序；同优先级、同层级内按调度分和并发数择优
 5. 15% 概率随机打散，降低热点与饥饿
+
+多个最终用户共享同一个下游 API Key 时，可传 `X-Codex2API-Affinity-Key` 作为稳定的用户或对话标识。Codex2API 只将其哈希后用于本地账号亲和，不会转发给上游。
 
 **动态并发规则：**
 
@@ -515,6 +519,8 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | `warm` | 基础并发 ÷ 2（最少 1） |
 | `risky` | 固定 1 |
 | `banned` | 固定 0，不参与调度 |
+
+上游持久 WebSocket 连接池同样受账号当前 `DynamicConcurrencyLimit` 约束，连接复用不会突破账号的有效并发上限。
 
 **调度分惩罚/奖励：**
 

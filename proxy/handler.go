@@ -52,6 +52,7 @@ type Handler struct {
 	deviceCfg    *DeviceProfileConfig // 设备指纹配置
 	cache        cache.TokenCache     // Redis/Memory 运行态缓存
 	apiKeyGateMu sync.Mutex
+	promptRiskMu sync.Mutex
 	apiKeyGate   *apiKeyConcurrencyLimiter
 }
 
@@ -145,6 +146,8 @@ type CodexUsageSyncResult struct {
 	Persisted5hOnly          bool
 	Premium5hRateLimited     bool
 	UsageWindowLimitsIgnored bool
+	// Cleared5h 表示本次同步因上游未返回 5h 窗口而清除了本地陈旧 5h 快照（issue #382）。
+	Cleared5h bool
 }
 
 type codexRateLimitWindow string
@@ -220,16 +223,65 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account == nil {
 			return false
 		}
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			return false
 		}
 		if model != "" && account.IsModelRateLimited(model) {
+			return false
+		}
+		if !account.SupportsCodexModel(model) {
 			return false
 		}
 		if isProOnlyModel(model) {
 			return isSparkPlanCandidate(account.GetPlanType())
 		}
 		return true
+	}
+}
+
+// requestUpstreamChannel 返回当前请求下游 Key 的上游渠道限定（空=不限）。
+func requestUpstreamChannel(c *gin.Context) string {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return ""
+	}
+	return row.Limits.ResolveUpstreamChannel()
+}
+
+// applyUpstreamChannelFilter 按下游 Key 的上游渠道限定改写账号过滤器。
+// grok 渠道换成 Grok 专属过滤（账号未声明模型时直接透传请求模型，不再要求声明）；
+// codex 渠道在原过滤器上排除 Grok 账号；未限定则原样返回。
+func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
+	switch requestUpstreamChannel(c) {
+	case database.UpstreamChannelGrok:
+		return grokChannelAccountFilter(effectiveModel)
+	case database.UpstreamChannelCodex:
+		return func(account *auth.Account) bool {
+			if account == nil || account.IsGrokAPI() {
+				return false
+			}
+			return filter(account)
+		}
+	}
+	return filter
+}
+
+// grokChannelAccountFilter 是 grok 渠道 Key 的账号过滤器：仅 Grok 账号；
+// 账号声明了 Models 白名单则要求命中（mapping 先行），未声明则放行全部模型。
+func grokChannelAccountFilter(model string) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsGrokAPI() {
+			return false
+		}
+		routedModel := model
+		if mappedModel, ok := resolveAccountModelMapping(account, model); ok && mappedModel != "" {
+			routedModel = mappedModel
+		}
+		if routedModel != "" && account.IsModelRateLimited(routedModel) {
+			return false
+		}
+		return account.GrokChannelSupportsModel(routedModel)
 	}
 }
 
@@ -243,9 +295,16 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
 	candidates := compactMappingCandidates(originalModel, effectiveModel)
-	return accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
+	inner := accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
 		return resolveAccountCompactModelMappingForCandidates(account, candidates)
 	})
+	return func(account *auth.Account) bool {
+		// Grok 上游没有 /responses/compact 端点，compact 请求不路由到 Grok 账号
+		if account.IsGrokAPI() {
+			return false
+		}
+		return inner(account)
+	}
 }
 
 func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
@@ -261,7 +320,7 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 		if account == nil {
 			return false
 		}
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			routedModel := effectiveModel
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
@@ -294,7 +353,7 @@ func (h *Handler) modelSupportedByAccountMapping(model string) bool {
 		return false
 	}
 	for _, account := range h.store.Accounts() {
-		if account == nil || !account.IsOpenAIResponsesAPI() {
+		if account == nil || !account.IsRelayStyle() {
 			continue
 		}
 		mappedModel, ok := resolveAccountModelMapping(account, model)
@@ -551,6 +610,7 @@ func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
 	}
 	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
 	h.store.SetAPIKeyAllowedPlans(row.ID, row.Limits.PlanAllow)
+	h.store.SetAPIKeyUpstreamChannel(row.ID, row.Limits.ResolveUpstreamChannel())
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）。DB 故障时保守返回 false。
@@ -603,6 +663,16 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
 	}
+	// 渠道在写入时按调度账号固化（内存索引查询），供仪表盘分渠道聚合；
+	// 账号已不在池中（如刚被删除）时按 codex 兜底。
+	if input.Channel == "" && h.store != nil {
+		input.Channel = database.UpstreamChannelCodex
+		if input.AccountID > 0 {
+			if acc := h.store.FindByID(input.AccountID); acc != nil && acc.IsGrokAPI() {
+				input.Channel = database.UpstreamChannelGrok
+			}
+		}
+	}
 	_ = h.db.InsertUsageLog(context.Background(), input)
 }
 
@@ -633,6 +703,8 @@ func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
 	populateAPIKeyMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
+	populateUserAgentMetaFromRequest(c, input)
+	populateWsAcquireFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
 	h.logUsage(input)
@@ -823,7 +895,7 @@ func (h *Handler) storeHasAvailableCodexAccount() bool {
 		return false
 	}
 	for _, account := range h.store.Accounts() {
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			continue
 		}
 		if account.IsAvailable() {
@@ -833,10 +905,10 @@ func (h *Handler) storeHasAvailableCodexAccount() bool {
 	return false
 }
 
-// excludeRelayAccountsFilter 在既有过滤器上追加"排除中转账号"约束。
+// excludeRelayAccountsFilter 在既有过滤器上追加"排除中转/Grok 账号"约束。
 func excludeRelayAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
 	return func(account *auth.Account) bool {
-		if account == nil || account.IsOpenAIResponsesAPI() {
+		if account == nil || account.IsRelayStyle() {
 			return false
 		}
 		return inner == nil || inner(account)
@@ -861,6 +933,33 @@ func extractReasoningEffort(body []byte) string {
 	return ""
 }
 
+// responsesPhaseTimingHeader /v1/responses 请求准备阶段分段耗时的响应头。
+// 首个 attempt 开始前写入(SSE 首字节尚未发出),下游网关可据此把
+// "网关侧首字慢 vs codex2api first_token_ms 快"的差值归因到具体阶段(issue #405)。
+const responsesPhaseTimingHeader = "X-Codex2API-Phase-Timing"
+
+// emitResponsesPhaseTimings 输出 /v1/responses 首个 attempt 之前的分段耗时。
+// 各分段含义:mw=进入 handler 前的中间件链(含 body 缓存/解压/鉴权),
+// read=handler 内读取请求体,validate=模型映射与请求校验,
+// prepare=上游请求体重建(Unmarshal→map→Marshal),schedule=Key 限流检查与账号调度。
+// attempt 开始后的耗时由既有 first_token_ms 覆盖,两者相加即 handler 全程。
+func emitResponsesPhaseTimings(c *gin.Context, logModel string, bodySize int, handlerStart, bodyReadDone, validateDone, prepareDone time.Time) {
+	now := time.Now()
+	middlewareMs := int64(0)
+	if reqCtx := api.GetRequestContext(c); reqCtx != nil && !reqCtx.StartTime.IsZero() {
+		middlewareMs = handlerStart.Sub(reqCtx.StartTime).Milliseconds()
+	}
+	summary := fmt.Sprintf("mw=%d;read=%d;validate=%d;prepare=%d;schedule=%d;body_kb=%d",
+		middlewareMs,
+		bodyReadDone.Sub(handlerStart).Milliseconds(),
+		validateDone.Sub(bodyReadDone).Milliseconds(),
+		prepareDone.Sub(validateDone).Milliseconds(),
+		now.Sub(prepareDone).Milliseconds(),
+		bodySize/1024)
+	c.Header(responsesPhaseTimingHeader, summary)
+	log.Printf("[TIMING] /v1/responses model=%s %s", logModel, summary)
+}
+
 // extractServiceTier 从请求体提取服务等级
 func extractServiceTier(body []byte) string {
 	if tier := gjson.GetBytes(body, "service_tier").String(); tier != "" {
@@ -871,12 +970,37 @@ func extractServiceTier(body []byte) string {
 
 const upstreamErrorKindMessageTooBig = "message_too_big"
 
+// upstreamErrorKindWsBusyAcquire 是 wsrelay busy session acquire 超时（issue #413）：
+// 同会话的前一个请求长时间占用 WS 连接导致的排队超时，属会话占用而非账号故障。
+const upstreamErrorKindWsBusyAcquire = "ws_busy_acquire"
+
+// isWsBusyAcquireTimeoutError 按错误文案识别 busy acquire 超时。wsrelay 依赖 proxy，
+// proxy 无法反向导入其哨兵类型，跨包只能靠稳定的错误消息片段匹配。
+func isWsBusyAcquireTimeoutError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "waiting for busy session")
+}
+
+// shouldPenalizeTransportKind 返回该传输失败是否应计入账号健康惩罚。
+// busy acquire 超时的账号本身没有故障，惩罚会让 fast scheduler 错误降权（issue #413）。
+func shouldPenalizeTransportKind(kind string) bool {
+	return kind != "" && kind != upstreamErrorKindWsBusyAcquire
+}
+
 func isWebsocketMessageTooBigError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "message too big") || strings.Contains(msg, "close 1009")
+	return strings.Contains(msg, "message too big") ||
+		strings.Contains(msg, "close 1009") ||
+		strings.Contains(msg, "read limit exceeded")
+}
+
+func websocketMessageTooBigSource(message string) string {
+	if strings.Contains(strings.ToLower(message), "read limit exceeded") {
+		return "local_read_limit"
+	}
+	return "peer_close"
 }
 
 func isWebsocketMessageTooBigOutcome(outcome streamOutcome) bool {
@@ -890,7 +1014,7 @@ func shouldFallbackWebsocketMessageTooBigToHTTP(outcome streamOutcome, useWebsoc
 	if wroteAnyBody || ctxErr != nil || writeErr != nil {
 		return false
 	}
-	return outcome.penalize
+	return true
 }
 
 func classifyTransportFailure(err error) string {
@@ -901,8 +1025,11 @@ func classifyTransportFailure(err error) string {
 	if isWebsocketMessageTooBigError(err) {
 		return upstreamErrorKindMessageTooBig
 	}
+	if isWsBusyAcquireTimeoutError(err) {
+		return upstreamErrorKindWsBusyAcquire
+	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded") {
 		return "timeout"
 	}
 	return "transport"
@@ -966,12 +1093,13 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 		if kind == "" {
 			kind = "transport"
 		}
+		messageTooBig := kind == upstreamErrorKindMessageTooBig
 		return streamOutcome{
 			logStatusCode:     logStatusUpstreamStreamBreak,
 			failureKind:       kind,
 			failureMessage:    fmt.Sprintf("上游流读取失败: %v", readErr),
-			penalize:          true,
-			verifyAccountAuth: isWebsocketUpstreamClose(readErr),
+			penalize:          !messageTooBig,
+			verifyAccountAuth: !messageTooBig && isWebsocketUpstreamClose(readErr),
 		}
 	}
 
@@ -997,11 +1125,13 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 			kind = "client"
 		}
 	}
+	// 400 中"账号不支持该模型"属账号权益问题，冷却后换号重试有意义，视同可重试故障。
+	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(responseFailedErrorBody(payload))
 	return streamOutcome{
 		logStatusCode:  statusCode,
 		failureKind:    kind,
 		failureMessage: message,
-		penalize:       statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500,
+		penalize:       statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500 || modelUnsupported,
 	}
 }
 
@@ -1317,6 +1447,7 @@ func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	auth := h.authMiddleware()
+	r.POST("/api/prompt-filter/newapi/verify", h.VerifyNewAPIPolicyHandshake)
 
 	// /v1 前缀路由（标准路径）
 	v1 := r.Group("/v1")
@@ -1380,6 +1511,8 @@ func (h *Handler) APIKeyAuthMiddleware() gin.HandlerFunc {
 func (h *Handler) authMiddleware() gin.HandlerFunc {
 	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
+		attachUserAgentAudit(c)
+		attachWsAcquireAudit(c)
 		// 如果没有配置任何密钥
 		if !h.hasAnyKeys() {
 			if allowAnonymous {
@@ -1482,12 +1615,18 @@ const (
 	logStatusUpstreamStreamBreak = 598
 )
 
-// isRetryableStatus 检查是否可重试的上游状态码
+// isRetryableStatus 检查是否可重试的上游状态码。
+// 403 也视为可重试：Codex 上游 403 全是账号侧问题（payment_required /
+// deactivated_workspace / codex_access_restricted 等 OAuth/套餐/工作区维度），
+// 非请求内容问题，换到号池里其他健康账号即可继续（issue #396）。
 func isRetryableStatus(code int) bool {
-	return code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
+	return code == http.StatusServiceUnavailable ||
+		code == http.StatusUnauthorized ||
+		code == http.StatusInternalServerError ||
+		code == http.StatusForbidden
 }
 
-func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
 	if statusCode == http.StatusTooManyRequests {
 		if rateLimitRetries == nil || *rateLimitRetries >= maxRateLimitRetries {
 			return false
@@ -1495,7 +1634,10 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 		*rateLimitRetries++
 		return true
 	}
-	if !isRetryableStatus(statusCode) {
+	// 400 一般是请求内容问题不重试；唯独"账号不支持该模型"是账号权益问题，
+	// 该账号已被模型冷却排除，换号重试可成功（issue #408）。
+	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(body)
+	if !isRetryableStatus(statusCode) && !modelUnsupported {
 		return false
 	}
 	if generalRetries == nil || *generalRetries >= maxGeneralRetries {
@@ -1655,11 +1797,13 @@ func firstGJSONInt(body []byte, paths ...string) int64 {
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
 func (h *Handler) Responses(c *gin.Context) {
 	// 1. 读取请求体
+	handlerStart := time.Now()
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	bodyReadDone := time.Now()
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
 	// （type=compaction_trigger）嵌进普通 /responses 请求体，而不调用
@@ -1693,7 +1837,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1736,28 +1883,32 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
-	sessionID := ResolveSessionID(c.Request.Header, rawBody)
-	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
-	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
+	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
+	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
 
+	validateDone := time.Now()
+
 	// 2. 准备 Codex 上游请求体（Unmarshal→map→Marshal，一次序列化）。
 	// OpenAI Responses relay body 仅在实际命中 relay 账号时惰性生成，避免 Codex 路径重复转换。
 	// previous_response_id 缓存按下游 API Key 隔离，防止跨用户注入他人对话历史。
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	codexBody, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
+	// strip 策略：剥离网关注入及客户端携带的图片工具能力声明，作为普通文本请求继续（issue #411）。
+	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	var openAIResponsesBody []byte
 	resetOpenAIResponsesBody := func() {
 		openAIResponsesBody = nil
 	}
 	getOpenAIResponsesBody := func() []byte {
 		if openAIResponsesBody == nil {
-			openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
+			openAIResponsesBody = applyImageGenerationStripPolicy(c, PrepareOpenAIResponsesBody(rawBody))
 		}
 		return openAIResponsesBody
 	}
@@ -1765,6 +1916,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
+	prepareDone := time.Now()
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
@@ -1788,6 +1940,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if pinBodySignalToCodexAccounts {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
 	}
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1797,8 +1950,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
-	forceHTTPAfterWSMessageTooBig := false
+	var wsHTTPFallback websocketHTTPFallbackState
 	invalidEncryptedContentRetried := false
+	overflowCompactRetried := false
+	overflowCompactEnabled := autoCompactOverflowEnabled(c)
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1810,7 +1965,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
+		if !retainedHTTPFallback {
+			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		}
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -1820,16 +1978,33 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 
+		if attempt == 0 {
+			emitResponsesPhaseTimings(c, logModel, len(rawBody), handlerStart, bodyReadDone, validateDone, prepareDone)
+		}
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		if !retainedHTTPFallback {
+			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		}
+		if wsHTTPFallback.ForceHTTP() {
+			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
+		}
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
+		// relay/Grok 账号走 HTTP 执行器（下方 IsRelayStyle 分支优先于 WS），这里同步排除，
+		// 避免日志把 relay 请求错标成 via_websocket。
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
+		}
+		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。
+		if useWebsocket && globalWSSizeRouter.PreferHTTP(len(codexBody)) {
+			useWebsocket = false
+			if attempt == 0 {
+				log.Printf("[WS] 请求体 %dKB 达到已学习的 1009 体积阈值，直接走 HTTP 上游 (endpoint=/v1/responses)", len(codexBody)/1024)
+			}
 		}
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -1847,7 +2022,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			if lastUpstreamCancel != nil {
 				lastUpstreamCancel()
 			}
@@ -1855,7 +2030,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel = upstreamCancel
 			ttftGuard := (*firstTokenTimeoutGuard)(nil)
 			if isStream {
-				ttftGuard = newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
+				ttftGuard = newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(currentFirstTokenTimeout(), bodySignalCompact), upstreamCancel)
 			}
 			stopTTFTGuard := func() {
 				if ttftGuard != nil {
@@ -1865,8 +2040,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			ttftTimedOut := func() bool {
 				return ttftGuard != nil && ttftGuard.TimedOut()
 			}
-			baseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+			upstreamEndpoint := relayUpstreamEndpointForAccount(account)
 			upstreamBody := getOpenAIResponsesBody()
 			var mappedBody []byte
 			var mappedModel string
@@ -1881,7 +2055,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr := ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -1891,14 +2065,18 @@ func (h *Handler) Responses(c *gin.Context) {
 					reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 				}
 				kind := classifyTransportFailure(reqErr)
+				if wsHTTPFallback.ForceHTTP() {
+					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
+				}
 				retryable := IsRetryableError(reqErr) || kind != ""
 				shouldRetry := false
 				if retryable {
 					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 				}
 				// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-				stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-				if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+				// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+				stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+				if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -1938,6 +2116,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			if resp.StatusCode != http.StatusOK {
 				stopTTFTGuard()
+				if wsHTTPFallback.ForceHTTP() {
+					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
+				}
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 
@@ -1972,7 +2153,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -2009,7 +2190,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 
-			c.Set("x-account-email", baseURL)
+			account.Mu().RLock()
+			relayAccountEmail := account.Email
+			account.Mu().RUnlock()
+			c.Set("x-account-email", relayAccountEmail)
 			c.Set("x-account-proxy", proxyURL)
 			c.Set("x-model", logModel)
 			c.Set("x-reasoning-effort", reasoningEffort)
@@ -2045,7 +2229,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.Release(account)
 					return
 				}
-				streamWriter := newStreamFlushWriter(c.Writer, flusher)
+				streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
@@ -2138,6 +2322,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
+			if wsHTTPFallback.ForceHTTP() {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
+			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
@@ -2227,14 +2414,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			} else if outcome.logStatusCode == http.StatusOK {
 				h.store.ClearModelCooldown(account, attemptEffectiveModel)
-				h.store.ConfirmResponsesAvailable(account)
+				h.store.ConfirmResponsesAvailableSince(account, start)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			h.store.Release(account)
 			return
 		}
 
-		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
+		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
@@ -2243,14 +2430,20 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
+		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
-		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
+		ttftGuard := newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(currentFirstTokenTimeout(), bodySignalCompact), upstreamCancel)
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图产生大体积
 		// 数据卡死 WS 流（issue #220）。显式生图请求已在上面强制走 HTTP。
 		upstreamBody := codexBody
 		if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
+		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
+		// 按尝试重算：不同尝试的生效模型/账号可能不同，规则按模型或账号门匹配则结果随之变化。
+		serviceTier = EffectiveRequestedServiceTier(upstreamBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -2261,11 +2454,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
+			}
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
-				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
-				forceHTTPAfterWSMessageTooBig = true
-				h.store.Release(account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				wsElapsed := time.Since(start)
+				globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
+				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()))
+				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
@@ -2274,8 +2470,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -2313,6 +2510,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
+			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
@@ -2336,6 +2536,19 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 
+			// 上下文超窗 + Key 开启自动压缩：摘要旧轮次后同参重试一次 (issue #415)
+			if overflowCompactEnabled && !overflowCompactRetried &&
+				resp.StatusCode == http.StatusBadRequest && isContextLengthExceededBody(errBody) {
+				if compacted, ok := h.compactOverflowResponsesBody(c.Request.Context(), codexBody); ok {
+					overflowCompactRetried = true
+					codexBody = compacted
+					expandedInputRaw = responsesInputRaw(codexBody)
+					log.Printf("上游报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
+					continue
+				}
+			}
+
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -2348,7 +2561,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2406,6 +2619,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 		// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 		abortedForHTTPError := false
+		// contentTokenSeen: 是否已出现真正的内容事件（严格判定，与 first_token_mode 无关）。
+		// loose 模式下 codex.rate_limits 等前置事件会置位 ttftRecorded，"首 token 前"
+		// 的失败抑制/真实错误码/事件缓冲决策改用本标志，避免在 loose 部署上失效。
+		contentTokenSeen := false
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
@@ -2427,7 +2644,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -2443,6 +2660,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+				}
+				// contentTokenSeen 用严格判定（与 first_token_mode 无关）：loose 模式下
+				// codex.rate_limits 等前置事件也会置位 ttftRecorded，若用它做"首 token 前"
+				// 判断，失败抑制/真实错误码/超窗压缩重试在 loose 部署上全部失效。
+				if !contentTokenSeen && isFirstTokenResult(parsed) {
+					contentTokenSeen = true
 				}
 
 				// 累计 delta 字符数
@@ -2468,21 +2691,26 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, contentTokenSeen, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
 					pendingFirstTokenEvents.Reset()
 					return false
 				}
 
 				// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 				// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 + [DONE] 让中转层误计费。
-				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) {
+				if shouldReturnHTTPErrorForResponseFailed(eventType, contentTokenSeen, wroteAnyBody, clientGone) {
 					pendingFirstTokenEvents.Reset()
 					abortedForHTTPError = true
 					return false
 				}
 
 				if !clientGone {
-					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+					// codex.* 前置元数据事件（rate_limits / response.metadata）与生命周期
+					// 事件一样延迟到首 token 一起冲刷：立即写出会提交 200 header 并置位
+					// wroteAnyBody，使首 token 前的 response.failed（如 context_length_exceeded）
+					// 既无法按真实错误码返回，也无法走超窗压缩重试。
+					shouldDefer := !contentTokenSeen && !gotTerminal &&
+						(isPreContentLifecycleEvent(eventType) || isCodexPreflightSSEEvent(eventType))
 					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
 					if err != nil {
 						writeErr = err
@@ -2519,6 +2747,8 @@ func (h *Handler) Responses(c *gin.Context) {
 							lastUpstreamCancel()
 						}
 						rctx, rcancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+						// 续想轮复用同一账号，沿用带账号维度的 attempt 身份。
+						rctx = WithPayloadRuleIdentity(rctx, attemptIdentity)
 						lastUpstreamCancel = rcancel
 						roundBody := body
 						if useWebsocket {
@@ -2637,12 +2867,15 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
+		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %s", attempt+1, account.ID(), outcome.failureMessage)
-			forceHTTPAfterWSMessageTooBig = true
+			wsElapsed := time.Since(start)
 			resp.Body.Close()
-			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
+			wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(outcome.failureMessage))
+			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
@@ -2679,6 +2912,22 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 		}
+		// 流内报上下文超窗（HTTP SSE 与 WS 上游同路径）+ Key 开启自动压缩：
+		// 未向下游写过任何字节时，摘要旧轮次后同参重试一次 (issue #415)。
+		if overflowCompactEnabled && !overflowCompactRetried && !wroteAnyBody &&
+			(!isStream || abortedForHTTPError) &&
+			isContextLengthExceededFailedPayload(terminalFailurePayload) {
+			if compacted, ok := h.compactOverflowResponsesBody(c.Request.Context(), codexBody); ok {
+				overflowCompactRetried = true
+				codexBody = compacted
+				expandedInputRaw = responsesInputRaw(codexBody)
+				log.Printf("上游流内报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+				resp.Body.Close()
+				h.store.Release(account)
+				continue
+			}
+		}
+
 		if isStream && abortedForHTTPError && !wroteAnyBody {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
@@ -2745,7 +2994,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
-			h.store.ConfirmResponsesAvailable(account)
+			h.store.ConfirmResponsesAvailableSince(account, start)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
@@ -2771,7 +3020,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2820,9 +3072,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
-	sessionID := ResolveSessionID(c.Request.Header, rawBody)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
-	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
+	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -2834,6 +3086,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 	// 准备上游请求体（previous_response_id 缓存按下游 API Key 隔离）
 	codexBody, _ := PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
+	// strip 策略：剥离图片工具能力声明后作为普通文本请求继续（issue #411）。
+	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
@@ -2909,7 +3163,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
-				if kind := classifyTransportFailure(reqErr); kind != "" {
+				if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -2962,7 +3216,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -3093,12 +3347,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 		// compact（会话压缩续写）刻意保留确定性 IsolateCodexSessionID、不走 resolveUpstreamSessionID
 		// 的默认隔离：压缩本身是对同一会话的延续，需要稳定的 prompt_cache_key 维持缓存连续性。
-		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionIdentity.upstreamSeed)
 		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -3152,7 +3406,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3291,7 +3545,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -3338,6 +3595,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	reasoningEffort := extractReasoningEffort(rawBody)
+	ruleIdentity := h.payloadRuleIdentity(c)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
@@ -3365,11 +3623,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
-	sessionID := ResolveSessionID(c.Request.Header, codexBody)
-	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, codexBody)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
-	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
+	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -3379,7 +3637,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
-	forceHTTPAfterWSMessageTooBig := false
+	var wsHTTPFallback websocketHTTPFallbackState
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -3391,7 +3649,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
+		if !retainedHTTPFallback {
+			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		}
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -3403,20 +3664,31 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
-		isRelayAccount := account.IsOpenAIResponsesAPI()
+		if !retainedHTTPFallback {
+			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		}
+		if wsHTTPFallback.ForceHTTP() {
+			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
+		}
+		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
 		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
 			useWebsocket = false
 		}
+		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。
+		if useWebsocket && globalWSSizeRouter.PreferHTTP(len(codexBody)) {
+			useWebsocket = false
+			if attempt == 0 {
+				log.Printf("[WS] 请求体 %dKB 达到已学习的 1009 体积阈值，直接走 HTTP 上游 (endpoint=/v1/chat/completions)", len(codexBody)/1024)
+			}
+		}
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			relayBaseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint = auth.OpenAIResponsesEndpoint(relayBaseURL, "/v1/responses")
+			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
 		}
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -3434,7 +3706,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
+		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
+		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
+		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
+		// 仅 Codex 路径（ExecuteRequest）套用规则；relay 账号不套用，保持原值。
+		// 按尝试重算：不同尝试的生效模型/账号可能不同，规则按模型或账号门匹配则结果随之变化。
+		if !isRelayAccount {
+			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
+		}
+
+		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
@@ -3443,6 +3724,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		var resp *http.Response
@@ -3454,7 +3736,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
 			upstreamBody := codexBody
@@ -3472,11 +3754,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
+			}
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
-				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %v", attempt+1, account.ID(), reqErr)
-				forceHTTPAfterWSMessageTooBig = true
-				h.store.Release(account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				wsElapsed := time.Since(start)
+				globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
+				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()))
+				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
@@ -3485,8 +3770,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -3524,6 +3810,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
+			}
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -3538,7 +3827,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3619,7 +3908,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -3772,12 +4061,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
+		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %s", attempt+1, account.ID(), outcome.failureMessage)
-			forceHTTPAfterWSMessageTooBig = true
+			wsElapsed := time.Since(start)
 			resp.Body.Close()
-			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
+			wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(outcome.failureMessage))
+			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
@@ -3901,7 +4193,7 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 		return
 	}
 
-	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
 	err := ReadSSEStream(body, func(data []byte) bool {
 		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
 		if chunk != nil {
@@ -4025,6 +4317,36 @@ func parseUsageLimitResetAt(body []byte, now time.Time) (time.Time, bool) {
 	return parseRetryAfterResetAt(body, now)
 }
 
+// IsCodexModelUnsupportedError 是 isCodexModelUnsupportedError 的导出包装，
+// 供管理端模型探测复用同一套"账号不支持该模型"识别逻辑。
+func IsCodexModelUnsupportedError(body []byte) bool {
+	return isCodexModelUnsupportedError(body)
+}
+
+// isCodexModelUnsupportedError 判断 400 响应是否为"当前账号不支持该模型"。
+// 该错误由账号套餐权益决定而非请求内容，换到支持该模型的账号即可成功，
+// 因此按 (账号, 模型) 维度冷却并换号重试，而不是原样透传给客户端（issue #408）。
+func isCodexModelUnsupportedError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	candidates := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+		string(body),
+	}
+	for _, candidate := range candidates {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "model is not supported when using codex") {
+			return true
+		}
+	}
+	return false
+}
+
 func isCodexModelCapacityError(body []byte) bool {
 	if len(body) == 0 {
 		return false
@@ -4068,13 +4390,25 @@ type codexWindowUsage struct {
 }
 
 func parseCodexWindowUsage(usedStr, windowStr, resetStr string) codexWindowUsage {
-	if usedStr == "" {
+	if strings.TrimSpace(usedStr) == "" || strings.TrimSpace(windowStr) == "" {
 		return codexWindowUsage{}
 	}
+	var usedPct, windowMin, resetSec float64
+	if _, err := fmt.Sscanf(usedStr, "%f", &usedPct); err != nil {
+		return codexWindowUsage{}
+	}
+	if _, err := fmt.Sscanf(windowStr, "%f", &windowMin); err != nil || windowMin <= 0 {
+		return codexWindowUsage{}
+	}
+	if strings.TrimSpace(resetStr) != "" {
+		if _, err := fmt.Sscanf(resetStr, "%f", &resetSec); err != nil {
+			resetSec = 0
+		}
+	}
 	return codexWindowUsage{
-		usedPct:   parseFloat(usedStr),
-		windowMin: parseFloat(windowStr),
-		resetSec:  parseFloat(resetStr),
+		usedPct:   usedPct,
+		windowMin: windowMin,
+		resetSec:  resetSec,
 		valid:     true,
 	}
 }
@@ -4254,12 +4588,31 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	// Grok 上游的错误语义与 Codex 不同（免费额度耗尽/超支限制/Retry-After），单独映射。
+	if account.IsGrokAPI() {
+		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)
+	}
 	if IsUsageLimitReachedError(body) {
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		log.Printf("账号 %d 触发用量上限 (status=%d, plan=%s, reason=%s)，冷却到 %s", account.ID(), statusCode, account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
 		return decision
 	}
 	switch statusCode {
+	case http.StatusBadRequest:
+		// 账号套餐不支持该模型：按 (账号, 模型) 冷却，调度器随后会跳过该组合；
+		// 其余 400 属请求内容问题，不动账号状态。
+		if model != "" && isCodexModelUnsupportedError(body) {
+			cooldown := h.store.MarkModelCooldown(account, model, 30*time.Minute, "model_not_supported")
+			log.Printf("账号 %d (plan=%s) 不支持模型 %s，该模型冷却到 %s", account.ID(), account.GetPlanType(), model, cooldown.ResetAt.Format(time.RFC3339))
+			return codex429Decision{
+				Scope:    rateLimitScopeModel,
+				Reason:   "model_not_supported",
+				Model:    model,
+				ResetAt:  cooldown.ResetAt,
+				Cooldown: time.Until(cooldown.ResetAt),
+			}
+		}
+		return codex429Decision{}
 	case http.StatusTooManyRequests:
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		if decision.Scope == rateLimitScopeModel {
@@ -4393,6 +4746,7 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	if account == nil || resp == nil {
 		return result
 	}
+	observedAt := time.Now()
 	if store != nil {
 		planHeader := resp.Header.Get("x-codex-plan-type")
 		store.UpdateAccountPlanType(account, planHeader)
@@ -4403,39 +4757,82 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	}
 	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
-	result.Used5hHeaders = responseHasCodex5hHeaders(resp)
-	result.UsagePct7d, result.HasUsage7d = parseCodexUsageHeaders(resp, account)
-	if store != nil {
-		if result.HasUsage7d {
-			store.PersistUsageSnapshot(account, result.UsagePct7d)
-			if result.UsagePct7d >= 100 {
-				result.Usage7dRateLimited = store.MarkUsage7dRateLimited(account)
+	observation := parseCodexUsageHeaderObservation(resp)
+	result.Used5hHeaders = observation.w5h.valid
+	usageApplied := false
+	if observation.authoritative {
+		usageApplied = account.ApplyUsageObservation(observedAt, func() {
+			parsed := applyCodexUsageHeaderObservation(store, account, observation, observedAt)
+			result.UsagePct7d = parsed.usagePct7d
+			result.HasUsage7d = parsed.hasUsage7d
+			result.Cleared5h = parsed.cleared5h
+			if store == nil {
+				return
 			}
-		} else if result.Used5hHeaders {
-			store.PersistUsageSnapshot5hOnly(account)
-			result.Persisted5hOnly = true
-		}
+			if result.HasUsage7d {
+				store.PersistUsageSnapshot(account, result.UsagePct7d)
+				if result.UsagePct7d >= 100 {
+					result.Usage7dRateLimited = store.MarkUsage7dRateLimited(account)
+				}
+			} else if result.Used5hHeaders {
+				store.PersistUsageSnapshot5hOnly(account)
+				result.Persisted5hOnly = true
+			}
+		})
 	}
 
 	result.UsagePct5h, result.Reset5hAt, result.HasUsage5h = account.GetUsageSnapshot5h()
-	if store != nil && result.HasUsage5h {
+	if usageApplied && store != nil && result.HasUsage5h {
 		// 被动 /responses 头刷新了 5h 窗口重置时刻：武装「到点即探」，窗口翻新即刷新进度条。
 		store.WakeBoundaryProbe(result.Reset5hAt)
 	}
-	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
+	if usageApplied && result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
 		if store != nil {
-			store.MarkPremium5hRateLimited(account, result.Reset5hAt)
+			result.Premium5hRateLimited = store.MarkPremium5hRateLimitedAt(account, result.Reset5hAt, observedAt)
+		} else {
+			result.Premium5hRateLimited = true
 		}
-		result.Premium5hRateLimited = true
 	}
 
 	return result
 }
 
+type codexUsageHeaderParseResult struct {
+	usagePct7d float64
+	hasUsage7d bool
+	cleared5h  bool
+}
+
+type codexUsageHeaderObservation struct {
+	w5h           codexWindowUsage
+	w7d           codexWindowUsage
+	authoritative bool
+}
+
 // parseCodexUsageHeaders 从 Codex 响应头解析 5h/7d 用量百分比
 func parseCodexUsageHeaders(resp *http.Response, account *auth.Account) (float64, bool) {
-	if resp == nil {
+	if resp == nil || account == nil {
 		return 0, false
+	}
+	observedAt := time.Now()
+	observation := parseCodexUsageHeaderObservation(resp)
+	if !observation.authoritative {
+		return 0, false
+	}
+	parsed := codexUsageHeaderParseResult{}
+	account.ApplyUsageObservation(observedAt, func() {
+		parsed = applyCodexUsageHeaderObservation(nil, account, observation, observedAt)
+	})
+	return parsed.usagePct7d, parsed.hasUsage7d
+}
+
+// parseCodexUsageHeaderObservation classifies only windows with a positive,
+// recognizable duration. Used-percent-only partial headers are not authoritative
+// evidence that the optional 5h window disappeared.
+func parseCodexUsageHeaderObservation(resp *http.Response) codexUsageHeaderObservation {
+	out := codexUsageHeaderObservation{}
+	if resp == nil {
+		return out
 	}
 
 	// 解析 primary 和 secondary 窗口
@@ -4449,46 +4846,43 @@ func parseCodexUsageHeaders(resp *http.Response, account *auth.Account) (float64
 	primary := parseCodexWindowUsage(primaryUsedStr, primaryWindowStr, primaryResetStr)
 	secondary := parseCodexWindowUsage(secondaryUsedStr, secondaryWindowStr, secondaryResetStr)
 
-	// 归一化：小窗口 (≤360min) → 5h，大窗口 (>360min) → 7d
-	var w5h, w7d codexWindowUsage
-	now := time.Now()
-
-	if primary.valid && secondary.valid {
-		if primary.windowMin >= secondary.windowMin {
-			w7d, w5h = primary, secondary
-		} else {
-			w7d, w5h = secondary, primary
+	for _, window := range []codexWindowUsage{primary, secondary} {
+		if !window.valid {
+			continue
 		}
-	} else if primary.valid {
-		if primary.windowMin <= 360 && primary.windowMin > 0 {
-			w5h = primary
-		} else {
-			w7d = primary
-		}
-	} else if secondary.valid {
-		if secondary.windowMin <= 360 && secondary.windowMin > 0 {
-			w5h = secondary
-		} else {
-			w7d = secondary
+		switch codexWindowType(window.windowMin) {
+		case codexRateLimitWindow5h:
+			if !out.w5h.valid {
+				out.w5h = window
+			}
+		case codexRateLimitWindow7d:
+			if !out.w7d.valid {
+				out.w7d = window
+			}
 		}
 	}
+	out.authoritative = out.w5h.valid || out.w7d.valid
+	return out
+}
 
-	// 写入 5h
-	if w5h.valid {
-		resetAt := now.Add(time.Duration(w5h.resetSec) * time.Second)
-		account.SetUsageSnapshot5hAt(w5h.usedPct, resetAt, now)
+func applyCodexUsageHeaderObservation(store *auth.Store, account *auth.Account, observation codexUsageHeaderObservation, observedAt time.Time) codexUsageHeaderParseResult {
+	out := codexUsageHeaderParseResult{}
+	if observation.w5h.valid {
+		resetAt := observedAt.Add(time.Duration(observation.w5h.resetSec) * time.Second)
+		account.SetUsageSnapshot5hAt(observation.w5h.usedPct, resetAt, observedAt)
+	} else if observation.authoritative {
+		out.cleared5h = store.ClearAbsentUsageSnapshot5hAt(account, observedAt)
 	}
 
-	// 写入 7d
-	if w7d.valid {
-		resetAt := now.Add(time.Duration(w7d.resetSec) * time.Second)
+	if observation.w7d.valid {
+		resetAt := observedAt.Add(time.Duration(observation.w7d.resetSec) * time.Second)
 		account.SetReset7dAt(resetAt)
-		account.SetWindow7dSeconds(int64(w7d.windowMin * 60))
-		account.SetUsagePercent7d(w7d.usedPct)
-		return w7d.usedPct, true
+		account.SetWindow7dSeconds(int64(observation.w7d.windowMin * 60))
+		account.SetUsagePercent7d(observation.w7d.usedPct)
+		out.usagePct7d = observation.w7d.usedPct
+		out.hasUsage7d = true
 	}
-
-	return 0, false
+	return out
 }
 
 // ParseCodexUsageHeaders 从响应头提取并更新账号用量信息
@@ -4555,6 +4949,20 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 				"message": "账号池暂无可用账号（上游账号鉴权失效），请稍后重试",
 				"type":    "server_error",
 				"code":    "account_pool_unauthorized",
+			},
+		})
+		return
+	}
+
+	// 上游账号 403（payment_required / deactivated_workspace / codex_access_restricted）
+	// 同样是账号侧问题：重试已换过号仍拿到 403 说明池内暂无可用账号。原样透传 403 会让
+	// 客户端（如 Claude Code）误判为自身无权限而直接停工（issue #396），改写为 503 池级错误。
+	if statusCode == http.StatusForbidden {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"message": "账号池暂无可用账号（上游账号被拒绝访问：额度/套餐或工作区受限），请稍后重试",
+				"type":    "server_error",
+				"code":    "account_pool_forbidden",
 			},
 		})
 		return
@@ -4630,6 +5038,23 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 				seen[key] = struct{}{}
 				models = append(models, alias)
 			}
+		}
+		// 全局模型映射的 from 键（Claude 模型映射：claude-* → gpt-*，用于 /v1/messages）
+		// 也要出现在 /v1/models，否则下游客户端拉不到可用的 Claude 模型名。
+		// 仅列非通配的显式映射键；通配规则（含 *）不作为具体模型暴露。
+		for _, rule := range parseModelMappingRules(h.store.GetModelMapping()) {
+			if rule.Wildcard {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(rule.From))
+			if key == "" {
+				continue
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			models = append(models, rule.From)
 		}
 	}
 	return models

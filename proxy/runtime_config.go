@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -32,20 +33,24 @@ const (
 	RequestIsolationModeIsolated  = "isolated"
 	RequestIsolationModePerAPIKey = "per-api-key"
 
-	defaultClientCompatMode      = ClientCompatModePreserve
-	defaultCodexMinCLIVersion    = "0.118.0"
-	defaultStreamFlushPolicy     = StreamFlushPolicyImmediate
-	defaultStreamFlushIntervalMS = 20
-	minStreamFlushIntervalMS     = 1
-	maxStreamFlushIntervalMS     = 1000
-	defaultFirstTokenMode        = FirstTokenModeStrict
-	defaultFirstTokenTimeoutSec  = 0
-	maxFirstTokenTimeoutSec      = 600
-	defaultBillingTierPolicy     = BillingTierPolicyActual
-	defaultCodexWSHideErrors     = true
-	defaultCodexWSSilentRetry    = true
-	defaultCodexWSSilentRetries  = 2
-	maxCodexWSSilentRetries      = 10
+	defaultClientCompatMode       = ClientCompatModePreserve
+	defaultCodexMinCLIVersion     = "0.118.0"
+	defaultStreamFlushPolicy      = StreamFlushPolicyImmediate
+	defaultStreamFlushIntervalMS  = 20
+	minStreamFlushIntervalMS      = 1
+	maxStreamFlushIntervalMS      = 1000
+	defaultFirstTokenMode         = FirstTokenModeStrict
+	defaultFirstTokenTimeoutSec   = 0
+	maxFirstTokenTimeoutSec       = 600
+	defaultBillingTierPolicy      = BillingTierPolicyActual
+	defaultCodexWSHideErrors      = true
+	defaultCodexWSSilentRetry     = true
+	defaultCodexWSSilentRetries   = 2
+	defaultCodexWSSizeRouter      = true
+	maxCodexWSSilentRetries       = 10
+	defaultCodexWSBusyMaxWaitSec  = 30
+	defaultCodexWSBusyPatienceSec = 2
+	maxCodexWSBusyWaitSec         = 300
 
 	defaultCodexContinueMaxRounds = 8
 	minCodexContinueMaxRounds     = 1
@@ -67,6 +72,13 @@ type RuntimeSettings struct {
 	CodexWSSilentRetries          int  // Codex WS 静默换号最大重试次数（默认 2）
 	CodexFastModelAliasEnabled    bool // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
 	CodexFastTierInterceptEnabled bool // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
+	CodexWSSizeRouter             bool // 1009 自学习体积路由：超大请求直接首发 HTTP（默认 true）
+	CodexWSBusyMaxWaitSec         int  // busy session/容量等待的累计上限秒数（默认 30，issue #413）
+	CodexWSBusyOverflow           bool // busy session 溢出到同账号兄弟连接（默认 false）
+	CodexWSBusyPatienceSec        int  // 触发溢出前的短等待秒数（默认 2）
+	// OverflowAutoCompact 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）。
+	// 全局开关与 per-key limits.auto_compact_overflow 为「或」关系。
+	OverflowAutoCompact bool
 	// CodexContinueThinking 检测到上游按 518n-2 指纹截断思考时自动续想并折叠成单响应（默认 false）。
 	CodexContinueThinking  bool
 	CodexContinueMaxRounds int // 单次请求最大续想轮数，含首轮（默认 8，范围 1-32）
@@ -115,6 +127,9 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSilentRetries:             defaultCodexWSSilentRetries,
 		CodexFastModelAliasEnabled:       true,
 		CodexFastTierInterceptEnabled:    false,
+		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
+		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
+		CodexWSBusyPatienceSec:           defaultCodexWSBusyPatienceSec,
 		CodexContinueMaxRounds:           defaultCodexContinueMaxRounds,
 		RequestIsolationMode:             defaultRequestIsolationMode(),
 		CodexCLIVersionSyncEnabled:       true,
@@ -221,6 +236,18 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexWSSilentRetries > maxCodexWSSilentRetries {
 		settings.CodexWSSilentRetries = maxCodexWSSilentRetries
 	}
+	if settings.CodexWSBusyMaxWaitSec <= 0 {
+		settings.CodexWSBusyMaxWaitSec = defaultCodexWSBusyMaxWaitSec
+	}
+	if settings.CodexWSBusyMaxWaitSec > maxCodexWSBusyWaitSec {
+		settings.CodexWSBusyMaxWaitSec = maxCodexWSBusyWaitSec
+	}
+	if settings.CodexWSBusyPatienceSec < 0 {
+		settings.CodexWSBusyPatienceSec = defaultCodexWSBusyPatienceSec
+	}
+	if settings.CodexWSBusyPatienceSec > maxCodexWSBusyWaitSec {
+		settings.CodexWSBusyPatienceSec = maxCodexWSBusyWaitSec
+	}
 	if settings.CodexContinueMaxRounds < minCodexContinueMaxRounds {
 		settings.CodexContinueMaxRounds = defaults.CodexContinueMaxRounds
 	}
@@ -251,6 +278,11 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
 		next.CodexFastModelAliasEnabled = settings.CodexFastModelAliasEnabled
 		next.CodexFastTierInterceptEnabled = settings.CodexFastTierInterceptEnabled
+		next.CodexWSSizeRouter = settings.CodexWSSizeRouterEnabled
+		next.CodexWSBusyMaxWaitSec = settings.CodexWSBusyAcquireMaxWaitSec
+		next.CodexWSBusyOverflow = settings.CodexWSBusyOverflowEnabled
+		next.CodexWSBusyPatienceSec = settings.CodexWSBusyPatienceSec
+		next.OverflowAutoCompact = settings.OverflowAutoCompactEnabled
 		next.CodexContinueThinking = settings.CodexContinueThinkingEnabled
 		next.CodexContinueMaxRounds = settings.CodexContinueMaxRounds
 		next.CodexSyncedCLIVersion = settings.CodexSyncedCLIVersion
@@ -258,6 +290,10 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexCLIVersionSyncIntervalHours = settings.CodexCLIVersionSyncIntervalHours
 		next.AutoResetCreditsEnabled = settings.AutoResetCreditsEnabled
 		next.AutoResetCreditsBeforeExpiryMin = settings.AutoResetCreditsBeforeExpiryMin
+		// Payload 重写规则不进 RuntimeSettings（编译后独立存放），此处顺带完成启动种子。
+		if err := SetPayloadRulesJSON(settings.PayloadRules); err != nil {
+			log.Printf("payload_rules 配置解析失败，已忽略: %v", err)
+		}
 	}
 	return storeRuntimeSettings(next)
 }

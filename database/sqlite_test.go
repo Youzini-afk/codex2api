@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -739,6 +740,40 @@ func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
 	}
 }
 
+func TestSQLiteInsertPendingAccountWithCredentialsIsDisabledAndAnnotated(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertPendingAccountWithCredentials(ctx, "pending", map[string]interface{}{
+		"refresh_token": "rt-pending",
+	}, "http://proxy.example", "contact@example.com", []string{"self-service"})
+	if err != nil {
+		t.Fatalf("InsertPendingAccountWithCredentials 返回错误: %v", err)
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID 返回错误: %v", err)
+	}
+	if row.Enabled {
+		t.Fatal("pending account Enabled = true, want false")
+	}
+	if row.Note != "contact@example.com" {
+		t.Fatalf("pending account Note = %q, want contact@example.com", row.Note)
+	}
+	if len(row.Tags) != 1 || row.Tags[0] != "self-service" {
+		t.Fatalf("pending account Tags = %v, want [self-service]", row.Tags)
+	}
+	if row.ProxyURL != "http://proxy.example" {
+		t.Fatalf("pending account ProxyURL = %q, want http://proxy.example", row.ProxyURL)
+	}
+}
+
 func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -754,7 +789,7 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
@@ -924,7 +959,7 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 		t.Fatalf("summary = %+v, want one 5xx/401/499/timeout/retry", summary)
 	}
 
-	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5)
+	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5, "")
 	if err != nil {
 		t.Fatalf("GetChartAggregation 返回错误: %v", err)
 	}
@@ -1082,61 +1117,69 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                         "CodexProxy",
-		MaxConcurrency:                   2,
-		GlobalRPM:                        0,
-		TestModel:                        "gpt-5.4",
-		TestContent:                      "say pong",
-		TestConcurrency:                  50,
-		BackgroundRefreshIntervalMinutes: 2,
-		UsageProbeMaxAgeMinutes:          10,
-		UsageProbeConcurrency:            16,
-		RecoveryProbeIntervalMinutes:     30,
-		PgMaxConns:                       50,
-		RedisPoolSize:                    30,
-		MaxRetries:                       2,
-		MaxRateLimitRetries:              1,
-		ModelMapping:                     "{}",
-		CodexModelMapping:                `{"gpt-5.2":"gpt-5.5"}`,
-		ReasoningEffortModels:            `[{"model":"gpt-5.5","effort":"xhigh"}]`,
-		PromptFilterMode:                 "monitor",
-		PromptFilterThreshold:            50,
-		PromptFilterStrictThreshold:      90,
-		PromptFilterLogMatches:           true,
-		PromptFilterMaxTextLength:        81920,
-		PromptFilterCustomPatterns:       "[]",
-		PromptFilterDisabledPatterns:     "[]",
-		PromptFilterReviewEnabled:        true,
-		PromptFilterReviewAPIKey:         "sk-review-test",
-		PromptFilterReviewBaseURL:        "https://review.example.com",
-		PromptFilterReviewModel:          "review-model",
-		PromptFilterReviewTimeoutSeconds: 7,
-		PromptFilterReviewFailClosed:     false,
-		ClientCompatMode:                 "preserve",
-		CodexMinCLIVersion:               "0.118.0",
-		CodexUserAgentConfig:             `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
-		UsageLogMode:                     "full",
-		UsageLogBatchSize:                200,
-		UsageLogFlushIntervalSeconds:     5,
-		StreamFlushPolicy:                "immediate",
-		StreamFlushIntervalMS:            20,
-		FirstTokenMode:                   "loose",
-		FirstTokenTimeoutSeconds:         17,
-		BillingTierPolicy:                "requested",
-		ImageStorageConfig:               "{}",
-		SchedulerMode:                    "round_robin",
-		AffinityMode:                     "bounded",
-		BackgroundConfig:                 "{}",
-		ShowFullUsageNumbers:             true,
-		PublicKeyUsagePageEnabled:        true,
-		CodexWSHideUpstreamErrors:        true,
-		CodexWSSilentRetryEnabled:        true,
-		CodexWSSilentMaxRetries:          4,
-		CodexFastModelAliasEnabled:       false,
-		CodexFastTierInterceptEnabled:    true,
-		IgnoreUsageLimitStatus:           true,
-		AutoResetCreditsEnabled:          true,
-		AutoResetCreditsBeforeExpiryMin:  75,
+		SiteName:                          "CodexProxy",
+		MaxConcurrency:                    2,
+		GlobalRPM:                         0,
+		TestModel:                         "gpt-5.4",
+		TestContent:                       "say pong",
+		TestConcurrency:                   50,
+		BackgroundRefreshIntervalMinutes:  2,
+		UsageProbeMaxAgeMinutes:           10,
+		UsageProbeConcurrency:             16,
+		RecoveryProbeIntervalMinutes:      30,
+		PgMaxConns:                        50,
+		RedisPoolSize:                     30,
+		MaxRetries:                        2,
+		MaxRateLimitRetries:               1,
+		ModelMapping:                      "{}",
+		CodexModelMapping:                 `{"gpt-5.2":"gpt-5.5"}`,
+		ReasoningEffortModels:             `[{"model":"gpt-5.5","effort":"xhigh"}]`,
+		PromptFilterMode:                  "monitor",
+		PromptFilterThreshold:             50,
+		PromptFilterStrictThreshold:       90,
+		PromptFilterStrictTerminalEnabled: true,
+		PromptFilterAdvancedConfig:        `{"normalization":{"enabled":true}}`,
+		PromptFilterLogMatches:            true,
+		PromptFilterMaxTextLength:         81920,
+		PromptFilterCustomPatterns:        "[]",
+		PromptFilterDisabledPatterns:      "[]",
+		PromptFilterReviewEnabled:         true,
+		PromptFilterReviewAPIKey:          "sk-review-test",
+		PromptFilterReviewBaseURL:         "https://review.example.com",
+		PromptFilterReviewModel:           "review-model",
+		PromptFilterReviewTimeoutSeconds:  7,
+		PromptFilterReviewFailClosed:      false,
+		ClientCompatMode:                  "preserve",
+		CodexMinCLIVersion:                "0.118.0",
+		CodexUserAgentConfig:              `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
+		UsageLogMode:                      "full",
+		UsageLogBatchSize:                 200,
+		UsageLogFlushIntervalSeconds:      5,
+		StreamFlushPolicy:                 "immediate",
+		StreamFlushIntervalMS:             20,
+		FirstTokenMode:                    "loose",
+		FirstTokenTimeoutSeconds:          17,
+		BillingTierPolicy:                 "requested",
+		ImageStorageConfig:                "{}",
+		SchedulerMode:                     "round_robin",
+		AffinityMode:                      "bounded",
+		BackgroundConfig:                  "{}",
+		ShowFullUsageNumbers:              true,
+		PublicKeyUsagePageEnabled:         true,
+		PublicImageStudioPageEnabled:      true,
+		CodexWSHideUpstreamErrors:         true,
+		CodexWSSilentRetryEnabled:         true,
+		CodexWSSilentMaxRetries:           4,
+		CodexFastModelAliasEnabled:        false,
+		CodexFastTierInterceptEnabled:     true,
+		CodexWSSizeRouterEnabled:          false,
+		CodexWSBusyAcquireMaxWaitSec:      41,
+		CodexWSBusyOverflowEnabled:        true,
+		CodexWSBusyPatienceSec:            3,
+		OverflowAutoCompactEnabled:        true,
+		IgnoreUsageLimitStatus:            true,
+		AutoResetCreditsEnabled:           true,
+		AutoResetCreditsBeforeExpiryMin:   75,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1150,6 +1193,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
+	}
+	if !settings.PromptFilterStrictTerminalEnabled {
+		t.Fatal("PromptFilterStrictTerminalEnabled = false, want true")
+	}
+	if settings.PromptFilterAdvancedConfig != `{"normalization":{"enabled":true}}` {
+		t.Fatalf("PromptFilterAdvancedConfig = %q", settings.PromptFilterAdvancedConfig)
 	}
 	if !settings.IgnoreUsageLimitStatus {
 		t.Fatal("IgnoreUsageLimitStatus = false, want true")
@@ -1171,6 +1220,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if !settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = false, want true")
+	}
+	if !settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = false, want true")
 	}
 	if settings.BillingTierPolicy != "requested" {
 		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
@@ -1217,6 +1269,21 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if !settings.CodexFastTierInterceptEnabled {
 		t.Fatalf("CodexFastTierInterceptEnabled = false, want true")
 	}
+	if settings.CodexWSSizeRouterEnabled {
+		t.Fatal("CodexWSSizeRouterEnabled = true, want false")
+	}
+	if settings.CodexWSBusyAcquireMaxWaitSec != 41 {
+		t.Fatalf("CodexWSBusyAcquireMaxWaitSec = %d, want 41", settings.CodexWSBusyAcquireMaxWaitSec)
+	}
+	if !settings.CodexWSBusyOverflowEnabled {
+		t.Fatal("CodexWSBusyOverflowEnabled = false, want true")
+	}
+	if settings.CodexWSBusyPatienceSec != 3 {
+		t.Fatalf("CodexWSBusyPatienceSec = %d, want 3", settings.CodexWSBusyPatienceSec)
+	}
+	if !settings.OverflowAutoCompactEnabled {
+		t.Fatal("OverflowAutoCompactEnabled = false, want true")
+	}
 
 	settings.PublicKeyUsagePageEnabled = false
 	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
@@ -1228,6 +1295,18 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = true, want false")
+	}
+
+	settings.PublicImageStudioPageEnabled = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	if settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = true, want false")
 	}
 }
 
@@ -1508,6 +1587,47 @@ func TestUsageLogsPersistEffectiveModel(t *testing.T) {
 	}
 }
 
+func TestUsageLogsPersistUserAgentAudit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:           1,
+		Endpoint:            "/v1/responses",
+		Model:               "gpt-5.4",
+		StatusCode:          200,
+		ClientUserAgent:     "curl/8.7.1",
+		UpstreamUserAgent:   "codex-tui/0.151.0 (Mac OS 15.5.0; arm64) xterm-256color (codex-tui; 0.151.0)",
+		UserAgentOverridden: true,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+	if got := logs[0].ClientUserAgent; got != "curl/8.7.1" {
+		t.Fatalf("ClientUserAgent = %q, want curl/8.7.1", got)
+	}
+	if got := logs[0].UpstreamUserAgent; !strings.HasPrefix(got, "codex-tui/0.151.0 ") {
+		t.Fatalf("UpstreamUserAgent = %q, want generated codex-tui UA", got)
+	}
+	if !logs[0].UserAgentOverridden {
+		t.Fatal("UserAgentOverridden = false, want true")
+	}
+}
+
 func TestUsageLogsPersistImageMetadata(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1740,7 +1860,7 @@ func TestUsageStatsIncludeBillingTotals(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -1839,7 +1959,7 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2071,7 +2191,7 @@ func TestUsageStatsBreakdownsRespectExplicitRange(t *testing.T) {
 		t.Fatalf("更新旧日志时间失败: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd)
+	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2147,7 +2267,7 @@ func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.
 		t.Fatalf("ClearUsageLogs 返回错误: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}

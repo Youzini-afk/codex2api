@@ -156,10 +156,10 @@ func (h *Handler) GetAdminSessionStatus(c *gin.Context) {
 	adminSecret, source := h.resolveAdminSecret(c.Request.Context())
 	if adminSecret == "" {
 		c.JSON(http.StatusOK, adminSessionStatusResponse{
-			AuthRequired:    false,
-			Authenticated:   true,
-			AdminAuthSource: "disabled",
-			AuthMethod:      "disabled",
+			AuthRequired:    true,
+			Authenticated:   false,
+			AdminAuthSource: source,
+			AuthMethod:      "none",
 		})
 		return
 	}
@@ -212,11 +212,9 @@ func (h *Handler) LoginAdminSession(c *gin.Context) {
 
 	adminSecret, source := h.resolveAdminSecret(c.Request.Context())
 	if adminSecret == "" {
-		c.JSON(http.StatusOK, adminSessionStatusResponse{
-			AuthRequired:    false,
-			Authenticated:   true,
-			AdminAuthSource: "disabled",
-			AuthMethod:      "disabled",
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "管理接口未初始化：ADMIN_SECRET 尚未配置。请先完成首次初始化。",
+			"code":  "bootstrap_required",
 		})
 		return
 	}

@@ -87,6 +87,8 @@ func NormalizeTestContent(content string) string {
 // Account 运行时账号状态
 type Account struct {
 	mu                      sync.RWMutex
+	usageSyncMu             sync.Mutex
+	usageObservedAt         time.Time
 	DBID                    int64 // 数据库 ID
 	RefreshToken            string
 	SessionToken            string
@@ -103,10 +105,25 @@ type Account struct {
 	Models                  []string
 	ModelMapping            string
 	CodexClientMetadataMode string
-	Status                  AccountStatus
-	CooldownUtil            time.Time
-	CooldownReason          string // rate_limited / unauthorized / 空
-	ErrorMsg                string
+	// Codex Agent Identity（auth_mode=agentIdentity）：不存 AT/RT，每次上游请求用
+	// agent_private_key(Ed25519, PKCS#8 base64) 动态签名。AgentTaskID 由 task 注册获得，
+	// 运行时缓存并落库(credentials.task_id)。
+	CodexAuthMode   string
+	AgentRuntimeID  string
+	AgentPrivateKey string
+	AgentTaskID     string
+	// Grok OAuth 刷新元数据（upstream_type=grok 且 OAuth 凭据时有效）
+	GrokClientID      string
+	GrokTokenEndpoint string
+	GrokOIDCIssuer    string
+	GrokPrincipalType string
+	GrokPrincipalID   string
+	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头），仅运行时。
+	grokRateLimit  *GrokRateLimitSnapshot
+	Status         AccountStatus
+	CooldownUtil   time.Time
+	CooldownReason string // rate_limited / rate_limited_5h / unauthorized / 空
+	ErrorMsg       string
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d      float64 // 7d 窗口使用率 0-100+
@@ -128,6 +145,18 @@ type Account struct {
 	// -1 表示尚未探测过（未知）；>=0 为已知次数。
 	RateLimitResetCredits      int
 	RateLimitResetCreditsValid bool
+	// ApplicableResetCredits 是当下「可应用」的重置券张数，来自 wham/usage 的
+	// rate_limit_reset_credits.applicable_available_count。未触限时上游返回 0
+	// （券在有效期内但此刻不生效）。
+	ApplicableResetCredits      int
+	ApplicableResetCreditsValid bool
+	// Credits* 是 wham/usage 返回的 credits 积分余额快照（零额度成本）。
+	// Balance 原样保留上游字符串（单位未知，不做换算）；Valid 表示已探测过。
+	CreditsBalance             string
+	CreditsHasCredits          bool
+	CreditsUnlimited           bool
+	CreditsOverageLimitReached bool
+	CreditsValid               bool
 	// resetCreditsProbedAt 记录最近一次成功 wham 用量探针的时间。
 	// 「主动重置次数」只能通过 wham 探针刷新（普通 /responses 流量不携带该字段），
 	// 因此用它独立判断重置次数是否过期，避免活跃账号因用量快照一直被流量刷新而长期不探针。
@@ -308,6 +337,14 @@ func (a *Account) hasDispatchCredentialLocked() bool {
 	if a.isOpenAIResponsesAPILocked() {
 		return true
 	}
+	if a.isGrokAPILocked() {
+		// API Key 直接可调度；OAuth 需等 AT 刷出（RT-only 由后台/lazy 刷新补齐）
+		return strings.TrimSpace(a.APIKey) != "" || strings.TrimSpace(a.AccessToken) != ""
+	}
+	if a.isCodexAgentIdentityLocked() {
+		// Agent Identity 无 AT：私钥即凭据，可直接调度（task_id 于请求前惰性注册）。
+		return true
+	}
 	return strings.TrimSpace(a.AccessToken) != ""
 }
 
@@ -330,7 +367,7 @@ func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.isOpenAIResponsesAPILocked() || len(a.Models) == 0 {
+	if !a.isRelayStyleLocked() || len(a.Models) == 0 {
 		return false
 	}
 	for _, candidate := range a.Models {
@@ -341,13 +378,46 @@ func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
 	return false
 }
 
+// SupportsCodexModel 判断 Codex OAuth 账号能否服务指定模型。
+// Models 为空表示未配置白名单，放行全部模型；非空时按大小写不敏感精确匹配。
+func (a *Account) SupportsCodexModel(model string) bool {
+	if a == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return true
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.Models) == 0 {
+		return true
+	}
+	for _, candidate := range a.Models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
+}
+
+// CodexModels 返回 Codex OAuth 账号配置的支持模型白名单（空表示放行全部）。
+func (a *Account) CodexModels() []string {
+	if a == nil {
+		return []string{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneStringSlice(a.Models)
+}
+
 func (a *Account) OpenAIResponsesModels() []string {
 	if a == nil {
 		return []string{}
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.isOpenAIResponsesAPILocked() {
+	if !a.isRelayStyleLocked() {
 		return []string{}
 	}
 	return cloneStringSlice(a.Models)
@@ -359,7 +429,7 @@ func (a *Account) OpenAIResponsesModelMapping() string {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.isOpenAIResponsesAPILocked() {
+	if !a.isRelayStyleLocked() {
 		return ""
 	}
 	return strings.TrimSpace(a.ModelMapping)
@@ -1026,6 +1096,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	if a.usageReserveActiveLocked(now, defaultUsageProbeMaxAge) && tier != HealthTierBanned {
 		tier = HealthTierRisky
 	}
+	if a.Status == StatusCooldown && a.CooldownReason == premium5hCooldownReason && tier != HealthTierBanned {
+		tier = HealthTierRisky
+	}
 	if a.SkipWarmTier && tier == HealthTierWarm {
 		tier = HealthTierHealthy
 	}
@@ -1577,7 +1650,11 @@ func (a *Account) SetCooldownUntil(until time.Time, reason string) {
 	switch reason {
 	case "unauthorized":
 		a.HealthTier = HealthTierBanned
-	case "rate_limited":
+	case "rate_limited_5h":
+		if a.HealthTier != HealthTierBanned {
+			a.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		if a.healthTierLocked() == HealthTierHealthy {
 			a.HealthTier = HealthTierWarm
 		} else {
@@ -1745,10 +1822,39 @@ func (a *Account) SetUsageSnapshot5h(pct float64, resetAt time.Time) {
 func (a *Account) SetUsageSnapshot5hAt(pct float64, resetAt time.Time, updatedAt time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if updatedAt.After(a.usageObservedAt) {
+		a.usageObservedAt = updatedAt
+	}
 	a.UsagePercent5h = pct
 	a.UsagePercent5hValid = true
 	a.Reset5hAt = resetAt
 	a.UsageUpdatedAt5h = updatedAt
+}
+
+// ApplyUsageObservation serializes one authoritative upstream usage observation,
+// including its database writes. The timestamp check prevents an older observer
+// that waited on the lock from overwriting a newer 5h presence/absence decision.
+func (a *Account) ApplyUsageObservation(observedAt time.Time, apply func()) bool {
+	if a == nil || apply == nil {
+		return false
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+
+	a.usageSyncMu.Lock()
+	defer a.usageSyncMu.Unlock()
+
+	a.mu.Lock()
+	if observedAt.Before(a.usageObservedAt) {
+		a.mu.Unlock()
+		return false
+	}
+	a.usageObservedAt = observedAt
+	a.mu.Unlock()
+
+	apply()
+	return true
 }
 
 // GetUsagePercent5h 获取 5h 用量百分比
@@ -1774,6 +1880,42 @@ func (a *Account) GetRateLimitResetCredits() (int, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.RateLimitResetCredits, a.RateLimitResetCreditsValid
+}
+
+// SetApplicableResetCredits 记录当下「可应用」的重置券张数（未触限时为 0）。
+func (a *Account) SetApplicableResetCredits(count int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if count < 0 {
+		count = 0
+	}
+	a.ApplicableResetCredits = count
+	a.ApplicableResetCreditsValid = true
+}
+
+// GetApplicableResetCredits 返回当下可应用的重置券张数及其是否已探测过。
+func (a *Account) GetApplicableResetCredits() (int, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.ApplicableResetCredits, a.ApplicableResetCreditsValid
+}
+
+// SetCreditBalance 记录 wham/usage 返回的 credits 积分余额快照。
+func (a *Account) SetCreditBalance(balance string, hasCredits, unlimited, overageReached bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.CreditsBalance = balance
+	a.CreditsHasCredits = hasCredits
+	a.CreditsUnlimited = unlimited
+	a.CreditsOverageLimitReached = overageReached
+	a.CreditsValid = true
+}
+
+// GetCreditBalance 返回 credits 积分余额快照及其是否已探测过。
+func (a *Account) GetCreditBalance() (balance string, hasCredits, unlimited, overageReached, ok bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.CreditsBalance, a.CreditsHasCredits, a.CreditsUnlimited, a.CreditsOverageLimitReached, a.CreditsValid
 }
 
 // MarkResetCreditsProbed 记录最近一次成功 wham 用量探针的时间。
@@ -1906,6 +2048,14 @@ func (a *Account) GetPlanType() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.PlanType
+}
+
+// GroupIDSnapshot 返回账号当前所属组 ID 的副本。GroupIDs 写入受 a.mu 保护
+// （ApplyAccountGroups / ApplyAccountGroupMemberships），跨 goroutine 读取须走此快照。
+func (a *Account) GroupIDSnapshot() []int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneInt64Slice(a.GroupIDs)
 }
 
 // applyRefreshedPlanTypeLocked applies a plan parsed from refreshed tokens.
@@ -2215,6 +2365,9 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
 		return false
 	}
+	if a.isRelayStyleLocked() {
+		return false // wham 探针是 ChatGPT 专属；中转/Grok 账号没有该端点
+	}
 	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false // token 失效，wham 也会 401，探针无意义
 	}
@@ -2229,7 +2382,7 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 		// premium 5h 限流期间不发 /responses 探活，但 wham 零成本，仍允许其刷新重置次数。
 		return resetCreditsStale
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
+	if a.Status == StatusCooldown && isUsageLimitCooldownReason(a.CooldownReason) && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		// 429 冷却期间不发 /responses 探活（避免加重限流），但允许 wham-only 探针刷新重置次数——
 		// 这正是用户最需要看到"还剩几次主动重置"的时刻。
 		return resetCreditsStale
@@ -2268,10 +2421,10 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	if a.UsagePercent7dValid && !a.Reset7dAt.IsZero() && !a.Reset7dAt.After(now) && a.UsageUpdatedAt.Before(a.Reset7dAt) {
 		return true
 	}
-	if a.effectiveAutoPause5h > 0 && !a.AutoPause5hDisabled {
-		if !a.UsagePercent5hValid || a.UsageUpdatedAt5h.IsZero() {
-			return true
-		}
+	// 5h 是上游可选窗口：仅当本地仍持有有效 5h 快照时才按 maxAge 刷新。
+	// 上游已取消 5h（issue #382）时，缺失快照不应因 auto-pause 5h 配置而永久探测。
+	if a.effectiveAutoPause5h > 0 && !a.AutoPause5hDisabled &&
+		a.UsagePercent5hValid && !a.UsageUpdatedAt5h.IsZero() {
 		if a.Reset5hAt.IsZero() || a.Reset5hAt.After(now) {
 			return now.Sub(a.UsageUpdatedAt5h) > maxAge
 		}
@@ -2336,7 +2489,7 @@ func (a *Account) InLimitedState() bool {
 	if a.premium5hRateLimitedLocked(now) {
 		return true
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
+	if a.Status == StatusCooldown && isUsageLimitCooldownReason(a.CooldownReason) && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return true
 	}
 	return false
@@ -2367,6 +2520,9 @@ func (a *Account) NeedsRecoveryProbe(minInterval time.Duration) bool {
 
 	if a.recoveryProbeInFlight || a.healthTierLocked() != HealthTierBanned {
 		return false
+	}
+	if a.isRelayStyleLocked() {
+		return false // 恢复探测走 ChatGPT 探针；中转/Grok 账号不适用
 	}
 	if a.RefreshToken == "" {
 		return false
@@ -2435,6 +2591,7 @@ type Store struct {
 	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
 	apiKeyAllowedPlans                 map[int64][]string
 	apiKeyAllowedPlanSets              map[int64]map[string]struct{}
+	apiKeyUpstreamChannels             map[int64]string
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
 	usageProbeBatch                    atomic.Bool
@@ -2485,6 +2642,11 @@ type Store struct {
 	codexWSSilentMaxRetries       atomic.Int64 // WS 静默换号最大重试次数，默认 2
 	codexFastModelAliasEnabled    atomic.Bool  // 允许 fast 后缀模型别名自动注入 service_tier=fast（默认 true）
 	codexFastTierInterceptEnabled atomic.Bool  // 拦截请求中显式 fast tier，仅保留 priority/default/flex（默认 false）
+	codexWSSizeRouterEnabled      atomic.Bool  // 1009 自学习体积路由，默认开启
+	codexWSBusyMaxWaitSec         atomic.Int64 // busy session 等待上限（秒），默认 30（issue #413）
+	codexWSBusyOverflowEnabled    atomic.Bool  // busy session 溢出到同账号兄弟连接，默认关闭
+	codexWSBusyPatienceSec        atomic.Int64 // 触发溢出前的短等待（秒），默认 2
+	overflowAutoCompactEnabled    atomic.Bool  // 上下文超窗自动摘要重试（实验性，默认关闭，issue #415）
 
 	// Codex 思考截断自动续想（默认关闭，不影响现有路径）
 	codexContinueThinkingEnabled atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
@@ -2503,6 +2665,7 @@ type Store struct {
 	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping          atomic.Value // 模型映射 JSON 字符串
 	codexModelMapping     atomic.Value // Codex 模型映射 JSON 字符串
+	payloadRules          atomic.Value // Payload 请求体重写规则 JSON 字符串
 	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
 	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
@@ -2519,6 +2682,7 @@ type Store struct {
 	smartPacingWindows            string   // protected by mu, "5h,7d" / "5h" / "7d"
 	groupAutoPauseThresholds      sync.Map // int64 -> [2]float64 {5h, 7d}
 	groupBaseConcurrencyOverrides sync.Map // int64 -> int64; missing means inherit global
+	groupNames                    sync.Map // int64 -> string; 组 ID→名，供 payload 规则按组名匹配
 }
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
@@ -2698,7 +2862,13 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 		acc.LastUnauthorizedAt = now
 		acc.LastFailureAt = now
 		acc.HealthTier = HealthTierBanned
-	case "rate_limited", "usage_limited", "usage_limit":
+	case "rate_limited_5h":
+		acc.LastRateLimitedAt = now
+		acc.LastFailureAt = now
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		acc.LastRateLimitedAt = now
 		acc.LastFailureAt = now
 		if acc.healthTierLocked() == HealthTierHealthy {
@@ -2907,6 +3077,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSSilentMaxRetries:            2,
 			CodexFastModelAliasEnabled:         true,
 			CodexFastTierInterceptEnabled:      false,
+			CodexWSSizeRouterEnabled:           true,
+			CodexWSBusyAcquireMaxWaitSec:       30,
+			CodexWSBusyPatienceSec:             2,
 			CodexContinueMaxRounds:             8,
 			AutoPause5hGuardBandPercent:        defaultAutoPause5hGuardBandPercent,
 			AutoPause5hGuardConcurrency:        defaultAutoPause5hGuardConcurrency,
@@ -2958,10 +3131,19 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.CodexModelMapping != "" {
 		s.codexModelMapping.Store(settings.CodexModelMapping)
 	}
+	if settings.PayloadRules != "" {
+		s.payloadRules.Store(settings.PayloadRules)
+	}
 	if settings.ReasoningEffortModels != "" {
 		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
 	}
-	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
+	promptFilterCfg := promptFilterConfigFromSettings(settings)
+	if s.db != nil {
+		if secret, err := s.db.GetPromptFilterNewAPISecret(context.Background()); err == nil {
+			promptFilterCfg.Advanced.NewAPI.Secret = secret
+		}
+	}
+	s.SetPromptFilterConfig(promptFilterCfg)
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -2981,6 +3163,11 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
 	s.codexFastModelAliasEnabled.Store(settings.CodexFastModelAliasEnabled)
 	s.codexFastTierInterceptEnabled.Store(settings.CodexFastTierInterceptEnabled)
+	s.codexWSSizeRouterEnabled.Store(settings.CodexWSSizeRouterEnabled)
+	s.codexWSBusyMaxWaitSec.Store(int64(database.NormalizeCodexWSBusyAcquireMaxWaitSec(settings.CodexWSBusyAcquireMaxWaitSec)))
+	s.codexWSBusyOverflowEnabled.Store(settings.CodexWSBusyOverflowEnabled)
+	s.codexWSBusyPatienceSec.Store(int64(database.NormalizeCodexWSBusyPatienceSec(settings.CodexWSBusyPatienceSec)))
+	s.overflowAutoCompactEnabled.Store(settings.OverflowAutoCompactEnabled)
 	s.codexContinueThinkingEnabled.Store(settings.CodexContinueThinkingEnabled)
 	s.codexContinueMaxRounds.Store(int64(database.NormalizeCodexContinueMaxRounds(settings.CodexContinueMaxRounds)))
 	s.codexCLIVersionSyncEnabled.Store(settings.CodexCLIVersionSyncEnabled)
@@ -3202,6 +3389,22 @@ func (s *Store) CodexWSSilentRetryEnabled() bool {
 	return s.codexWSSilentRetryEnabled.Load()
 }
 
+// SetCodexWSSizeRouterEnabled 设置是否启用 1009 自学习体积路由。
+func (s *Store) SetCodexWSSizeRouterEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSSizeRouterEnabled.Store(enabled)
+}
+
+// CodexWSSizeRouterEnabled 返回是否启用 1009 自学习体积路由。
+func (s *Store) CodexWSSizeRouterEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexWSSizeRouterEnabled.Load()
+}
+
 // SetCodexWSSilentMaxRetries 设置 WS 静默换号最大重试次数。
 func (s *Store) SetCodexWSSilentMaxRetries(retries int) {
 	if s == nil {
@@ -3248,6 +3451,70 @@ func (s *Store) CodexFastTierInterceptEnabled() bool {
 		return false
 	}
 	return s.codexFastTierInterceptEnabled.Load()
+}
+
+// SetCodexWSBusyAcquireMaxWaitSec 设置 busy session 等待上限（秒）。
+func (s *Store) SetCodexWSBusyAcquireMaxWaitSec(seconds int) {
+	if s == nil {
+		return
+	}
+	s.codexWSBusyMaxWaitSec.Store(int64(database.NormalizeCodexWSBusyAcquireMaxWaitSec(seconds)))
+}
+
+// CodexWSBusyAcquireMaxWaitSec 返回 busy session 等待上限（秒）。
+func (s *Store) CodexWSBusyAcquireMaxWaitSec() int {
+	if s == nil {
+		return 30
+	}
+	return int(s.codexWSBusyMaxWaitSec.Load())
+}
+
+// SetCodexWSBusyOverflowEnabled 设置是否允许 busy session 溢出到同账号兄弟连接。
+func (s *Store) SetCodexWSBusyOverflowEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSBusyOverflowEnabled.Store(enabled)
+}
+
+// CodexWSBusyOverflowEnabled 返回是否允许 busy session 溢出到同账号兄弟连接。
+func (s *Store) CodexWSBusyOverflowEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexWSBusyOverflowEnabled.Load()
+}
+
+// SetOverflowAutoCompactEnabled 设置是否开启上下文超窗自动摘要重试（实验性）。
+func (s *Store) SetOverflowAutoCompactEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.overflowAutoCompactEnabled.Store(enabled)
+}
+
+// OverflowAutoCompactEnabled 返回是否开启上下文超窗自动摘要重试（实验性）。
+func (s *Store) OverflowAutoCompactEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.overflowAutoCompactEnabled.Load()
+}
+
+// SetCodexWSBusyPatienceSec 设置触发溢出前的短等待（秒）。
+func (s *Store) SetCodexWSBusyPatienceSec(seconds int) {
+	if s == nil {
+		return
+	}
+	s.codexWSBusyPatienceSec.Store(int64(database.NormalizeCodexWSBusyPatienceSec(seconds)))
+}
+
+// CodexWSBusyPatienceSec 返回触发溢出前的短等待（秒）。
+func (s *Store) CodexWSBusyPatienceSec() int {
+	if s == nil {
+		return 2
+	}
+	return int(s.codexWSBusyPatienceSec.Load())
 }
 
 // SetCodexContinueThinkingEnabled 设置是否在上游截断思考时自动续想。
@@ -3663,6 +3930,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			if g.BaseConcurrencyOverride.Valid {
 				s.groupBaseConcurrencyOverrides.Store(g.ID, g.BaseConcurrencyOverride.Int64)
 			}
+			s.groupNames.Store(g.ID, strings.TrimSpace(g.Name))
 		}
 	}
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
@@ -3688,7 +3956,12 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	modelMapping := strings.TrimSpace(row.GetCredential("model_mapping"))
 	codexClientMetadataMode := NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
-	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount {
+	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
+	// Agent Identity：无 AT/RT，凭 agent_private_key 动态签名，不能被下面的空凭据 guard 拒绝。
+	isAgentIdentityAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("auth_mode")), CodexAuthModeAgentIdentity) &&
+		strings.TrimSpace(row.GetCredential("agent_runtime_id")) != "" &&
+		strings.TrimSpace(row.GetCredential("agent_private_key")) != ""
+	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGrokAccount && !isAgentIdentityAccount {
 		log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
 		return nil
 	}
@@ -3714,6 +3987,40 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 			account.PlanType = "api"
 		}
 	}
+	if isGrokAccount {
+		account.GrokClientID = row.GetCredential("grok_client_id")
+		account.GrokTokenEndpoint = row.GetCredential("grok_token_endpoint")
+		account.GrokOIDCIssuer = row.GetCredential("grok_oidc_issuer")
+		account.GrokPrincipalType = row.GetCredential("grok_principal_type")
+		account.GrokPrincipalID = row.GetCredential("grok_principal_id")
+		// API Key 凭据没有 AT，下方 at!="" 的恢复分支不会执行，这里补齐身份信息
+		account.AccountID = row.GetCredential("account_id")
+		account.Email = row.GetCredential("email")
+		account.PlanType = row.GetCredential("plan_type")
+		if strings.TrimSpace(apiKey) != "" || at != "" {
+			account.HealthTier = HealthTierHealthy
+		}
+		if account.PlanType == "" {
+			account.PlanType = "api"
+		}
+		// billing 探针的周/月用量随 credentials 落库，重启后在此恢复运行时快照
+		// （周额度占用 5h 槽位、月额度占用 7d 槽位，与探针写入端一致）
+		grokUsageUpdatedAt := time.Time{}
+		if raw := row.GetCredential("grok_usage_updated_at"); raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil {
+				grokUsageUpdatedAt = t
+			}
+		}
+		if pct, ok := row.GetCredentialFloat64("grok_weekly_usage_percent"); ok {
+			account.SetUsageSnapshot5hAt(pct, grokParseTime(row.GetCredential("grok_weekly_period_end")), grokUsageUpdatedAt)
+		}
+		if pct, ok := row.GetCredentialFloat64("grok_monthly_usage_percent"); ok {
+			account.SetUsageSnapshot(pct, grokUsageUpdatedAt)
+			if end := grokParseTime(row.GetCredential("grok_monthly_period_end")); !end.IsZero() {
+				account.SetReset7dAt(end)
+			}
+		}
+	}
 	account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
 	account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
 	account.UsageReservePercent5h = reflectOptionalInt64Field(row, "UsageReservePercent5h")
@@ -3735,6 +4042,23 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.Status = StatusError
 		account.ErrorMsg = row.ErrorMessage
 		account.HealthTier = HealthTierRisky
+	}
+
+	// Agent Identity：填充签名凭据与身份信息（无 AT/RT，健康档直接置为 healthy）
+	if isAgentIdentityAccount {
+		account.CodexAuthMode = CodexAuthModeAgentIdentity
+		account.AgentRuntimeID = strings.TrimSpace(row.GetCredential("agent_runtime_id"))
+		account.AgentPrivateKey = strings.TrimSpace(row.GetCredential("agent_private_key"))
+		account.AgentTaskID = strings.TrimSpace(row.GetCredential("task_id"))
+		account.AccountID = row.GetCredential("account_id")
+		account.Email = row.GetCredential("email")
+		account.PlanType = row.GetCredential("plan_type")
+		if account.PlanType == "" {
+			account.PlanType = "free"
+		}
+		if account.Status != StatusError {
+			account.HealthTier = HealthTierHealthy
+		}
 	}
 
 	// 尝试从 credentials 恢复已有的 AT
@@ -4013,7 +4337,7 @@ func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
 			continue
 		}
 		status := acc.RuntimeStatus()
-		if status != "rate_limited" && status != "usage_exhausted" {
+		if status != "rate_limited" && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
 			continue
 		}
 
@@ -4189,7 +4513,7 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 	if acc.quotaAutoPausedLocked(now) {
 		return false
 	}
-	if acc.isOpenAIResponsesAPILocked() {
+	if acc.isRelayStyleLocked() {
 		return true
 	}
 	return strings.TrimSpace(acc.AccessToken) != "" ||
@@ -4887,6 +5211,19 @@ func (s *Store) GetCodexModelMapping() string {
 	return "{}"
 }
 
+// SetPayloadRules 动态更新 Payload 请求体重写规则 JSON
+func (s *Store) SetPayloadRules(rules string) {
+	s.payloadRules.Store(rules)
+}
+
+// GetPayloadRules 获取当前 Payload 请求体重写规则 JSON
+func (s *Store) GetPayloadRules() string {
+	if v, ok := s.payloadRules.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
 // SetReasoningEffortModels 动态更新带思考强度的模型别名 JSON 数组。
 func (s *Store) SetReasoningEffortModels(value string) {
 	s.reasoningEffortModels.Store(value)
@@ -4950,6 +5287,10 @@ func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfil
 	cfg.Mode = settings.PromptFilterMode
 	cfg.Threshold = settings.PromptFilterThreshold
 	cfg.StrictThreshold = settings.PromptFilterStrictThreshold
+	cfg.StrictTerminalEnabled = settings.PromptFilterStrictTerminalEnabled
+	if advanced, err := promptfilter.ParseAdvancedConfig(settings.PromptFilterAdvancedConfig); err == nil {
+		cfg.Advanced = advanced
+	}
 	cfg.LogMatches = settings.PromptFilterLogMatches
 	cfg.MaxTextLength = settings.PromptFilterMaxTextLength
 	cfg.SensitiveWords = settings.PromptFilterSensitiveWords
@@ -5110,6 +5451,38 @@ func (s *Store) SetGroupAutoPauseThresholds(groupID int64, t5h, t7d float64) {
 
 func (s *Store) DeleteGroupAutoPauseThresholds(groupID int64) {
 	s.groupAutoPauseThresholds.Delete(groupID)
+}
+
+// SetGroupName 记录/更新组 ID→名映射（组创建或改名时调用）。
+func (s *Store) SetGroupName(groupID int64, name string) {
+	if s == nil || groupID <= 0 {
+		return
+	}
+	s.groupNames.Store(groupID, strings.TrimSpace(name))
+}
+
+// DeleteGroupName 移除组 ID→名映射（组删除时调用）。
+func (s *Store) DeleteGroupName(groupID int64) {
+	if s == nil {
+		return
+	}
+	s.groupNames.Delete(groupID)
+}
+
+// ResolveGroupNames 把组 ID 列表解析为组名列表；缺失（未加载/已删除）的项跳过。
+func (s *Store) ResolveGroupNames(groupIDs []int64) []string {
+	if s == nil || len(groupIDs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(groupIDs))
+	for _, id := range groupIDs {
+		if v, ok := s.groupNames.Load(id); ok {
+			if name, _ := v.(string); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
 }
 
 func (s *Store) GetGroupAutoPauseThresholds(groupID int64) (float64, float64) {
@@ -5516,6 +5889,43 @@ func (s *Store) GetAPIKeyAllowedGroups(apiKeyID int64) []int64 {
 	return cloneInt64Slice(s.apiKeyAllowedGroups[apiKeyID])
 }
 
+// SetAPIKeyUpstreamChannel 设置某 API Key 的上游渠道限定（codex/grok，空=不限）。
+// 仅在取值真正变化时重建调度器。
+func (s *Store) SetAPIKeyUpstreamChannel(apiKeyID int64, channel string) {
+	if apiKeyID <= 0 {
+		return
+	}
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok {
+		channel = ""
+	}
+	s.apiKeyGroupsMu.Lock()
+	if s.apiKeyUpstreamChannels == nil {
+		s.apiKeyUpstreamChannels = make(map[int64]string)
+	}
+	if s.apiKeyUpstreamChannels[apiKeyID] == channel {
+		s.apiKeyGroupsMu.Unlock()
+		return
+	}
+	if channel == "" {
+		delete(s.apiKeyUpstreamChannels, apiKeyID)
+	} else {
+		s.apiKeyUpstreamChannels[apiKeyID] = channel
+	}
+	s.apiKeyGroupsMu.Unlock()
+	s.rebuildFastScheduler()
+}
+
+// APIKeyUpstreamChannel 返回某 API Key 的上游渠道限定（空=不限）。
+func (s *Store) APIKeyUpstreamChannel(apiKeyID int64) string {
+	if s == nil || apiKeyID <= 0 {
+		return ""
+	}
+	s.apiKeyGroupsMu.RLock()
+	defer s.apiKeyGroupsMu.RUnlock()
+	return s.apiKeyUpstreamChannels[apiKeyID]
+}
+
 func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return nil
@@ -5529,6 +5939,7 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 	s.apiKeyAllowedGroupSets = make(map[int64]map[int64]struct{}, len(keys))
 	s.apiKeyAllowedPlans = make(map[int64][]string, len(keys))
 	s.apiKeyAllowedPlanSets = make(map[int64]map[string]struct{}, len(keys))
+	s.apiKeyUpstreamChannels = make(map[int64]string, len(keys))
 	for _, key := range keys {
 		normalized := normalizeAllowedGroupIDs(key.AllowedGroupIDs)
 		if len(normalized) > 0 {
@@ -5539,6 +5950,9 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 		if len(plans) > 0 {
 			s.apiKeyAllowedPlans[key.ID] = append([]string(nil), plans...)
 			s.apiKeyAllowedPlanSets[key.ID] = stringSet(plans)
+		}
+		if channel := key.Limits.ResolveUpstreamChannel(); channel != "" {
+			s.apiKeyUpstreamChannels[key.ID] = channel
 		}
 	}
 	s.apiKeyGroupsMu.Unlock()
@@ -5555,7 +5969,19 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	s.apiKeyGroupsMu.RLock()
 	allowedGroups := s.apiKeyAllowedGroupSets[apiKeyID]
 	allowedPlans := s.apiKeyAllowedPlanSets[apiKeyID]
+	channel := s.apiKeyUpstreamChannels[apiKeyID]
 	s.apiKeyGroupsMu.RUnlock()
+	// 渠道限定是硬门：grok 渠道只允许 Grok 账号，codex 渠道排除 Grok 账号。
+	switch channel {
+	case database.UpstreamChannelGrok:
+		if !acc.IsGrokAPI() {
+			return false
+		}
+	case database.UpstreamChannelCodex:
+		if acc.IsGrokAPI() {
+			return false
+		}
+	}
 	if len(allowedGroups) == 0 && len(allowedPlans) == 0 {
 		return true
 	}
@@ -5694,6 +6120,23 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 	return true
 }
 
+// NormalizeAccountModels 归一化账号支持模型列表（去重、去空白、按字典序排序）。
+func NormalizeAccountModels(values []string) []string {
+	return normalizeModelList(values)
+}
+
+// ApplyAccountModels 更新运行时账号的支持模型白名单（空列表 = 清空白名单，放行全部模型）。
+func (s *Store) ApplyAccountModels(dbID int64, models []string) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	acc.Models = normalizeModelList(models)
+	acc.mu.Unlock()
+	return true
+}
+
 func (s *Store) ApplyAccountProxyURL(dbID int64, proxyURL string) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
@@ -5791,7 +6234,12 @@ func (s *Store) markCooldownUntil(acc *Account, until time.Time, reason string, 
 		acc.LastUnauthorizedAt = now
 		acc.LastFailureAt = now
 		acc.HealthTier = HealthTierBanned
-	case "rate_limited", "usage_limited", "usage_limit":
+	case "rate_limited_5h":
+		acc.LastRateLimitedAt = now
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		acc.LastRateLimitedAt = now
 		if acc.healthTierLocked() == HealthTierHealthy {
 			acc.HealthTier = HealthTierWarm
@@ -5837,7 +6285,15 @@ func (s *Store) markCooldown(acc *Account, duration time.Duration, reason string
 		acc.FailureStreak++
 		acc.SuccessStreak = 0
 		acc.HealthTier = HealthTierBanned
-	case "rate_limited":
+	case "rate_limited_5h":
+		acc.LastRateLimitedAt = now
+		acc.LastFailureAt = now
+		acc.FailureStreak++
+		acc.SuccessStreak = 0
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		acc.LastRateLimitedAt = now
 		acc.LastFailureAt = now
 		acc.FailureStreak++
@@ -6041,25 +6497,98 @@ func (s *Store) ClearCooldown(acc *Account) {
 	}
 }
 
+// ClearUsageLimitCooldownSince clears only a usage/rate-limit cooldown that
+// was already present when observedAt was captured. Authentication failures,
+// generic errors, disabled states, and newer cooldowns are left untouched.
+func (s *Store) ClearUsageLimitCooldownSince(acc *Account, observedAt time.Time) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+
+	acc.mu.Lock()
+	if acc.Status != StatusCooldown || !isUsageLimitCooldownReason(acc.CooldownReason) ||
+		(!acc.LastRateLimitedAt.IsZero() && acc.LastRateLimitedAt.After(observedAt)) {
+		acc.mu.Unlock()
+		return false
+	}
+	reason := acc.CooldownReason
+	until := acc.CooldownUtil
+	acc.Status = StatusReady
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.ErrorMsg = ""
+	acc.LastRateLimitedAt = time.Time{}
+	if acc.HealthTier != HealthTierBanned {
+		acc.HealthTier = HealthTierWarm
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+	acc.mu.RLock()
+	status := acc.Status
+	currentReason := acc.CooldownReason
+	currentUntil := acc.CooldownUtil
+	acc.mu.RUnlock()
+	if status == StatusCooldown && currentReason != "" {
+		s.setCachedAccountCooldown(acc.DBID, currentReason, currentUntil)
+	}
+	if s.db == nil {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := s.db.ClearCooldownIfReasonAndUntil(ctx, acc.DBID, reason, until); err != nil {
+		log.Printf("[账号 %d] 清理过期用量冷却状态失败: %v", acc.DBID, err)
+	}
+	return true
+}
+
 func isUsageLimitCooldownReason(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limit":
+	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limited", "usage_limit":
 		return true
 	default:
 		return false
 	}
 }
 
-// ConfirmResponsesAvailable clears only a usage/rate-limit cooldown after a
-// completed Responses request succeeds. Authentication and unrelated error
-// states are intentionally untouched.
+// ConfirmResponsesAvailable preserves the original API for callers whose
+// success evidence is current at call time.
 func (s *Store) ConfirmResponsesAvailable(acc *Account) bool {
+	requestStartedAt := time.Now()
+	if acc != nil {
+		acc.mu.RLock()
+		if !acc.LastRateLimitedAt.IsZero() && !requestStartedAt.After(acc.LastRateLimitedAt) {
+			// Windows 等平台的 wall clock 分辨率可能让连续两次 time.Now()
+			// 相等；无显式起始时间的兼容入口代表“当前成功证据”，应视为
+			// 晚于调用前已存在的限流记录。解锁后的新限流仍会被 Since 拦住。
+			requestStartedAt = acc.LastRateLimitedAt.Add(time.Nanosecond)
+		}
+		acc.mu.RUnlock()
+	}
+	return s.ConfirmResponsesAvailableSince(acc, requestStartedAt)
+}
+
+// ConfirmResponsesAvailableSince clears only a usage/rate-limit cooldown when
+// a completed Responses request started after the latest rate-limit evidence.
+// A stale in-flight success must not undo a newer usage_limit_reached result.
+// Authentication and unrelated error states are intentionally untouched.
+func (s *Store) ConfirmResponsesAvailableSince(acc *Account, requestStartedAt time.Time) bool {
 	if s == nil || acc == nil {
 		return false
 	}
 
 	acc.mu.Lock()
-	if !acc.ignoreUsageLimitStatus || acc.Status != StatusCooldown || !isUsageLimitCooldownReason(acc.CooldownReason) {
+	if !acc.ignoreUsageLimitStatus ||
+		acc.Status != StatusCooldown ||
+		!isUsageLimitCooldownReason(acc.CooldownReason) ||
+		(!acc.LastRateLimitedAt.IsZero() && !requestStartedAt.After(acc.LastRateLimitedAt)) {
 		acc.mu.Unlock()
 		return false
 	}
@@ -7041,6 +7570,10 @@ func (s *Store) refreshAccountForced(ctx context.Context, acc *Account) error {
 
 // refreshAccountWithOptions 刷新单个账号的 AT（带缓存锁与 token 缓存）
 func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, forceRefresh bool) error {
+	// Grok 账号走 auth.x.ai 的 OAuth 刷新流程，与 ChatGPT 的 RT 刷新完全不同。
+	if acc.IsGrokAPI() {
+		return s.refreshGrokAccount(ctx, acc, forceRefresh)
+	}
 	acc.mu.RLock()
 	rt := acc.RefreshToken
 	st := acc.SessionToken

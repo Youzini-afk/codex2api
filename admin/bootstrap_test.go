@@ -54,3 +54,28 @@ func TestBootstrapAllowClientIPNoneDisablesDefault(t *testing.T) {
 		t.Error("loopback must always be allowed even with none")
 	}
 }
+
+func TestDefaultBootstrapSettingsPreserveRuntimeDefaults(t *testing.T) {
+	settings := defaultBootstrapSettings()
+	if settings.MaxRateLimitRetries != 1 {
+		t.Fatalf("MaxRateLimitRetries = %d, want 1", settings.MaxRateLimitRetries)
+	}
+	if !settings.UsageProbeResponsesFallbackEnabled {
+		t.Fatal("UsageProbeResponsesFallbackEnabled = false, want true")
+	}
+	if !settings.CodexFastModelAliasEnabled {
+		t.Fatal("CodexFastModelAliasEnabled = false, want true")
+	}
+	if settings.CodexFastTierInterceptEnabled {
+		t.Fatal("CodexFastTierInterceptEnabled = true, want false")
+	}
+	if !settings.CodexWSSizeRouterEnabled {
+		t.Fatal("CodexWSSizeRouterEnabled = false, want true")
+	}
+	if settings.CodexWSBusyAcquireMaxWaitSec != 30 || settings.CodexWSBusyPatienceSec != 2 {
+		t.Fatalf("busy defaults = (%d, %d), want (30, 2)", settings.CodexWSBusyAcquireMaxWaitSec, settings.CodexWSBusyPatienceSec)
+	}
+	if !settings.CodexCLIVersionSyncEnabled || settings.CodexCLIVersionSyncIntervalHours != 12 {
+		t.Fatalf("CLI sync defaults = (%t, %d), want (true, 12)", settings.CodexCLIVersionSyncEnabled, settings.CodexCLIVersionSyncIntervalHours)
+	}
+}

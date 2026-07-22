@@ -21,6 +21,8 @@ import {
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
 import AccountHealthBar from "./AccountHealthBar";
+import ChannelLogo from "./ChannelLogo";
+import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,6 +45,11 @@ function isFutureTime(value?: string): boolean {
 
 function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
   const status = (account.status || "").toLowerCase();
+  const reason = (account.cooldown_reason || "").toLowerCase();
+  if (status === "rate_limited_5h") return "5h";
+  if (status === "rate_limited_7d") return "7d";
+  if (reason === "rate_limited_5h") return "5h";
+  if (reason === "rate_limited_7d") return "7d";
   if (status === "rate_limited" || status === "quota_paused" || status === "usage_exhausted") {
     if (account.reset_5h_at && isFutureTime(account.reset_5h_at)) return "5h";
     if (account.reset_7d_at && isFutureTime(account.reset_7d_at)) return "7d";
@@ -215,7 +222,17 @@ export default function AccountDetailSheet({
         >
           <SheetHeader>
             <div className="flex items-start justify-between gap-3 pr-2">
-              <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-1 items-start gap-3">
+                <span className="mt-0.5 flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-card ring-1 ring-border shadow-sm">
+                  {account.grok_api ? (
+                    <ChannelLogo channel="grok" size={22} />
+                  ) : account.openai_responses_api ? (
+                    <ModelLogo model="openai" variant="plain" size={22} />
+                  ) : (
+                    <ChannelLogo channel="codex" size={40} className="rounded-xl" />
+                  )}
+                </span>
+                <div className="min-w-0 flex-1">
                 <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                   {sequence != null && (
                     <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px] font-semibold text-muted-foreground">
@@ -243,6 +260,7 @@ export default function AccountDetailSheet({
                     {t("accounts.detailSubtitle")}
                   </SheetDescription>
                 )}
+                </div>
               </div>
               <div className="flex shrink-0 items-center gap-0.5">
                 <Button
@@ -457,7 +475,9 @@ export default function AccountDetailSheet({
             {(account.proxy_url ||
               account.at_only ||
               account.openai_responses_api ||
-              account.base_url) && (
+              account.base_url ||
+              (!account.openai_responses_api &&
+                (account.models?.length ?? 0) > 0)) && (
               <Section title={t("accounts.detailTechnical")}>
                 <div className="space-y-2 rounded-xl border border-border bg-card p-3 text-[12px]">
                   {account.at_only && (
@@ -510,6 +530,19 @@ export default function AccountDetailSheet({
                       </span>
                     </div>
                   )}
+                  {!account.openai_responses_api &&
+                    (account.models?.length ?? 0) > 0 && (
+                      <div className="flex justify-between gap-3">
+                        <span className="shrink-0 text-muted-foreground">
+                          {t("accounts.supportedModelsAction")}
+                        </span>
+                        <span className="font-medium tabular-nums text-foreground">
+                          {t("accounts.supportedModelsCount", {
+                            count: account.models?.length ?? 0,
+                          })}
+                        </span>
+                      </div>
+                    )}
                 </div>
               </Section>
             )}

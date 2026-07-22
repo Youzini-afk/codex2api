@@ -64,7 +64,7 @@ func TestLoginAdminSessionRejectsInvalidSecret(t *testing.T) {
 	assertErrorMessage(t, loginResp, "管理密钥错误")
 }
 
-func TestGetAdminSessionStatusDisabledWithoutSecret(t *testing.T) {
+func TestGetAdminSessionStatusRequiresBootstrapWithoutSecret(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	handler := &Handler{
@@ -85,11 +85,36 @@ func TestGetAdminSessionStatusDisabledWithoutSecret(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if payload.AuthRequired {
-		t.Fatal("expected auth to be disabled")
+	if !payload.AuthRequired {
+		t.Fatal("expected admin auth to remain required before bootstrap")
 	}
-	if !payload.Authenticated {
-		t.Fatal("expected disabled auth to report authenticated")
+	if payload.Authenticated {
+		t.Fatal("expected unauthenticated status before bootstrap")
+	}
+	if payload.AuthMethod != "none" {
+		t.Fatalf("auth method = %q, want none", payload.AuthMethod)
+	}
+}
+
+func TestLoginAdminSessionRequiresBootstrapWithoutSecret(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{
+		db:           newTestAdminDB(t),
+		sessionStore: newAdminSessionStore(),
+	}
+	router := newAdminAuthTestRouter(handler)
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/admin/auth/login", bytes.NewBufferString(`{"secret":"anything"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginResp := httptest.NewRecorder()
+	router.ServeHTTP(loginResp, loginReq)
+
+	if loginResp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("login status = %d, want %d", loginResp.Code, http.StatusServiceUnavailable)
+	}
+	if !bytes.Contains(loginResp.Body.Bytes(), []byte(`"code":"bootstrap_required"`)) {
+		t.Fatalf("login response = %s, want bootstrap_required", loginResp.Body.String())
 	}
 }
 

@@ -17,21 +17,33 @@ import (
 const promptFilterFullTextMaxRunes = 32000
 
 func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
+	if c != nil && c.GetBool("prompt_intelligence_internal") {
+		return false
+	}
 	if h == nil || h.store == nil {
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	// 本地 filter 与需要正文的 advanced 能力全部关闭时，在提取正文前直接放行，
+	// 避免对大请求体做无效的 JSON 遍历/UTF-8 解码 (issue #417)。
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
+	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
 	}
+	verdict = h.applyAdvancedPromptProtection(c, text, verdict, cfg)
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
 	}
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
+	}
+	if h.sendNewAPIPolicyBlock(c, cfg, verdict.Reason, rawBody) {
+		return true
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
@@ -46,16 +58,23 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
 	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
 		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
 	}
+	verdict = h.applyAdvancedPromptProtection(c, text, verdict, cfg)
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
 	}
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
+	}
+	if h.sendNewAPIPolicyBlock(c, cfg, verdict.Reason, []byte(text)) {
+		return true
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
@@ -70,16 +89,23 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
+	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
 	}
+	verdict = h.applyAdvancedPromptProtection(c, text, verdict, cfg)
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
 	}
 	if verdict.Action == promptfilter.ActionBlock {
+		if h.sendNewAPIPolicyBlock(c, cfg, verdict.Reason, rawBody) {
+			return true
+		}
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request contains content blocked by prompt filter")
 		return true
 	}
@@ -190,6 +216,9 @@ func populatePromptFilterAPIKeyMeta(c *gin.Context, input *database.PromptFilter
 }
 
 func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
+	if verdict.TerminalStrictHit {
+		return false
+	}
 	if verdict.Action != promptfilter.ActionWarn && verdict.Action != promptfilter.ActionBlock {
 		return false
 	}

@@ -55,6 +55,22 @@ func APIKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
 	return apiKeyRowFromContext(c)
 }
 
+// payloadRuleIdentity 从鉴权 context 构造 payload 规则身份（供 api_key_*/group_* 匹配门与
+// service_tier 记账重算共用）。无鉴权身份时返回 nil（带身份门的规则将 fail-closed 不命中）。
+func (h *Handler) payloadRuleIdentity(c *gin.Context) *PayloadRuleIdentity {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return nil
+	}
+	id := &PayloadRuleIdentity{APIKeyID: row.ID, APIKeyName: strings.TrimSpace(row.Name)}
+	if h != nil && h.store != nil {
+		// 用 store 侧的允许组（组删除后会刷新，是权威源），再解析组名。
+		id.GroupIDs = h.store.GetAPIKeyAllowedGroups(row.ID)
+		id.GroupNames = h.store.ResolveGroupNames(id.GroupIDs)
+	}
+	return id
+}
+
 // EnforceAPIKeyLimits checks API key scoped model and rate/cost limits.
 func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
 	return h.enforceAPIKeyLimits(c, model)
@@ -86,8 +102,9 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
-	// 1b. 生图禁用 (本机校验:模型/端点/请求体意图,无 I/O)
-	if limits.DisableImageGeneration {
+	// 1b. 生图 block 策略 (本机校验:模型/端点/请求体意图,无 I/O)。
+	// strip 策略不在此短路——它在转发前改写请求体（见 stripResponsesImageGenerationCapabilities）。
+	if limits.ResolveImageGenerationPolicy() == database.ImageGenerationPolicyBlock {
 		if msg := checkAPIKeyImageGeneration(c, model); msg != "" {
 			return http.StatusForbidden, msg
 		}
@@ -162,6 +179,27 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	}
 
 	return 0, ""
+}
+
+// apiKeyImageGenerationPolicy 返回当前请求所属 API Key 的图片工具策略。
+// 无鉴权身份（内部路径）时返回 allow，不改写请求。
+func apiKeyImageGenerationPolicy(c *gin.Context) string {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return database.ImageGenerationPolicyAllow
+	}
+	return row.Limits.ResolveImageGenerationPolicy()
+}
+
+// applyImageGenerationStripPolicy 在 strip 策略下剥离请求体里的图片工具能力声明，
+// 把请求当作普通文本请求继续转发（issue #411）。应在请求体准备完成（含网关自动注入
+// 图片工具/桥接 instructions）之后调用，从而一并清理网关注入的能力声明。非 strip 策略
+// 原样返回。
+func applyImageGenerationStripPolicy(c *gin.Context, body []byte) []byte {
+	if apiKeyImageGenerationPolicy(c) != database.ImageGenerationPolicyStrip {
+		return body
+	}
+	return stripResponsesImageGenerationCapabilities(body)
 }
 
 // SendAPIKeyLimitError writes a standard /v1 API key limit error response.
