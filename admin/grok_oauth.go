@@ -253,17 +253,7 @@ func (h *Handler) PollGrokDeviceAuth(c *gin.Context) {
 		return
 	}
 
-	if h.probeUsage != nil {
-		go func(accountID int64) {
-			acc := h.store.FindByID(accountID)
-			if acc == nil {
-				return
-			}
-			probeCtx, probeCancel := context.WithTimeout(context.Background(), 25*time.Second)
-			defer probeCancel()
-			_ = h.probeUsage(probeCtx, acc)
-		}(id)
-	}
+	h.triggerGrokUsageProbe(id)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "authorized",
@@ -310,8 +300,11 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 	}
 
 	credentials := map[string]interface{}{
-		"upstream_type":       auth.UpstreamGrok,
-		"plan_type":           "api",
+		"upstream_type": auth.UpstreamGrok,
+		// OAuth（device/sso/refresh）导入的是 grok.com 订阅账号，默认按免费档展示；
+		// billing 探针成功后会纠正为 SuperGrok / SuperGrok Heavy。旧值 "api" 混淆了
+		// "接入方式"与"订阅档位"，会让免费账号长期错显为 api。
+		"plan_type":           "free",
 		"refresh_token":       in.Token.RefreshToken,
 		"access_token":        in.Token.AccessToken,
 		"expires_at":          in.Token.ExpiresAt.Format(time.RFC3339),
@@ -362,7 +355,7 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 		BaseURL:           baseURL,
 		Models:            in.Models,
 		Email:             email,
-		PlanType:          "api",
+		PlanType:          "free",
 		GrokClientID:      clientID,
 		GrokOIDCIssuer:    auth.GrokDefaultOIDCIssuer,
 		GrokTokenEndpoint: strings.TrimSpace(in.TokenEndpoint),

@@ -16,6 +16,7 @@ import (
 	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
@@ -350,6 +351,7 @@ func (h *Handler) PostBootstrap(c *gin.Context) {
 // 与 main.go 中 step 3 保持一致，避免 PostBootstrap 在数据库尚无任何记录时
 // 写入空值导致后续业务设置缺失。
 func defaultBootstrapSettings() *database.SystemSettings {
+	promptFilterCfg := promptfilter.RecommendedConfig()
 	return &database.SystemSettings{
 		SiteName:                           database.DefaultSiteName,
 		MaxConcurrency:                     2,
@@ -366,9 +368,11 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		LazyMode:                           false,
 		PgMaxConns:                         50,
 		RedisPoolSize:                      30,
-		PromptFilterMode:                   "monitor",
-		PromptFilterThreshold:              50,
-		PromptFilterStrictThreshold:        90,
+		PromptFilterMode:                   promptFilterCfg.Mode,
+		PromptFilterThreshold:              promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
 		PromptFilterLogMatches:             true,
 		PromptFilterMaxTextLength:          81920,
 		PromptFilterCustomPatterns:         "[]",
@@ -384,6 +388,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		FirstTokenTimeoutSeconds:           0,
 		BillingTierPolicy:                  proxy.BillingTierPolicyActual,
 		AffinityMode:                       "bounded",
+		GrokConfig:                         `{"affinity_mode":"strict","probe_enabled":false,"probe_interval_minutes":30,"max_rate_limit_retries":0}`,
 		PublicKeyUsagePageEnabled:          true,
 		PublicImageStudioPageEnabled:       true,
 		CodexWSHideUpstreamErrors:          true,

@@ -17,6 +17,7 @@ const statusConfig: Record<string, { variant: 'default' | 'secondary' | 'destruc
   rate_limited_7d: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   usage_exhausted: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   usage_reserved: { variant: 'secondary', dotColor: 'bg-cyan-500' },
+  usage_limited: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   quota_paused: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   unauthorized: { variant: 'destructive', dotColor: 'bg-red-500' },
   error: { variant: 'destructive', dotColor: 'bg-red-400' },

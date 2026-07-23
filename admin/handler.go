@@ -33,6 +33,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/openaiidentity"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -188,16 +189,51 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	if account.IsCodexAgentIdentity() {
 		return
 	}
-	// AT / codex_at 账号的 OAuth 身份（email + account_id）在插入时无法从
+	// AT / codex_at 账号的 OAuth 身份（email + workspace_id）在插入时无法从
 	// JWT 解出，由上面的 wham 探针补齐并落库。身份既已可知，此刻回查是否与
 	// 已有账号同一身份：若重复则把凭证合并进旧账号并软删本账号——与 RT 路径
-	// refreshImportedAccountAndProbe 对称，补上 AT 导入/添加事后无法去重的缺口
-	// （codex_at 原文轮换 + 存量 account_id 被 user_id 污染都会导致插入期判重失配）。
-	h.mergeRefreshedDuplicateIntoExisting(accountID, source)
+	// refreshImportedAccountAndProbe 对称，补上 AT 导入/添加事后无法去重的缺口。
+	// 合并按 email + workspace_id 身份进行（workspace_identity v3），并沿用
+	// 数据库生命周期 ctx 与串行合并锁（防并发导入互相软删）。
+	h.mergeRefreshedDuplicateIntoExistingContext(ctx, accountID, source)
+}
+
+func (h *Handler) startDBBackgroundTask(task func(context.Context)) bool {
+	if h == nil || task == nil {
+		return false
+	}
+	if h.db != nil {
+		return h.db.RunBackgroundTask(task)
+	}
+	go task(context.Background())
+	return true
+}
+
+// startDBBackgroundTaskWithParent ties a task to both a caller-owned service
+// context and the database lifecycle. Cancellation of either context stops the
+// task, while the database tracker guarantees shutdown waits for its exit.
+func (h *Handler) startDBBackgroundTaskWithParent(parent context.Context, task func(context.Context)) bool {
+	if task == nil {
+		return false
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	return h.startDBBackgroundTask(func(lifecycle context.Context) {
+		ctx, cancel := context.WithCancel(lifecycle)
+		stopParent := context.AfterFunc(parent, cancel)
+		defer func() {
+			stopParent()
+			cancel()
+		}()
+		task(ctx)
+	})
 }
 
 func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
-	go h.probeImportedAccountUsage(context.Background(), accountID, source)
+	h.startDBBackgroundTask(func(ctx context.Context) {
+		h.probeImportedAccountUsage(ctx, accountID, source)
+	})
 }
 
 func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source string) {
@@ -209,8 +245,11 @@ func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source s
 	}
 }
 
-func (h *Handler) refreshImportedAccountAndProbe(accountID int64, source string) {
-	refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID int64, source string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	err := h.refreshAccountByID(refreshCtx, accountID)
 	cancel()
 	if err != nil {
@@ -220,10 +259,10 @@ func (h *Handler) refreshImportedAccountAndProbe(accountID int64, source string)
 	log.Printf("导入账号 %d 刷新成功", accountID)
 	// 裸 RT 导入时身份要等首次刷新后才可知：此刻回查身份重复，
 	// 若与已有账号同一身份则合并凭证并移除本账号（保留旧账号的用量统计）。
-	if h.mergeRefreshedDuplicateIntoExisting(accountID, source) {
+	if h.mergeRefreshedDuplicateIntoExistingContext(ctx, accountID, source) {
 		return
 	}
-	h.probeImportedAccountUsage(context.Background(), accountID, source)
+	h.probeImportedAccountUsage(ctx, accountID, source)
 }
 
 // mergeRefreshedDuplicateIntoExisting 检查刚刷新完的新导入账号是否与已有账号
@@ -231,43 +270,40 @@ func (h *Handler) refreshImportedAccountAndProbe(accountID int64, source string)
 // 合并进已有账号——codex_* 用量快照键不在更新集里，旧账号的用量统计与按
 // 账号 ID 关联的请求历史全部保留——然后软删新插入的账号。返回 true 表示已合并。
 func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string) bool {
+	return h.mergeRefreshedDuplicateIntoExistingContext(context.Background(), newID, source)
+}
+
+func (h *Handler) mergeRefreshedDuplicateIntoExistingContext(parent context.Context, newID int64, source string) bool {
 	if h == nil || h.db == nil || h.store == nil {
 		return false
+	}
+	if parent == nil {
+		parent = context.Background()
 	}
 	// 串行化合并：并发导入同一身份的多个账号时，两个合并流程若交错执行，
 	// 可能互相把对方选为“已有账号”，导致双方都被软删（账号丢失）。
 	h.mergeDuplicateMu.Lock()
 	defer h.mergeDuplicateMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 
 	newRow, err := h.db.GetAccountByID(ctx, newID)
 	if err != nil || newRow == nil {
 		return false
 	}
-	// 勾选"允许重复添加"导入的副本是用户故意保留的，不合并。
-	if strings.EqualFold(strings.TrimSpace(newRow.GetCredential("allow_duplicate")), "true") {
-		return false
-	}
 	email := strings.TrimSpace(newRow.GetCredential("email"))
-	identity := strings.TrimSpace(newRow.GetCredential("account_id"))
-	if identity == "" {
-		identity = strings.TrimSpace(newRow.GetCredential("chatgpt_account_id"))
-	}
-	if identity == "" {
-		identity = strings.TrimSpace(newRow.GetCredential("user_id"))
-	}
-	if email == "" || identity == "" {
+	workspaceID := openaiidentity.NormalizeWorkspaceID(newRow.GetCredential("workspace_id"))
+	if email == "" || workspaceID == "" {
 		return false
 	}
-	oldID, err := h.db.FindActiveAccountByOAuthIdentity(ctx, email, identity, newID)
+	oldID, err := h.db.FindActiveAccountByOAuthIdentity(ctx, email, workspaceID, newID)
 	if err != nil || oldID <= 0 {
 		return false
 	}
 
 	updates := make(map[string]interface{})
-	for _, key := range []string{"refresh_token", "session_token", "access_token", "access_token_type", "id_token", "expires_at", "email", "account_id", "chatgpt_account_id", "user_id", "chatgpt_user_id", "plan_type", "subscription_expires_at"} {
+	for _, key := range []string{"refresh_token", "session_token", "access_token", "access_token_type", "id_token", "expires_at", "email", "account_id", "chatgpt_account_id", "workspace_id", "user_id", "chatgpt_user_id", "plan_type", "subscription_expires_at"} {
 		if v := strings.TrimSpace(newRow.GetCredential(key)); v != "" {
 			updates[key] = v
 		}
@@ -295,8 +331,12 @@ func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string
 	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
 		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
 	}
-	h.db.InsertAccountEventAsync(newID, "deleted", fmt.Sprintf("merged_into_%d", oldID))
-	h.db.InsertAccountEventAsync(oldID, "updated", "rt_upgrade_merge")
+	if err := h.db.InsertAccountEvent(ctx, newID, "deleted", fmt.Sprintf("merged_into_%d", oldID)); err != nil {
+		log.Printf("记录合并账号 %d 删除事件失败: %v", newID, err)
+	}
+	if err := h.db.InsertAccountEvent(ctx, oldID, "updated", "rt_upgrade_merge"); err != nil {
+		log.Printf("记录合并账号 %d 更新事件失败: %v", oldID, err)
+	}
 	log.Printf("导入账号 %d 与已有账号 %d 同一 OAuth 身份，已合并凭证（RT 升级）并保留用量统计 (source=%s)", newID, oldID, source)
 	return true
 }
@@ -487,12 +527,15 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
 	api.POST("/accounts/clean-error", h.CleanError)
+	api.POST("/accounts/grok/clean-banned", h.CleanGrokBanned)
+	api.POST("/accounts/grok/clean-error", h.CleanGrokError)
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
 	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
+	api.GET("/usage/api-keys/:id/accounts", h.GetAPIKeyAccountStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
@@ -735,11 +778,11 @@ func isDashboardAbnormalAccount(status string) bool {
 
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 	switch status {
-	case "rate_limited", "usage_exhausted", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
 		return true
 	}
 	switch cooldownReason {
-	case "rate_limited", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limited":
 		return true
 	}
 	return false
@@ -769,6 +812,7 @@ type accountResponse struct {
 	GrokAuthKind               string                      `json:"grok_auth_kind,omitempty"`
 	GrokBilling                json.RawMessage             `json:"grok_billing,omitempty"`
 	GrokRateLimit              *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
+	GrokFreeQuota              *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
 	BaseURL                    string                      `json:"base_url,omitempty"`
 	Models                     []string                    `json:"models,omitempty"`
 	ModelMapping               string                      `json:"model_mapping,omitempty"`
@@ -1017,6 +1061,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			if isGrokAccount {
 				if snap, hasSnap := acc.GetGrokRateLimitSnapshot(); hasSnap {
 					resp.GrokRateLimit = &snap
+				}
+				if snap, hasSnap := acc.GetGrokFreeQuotaSnapshot(); hasSnap {
+					resp.GrokFreeQuota = &snap
 				}
 			}
 			acc.Mu().RLock()
@@ -2312,7 +2359,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			h.triggerImportedAccountUsageProbe(id, "manual_add")
 		} else if !h.store.GetLazyMode() {
 			// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
-			go h.refreshImportedAccountAndProbe(id, "manual_add_refresh")
+			h.startDBBackgroundTask(func(ctx context.Context) {
+				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
+			})
 		}
 	}
 
@@ -2392,7 +2441,9 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 		if newAcc.GetAccessToken() != "" {
 			h.triggerImportedAccountUsageProbe(id, "manual_add")
 		} else if !h.store.GetLazyMode() {
-			go h.refreshImportedAccountAndProbe(id, "manual_add_refresh")
+			h.startDBBackgroundTask(func(ctx context.Context) {
+				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
+			})
 		}
 
 		sendImportEvent(c, importEvent{
@@ -2498,10 +2549,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	updatedCount := 0
 	duplicateCount := 0
 
-	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 工作区/用户 ID，如 codex_at）
+	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + workspace_id，如 codex_at）
 	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
-	//（email + account_id/user_id）去重/更新——AT 会轮换，仅按原文去重会重复导入同一账号。
-	// 勾选"允许重复添加"时跳过全部去重，强制新建。
+	//（email + workspace_id）去重/更新。允许重复仅对 workspace_id 为空的账号生效。
 	existingATs := make(map[string]bool)
 	seenAT := make(map[string]bool)
 	if !req.AllowDuplicate {
@@ -2525,7 +2575,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			allowDuplicate: req.AllowDuplicate,
 			customHeaders:  customHeaders,
 		})
-		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+		if seed.email != "" && seed.workspaceID != "" {
 			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
@@ -2642,6 +2692,13 @@ func (h *Handler) PushTokenAccount(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken: req.RefreshToken,
+		accessToken:  req.AccessToken,
+		idToken:      req.IDToken,
+		accountID:    req.AccountID,
+		email:        req.Email,
+	})
 
 	if req.RefreshToken != "" {
 		existingRTs, err := h.db.GetAllRefreshTokens(ctx)
@@ -2661,48 +2718,19 @@ func (h *Handler) PushTokenAccount(c *gin.Context) {
 		}
 
 		h.db.InsertAccountEventAsync(id, "added", "push_token")
-		newAcc := &auth.Account{
-			DBID:         id,
-			RefreshToken: req.RefreshToken,
-			ProxyURL:     req.ProxyURL,
-		}
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
-		credentials := map[string]interface{}{}
-		if req.Email != "" {
-			credentials["email"] = req.Email
-		}
-		if req.AccessToken != "" {
-			credentials["access_token"] = req.AccessToken
-			if atInfo := auth.ParseAccessToken(req.AccessToken); atInfo != nil {
-				if atInfo.Email != "" && req.Email == "" {
-					credentials["email"] = atInfo.Email
-				}
-				if atInfo.ChatGPTAccountID != "" {
-					credentials["account_id"] = atInfo.ChatGPTAccountID
-				}
-				if atInfo.PlanType != "" {
-					credentials["plan_type"] = atInfo.PlanType
-				}
-				if !atInfo.ExpiresAt.IsZero() {
-					credentials["expires_at"] = atInfo.ExpiresAt.Format(time.RFC3339)
-				}
-			}
-		}
-		if req.IDToken != "" {
-			credentials["id_token"] = req.IDToken
-		}
-		if req.AccountID != "" {
-			credentials["account_id"] = req.AccountID
-		}
-		if len(credentials) > 0 {
+		if credentials := tokenCredentialMap(seed); len(credentials) > 0 {
 			if err := h.db.UpdateCredentials(ctx, id, credentials); err != nil {
 				log.Printf("推送 RT 账号 %d 更新 credentials 失败: %v", id, err)
 			}
 		}
 
 		if h.refreshAccount != nil {
-			go h.refreshImportedAccountAndProbe(id, "push_token")
+			h.startDBBackgroundTask(func(ctx context.Context) {
+				h.refreshImportedAccountAndProbe(ctx, id, "push_token")
+			})
 		}
 
 		security.SecurityAuditLog("ACCOUNT_PUSH_IMPORTED", fmt.Sprintf("mode=rt id=%d ip=%s source=%s", id, c.ClientIP(), req.Source))
@@ -2732,48 +2760,10 @@ func (h *Handler) PushTokenAccount(c *gin.Context) {
 	}
 
 	h.db.InsertAccountEventAsync(id, "added", "push_token_at")
-	atInfo := auth.ParseAccessToken(req.AccessToken)
-	newAcc := &auth.Account{
-		DBID:        id,
-		AccessToken: req.AccessToken,
-		ExpiresAt:   time.Now().Add(1 * time.Hour),
-		ProxyURL:    req.ProxyURL,
-	}
-	if atInfo != nil {
-		newAcc.Email = atInfo.Email
-		newAcc.AccountID = atInfo.ChatGPTAccountID
-		newAcc.PlanType = atInfo.PlanType
-		if !atInfo.ExpiresAt.IsZero() {
-			newAcc.ExpiresAt = atInfo.ExpiresAt
-		}
-	}
+	newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
 	h.store.AddAccount(newAcc)
 
-	credentials := map[string]interface{}{}
-	if atInfo != nil {
-		if atInfo.Email != "" {
-			credentials["email"] = atInfo.Email
-		}
-		if atInfo.ChatGPTAccountID != "" {
-			credentials["account_id"] = atInfo.ChatGPTAccountID
-		}
-		if atInfo.PlanType != "" {
-			credentials["plan_type"] = atInfo.PlanType
-		}
-		if !newAcc.ExpiresAt.IsZero() {
-			credentials["expires_at"] = newAcc.ExpiresAt.Format(time.RFC3339)
-		}
-	}
-	if req.Email != "" {
-		credentials["email"] = req.Email
-	}
-	if req.IDToken != "" {
-		credentials["id_token"] = req.IDToken
-	}
-	if req.AccountID != "" {
-		credentials["account_id"] = req.AccountID
-	}
-	if len(credentials) > 0 {
+	if credentials := tokenCredentialMap(seed); len(credentials) > 0 {
 		if err := h.db.UpdateCredentials(ctx, id, credentials); err != nil {
 			log.Printf("推送 AT 账号 %d 更新 credentials 失败: %v", id, err)
 		}
@@ -2831,7 +2821,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		}
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
-		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+		if seed.email != "" && seed.workspaceID != "" {
 			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
@@ -3399,6 +3389,31 @@ type jsonAgentIdentityNode struct {
 	FedRAMP         bool   `json:"chatgpt_account_is_fedramp"`
 }
 
+// agentIdentityNodeFromFlatCredentials 从平铺在 credentials 里的 Agent Identity 字段
+// 合成 agent_identity 节点：sub2api / codex2api 的账号导出把这些字段直接摊在
+// credentials 对象上（auth_mode=agentIdentity + agent_runtime_id…），不套
+// agent_identity 子对象。既有子对象则不必调用本函数。
+func agentIdentityNodeFromFlatCredentials(authMode, runtimeID, privateKey, taskID, accountID, userID, email, planType string, fedramp bool) *jsonAgentIdentityNode {
+	runtimeID = strings.TrimSpace(runtimeID)
+	// 仅当 auth_mode 声明或带 runtime_id 时才认为是 Agent Identity 平铺形态。
+	if !strings.EqualFold(strings.TrimSpace(authMode), auth.CodexAuthModeAgentIdentity) && runtimeID == "" {
+		return nil
+	}
+	if runtimeID == "" || strings.TrimSpace(privateKey) == "" {
+		return nil
+	}
+	return &jsonAgentIdentityNode{
+		AgentRuntimeID:  runtimeID,
+		AgentPrivateKey: strings.TrimSpace(privateKey),
+		TaskID:          strings.TrimSpace(taskID),
+		AccountID:       strings.TrimSpace(accountID),
+		ChatGPTUserID:   strings.TrimSpace(userID),
+		Email:           strings.TrimSpace(email),
+		PlanType:        strings.TrimSpace(planType),
+		FedRAMP:         fedramp,
+	}
+}
+
 // agentIdentityImportTokenFromNode 把 agent_identity 子对象转成 importToken（无有效字段时返回 ok=false）。
 func agentIdentityImportTokenFromNode(node *jsonAgentIdentityNode, fallbackName string) (importToken, bool) {
 	if node == nil {
@@ -3428,6 +3443,11 @@ func agentIdentityImportTokenFromNode(node *jsonAgentIdentityNode, fallbackName 
 type jsonAccountEntry struct {
 	AuthMode              string                 `json:"auth_mode"`
 	AgentIdentity         *jsonAgentIdentityNode `json:"agent_identity"`
+	AgentRuntimeID        string                 `json:"agent_runtime_id"`
+	AgentPrivateKey       string                 `json:"agent_private_key"`
+	AgentTaskID           string                 `json:"task_id"`
+	ChatGPTUserID         string                 `json:"chatgpt_user_id"`
+	AgentFedRAMP          bool                   `json:"chatgpt_account_is_fedramp"`
 	RefreshToken          string                 `json:"refresh_token"`
 	SessionToken          string                 `json:"session_token"`
 	SessionTokenCamel     string                 `json:"sessionToken"`
@@ -3437,7 +3457,6 @@ type jsonAccountEntry struct {
 	IDTokenCamel          string                 `json:"idToken"`
 	AccountID             string                 `json:"account_id"`
 	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
-	ChatGPTUserID         string                 `json:"chatgpt_user_id"`
 	UserID                string                 `json:"user_id"`
 	ChatGPTAccountUserID  string                 `json:"chatgpt_account_user_id"`
 	AccountUserID         string                 `json:"account_user_id"`
@@ -3482,6 +3501,11 @@ type sub2apiAccountEntry struct {
 type sub2apiAccountCredentials struct {
 	AuthMode              string                 `json:"auth_mode"`
 	AgentIdentity         *jsonAgentIdentityNode `json:"agent_identity"`
+	AgentRuntimeID        string                 `json:"agent_runtime_id"`
+	AgentPrivateKey       string                 `json:"agent_private_key"`
+	AgentTaskID           string                 `json:"task_id"`
+	ChatGPTUserID         string                 `json:"chatgpt_user_id"`
+	AgentFedRAMP          bool                   `json:"chatgpt_account_is_fedramp"`
 	RefreshToken          string                 `json:"refresh_token"`
 	SessionToken          string                 `json:"session_token"`
 	SessionTokenCamel     string                 `json:"sessionToken"`
@@ -3491,7 +3515,6 @@ type sub2apiAccountCredentials struct {
 	IDTokenCamel          string                 `json:"idToken"`
 	AccountID             string                 `json:"account_id"`
 	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
-	ChatGPTUserID         string                 `json:"chatgpt_user_id"`
 	UserID                string                 `json:"user_id"`
 	ChatGPTAccountUserID  string                 `json:"chatgpt_account_user_id"`
 	AccountUserID         string                 `json:"account_user_id"`
@@ -3591,8 +3614,13 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 		accID := firstNonEmpty(entry.AccountID, entry.User.ID, entry.Account.ID)
 		expiresAt := firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String(), entry.Expires.String())
 
-		// Agent Identity 条目：无 RT/ST/AT，单独识别。
-		if tok, ok := agentIdentityImportTokenFromNode(entry.AgentIdentity, name); ok {
+		// Agent Identity 条目：无 RT/ST/AT，单独识别。子对象缺失时回退到
+		// 平铺在条目根上的 Agent Identity 字段（sub2api / codex2api 导出形态）。
+		agentNode := entry.AgentIdentity
+		if agentNode == nil {
+			agentNode = agentIdentityNodeFromFlatCredentials(entry.AuthMode, entry.AgentRuntimeID, entry.AgentPrivateKey, entry.AgentTaskID, accID, entry.ChatGPTUserID, email, planType, entry.AgentFedRAMP)
+		}
+		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
 			tokens = append(tokens, tok)
 			continue
 		}
@@ -3645,8 +3673,13 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 		accID := firstNonEmpty(c.AccountID, c.User.ID, c.Account.ID)
 		expiresAt := firstNonEmpty(c.ExpiresAt.String(), c.Expired.String(), c.Expires.String())
 
-		// Agent Identity 条目：无 RT/ST/AT，单独识别。
-		if tok, ok := agentIdentityImportTokenFromNode(c.AgentIdentity, name); ok {
+		// Agent Identity 条目：无 RT/ST/AT，单独识别。子对象缺失时回退到
+		// 平铺在 credentials 里的 Agent Identity 字段（sub2api 导出形态）。
+		agentNode := c.AgentIdentity
+		if agentNode == nil {
+			agentNode = agentIdentityNodeFromFlatCredentials(c.AuthMode, c.AgentRuntimeID, c.AgentPrivateKey, c.AgentTaskID, accID, c.ChatGPTUserID, email, planType, c.AgentFedRAMP)
+		}
+		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
 			tokens = append(tokens, tok)
 			continue
 		}
@@ -3776,19 +3809,11 @@ func importTokenSeed(t importToken, conflicts map[string]bool) tokenCredentialSe
 func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) string {
 	seed := importTokenSeed(t, conflicts)
 	email := strings.ToLower(strings.TrimSpace(seed.email))
-	accountID := strings.TrimSpace(seed.accountID)
-	if accountID == "" && strings.TrimSpace(t.accountID) == "" {
-		accountID = strings.TrimSpace(t.chatgptAccountID)
-	}
-	// 个人账号可能只有 user_id（无工作区 account_id），用它兜底做身份键，
-	// 否则文件导入会退化为凭证原文比对，AT 轮换后重复导入。
-	if accountID == "" {
-		accountID = strings.TrimSpace(seed.userID)
-	}
-	if email == "" || accountID == "" {
+	workspaceID := strings.TrimSpace(seed.workspaceID)
+	if email == "" || workspaceID == "" {
 		return ""
 	}
-	return email + "\x00" + accountID
+	return email + "\x00" + workspaceID
 }
 
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
@@ -4184,7 +4209,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	}
 	tokens = regularTokens
 	// 文件内去重：
-	// 1) 当条目可解析出 email + account_id 时，以它作为 OAuth 身份键；
+	// 1) 当 JWT 可解析出 email + workspace_id 时，以它作为 OAuth 身份键；
 	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
 	// 2) 当条目带有 chatgpt_account_id/account_id 但没有 OAuth 身份时，优先以 (workspace/account, user_id/email) 区分，
 	//    再退回 workspace/account，避免 Sub2Api 同一 workspace 下不同用户被合并。
@@ -4302,9 +4327,34 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	duplicateCount := ambiguousOAuthIdentityCount
 
 	if allowDuplicate {
-		// 允许重复添加：跳过数据库去重，所有解析出的 token 均作为新账号导入。
-		newTokens = tokens
-		duplicateCount = 0
+		knownCount := 0
+		for _, t := range tokens {
+			if importTokenOAuthIdentityKey(t, conflictingChatGPTIDs) == "" {
+				newTokens = append(newTokens, t)
+			} else {
+				knownCount++
+			}
+		}
+		knownUniqueCount := 0
+		for _, t := range unique {
+			if importTokenOAuthIdentityKey(t, conflictingChatGPTIDs) != "" {
+				knownUniqueCount++
+				seed := importTokenSeed(t, conflictingChatGPTIDs)
+				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
+					log.Printf("查询已有 OAuth 身份失败: %v", err)
+				} else if duplicateID > 0 {
+					row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
+					if err != nil {
+						log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
+					} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
+						duplicateCount++
+						continue
+					}
+				}
+				newTokens = append(newTokens, t)
+			}
+		}
+		duplicateCount += knownCount - knownUniqueCount - ambiguousOAuthIdentityCount
 	} else {
 		existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
 		if err != nil {
@@ -4493,7 +4543,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			if tok.accessToken != "" && tok.refreshToken == "" {
 				importSource = "import_at"
 			}
-			if !allowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+			if seed.email != "" && seed.workspaceID != "" {
 				if name == "" {
 					if importSource == "import_at" {
 						name = fmt.Sprintf("at-import-%d", idx+1)
@@ -4523,7 +4573,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					if acc := h.store.FindByID(id); acc != nil {
 						h.applyImportedAccountUsageState(acc, importSource)
 						if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
-							go h.refreshImportedAccountAndProbe(id, importSource+"_refresh")
+							h.startDBBackgroundTask(func(ctx context.Context) {
+								h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
+							})
 						}
 					}
 				}
@@ -4604,7 +4656,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					h.triggerImportedAccountUsageProbe(id, "import")
 				} else if !h.store.GetLazyMode() {
 					// 后台异步刷新，不阻塞导入流程；刷新成功后立即做 wham 用量采样。
-					go h.refreshImportedAccountAndProbe(id, "import_refresh")
+					h.startDBBackgroundTask(func(ctx context.Context) {
+						h.refreshImportedAccountAndProbe(ctx, id, "import_refresh")
+					})
 				}
 			}
 		}(i, t)
@@ -4857,10 +4911,19 @@ func (h *Handler) restoreAccountByID(ctx context.Context, id int64) error {
 		return err
 	}
 	seed := tokenCredentialSeedFromAccountRow(row)
-	if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id); err != nil {
-		return err
-	} else if duplicateID > 0 {
-		return fmt.Errorf("%w: 已存在相同 OAuth 账号 (id=%d)，请先删除正常账号或清理回收站账号", errDuplicateOAuthIdentity, duplicateID)
+	if seed.email != "" && seed.workspaceID != "" {
+		h.mergeDuplicateMu.Lock()
+		defer h.mergeDuplicateMu.Unlock()
+		if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id); err != nil {
+			return err
+		} else if duplicateID > 0 {
+			return fmt.Errorf("%w: 已存在相同 OAuth 账号 (id=%d)，请先删除正常账号或清理回收站账号", errDuplicateOAuthIdentity, duplicateID)
+		}
+		if row.GetCredential("workspace_id") != seed.workspaceID {
+			if err := h.db.UpdateCredentials(ctx, id, map[string]interface{}{"workspace_id": seed.workspaceID}); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := h.db.RestoreAccount(ctx, id); err != nil {
@@ -4884,8 +4947,10 @@ func tokenCredentialSeedFromAccountRow(row *database.AccountRow) tokenCredential
 		refreshToken:          row.GetCredential("refresh_token"),
 		sessionToken:          row.GetCredential("session_token"),
 		accessToken:           row.GetCredential("access_token"),
+		accessTokenType:       row.GetCredential("access_token_type"),
 		idToken:               row.GetCredential("id_token"),
 		accountID:             firstNonEmpty(row.GetCredential("account_id"), row.GetCredential("chatgpt_account_id")),
+		workspaceID:           row.GetCredential("workspace_id"),
 		email:                 row.GetCredential("email"),
 		planType:              row.GetCredential("plan_type"),
 		expiresAtRaw:          row.GetCredential("expires_at"),
@@ -5526,13 +5591,13 @@ func (h *Handler) syncAccountPlanAfterReset(_ context.Context, acc *auth.Account
 	if h == nil || h.syncAccountPlanOnReset == nil || acc == nil {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	h.startDBBackgroundTask(func(parent context.Context) {
+		ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 		defer cancel()
 		if err := h.syncAccountPlanOnReset(ctx, acc); err != nil {
 			log.Printf("[账号 %d] 重置后同步 Codex plan type 失败: %v", acc.DBID, err)
 		}
-	}()
+	})
 }
 
 func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Account) error {
@@ -5639,6 +5704,36 @@ func (h *Handler) GetAPIKeyTokenStats(c *gin.Context) {
 	}
 	if items == nil {
 		items = []database.APIKeyTokenStat{}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+// GetAPIKeyAccountStats 返回单个 API Key 按上游账号拆分的用量（账号明细"按 Key 分解"的转置视图）。
+// 支持可选 query 参数 start/end (RFC3339)；缺省回落到"今日"。
+// GET /api/admin/usage/api-keys/:id/accounts
+func (h *Handler) GetAPIKeyAccountStats(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的 API Key ID")
+		return
+	}
+
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+
+	items, err := h.db.ListAPIKeyAccountStats(ctx, id, rangeStart, rangeEnd)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if items == nil {
+		items = []database.APIKeyAccountStat{}
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }
@@ -6814,235 +6909,247 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	SiteName                           string  `json:"site_name"`
-	SiteLogo                           string  `json:"site_logo"`
-	BackgroundImage                    string  `json:"background_image"`
-	BackgroundOpacity                  int     `json:"background_opacity"`
-	BackgroundBlur                     int     `json:"background_blur"`
-	BackgroundGlassOpacity             int     `json:"background_glass_opacity"`
-	BackgroundGlassBlur                int     `json:"background_glass_blur"`
-	MaxConcurrency                     int     `json:"max_concurrency"`
-	GlobalRPM                          int     `json:"global_rpm"`
-	TestModel                          string  `json:"test_model"`
-	TestContent                        string  `json:"test_content"`
-	TestConcurrency                    int     `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes   int     `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes            int     `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency              int     `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled bool    `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes       int     `json:"recovery_probe_interval_minutes"`
-	LazyMode                           bool    `json:"lazy_mode"`
-	ProxyURL                           string  `json:"proxy_url"`
-	PgMaxConns                         int     `json:"pg_max_conns"`
-	RedisPoolSize                      int     `json:"redis_pool_size"`
-	AutoCleanUnauthorized              bool    `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited               bool    `json:"auto_clean_rate_limited"`
-	AdminSecret                        string  `json:"admin_secret"`
-	AdminAuthSource                    string  `json:"admin_auth_source"`
-	AutoCleanFullUsage                 bool    `json:"auto_clean_full_usage"`
-	AutoCleanError                     bool    `json:"auto_clean_error"`
-	AutoCleanExpired                   bool    `json:"auto_clean_expired"`
-	AutoResetCreditsEnabled            bool    `json:"auto_reset_credits_enabled"`
-	AutoResetCreditsBeforeExpiryMin    int     `json:"auto_reset_credits_before_expiry_min"`
-	ProxyPoolEnabled                   bool    `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled               bool    `json:"fast_scheduler_enabled"`
-	CodexForceWebsocket                bool    `json:"codex_force_websocket"`
-	CodexWSKeepaliveEnabled            bool    `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec        int     `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors          bool    `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled          bool    `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries            int     `json:"codex_ws_silent_max_retries"`
-	CodexFastModelAliasEnabled         bool    `json:"codex_fast_model_alias_enabled"`
-	CodexFastTierInterceptEnabled      bool    `json:"codex_fast_tier_intercept_enabled"`
-	CodexWSSizeRouterEnabled           bool    `json:"codex_ws_size_router_enabled"`
-	CodexWSBusyAcquireMaxWaitSec       int     `json:"codex_ws_busy_acquire_max_wait_sec"`
-	CodexWSBusyOverflowEnabled         bool    `json:"codex_ws_busy_overflow_enabled"`
-	CodexWSBusyPatienceSec             int     `json:"codex_ws_busy_patience_sec"`
-	OverflowAutoCompactEnabled         bool    `json:"overflow_auto_compact_enabled"`
-	CodexContinueThinkingEnabled       bool    `json:"codex_continue_thinking_enabled"`
-	CodexContinueMaxRounds             int     `json:"codex_continue_max_rounds"`
-	CodexCLIVersionSyncEnabled         bool    `json:"codex_cli_version_sync_enabled"`
-	CodexCLIVersionSyncIntervalHours   int     `json:"codex_cli_version_sync_interval_hours"`
-	CodexSyncedCLIVersion              string  `json:"codex_synced_cli_version"`
-	SchedulerMode                      string  `json:"scheduler_mode"`
-	AffinityMode                       string  `json:"affinity_mode"`
-	MaxRetries                         int     `json:"max_retries"`
-	MaxRateLimitRetries                int     `json:"max_rate_limit_retries"`
-	RetryIntervalMS                    int     `json:"retry_interval_ms"`
-	TransportRetryPolicy               string  `json:"transport_retry_policy"`
-	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
-	DatabaseDriver                     string  `json:"database_driver"`
-	DatabaseLabel                      string  `json:"database_label"`
-	CacheDriver                        string  `json:"cache_driver"`
-	CacheLabel                         string  `json:"cache_label"`
-	ExpiredCleaned                     int     `json:"expired_cleaned,omitempty"`
-	ModelMapping                       string  `json:"model_mapping"`
-	CodexModelMapping                  string  `json:"codex_model_mapping"`
-	PayloadRules                       string  `json:"payload_rules"`
-	ReasoningEffortModels              string  `json:"reasoning_effort_models"`
-	ResinURL                           string  `json:"resin_url"`
-	ResinPlatformName                  string  `json:"resin_platform_name"`
-	PromptFilterEnabled                bool    `json:"prompt_filter_enabled"`
-	PromptFilterMode                   string  `json:"prompt_filter_mode"`
-	PromptFilterThreshold              int     `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold        int     `json:"prompt_filter_strict_threshold"`
-	PromptFilterStrictTerminalEnabled  bool    `json:"prompt_filter_strict_terminal_enabled"`
-	PromptFilterAdvancedConfig         string  `json:"prompt_filter_advanced_config"`
-	PromptFilterLogMatches             bool    `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength          int     `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords         string  `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns         string  `json:"prompt_filter_custom_patterns"`
-	PromptFilterDisabledPatterns       string  `json:"prompt_filter_disabled_patterns"`
-	PromptFilterReviewEnabled          bool    `json:"prompt_filter_review_enabled"`
-	PromptFilterReviewAPIKeyConfigured bool    `json:"prompt_filter_review_api_key_configured"`
-	PromptFilterReviewAPIKeyCount      int     `json:"prompt_filter_review_api_key_count"`
-	PromptFilterReviewBaseURL          string  `json:"prompt_filter_review_base_url"`
-	PromptFilterReviewModel            string  `json:"prompt_filter_review_model"`
-	PromptFilterReviewTimeoutSeconds   int     `json:"prompt_filter_review_timeout_seconds"`
-	PromptFilterReviewFailClosed       bool    `json:"prompt_filter_review_fail_closed"`
-	ClientCompatMode                   string  `json:"client_compat_mode"`
-	CodexMinCLIVersion                 string  `json:"codex_min_cli_version"`
-	CodexUserAgentConfig               string  `json:"codex_user_agent_config"`
-	UsageLogMode                       string  `json:"usage_log_mode"`
-	UsageLogBatchSize                  int     `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds       int     `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                  string  `json:"stream_flush_policy"`
-	StreamFlushIntervalMS              int     `json:"stream_flush_interval_ms"`
-	FirstTokenMode                     string  `json:"first_token_mode"`
-	FirstTokenTimeoutSeconds           int     `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                  string  `json:"billing_tier_policy"`
-	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
-	PublicKeyUsagePageEnabled          bool    `json:"public_key_usage_page_enabled"`
-	PublicImageStudioPageEnabled       bool    `json:"public_image_studio_page_enabled"`
-	PublicAccountPortalPageEnabled     bool    `json:"public_account_portal_page_enabled"`
-	ImageStorageBackend                string  `json:"image_storage_backend"`
-	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
-	ImageS3Region                      string  `json:"image_s3_region"`
-	ImageS3Bucket                      string  `json:"image_s3_bucket"`
-	ImageS3AccessKey                   string  `json:"image_s3_access_key"`
-	ImageS3SecretKey                   string  `json:"image_s3_secret_key"`
-	ImageS3Prefix                      string  `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle              bool    `json:"image_s3_force_path_style"`
-	AutoPause5hThreshold               float64 `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
-	AutoPause5hGuardBandPercent        float64 `json:"auto_pause_5h_guard_band_percent"`
-	AutoPause5hGuardConcurrency        int     `json:"auto_pause_5h_guard_concurrency"`
-	SmartPacingEnabled                 bool    `json:"smart_pacing_enabled"`
-	SmartPacingMinConcurrency          int     `json:"smart_pacing_min_concurrency"`
-	SmartPacingWindows                 string  `json:"smart_pacing_windows"`
-	IgnoreUsageLimitStatus             bool    `json:"ignore_usage_limit_status"`
+	SiteName                            string  `json:"site_name"`
+	SiteLogo                            string  `json:"site_logo"`
+	BackgroundImage                     string  `json:"background_image"`
+	BackgroundOpacity                   int     `json:"background_opacity"`
+	BackgroundBlur                      int     `json:"background_blur"`
+	BackgroundGlassOpacity              int     `json:"background_glass_opacity"`
+	BackgroundGlassBlur                 int     `json:"background_glass_blur"`
+	MaxConcurrency                      int     `json:"max_concurrency"`
+	GlobalRPM                           int     `json:"global_rpm"`
+	TestModel                           string  `json:"test_model"`
+	TestContent                         string  `json:"test_content"`
+	TestConcurrency                     int     `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes    int     `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes             int     `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency               int     `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled  bool    `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes        int     `json:"recovery_probe_interval_minutes"`
+	LazyMode                            bool    `json:"lazy_mode"`
+	ProxyURL                            string  `json:"proxy_url"`
+	PgMaxConns                          int     `json:"pg_max_conns"`
+	RedisPoolSize                       int     `json:"redis_pool_size"`
+	AutoCleanUnauthorized               bool    `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                bool    `json:"auto_clean_rate_limited"`
+	AdminSecret                         string  `json:"admin_secret"`
+	AdminAuthSource                     string  `json:"admin_auth_source"`
+	AutoCleanFullUsage                  bool    `json:"auto_clean_full_usage"`
+	AutoCleanError                      bool    `json:"auto_clean_error"`
+	AutoCleanExpired                    bool    `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled             bool    `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin     int     `json:"auto_reset_credits_before_expiry_min"`
+	ProxyPoolEnabled                    bool    `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                bool    `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket                 bool    `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled             bool    `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec         int     `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors           bool    `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled           bool    `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries             int     `json:"codex_ws_silent_max_retries"`
+	CodexFastModelAliasEnabled          bool    `json:"codex_fast_model_alias_enabled"`
+	CodexFastTierInterceptEnabled       bool    `json:"codex_fast_tier_intercept_enabled"`
+	CodexWSSizeRouterEnabled            bool    `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec        int     `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled          bool    `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec              int     `json:"codex_ws_busy_patience_sec"`
+	OverflowAutoCompactEnabled          bool    `json:"overflow_auto_compact_enabled"`
+	CodexPreflightSSEPassthroughEnabled bool    `json:"codex_preflight_sse_passthrough_enabled"`
+	FirstTokenExcludesWsAcquire         bool    `json:"first_token_excludes_ws_acquire"`
+	CodexContinueThinkingEnabled        bool    `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds              int     `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled          bool    `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours    int     `json:"codex_cli_version_sync_interval_hours"`
+	CodexSyncedCLIVersion               string  `json:"codex_synced_cli_version"`
+	SchedulerMode                       string  `json:"scheduler_mode"`
+	AffinityMode                        string  `json:"affinity_mode"`
+	GrokAffinityMode                    string  `json:"grok_affinity_mode"`
+	GrokProbeEnabled                    bool    `json:"grok_probe_enabled"`
+	GrokProbeIntervalMinutes            int     `json:"grok_probe_interval_minutes"`
+	GrokMaxRateLimitRetries             int     `json:"grok_max_rate_limit_retries"`
+	MaxRetries                          int     `json:"max_retries"`
+	MaxRateLimitRetries                 int     `json:"max_rate_limit_retries"`
+	RetryIntervalMS                     int     `json:"retry_interval_ms"`
+	TransportRetryPolicy                string  `json:"transport_retry_policy"`
+	AllowRemoteMigration                bool    `json:"allow_remote_migration"`
+	DatabaseDriver                      string  `json:"database_driver"`
+	DatabaseLabel                       string  `json:"database_label"`
+	CacheDriver                         string  `json:"cache_driver"`
+	CacheLabel                          string  `json:"cache_label"`
+	ExpiredCleaned                      int     `json:"expired_cleaned,omitempty"`
+	ModelMapping                        string  `json:"model_mapping"`
+	CodexModelMapping                   string  `json:"codex_model_mapping"`
+	PayloadRules                        string  `json:"payload_rules"`
+	ReasoningEffortModels               string  `json:"reasoning_effort_models"`
+	ResinURL                            string  `json:"resin_url"`
+	ResinPlatformName                   string  `json:"resin_platform_name"`
+	PromptFilterEnabled                 bool    `json:"prompt_filter_enabled"`
+	PromptFilterMode                    string  `json:"prompt_filter_mode"`
+	PromptFilterThreshold               int     `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold         int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterStrictTerminalEnabled   bool    `json:"prompt_filter_strict_terminal_enabled"`
+	PromptFilterAdvancedConfig          string  `json:"prompt_filter_advanced_config"`
+	PromptFilterLogMatches              bool    `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength           int     `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords          string  `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns          string  `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns        string  `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled           bool    `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAPIKeyConfigured  bool    `json:"prompt_filter_review_api_key_configured"`
+	PromptFilterReviewAPIKeyCount       int     `json:"prompt_filter_review_api_key_count"`
+	PromptFilterReviewBaseURL           string  `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel             string  `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds    int     `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed        bool    `json:"prompt_filter_review_fail_closed"`
+	ClientCompatMode                    string  `json:"client_compat_mode"`
+	CodexMinCLIVersion                  string  `json:"codex_min_cli_version"`
+	CodexUserAgentConfig                string  `json:"codex_user_agent_config"`
+	UsageLogMode                        string  `json:"usage_log_mode"`
+	UsageLogBatchSize                   int     `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds        int     `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                   string  `json:"stream_flush_policy"`
+	StreamFlushIntervalMS               int     `json:"stream_flush_interval_ms"`
+	FirstTokenMode                      string  `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds            int     `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                   string  `json:"billing_tier_policy"`
+	ShowFullUsageNumbers                bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled           bool    `json:"public_key_usage_page_enabled"`
+	PublicImageStudioPageEnabled        bool    `json:"public_image_studio_page_enabled"`
+	PublicAccountPortalPageEnabled      bool    `json:"public_account_portal_page_enabled"`
+	ImageStorageBackend                 string  `json:"image_storage_backend"`
+	ImageS3Endpoint                     string  `json:"image_s3_endpoint"`
+	ImageS3Region                       string  `json:"image_s3_region"`
+	ImageS3Bucket                       string  `json:"image_s3_bucket"`
+	ImageS3AccessKey                    string  `json:"image_s3_access_key"`
+	ImageS3SecretKey                    string  `json:"image_s3_secret_key"`
+	ImageS3Prefix                       string  `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle               bool    `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold                float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold                float64 `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent         float64 `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency         int     `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                  bool    `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency           int     `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                  string  `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus              bool    `json:"ignore_usage_limit_status"`
 }
 
 type updateSettingsReq struct {
-	SiteName                           *string  `json:"site_name"`
-	SiteLogo                           *string  `json:"site_logo"`
-	BackgroundImage                    *string  `json:"background_image"`
-	BackgroundOpacity                  *int     `json:"background_opacity"`
-	BackgroundBlur                     *int     `json:"background_blur"`
-	BackgroundGlassOpacity             *int     `json:"background_glass_opacity"`
-	BackgroundGlassBlur                *int     `json:"background_glass_blur"`
-	MaxConcurrency                     *int     `json:"max_concurrency"`
-	GlobalRPM                          *int     `json:"global_rpm"`
-	TestModel                          *string  `json:"test_model"`
-	TestContent                        *string  `json:"test_content"`
-	TestConcurrency                    *int     `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes   *int     `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes            *int     `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency              *int     `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled *bool    `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes       *int     `json:"recovery_probe_interval_minutes"`
-	LazyMode                           *bool    `json:"lazy_mode"`
-	ProxyURL                           *string  `json:"proxy_url"`
-	PgMaxConns                         *int     `json:"pg_max_conns"`
-	RedisPoolSize                      *int     `json:"redis_pool_size"`
-	AutoCleanUnauthorized              *bool    `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited               *bool    `json:"auto_clean_rate_limited"`
-	AdminSecret                        *string  `json:"admin_secret"`
-	AutoCleanFullUsage                 *bool    `json:"auto_clean_full_usage"`
-	AutoCleanError                     *bool    `json:"auto_clean_error"`
-	AutoCleanExpired                   *bool    `json:"auto_clean_expired"`
-	AutoResetCreditsEnabled            *bool    `json:"auto_reset_credits_enabled"`
-	AutoResetCreditsBeforeExpiryMin    *int     `json:"auto_reset_credits_before_expiry_min"`
-	ProxyPoolEnabled                   *bool    `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled               *bool    `json:"fast_scheduler_enabled"`
-	CodexForceWebsocket                *bool    `json:"codex_force_websocket"`
-	CodexWSKeepaliveEnabled            *bool    `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec        *int     `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors          *bool    `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled          *bool    `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries            *int     `json:"codex_ws_silent_max_retries"`
-	CodexFastModelAliasEnabled         *bool    `json:"codex_fast_model_alias_enabled"`
-	CodexFastTierInterceptEnabled      *bool    `json:"codex_fast_tier_intercept_enabled"`
-	CodexWSSizeRouterEnabled           *bool    `json:"codex_ws_size_router_enabled"`
-	CodexWSBusyAcquireMaxWaitSec       *int     `json:"codex_ws_busy_acquire_max_wait_sec"`
-	CodexWSBusyOverflowEnabled         *bool    `json:"codex_ws_busy_overflow_enabled"`
-	CodexWSBusyPatienceSec             *int     `json:"codex_ws_busy_patience_sec"`
-	OverflowAutoCompactEnabled         *bool    `json:"overflow_auto_compact_enabled"`
-	CodexContinueThinkingEnabled       *bool    `json:"codex_continue_thinking_enabled"`
-	CodexContinueMaxRounds             *int     `json:"codex_continue_max_rounds"`
-	CodexCLIVersionSyncEnabled         *bool    `json:"codex_cli_version_sync_enabled"`
-	CodexCLIVersionSyncIntervalHours   *int     `json:"codex_cli_version_sync_interval_hours"`
-	SchedulerMode                      *string  `json:"scheduler_mode"`
-	AffinityMode                       *string  `json:"affinity_mode"`
-	MaxRetries                         *int     `json:"max_retries"`
-	MaxRateLimitRetries                *int     `json:"max_rate_limit_retries"`
-	RetryIntervalMS                    *int     `json:"retry_interval_ms"`
-	TransportRetryPolicy               *string  `json:"transport_retry_policy"`
-	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
-	ModelMapping                       *string  `json:"model_mapping"`
-	CodexModelMapping                  *string  `json:"codex_model_mapping"`
-	PayloadRules                       *string  `json:"payload_rules"`
-	ReasoningEffortModels              *string  `json:"reasoning_effort_models"`
-	ResinURL                           *string  `json:"resin_url"`
-	ResinPlatformName                  *string  `json:"resin_platform_name"`
-	PromptFilterEnabled                *bool    `json:"prompt_filter_enabled"`
-	PromptFilterMode                   *string  `json:"prompt_filter_mode"`
-	PromptFilterThreshold              *int     `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold        *int     `json:"prompt_filter_strict_threshold"`
-	PromptFilterStrictTerminalEnabled  *bool    `json:"prompt_filter_strict_terminal_enabled"`
-	PromptFilterAdvancedConfig         *string  `json:"prompt_filter_advanced_config"`
-	PromptFilterLogMatches             *bool    `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength          *int     `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords         *string  `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns         *string  `json:"prompt_filter_custom_patterns"`
-	PromptFilterDisabledPatterns       *string  `json:"prompt_filter_disabled_patterns"`
-	PromptFilterReviewEnabled          *bool    `json:"prompt_filter_review_enabled"`
-	PromptFilterReviewAPIKey           *string  `json:"prompt_filter_review_api_key"`
-	PromptFilterReviewBaseURL          *string  `json:"prompt_filter_review_base_url"`
-	PromptFilterReviewModel            *string  `json:"prompt_filter_review_model"`
-	PromptFilterReviewTimeoutSeconds   *int     `json:"prompt_filter_review_timeout_seconds"`
-	PromptFilterReviewFailClosed       *bool    `json:"prompt_filter_review_fail_closed"`
-	ClientCompatMode                   *string  `json:"client_compat_mode"`
-	CodexMinCLIVersion                 *string  `json:"codex_min_cli_version"`
-	CodexUserAgentConfig               *string  `json:"codex_user_agent_config"`
-	UsageLogMode                       *string  `json:"usage_log_mode"`
-	UsageLogBatchSize                  *int     `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds       *int     `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                  *string  `json:"stream_flush_policy"`
-	StreamFlushIntervalMS              *int     `json:"stream_flush_interval_ms"`
-	FirstTokenMode                     *string  `json:"first_token_mode"`
-	FirstTokenTimeoutSeconds           *int     `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
-	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
-	PublicKeyUsagePageEnabled          *bool    `json:"public_key_usage_page_enabled"`
-	PublicImageStudioPageEnabled       *bool    `json:"public_image_studio_page_enabled"`
-	PublicAccountPortalPageEnabled     *bool    `json:"public_account_portal_page_enabled"`
-	ImageStorageBackend                *string  `json:"image_storage_backend"`
-	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
-	ImageS3Region                      *string  `json:"image_s3_region"`
-	ImageS3Bucket                      *string  `json:"image_s3_bucket"`
-	ImageS3AccessKey                   *string  `json:"image_s3_access_key"`
-	ImageS3SecretKey                   *string  `json:"image_s3_secret_key"`
-	ImageS3Prefix                      *string  `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle              *bool    `json:"image_s3_force_path_style"`
-	AutoPause5hThreshold               *float64 `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold               *float64 `json:"auto_pause_7d_threshold"`
-	AutoPause5hGuardBandPercent        *float64 `json:"auto_pause_5h_guard_band_percent"`
-	AutoPause5hGuardConcurrency        *int     `json:"auto_pause_5h_guard_concurrency"`
-	SmartPacingEnabled                 *bool    `json:"smart_pacing_enabled"`
-	SmartPacingMinConcurrency          *int     `json:"smart_pacing_min_concurrency"`
-	SmartPacingWindows                 *string  `json:"smart_pacing_windows"`
-	IgnoreUsageLimitStatus             *bool    `json:"ignore_usage_limit_status"`
+	SiteName                            *string  `json:"site_name"`
+	SiteLogo                            *string  `json:"site_logo"`
+	BackgroundImage                     *string  `json:"background_image"`
+	BackgroundOpacity                   *int     `json:"background_opacity"`
+	BackgroundBlur                      *int     `json:"background_blur"`
+	BackgroundGlassOpacity              *int     `json:"background_glass_opacity"`
+	BackgroundGlassBlur                 *int     `json:"background_glass_blur"`
+	MaxConcurrency                      *int     `json:"max_concurrency"`
+	GlobalRPM                           *int     `json:"global_rpm"`
+	TestModel                           *string  `json:"test_model"`
+	TestContent                         *string  `json:"test_content"`
+	TestConcurrency                     *int     `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes    *int     `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes             *int     `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency               *int     `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled  *bool    `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes        *int     `json:"recovery_probe_interval_minutes"`
+	LazyMode                            *bool    `json:"lazy_mode"`
+	ProxyURL                            *string  `json:"proxy_url"`
+	PgMaxConns                          *int     `json:"pg_max_conns"`
+	RedisPoolSize                       *int     `json:"redis_pool_size"`
+	AutoCleanUnauthorized               *bool    `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                *bool    `json:"auto_clean_rate_limited"`
+	AdminSecret                         *string  `json:"admin_secret"`
+	AutoCleanFullUsage                  *bool    `json:"auto_clean_full_usage"`
+	AutoCleanError                      *bool    `json:"auto_clean_error"`
+	AutoCleanExpired                    *bool    `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled             *bool    `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin     *int     `json:"auto_reset_credits_before_expiry_min"`
+	ProxyPoolEnabled                    *bool    `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                *bool    `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket                 *bool    `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled             *bool    `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec         *int     `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors           *bool    `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled           *bool    `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries             *int     `json:"codex_ws_silent_max_retries"`
+	CodexFastModelAliasEnabled          *bool    `json:"codex_fast_model_alias_enabled"`
+	CodexFastTierInterceptEnabled       *bool    `json:"codex_fast_tier_intercept_enabled"`
+	CodexWSSizeRouterEnabled            *bool    `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec        *int     `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled          *bool    `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec              *int     `json:"codex_ws_busy_patience_sec"`
+	OverflowAutoCompactEnabled          *bool    `json:"overflow_auto_compact_enabled"`
+	CodexPreflightSSEPassthroughEnabled *bool    `json:"codex_preflight_sse_passthrough_enabled"`
+	FirstTokenExcludesWsAcquire         *bool    `json:"first_token_excludes_ws_acquire"`
+	CodexContinueThinkingEnabled        *bool    `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds              *int     `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled          *bool    `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours    *int     `json:"codex_cli_version_sync_interval_hours"`
+	SchedulerMode                       *string  `json:"scheduler_mode"`
+	AffinityMode                        *string  `json:"affinity_mode"`
+	GrokAffinityMode                    *string  `json:"grok_affinity_mode"`
+	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
+	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
+	GrokMaxRateLimitRetries             *int     `json:"grok_max_rate_limit_retries"`
+	MaxRetries                          *int     `json:"max_retries"`
+	MaxRateLimitRetries                 *int     `json:"max_rate_limit_retries"`
+	RetryIntervalMS                     *int     `json:"retry_interval_ms"`
+	TransportRetryPolicy                *string  `json:"transport_retry_policy"`
+	AllowRemoteMigration                *bool    `json:"allow_remote_migration"`
+	ModelMapping                        *string  `json:"model_mapping"`
+	CodexModelMapping                   *string  `json:"codex_model_mapping"`
+	PayloadRules                        *string  `json:"payload_rules"`
+	ReasoningEffortModels               *string  `json:"reasoning_effort_models"`
+	ResinURL                            *string  `json:"resin_url"`
+	ResinPlatformName                   *string  `json:"resin_platform_name"`
+	PromptFilterEnabled                 *bool    `json:"prompt_filter_enabled"`
+	PromptFilterMode                    *string  `json:"prompt_filter_mode"`
+	PromptFilterThreshold               *int     `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold         *int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterStrictTerminalEnabled   *bool    `json:"prompt_filter_strict_terminal_enabled"`
+	PromptFilterAdvancedConfig          *string  `json:"prompt_filter_advanced_config"`
+	PromptFilterLogMatches              *bool    `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength           *int     `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords          *string  `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns          *string  `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns        *string  `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled           *bool    `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAPIKey            *string  `json:"prompt_filter_review_api_key"`
+	PromptFilterReviewBaseURL           *string  `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel             *string  `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds    *int     `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed        *bool    `json:"prompt_filter_review_fail_closed"`
+	ClientCompatMode                    *string  `json:"client_compat_mode"`
+	CodexMinCLIVersion                  *string  `json:"codex_min_cli_version"`
+	CodexUserAgentConfig                *string  `json:"codex_user_agent_config"`
+	UsageLogMode                        *string  `json:"usage_log_mode"`
+	UsageLogBatchSize                   *int     `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds        *int     `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                   *string  `json:"stream_flush_policy"`
+	StreamFlushIntervalMS               *int     `json:"stream_flush_interval_ms"`
+	FirstTokenMode                      *string  `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds            *int     `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                   *string  `json:"billing_tier_policy"`
+	ShowFullUsageNumbers                *bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled           *bool    `json:"public_key_usage_page_enabled"`
+	PublicImageStudioPageEnabled        *bool    `json:"public_image_studio_page_enabled"`
+	PublicAccountPortalPageEnabled      *bool    `json:"public_account_portal_page_enabled"`
+	ImageStorageBackend                 *string  `json:"image_storage_backend"`
+	ImageS3Endpoint                     *string  `json:"image_s3_endpoint"`
+	ImageS3Region                       *string  `json:"image_s3_region"`
+	ImageS3Bucket                       *string  `json:"image_s3_bucket"`
+	ImageS3AccessKey                    *string  `json:"image_s3_access_key"`
+	ImageS3SecretKey                    *string  `json:"image_s3_secret_key"`
+	ImageS3Prefix                       *string  `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle               *bool    `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold                *float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold                *float64 `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent         *float64 `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency         *int     `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                  *bool    `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency           *int     `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                  *string  `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus              *bool    `json:"ignore_usage_limit_status"`
 }
 
 type brandingResponse struct {
@@ -7473,6 +7580,35 @@ func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
 	return normalizeBackgroundConfig(cfg)
 }
 
+// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试配置编码成 grok_config JSON 落库。
+func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int) string {
+	mode := strings.TrimSpace(affinityMode)
+	switch mode {
+	case auth.AffinityModeFollow, auth.AffinityModeBounded, auth.AffinityModeOff, auth.AffinityModeStrict:
+	default:
+		mode = auth.AffinityModeStrict
+	}
+	if probeIntervalMinutes <= 0 {
+		probeIntervalMinutes = auth.GrokProbeDefaultIntervalMinutes
+	}
+	if probeIntervalMinutes < auth.GrokProbeMinIntervalMinutes {
+		probeIntervalMinutes = auth.GrokProbeMinIntervalMinutes
+	}
+	if maxRateLimitRetries < 0 {
+		maxRateLimitRetries = 0
+	}
+	b, err := json.Marshal(map[string]any{
+		"affinity_mode":          mode,
+		"probe_enabled":          probeEnabled,
+		"probe_interval_minutes": probeIntervalMinutes,
+		"max_rate_limit_retries": maxRateLimitRetries,
+	})
+	if err != nil {
+		return `{"affinity_mode":"strict"}`
+	}
+	return string(b)
+}
+
 func encodeBackgroundConfig(cfg brandingBackgroundConfig) string {
 	cfg = normalizeBackgroundConfig(cfg)
 	data, err := json.Marshal(cfg)
@@ -7546,6 +7682,12 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		publicAccountPortalPageEnabled = dbSettings.PublicAccountPortalPageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
+	promptFilterAdvancedRaw := h.store.GetPromptFilterAdvancedConfig()
+	if dbSettings != nil {
+		if document, err := promptfilter.ParseAdvancedConfigDocument(dbSettings.PromptFilterAdvancedConfig); err == nil {
+			promptFilterAdvancedRaw = document.Raw
+		}
+	}
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
 	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
@@ -7560,122 +7702,128 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		bgCfg = decodeBackgroundConfig(dbSettings.BackgroundConfig)
 	}
 	c.JSON(http.StatusOK, settingsResponse{
-		SiteName:                           branding.SiteName,
-		SiteLogo:                           branding.SiteLogo,
-		BackgroundImage:                    bgCfg.Image,
-		BackgroundOpacity:                  bgCfg.Opacity,
-		BackgroundBlur:                     bgCfg.Blur,
-		BackgroundGlassOpacity:             bgCfg.GlassOpacity,
-		BackgroundGlassBlur:                bgCfg.GlassBlur,
-		MaxConcurrency:                     h.store.GetMaxConcurrency(),
-		GlobalRPM:                          h.rateLimiter.GetRPM(),
-		TestModel:                          h.store.GetTestModel(),
-		TestContent:                        h.store.GetTestContent(),
-		TestConcurrency:                    h.store.GetTestConcurrency(),
-		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
-		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
-		UsageProbeConcurrency:              h.store.GetUsageProbeConcurrency(),
-		UsageProbeResponsesFallbackEnabled: h.store.UsageProbeResponsesFallbackEnabled(),
-		RecoveryProbeIntervalMinutes:       h.store.GetRecoveryProbeIntervalMinutes(),
-		LazyMode:                           h.store.GetLazyMode(),
-		ProxyURL:                           h.store.GetProxyURL(),
-		PgMaxConns:                         h.pgMaxConns,
-		RedisPoolSize:                      h.redisPoolSize,
-		AutoCleanUnauthorized:              h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:               h.store.GetAutoCleanRateLimited(),
-		AdminSecret:                        adminSecret,
-		AdminAuthSource:                    adminAuthSource,
-		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:                     h.store.GetAutoCleanError(),
-		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
-		AutoResetCreditsEnabled:            autoResetCreditsEnabled,
-		AutoResetCreditsBeforeExpiryMin:    autoResetCreditsBeforeExpiryMin,
-		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
-		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
-		CodexWSKeepaliveEnabled:            h.store.CodexWSKeepaliveEnabled(),
-		CodexWSKeepaliveIntervalSec:        h.store.CodexWSKeepaliveIntervalSec(),
-		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
-		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
-		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
-		CodexFastModelAliasEnabled:         h.store.CodexFastModelAliasEnabled(),
-		CodexFastTierInterceptEnabled:      h.store.CodexFastTierInterceptEnabled(),
-		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
-		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
-		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
-		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
-		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
-		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
-		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
-		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
-		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
-		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
-		SchedulerMode:                      h.store.GetSchedulerMode(),
-		AffinityMode:                       h.store.GetAffinityMode(),
-		MaxRetries:                         h.store.GetMaxRetries(),
-		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
-		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
-		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
-		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
-		DatabaseDriver:                     h.databaseDriver,
-		DatabaseLabel:                      h.databaseLabel,
-		CacheDriver:                        h.cacheDriver,
-		CacheLabel:                         h.cacheLabel,
-		ModelMapping:                       h.store.GetModelMapping(),
-		CodexModelMapping:                  h.store.GetCodexModelMapping(),
-		PayloadRules:                       h.store.GetPayloadRules(),
-		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
-		ResinURL:                           resinURL,
-		ResinPlatformName:                  resinPlatformName,
-		PromptFilterEnabled:                promptFilterCfg.Enabled,
-		PromptFilterMode:                   promptFilterCfg.Mode,
-		PromptFilterThreshold:              promptFilterCfg.Threshold,
-		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
-		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
-		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
-		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
-		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
-		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
-		PromptFilterCustomPatterns:         promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
-		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
-		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
-		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
-		PromptFilterReviewAPIKeyCount:      len(promptFilterCfg.Review.APIKeyList()),
-		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
-		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
-		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
-		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
-		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
-		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
-		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
-		UsageLogMode:                       h.db.GetUsageLogMode(),
-		UsageLogBatchSize:                  h.db.GetUsageLogBatchSize(),
-		UsageLogFlushIntervalSeconds:       h.db.GetUsageLogFlushIntervalSeconds(),
-		StreamFlushPolicy:                  runtimeCfg.StreamFlushPolicy,
-		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
-		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
-		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
-		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
-		ShowFullUsageNumbers:               showFullUsageNumbers,
-		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
-		PublicImageStudioPageEnabled:       publicImageStudioPageEnabled,
-		PublicAccountPortalPageEnabled:     publicAccountPortalPageEnabled,
-		ImageStorageBackend:                imgCfg.Backend,
-		ImageS3Endpoint:                    imgCfg.Endpoint,
-		ImageS3Region:                      imgCfg.Region,
-		ImageS3Bucket:                      imgCfg.Bucket,
-		ImageS3AccessKey:                   imgCfg.AccessKey,
-		ImageS3SecretKey:                   imgCfg.SecretKey,
-		ImageS3Prefix:                      imgPrefix,
-		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
-		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
-		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
-		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
-		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
-		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
-		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
-		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
-		IgnoreUsageLimitStatus:             h.store.IgnoreUsageLimitStatus(),
+		SiteName:                            branding.SiteName,
+		SiteLogo:                            branding.SiteLogo,
+		BackgroundImage:                     bgCfg.Image,
+		BackgroundOpacity:                   bgCfg.Opacity,
+		BackgroundBlur:                      bgCfg.Blur,
+		BackgroundGlassOpacity:              bgCfg.GlassOpacity,
+		BackgroundGlassBlur:                 bgCfg.GlassBlur,
+		MaxConcurrency:                      h.store.GetMaxConcurrency(),
+		GlobalRPM:                           h.rateLimiter.GetRPM(),
+		TestModel:                           h.store.GetTestModel(),
+		TestContent:                         h.store.GetTestContent(),
+		TestConcurrency:                     h.store.GetTestConcurrency(),
+		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
+		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
+		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
+		LazyMode:                            h.store.GetLazyMode(),
+		ProxyURL:                            h.store.GetProxyURL(),
+		PgMaxConns:                          h.pgMaxConns,
+		RedisPoolSize:                       h.redisPoolSize,
+		AutoCleanUnauthorized:               h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:                h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                         adminSecret,
+		AdminAuthSource:                     adminAuthSource,
+		AutoCleanFullUsage:                  h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                      h.store.GetAutoCleanError(),
+		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:             autoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
+		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
+		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
+		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
+		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
+		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
+		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
+		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
+		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
+		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:              h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		SchedulerMode:                       h.store.GetSchedulerMode(),
+		AffinityMode:                        h.store.GetAffinityMode(),
+		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
+		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
+		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
+		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		MaxRetries:                          h.store.GetMaxRetries(),
+		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                      h.databaseDriver,
+		DatabaseLabel:                       h.databaseLabel,
+		CacheDriver:                         h.cacheDriver,
+		CacheLabel:                          h.cacheLabel,
+		ModelMapping:                        h.store.GetModelMapping(),
+		CodexModelMapping:                   h.store.GetCodexModelMapping(),
+		PayloadRules:                        h.store.GetPayloadRules(),
+		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
+		ResinURL:                            resinURL,
+		ResinPlatformName:                   resinPlatformName,
+		PromptFilterEnabled:                 promptFilterCfg.Enabled,
+		PromptFilterMode:                    promptFilterCfg.Mode,
+		PromptFilterThreshold:               promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:         promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:   promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:          promptFilterAdvancedRaw,
+		PromptFilterLogMatches:              promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:           promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:          promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:          promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:        promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		PromptFilterReviewEnabled:           promptFilterCfg.Review.Enabled,
+		PromptFilterReviewAPIKeyConfigured:  promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewAPIKeyCount:       len(promptFilterCfg.Review.APIKeyList()),
+		PromptFilterReviewBaseURL:           promptFilterCfg.Review.BaseURL,
+		PromptFilterReviewModel:             promptFilterCfg.Review.Model,
+		PromptFilterReviewTimeoutSeconds:    promptFilterCfg.Review.TimeoutSeconds,
+		PromptFilterReviewFailClosed:        promptFilterCfg.Review.FailClosed,
+		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		UsageLogMode:                        h.db.GetUsageLogMode(),
+		UsageLogBatchSize:                   h.db.GetUsageLogBatchSize(),
+		UsageLogFlushIntervalSeconds:        h.db.GetUsageLogFlushIntervalSeconds(),
+		StreamFlushPolicy:                   runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:               runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
+		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ShowFullUsageNumbers:                showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
+		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
+		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
+		ImageStorageBackend:                 imgCfg.Backend,
+		ImageS3Endpoint:                     imgCfg.Endpoint,
+		ImageS3Region:                       imgCfg.Region,
+		ImageS3Bucket:                       imgCfg.Bucket,
+		ImageS3AccessKey:                    imgCfg.AccessKey,
+		ImageS3SecretKey:                    imgCfg.SecretKey,
+		ImageS3Prefix:                       imgPrefix,
+		ImageS3ForcePathStyle:               imgCfg.ForcePathStyle,
+		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:         h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                  h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:           h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                  h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:              h.store.IgnoreUsageLimitStatus(),
 	})
 }
 
@@ -8096,6 +8244,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: overflow_auto_compact_enabled = %t", *req.OverflowAutoCompactEnabled)
 	}
 
+	if req.CodexPreflightSSEPassthroughEnabled != nil {
+		h.store.SetCodexPreflightSSEPassthroughEnabled(*req.CodexPreflightSSEPassthroughEnabled)
+		runtimeCfg.CodexPreflightSSEPassthrough = *req.CodexPreflightSSEPassthroughEnabled
+		log.Printf("设置已更新: codex_preflight_sse_passthrough_enabled = %t", *req.CodexPreflightSSEPassthroughEnabled)
+	}
+
+	if req.FirstTokenExcludesWsAcquire != nil {
+		h.store.SetFirstTokenExcludesWsAcquire(*req.FirstTokenExcludesWsAcquire)
+		runtimeCfg.FirstTokenExcludesWsAcquire = *req.FirstTokenExcludesWsAcquire
+		log.Printf("设置已更新: first_token_excludes_ws_acquire = %t", *req.FirstTokenExcludesWsAcquire)
+	}
+
 	if req.CodexContinueThinkingEnabled != nil {
 		h.store.SetCodexContinueThinkingEnabled(*req.CodexContinueThinkingEnabled)
 		runtimeCfg.CodexContinueThinking = *req.CodexContinueThinkingEnabled
@@ -8130,6 +8290,30 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.AffinityMode != nil {
 		h.store.SetAffinityMode(*req.AffinityMode)
 		log.Printf("设置已更新: affinity_mode = %s", *req.AffinityMode)
+	}
+
+	if req.GrokAffinityMode != nil {
+		h.store.SetGrokAffinityMode(*req.GrokAffinityMode)
+		log.Printf("设置已更新: grok_affinity_mode = %s", *req.GrokAffinityMode)
+	}
+
+	// 定期探测:开关与间隔任一变更都重设运行时配置(SetGrokProbeConfig 会钳间隔下限)。
+	if req.GrokProbeEnabled != nil || req.GrokProbeIntervalMinutes != nil {
+		enabled := h.store.GrokProbeEnabled()
+		if req.GrokProbeEnabled != nil {
+			enabled = *req.GrokProbeEnabled
+		}
+		interval := h.store.GrokProbeIntervalMinutes()
+		if req.GrokProbeIntervalMinutes != nil {
+			interval = *req.GrokProbeIntervalMinutes
+		}
+		h.store.SetGrokProbeConfig(enabled, interval)
+		log.Printf("设置已更新: grok_probe_enabled=%v grok_probe_interval_minutes=%d", enabled, h.store.GrokProbeIntervalMinutes())
+	}
+
+	if req.GrokMaxRateLimitRetries != nil {
+		h.store.SetGrokMaxRateLimitRetries(*req.GrokMaxRateLimitRetries)
+		log.Printf("设置已更新: grok_max_rate_limit_retries = %d", h.store.GrokMaxRateLimitRetries())
 	}
 
 	if req.MaxRetries != nil {
@@ -8352,6 +8536,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	promptFilterCfg := h.store.GetPromptFilterConfig()
+	promptFilterAdvancedRaw := h.store.GetPromptFilterAdvancedConfig()
+	promptFilterNewAPISecret := promptFilterCfg.Advanced.NewAPI.Secret
+	// The database is authoritative for the persisted JSON in multi-instance
+	// deployments. Invalid persisted JSON must not replace the Store's last
+	// valid raw/effective pair.
+	if existingSettings != nil {
+		if document, err := promptfilter.ParseAdvancedConfigDocument(existingSettings.PromptFilterAdvancedConfig); err == nil {
+			promptFilterAdvancedRaw = document.Raw
+			promptFilterCfg.Advanced = document.Effective
+			promptFilterCfg.Advanced.NewAPI.Secret = promptFilterNewAPISecret
+		}
+	}
 	promptFilterChanged := false
 	if req.PromptFilterEnabled != nil {
 		promptFilterCfg.Enabled = *req.PromptFilterEnabled
@@ -8374,12 +8570,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		promptFilterChanged = true
 	}
 	if req.PromptFilterAdvancedConfig != nil {
-		advanced, err := promptfilter.ParseAdvancedConfig(*req.PromptFilterAdvancedConfig)
+		document, err := promptfilter.MergeAdvancedConfigDocument(promptFilterAdvancedRaw, *req.PromptFilterAdvancedConfig)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "prompt_filter_advanced_config JSON 无效: " + err.Error()})
 			return
 		}
-		promptFilterCfg.Advanced = advanced
+		promptFilterAdvancedRaw = document.Raw
+		promptFilterCfg.Advanced = document.Effective
+		promptFilterCfg.Advanced.NewAPI.Secret = promptFilterNewAPISecret
 		promptFilterChanged = true
 	}
 	if req.PromptFilterLogMatches != nil {
@@ -8536,107 +8734,110 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
-		SiteName:                           siteName,
-		SiteLogo:                           siteLogo,
-		MaxConcurrency:                     h.store.GetMaxConcurrency(),
-		GlobalRPM:                          h.rateLimiter.GetRPM(),
-		TestModel:                          h.store.GetTestModel(),
-		TestContent:                        h.store.GetTestContent(),
-		TestConcurrency:                    h.store.GetTestConcurrency(),
-		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
-		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
-		UsageProbeConcurrency:              h.store.GetUsageProbeConcurrency(),
-		UsageProbeResponsesFallbackEnabled: h.store.UsageProbeResponsesFallbackEnabled(),
-		RecoveryProbeIntervalMinutes:       h.store.GetRecoveryProbeIntervalMinutes(),
-		LazyMode:                           h.store.GetLazyMode(),
-		ProxyURL:                           h.store.GetProxyURL(),
-		PgMaxConns:                         h.pgMaxConns,
-		RedisPoolSize:                      h.redisPoolSize,
-		AutoCleanUnauthorized:              h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:               h.store.GetAutoCleanRateLimited(),
-		AdminSecret:                        currentAdminSecret,
-		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:                     h.store.GetAutoCleanError(),
-		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
-		AutoResetCreditsEnabled:            runtimeCfg.AutoResetCreditsEnabled,
-		AutoResetCreditsBeforeExpiryMin:    runtimeCfg.AutoResetCreditsBeforeExpiryMin,
-		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
-		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
-		CodexWSKeepaliveEnabled:            h.store.CodexWSKeepaliveEnabled(),
-		CodexWSKeepaliveIntervalSec:        h.store.CodexWSKeepaliveIntervalSec(),
-		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
-		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
-		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
-		CodexFastModelAliasEnabled:         h.store.CodexFastModelAliasEnabled(),
-		CodexFastTierInterceptEnabled:      h.store.CodexFastTierInterceptEnabled(),
-		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
-		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
-		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
-		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
-		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
-		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
-		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
-		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
-		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
-		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
-		SchedulerMode:                      h.store.GetSchedulerMode(),
-		AffinityMode:                       h.store.GetAffinityMode(),
-		MaxRetries:                         h.store.GetMaxRetries(),
-		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
-		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
-		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
-		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
-		ModelMapping:                       h.store.GetModelMapping(),
-		CodexModelMapping:                  h.store.GetCodexModelMapping(),
-		PayloadRules:                       h.store.GetPayloadRules(),
-		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
-		ResinURL:                           resinURL,
-		ResinPlatformName:                  resinPlatformName,
-		PromptFilterEnabled:                promptFilterCfg.Enabled,
-		PromptFilterMode:                   promptFilterCfg.Mode,
-		PromptFilterThreshold:              promptFilterCfg.Threshold,
-		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
-		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
-		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
-		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
-		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
-		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
-		PromptFilterCustomPatterns:         promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
-		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
-		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
-		PromptFilterReviewAPIKey:           promptFilterCfg.Review.APIKey,
-		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
-		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
-		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
-		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
-		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
-		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
-		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
-		UsageLogMode:                       usageLogMode,
-		UsageLogBatchSize:                  usageLogBatchSize,
-		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
-		StreamFlushPolicy:                  runtimeCfg.StreamFlushPolicy,
-		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
-		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
-		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
-		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
-		ShowFullUsageNumbers:               showFullUsageNumbers,
-		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
-		PublicImageStudioPageEnabled:       publicImageStudioPageEnabled,
-		PublicAccountPortalPageEnabled:     publicAccountPortalPageEnabled,
-		ImageStorageConfig:                 imgConfigJSON,
-		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
-		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
-		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
-		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
-		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
-		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
-		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
-		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
-		IgnoreUsageLimitStatus:             h.store.IgnoreUsageLimitStatus(),
-		ModelPricingOverrides:              modelPricingOverrides,
-		ModelPricingSyncURL:                modelPricingSyncURL,
+		SiteName:                            siteName,
+		SiteLogo:                            siteLogo,
+		MaxConcurrency:                      h.store.GetMaxConcurrency(),
+		GlobalRPM:                           h.rateLimiter.GetRPM(),
+		TestModel:                           h.store.GetTestModel(),
+		TestContent:                         h.store.GetTestContent(),
+		TestConcurrency:                     h.store.GetTestConcurrency(),
+		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
+		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
+		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
+		LazyMode:                            h.store.GetLazyMode(),
+		ProxyURL:                            h.store.GetProxyURL(),
+		PgMaxConns:                          h.pgMaxConns,
+		RedisPoolSize:                       h.redisPoolSize,
+		AutoCleanUnauthorized:               h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:                h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                         currentAdminSecret,
+		AutoCleanFullUsage:                  h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                      h.store.GetAutoCleanError(),
+		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
+		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
+		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
+		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
+		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
+		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
+		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
+		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
+		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
+		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:              h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		SchedulerMode:                       h.store.GetSchedulerMode(),
+		AffinityMode:                        h.store.GetAffinityMode(),
+		MaxRetries:                          h.store.GetMaxRetries(),
+		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && hasAdminSecret,
+		ModelMapping:                        h.store.GetModelMapping(),
+		CodexModelMapping:                   h.store.GetCodexModelMapping(),
+		PayloadRules:                        h.store.GetPayloadRules(),
+		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
+		ResinURL:                            resinURL,
+		ResinPlatformName:                   resinPlatformName,
+		PromptFilterEnabled:                 promptFilterCfg.Enabled,
+		PromptFilterMode:                    promptFilterCfg.Mode,
+		PromptFilterThreshold:               promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:         promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:   promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:          promptFilterAdvancedRaw,
+		PromptFilterLogMatches:              promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:           promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:          promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:          promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:        promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		PromptFilterReviewEnabled:           promptFilterCfg.Review.Enabled,
+		PromptFilterReviewAPIKey:            promptFilterCfg.Review.APIKey,
+		PromptFilterReviewBaseURL:           promptFilterCfg.Review.BaseURL,
+		PromptFilterReviewModel:             promptFilterCfg.Review.Model,
+		PromptFilterReviewTimeoutSeconds:    promptFilterCfg.Review.TimeoutSeconds,
+		PromptFilterReviewFailClosed:        promptFilterCfg.Review.FailClosed,
+		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		UsageLogMode:                        usageLogMode,
+		UsageLogBatchSize:                   usageLogBatchSize,
+		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
+		StreamFlushPolicy:                   runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:               runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
+		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ShowFullUsageNumbers:                showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
+		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
+		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
+		ImageStorageConfig:                  imgConfigJSON,
+		BackgroundConfig:                    encodeBackgroundConfig(bgCfg),
+		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries()),
+		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:         h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                  h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:           h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                  h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:              h.store.IgnoreUsageLimitStatus(),
+		ModelPricingOverrides:               modelPricingOverrides,
+		ModelPricingSyncURL:                 modelPricingSyncURL,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -8651,7 +8852,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	} else {
 		if promptFilterChanged {
-			h.store.SetPromptFilterConfig(promptFilterCfg)
+			if err := h.store.SetPromptFilterConfigWithAdvancedRaw(promptFilterCfg, promptFilterAdvancedRaw); err != nil {
+				// The document was validated before persistence, so reaching this
+				// branch indicates an internal invariant violation. Keep the last
+				// valid runtime state rather than publishing a partial update.
+				log.Printf("无法发布 Prompt 检查运行时配置: %v", err)
+				writeError(c, http.StatusInternalServerError, "Prompt 检查设置已保存，但运行时配置更新失败")
+				return
+			}
 			log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
 		}
 		if autoResetCreditsChanged {
@@ -8680,120 +8888,126 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, settingsResponse{
-		SiteName:                           siteName,
-		SiteLogo:                           siteLogo,
-		BackgroundImage:                    bgCfg.Image,
-		BackgroundOpacity:                  bgCfg.Opacity,
-		BackgroundBlur:                     bgCfg.Blur,
-		BackgroundGlassOpacity:             bgCfg.GlassOpacity,
-		BackgroundGlassBlur:                bgCfg.GlassBlur,
-		MaxConcurrency:                     h.store.GetMaxConcurrency(),
-		GlobalRPM:                          h.rateLimiter.GetRPM(),
-		TestModel:                          h.store.GetTestModel(),
-		TestContent:                        h.store.GetTestContent(),
-		TestConcurrency:                    h.store.GetTestConcurrency(),
-		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
-		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
-		UsageProbeConcurrency:              h.store.GetUsageProbeConcurrency(),
-		UsageProbeResponsesFallbackEnabled: h.store.UsageProbeResponsesFallbackEnabled(),
-		RecoveryProbeIntervalMinutes:       h.store.GetRecoveryProbeIntervalMinutes(),
-		LazyMode:                           h.store.GetLazyMode(),
-		ProxyURL:                           h.store.GetProxyURL(),
-		PgMaxConns:                         h.pgMaxConns,
-		RedisPoolSize:                      h.redisPoolSize,
-		AutoCleanUnauthorized:              h.store.GetAutoCleanUnauthorized(),
-		AutoCleanRateLimited:               h.store.GetAutoCleanRateLimited(),
-		AdminSecret:                        adminSecretForDisplay,
-		AdminAuthSource:                    adminAuthSource,
-		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
-		AutoCleanError:                     h.store.GetAutoCleanError(),
-		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
-		AutoResetCreditsEnabled:            runtimeCfg.AutoResetCreditsEnabled,
-		AutoResetCreditsBeforeExpiryMin:    runtimeCfg.AutoResetCreditsBeforeExpiryMin,
-		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
-		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
-		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
-		CodexWSKeepaliveEnabled:            h.store.CodexWSKeepaliveEnabled(),
-		CodexWSKeepaliveIntervalSec:        h.store.CodexWSKeepaliveIntervalSec(),
-		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
-		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
-		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
-		CodexFastModelAliasEnabled:         h.store.CodexFastModelAliasEnabled(),
-		CodexFastTierInterceptEnabled:      h.store.CodexFastTierInterceptEnabled(),
-		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
-		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
-		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
-		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
-		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
-		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
-		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
-		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
-		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
-		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
-		SchedulerMode:                      h.store.GetSchedulerMode(),
-		AffinityMode:                       h.store.GetAffinityMode(),
-		MaxRetries:                         h.store.GetMaxRetries(),
-		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
-		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
-		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
-		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
-		DatabaseDriver:                     h.databaseDriver,
-		DatabaseLabel:                      h.databaseLabel,
-		CacheDriver:                        h.cacheDriver,
-		CacheLabel:                         h.cacheLabel,
-		ExpiredCleaned:                     expiredCleaned,
-		ModelMapping:                       h.store.GetModelMapping(),
-		CodexModelMapping:                  h.store.GetCodexModelMapping(),
-		PayloadRules:                       h.store.GetPayloadRules(),
-		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
-		ResinURL:                           resinURL,
-		ResinPlatformName:                  resinPlatformName,
-		PromptFilterEnabled:                promptFilterCfg.Enabled,
-		PromptFilterMode:                   promptFilterCfg.Mode,
-		PromptFilterThreshold:              promptFilterCfg.Threshold,
-		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
-		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
-		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
-		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
-		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
-		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
-		PromptFilterCustomPatterns:         promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
-		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
-		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
-		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
-		PromptFilterReviewAPIKeyCount:      len(promptFilterCfg.Review.APIKeyList()),
-		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
-		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
-		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
-		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
-		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
-		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
-		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
-		UsageLogMode:                       usageLogMode,
-		UsageLogBatchSize:                  usageLogBatchSize,
-		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
-		StreamFlushPolicy:                  runtimeCfg.StreamFlushPolicy,
-		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
-		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
-		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
-		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
-		ShowFullUsageNumbers:               showFullUsageNumbers,
-		ImageStorageBackend:                imgCfg.Backend,
-		ImageS3Endpoint:                    imgCfg.Endpoint,
-		ImageS3Region:                      imgCfg.Region,
-		ImageS3Bucket:                      imgCfg.Bucket,
-		ImageS3AccessKey:                   imgCfg.AccessKey,
-		ImageS3SecretKey:                   imgCfg.SecretKey,
-		ImageS3Prefix:                      strings.TrimSuffix(imgCfg.Prefix, "/"),
-		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
-		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
-		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
-		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
-		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
-		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
-		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
-		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
-		IgnoreUsageLimitStatus:             h.store.IgnoreUsageLimitStatus(),
+		SiteName:                            siteName,
+		SiteLogo:                            siteLogo,
+		BackgroundImage:                     bgCfg.Image,
+		BackgroundOpacity:                   bgCfg.Opacity,
+		BackgroundBlur:                      bgCfg.Blur,
+		BackgroundGlassOpacity:              bgCfg.GlassOpacity,
+		BackgroundGlassBlur:                 bgCfg.GlassBlur,
+		MaxConcurrency:                      h.store.GetMaxConcurrency(),
+		GlobalRPM:                           h.rateLimiter.GetRPM(),
+		TestModel:                           h.store.GetTestModel(),
+		TestContent:                         h.store.GetTestContent(),
+		TestConcurrency:                     h.store.GetTestConcurrency(),
+		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
+		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
+		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
+		LazyMode:                            h.store.GetLazyMode(),
+		ProxyURL:                            h.store.GetProxyURL(),
+		PgMaxConns:                          h.pgMaxConns,
+		RedisPoolSize:                       h.redisPoolSize,
+		AutoCleanUnauthorized:               h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:                h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                         adminSecretForDisplay,
+		AdminAuthSource:                     adminAuthSource,
+		AutoCleanFullUsage:                  h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                      h.store.GetAutoCleanError(),
+		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
+		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
+		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
+		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
+		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
+		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
+		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
+		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
+		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
+		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:              h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		SchedulerMode:                       h.store.GetSchedulerMode(),
+		AffinityMode:                        h.store.GetAffinityMode(),
+		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
+		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
+		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
+		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		MaxRetries:                          h.store.GetMaxRetries(),
+		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                      h.databaseDriver,
+		DatabaseLabel:                       h.databaseLabel,
+		CacheDriver:                         h.cacheDriver,
+		CacheLabel:                          h.cacheLabel,
+		ExpiredCleaned:                      expiredCleaned,
+		ModelMapping:                        h.store.GetModelMapping(),
+		CodexModelMapping:                   h.store.GetCodexModelMapping(),
+		PayloadRules:                        h.store.GetPayloadRules(),
+		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
+		ResinURL:                            resinURL,
+		ResinPlatformName:                   resinPlatformName,
+		PromptFilterEnabled:                 promptFilterCfg.Enabled,
+		PromptFilterMode:                    promptFilterCfg.Mode,
+		PromptFilterThreshold:               promptFilterCfg.Threshold,
+		PromptFilterStrictThreshold:         promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:   promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:          promptFilterAdvancedRaw,
+		PromptFilterLogMatches:              promptFilterCfg.LogMatches,
+		PromptFilterMaxTextLength:           promptFilterCfg.MaxTextLength,
+		PromptFilterSensitiveWords:          promptFilterCfg.SensitiveWords,
+		PromptFilterCustomPatterns:          promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
+		PromptFilterDisabledPatterns:        promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		PromptFilterReviewEnabled:           promptFilterCfg.Review.Enabled,
+		PromptFilterReviewAPIKeyConfigured:  promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewAPIKeyCount:       len(promptFilterCfg.Review.APIKeyList()),
+		PromptFilterReviewBaseURL:           promptFilterCfg.Review.BaseURL,
+		PromptFilterReviewModel:             promptFilterCfg.Review.Model,
+		PromptFilterReviewTimeoutSeconds:    promptFilterCfg.Review.TimeoutSeconds,
+		PromptFilterReviewFailClosed:        promptFilterCfg.Review.FailClosed,
+		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		UsageLogMode:                        usageLogMode,
+		UsageLogBatchSize:                   usageLogBatchSize,
+		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
+		StreamFlushPolicy:                   runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:               runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
+		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ImageStorageBackend:                 imgCfg.Backend,
+		ImageS3Endpoint:                     imgCfg.Endpoint,
+		ImageS3Region:                       imgCfg.Region,
+		ImageS3Bucket:                       imgCfg.Bucket,
+		ImageS3AccessKey:                    imgCfg.AccessKey,
+		ImageS3SecretKey:                    imgCfg.SecretKey,
+		ImageS3Prefix:                       strings.TrimSuffix(imgCfg.Prefix, "/"),
+		ImageS3ForcePathStyle:               imgCfg.ForcePathStyle,
+		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:         h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                  h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:           h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                  h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:              h.store.IgnoreUsageLimitStatus(),
 	})
 }
 
@@ -9311,6 +9525,26 @@ func (h *Handler) CleanRateLimited(c *gin.Context) {
 // CleanError 清理错误（error）账号
 func (h *Handler) CleanError(c *gin.Context) {
 	h.cleanByStatus(c, "error")
+}
+
+// CleanGrokBanned 清理封禁（unauthorized）的 Grok 账号
+func (h *Handler) CleanGrokBanned(c *gin.Context) {
+	h.cleanGrokByStatus(c, "unauthorized")
+}
+
+// CleanGrokError 清理错误（error）的 Grok 账号
+func (h *Handler) CleanGrokError(c *gin.Context) {
+	h.cleanGrokByStatus(c, "error")
+}
+
+// cleanGrokByStatus 按运行时状态清理 Grok 账号，不影响其它平台
+func (h *Handler) cleanGrokByStatus(c *gin.Context, targetStatus string) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	cleaned := h.store.CleanGrokByRuntimeStatus(ctx, targetStatus)
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
 }
 
 // cleanByStatus 按运行时状态清理账号

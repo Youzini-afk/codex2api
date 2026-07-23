@@ -23,6 +23,7 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
@@ -61,6 +62,7 @@ func main() {
 	sysCtx, sysCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	settings, err := db.GetSystemSettings(sysCtx)
 	sysCancel()
+	recommendedPromptFilter := promptfilter.RecommendedConfig()
 
 	if err == nil && settings == nil {
 		// 初次运行，保存初始安全设置到数据库
@@ -84,9 +86,11 @@ func main() {
 			RedisPoolSize:                      30,
 			AutoCleanUnauthorized:              false,
 			AutoCleanRateLimited:               false,
-			PromptFilterMode:                   "monitor",
-			PromptFilterThreshold:              50,
-			PromptFilterStrictThreshold:        90,
+			PromptFilterMode:                   recommendedPromptFilter.Mode,
+			PromptFilterThreshold:              recommendedPromptFilter.Threshold,
+			PromptFilterStrictThreshold:        recommendedPromptFilter.StrictThreshold,
+			PromptFilterStrictTerminalEnabled:  recommendedPromptFilter.StrictTerminalEnabled,
+			PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(recommendedPromptFilter.Advanced),
 			PromptFilterLogMatches:             true,
 			PromptFilterMaxTextLength:          81920,
 			PromptFilterCustomPatterns:         "[]",
@@ -140,9 +144,11 @@ func main() {
 			LazyMode:                           false,
 			PgMaxConns:                         50,
 			RedisPoolSize:                      30,
-			PromptFilterMode:                   "monitor",
-			PromptFilterThreshold:              50,
-			PromptFilterStrictThreshold:        90,
+			PromptFilterMode:                   recommendedPromptFilter.Mode,
+			PromptFilterThreshold:              recommendedPromptFilter.Threshold,
+			PromptFilterStrictThreshold:        recommendedPromptFilter.StrictThreshold,
+			PromptFilterStrictTerminalEnabled:  recommendedPromptFilter.StrictTerminalEnabled,
+			PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(recommendedPromptFilter.Advanced),
 			PromptFilterLogMatches:             true,
 			PromptFilterMaxTextLength:          81920,
 			PromptFilterCustomPatterns:         "[]",
@@ -297,6 +303,8 @@ func main() {
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
 	adminHandler.StartAutoResetCredits(backgroundCtx)
+	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
+	adminHandler.StartGrokStatusProbe(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -518,8 +526,12 @@ func main() {
 	}
 	adminHandler.WaitAutoResetCredits()
 	wsKeepalive.Stop()
-	store.Stop()
 	wsrelay.ShutdownExecutor()
+	store.Stop()
+	// 所有请求入口和后台生产者停止后，再排空仍可能访问 Store、缓存或数据库的短任务。
+	if !db.DrainBackgroundTasks(2 * time.Second) {
+		log.Printf("部分后台任务未在关闭窗口内退出")
+	}
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
 }

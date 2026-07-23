@@ -26,6 +26,7 @@ import type {
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
+  APIKeyAccountStat,
   AccountsResponse,
   ChartAggregation,
   CreateAccountResponse,
@@ -543,6 +544,10 @@ export const api = {
     request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchDeleteAccounts: (ids: number[]) =>
+    request<{ message: string; deleted: number; success: number; failed: number }>('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchRefreshAccounts: (ids: number[]) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-refresh', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number, days?: number) => {
     const search = new URLSearchParams()
     if (typeof days === 'number') search.set('days', String(days))
@@ -625,6 +630,15 @@ export const api = {
     const qs = searchParams.toString()
     return request<{ items: APIKeyTokenStat[] }>(
       qs ? `/usage/api-keys?${qs}` : '/usage/api-keys',
+    )
+  },
+  getAPIKeyAccountStats: (id: number, params: { start?: string; end?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    const qs = searchParams.toString()
+    return request<{ items: APIKeyAccountStat[] }>(
+      qs ? `/usage/api-keys/${id}/accounts?${qs}` : `/usage/api-keys/${id}/accounts`,
     )
   },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
@@ -826,6 +840,10 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/clean-rate-limited', { method: 'POST' }),
   cleanError: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-error', { method: 'POST' }),
+  cleanGrokBanned: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-banned', { method: 'POST' }),
+  cleanGrokError: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-error', { method: 'POST' }),
   exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[] }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))

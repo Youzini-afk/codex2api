@@ -91,6 +91,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 
 	if len(rawBody) == 0 {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
@@ -410,7 +411,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 
 			translator := newAnthropicStreamTranslator(originalModel)
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 			var pendingFirstTokenEvents bytes.Buffer
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
