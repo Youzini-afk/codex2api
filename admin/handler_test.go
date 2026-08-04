@@ -123,6 +123,44 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 	}
 }
 
+// 积分顶着限流的账号 RuntimeStatus 仍是 rate_limited（用量窗口客观上打满了），
+// 但它照常参与调度，仪表盘该把它算进「可用」而不是「限流」。
+func TestSummarizeDashboardAccountsCountsCreditBackedAsNormal(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true}, // 积分顶替限流
+		{ID: 2, Status: "active", Enabled: true}, // 真限流
+	}
+
+	usingCredits := &auth.Account{
+		DBID:                  1,
+		AccessToken:           "at-1",
+		Status:                auth.StatusReady,
+		PlanType:              "plus",
+		UsagePercent5h:        100,
+		UsagePercent5hValid:   true,
+		Reset5hAt:             time.Now().Add(2 * time.Hour),
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+		CreditsValid:          true,
+		CreditsHasCredits:     true,
+		CreditsBalance:        "1000.0000000000",
+	}
+	if !usingCredits.UsingCredits() {
+		t.Fatalf("fixture is not using credits; RuntimeStatus=%q", usingCredits.RuntimeStatus())
+	}
+	if got := usingCredits.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus = %q, want rate_limited", got)
+	}
+
+	rateLimited := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
+
+	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{usingCredits, rateLimited})
+	if got.total != 2 || got.normal != 1 || got.rateLimited != 1 {
+		t.Fatalf("counts = %+v, want total=2 normal=1 rateLimited=1", got)
+	}
+}
+
 func TestNormalizeBackgroundUploadMedia(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -422,7 +460,7 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 	handler := &Handler{
 		refreshAccount: func(_ context.Context, id int64) error {
 			if id == 8 {
-				return errors.New("账号 8 不存在")
+				return errors.New("token endpoint returned status 401")
 			}
 			return nil
 		},
@@ -446,6 +484,10 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 		`"type":"progress"`,
 		`"type":"complete"`,
 		`"action":"batch_refresh"`,
+		`"status":"success"`,
+		`"status":"failed"`,
+		`"http_status":200`,
+		`"http_status":401`,
 		`"success":1`,
 		`"failed":1`,
 	} {
@@ -826,6 +868,116 @@ func TestGetUsageLogsRejectsInvalidAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestGetUsageLogsRejectsInvalidCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "compact",
+			query:     "compact=maybe",
+			wantError: "compact 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "compaction history",
+			query:     "has_compaction_history=1",
+			wantError: "has_compaction_history 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsAppliesCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "trigger-only", StatusCode: http.StatusOK, Compact: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "history-only", StatusCode: http.StatusOK, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "both", StatusCode: http.StatusOK, Compact: true, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "neither", StatusCode: http.StatusOK},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	tests := []struct {
+		name       string
+		query      string
+		wantModels map[string]bool
+	}{
+		{
+			name:       "trigger",
+			query:      "compact=true",
+			wantModels: map[string]bool{"trigger-only": true, "both": true},
+		},
+		{
+			name:       "history",
+			query:      "has_compaction_history=true",
+			wantModels: map[string]bool{"history-only": true, "both": true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ginCtx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			var page database.UsageLogPage
+			if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if page.Total != int64(len(test.wantModels)) || len(page.Logs) != len(test.wantModels) {
+				t.Fatalf("total/logs = %d/%d, want %d; body=%s", page.Total, len(page.Logs), len(test.wantModels), recorder.Body.String())
+			}
+			for _, logRow := range page.Logs {
+				if !test.wantModels[logRow.Model] {
+					t.Fatalf("unexpected model %q for %s filter", logRow.Model, test.name)
+				}
+			}
+		})
+	}
+}
+
 func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1093,6 +1245,56 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsPersistsWeakNetworkMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"codex_ws_weak_network_mode":true}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.CodexWSWeakNetworkMode {
+		t.Fatal("response codex_ws_weak_network_mode = false, want true")
+	}
+	if !proxy.CurrentRuntimeSettings().CodexWSWeakNetworkMode {
+		t.Fatal("runtime codex_ws_weak_network_mode = false, want true")
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || !persisted.CodexWSWeakNetworkMode {
+		t.Fatal("persisted codex_ws_weak_network_mode = false, want true")
+	}
+}
+
 func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1107,10 +1309,6 @@ func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.
 	}`
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("seed settings: %v", err)
-	}
-	newAPISecret := strings.Repeat("s", 32)
-	if err := db.SetPromptFilterNewAPISecret(context.Background(), newAPISecret); err != nil {
-		t.Fatalf("seed NewAPI secret: %v", err)
 	}
 	store := auth.NewStore(db, tc, settings)
 	t.Cleanup(store.Stop)
@@ -1167,13 +1365,6 @@ func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.
 	if got := store.GetPromptFilterConfig().Advanced.Guard.Mode; got != "enforce" {
 		t.Fatalf("runtime guard.mode = %q, want enforce", got)
 	}
-	if got := store.GetPromptFilterConfig().Advanced.NewAPI.Secret; got != newAPISecret {
-		t.Fatalf("runtime NewAPI secret changed during advanced update")
-	}
-	if strings.Contains(updateResponse.PromptFilterAdvancedConfig, newAPISecret) {
-		t.Fatal("NewAPI secret leaked into prompt_filter_advanced_config")
-	}
-
 	// An unrelated partial update must not reserialize the typed runtime config
 	// and erase fields unknown to this binary.
 	unrelated := httptest.NewRecorder()
@@ -1509,7 +1700,7 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 		{
 			name:    "base concurrency out of range",
 			body:    `{"base_concurrency_override":0}`,
-			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
+			message: "base_concurrency_override 超出范围，必须 >= 1",
 		},
 		{
 			name:    "5h reserve out of range",

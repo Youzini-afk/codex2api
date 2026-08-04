@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -1375,13 +1376,19 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
 }
 
-func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
-	preferredFilter := h.withModelCooldownFilter(model, imagePreferredAccountFilter)
+// nextImageAccount 先在 plus 及以上套餐的账号里挑，挑不到再放开到全部账号。
+// 两层都要过 scope 预算闸门（issue #439），否则回退层会绕过预算限制。
+// 无指纹分流同样要覆盖两层：否则生图流量既能落到分流组账号上，无指纹的生图请求
+// 又不会被关进分流组，两个方向都跟配置意图相反。
+func (h *Handler) nextImageAccount(c *gin.Context, apiKeyID int64, exclude map[int64]bool, model string, identity requestSessionIdentity) (*auth.Account, string) {
+	preferredFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, imagePreferredAccountFilter))
+	preferredFilter = h.applyScopeBudgetFilter(c, preferredFilter)
 	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
+	fallbackFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, nil))
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, fallbackFilter))
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
@@ -1394,6 +1401,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	}
 
 	apiKeyID := requestAPIKeyID(c)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, responsesBody)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	maxRetries := h.getMaxRetries()
 	maxRateLimitRetries := h.getMaxRateLimitRetries()
 	generalRetries := 0
@@ -1414,12 +1424,17 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts, requestModel)
+		account, stickyProxyURL := h.nextImageAccount(c, apiKeyID, excludeAccounts, requestModel, sessionIdentity)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, nil))
+			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, nil))
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.applyScopeBudgetFilter(c, waitFilter))
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
+				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
@@ -1427,6 +1442,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			}
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
@@ -1464,23 +1480,27 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
+			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody, upstreamCyberPolicyAttempt{
+				Transport: upstreamPromptPolicyTransport(stream, false), StatusCode: resp.StatusCode,
+				AccountID: account.ID(), AttemptIndex: attempt + 1,
+			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          inboundEndpoint,
-				Model:             logModel,
-				EffectiveModel:    logEffectiveModel,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				InboundEndpoint:   inboundEndpoint,
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            stream,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:              account.ID(),
+				Endpoint:               inboundEndpoint,
+				Model:                  logModel,
+				EffectiveModel:         logEffectiveModel,
+				StatusCode:             resp.StatusCode,
+				DurationMs:             durationMs,
+				InboundEndpoint:        inboundEndpoint,
+				UpstreamEndpoint:       "/v1/responses",
+				Stream:                 stream,
+				IsRetryAttempt:         shouldRetry,
+				AttemptIndex:           attempt + 1,
+				UpstreamErrorKind:      upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:           usageLogErrorMessage(resp.StatusCode, errBody),
+				PromptPolicyIncidentID: promptPolicyIncidentID,
 			})
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
@@ -1502,11 +1522,22 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		var imageCount int
 		var imageLogInfo imageUsageLogInfo
 		var readErr error
+		promptPolicyIncidentID := ""
 		if stream {
 			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start)
+			if payload := imageResponseFailedPayload(readErr); len(payload) > 0 {
+				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, responseFailedErrorBody(payload), upstreamCyberPolicyAttempt{
+					Transport: "sse", StatusCode: http.StatusBadGateway, AccountID: account.ID(), AttemptIndex: attempt + 1,
+				}))
+			}
 		} else {
 			var out []byte
 			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(c.Request.Context(), resp.Body, responseFormat, requestModel, urlFor)
+			if payload := imageResponseFailedPayload(readErr); len(payload) > 0 {
+				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, responseFailedErrorBody(payload), upstreamCyberPolicyAttempt{
+					Transport: "http", StatusCode: http.StatusBadGateway, AccountID: account.ID(), AttemptIndex: attempt + 1,
+				}))
+			}
 			if readErr == nil {
 				persister.finalize(c.Request.Context())
 				c.Data(http.StatusOK, "application/json", out)
@@ -1519,7 +1550,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
 				// Always record the failed attempt so it appears in usage stats,
 				// matching the chat completions error path.
-				h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+				failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
+				failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+				h.logUsageForRequest(c, failedLog)
 				if willRetry {
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(readErr.Error())
@@ -1542,7 +1575,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// Only retry when nothing has been written to the client yet.
 			willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) && !c.Writer.Written()
 			// Always record the failed attempt so it appears in usage stats.
-			h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+			failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
+			failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+			h.logUsageForRequest(c, failedLog)
 			if willRetry {
 				lastStatusCode = statusCode
 				lastBody = []byte(readErr.Error())
@@ -1709,7 +1744,7 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 			readErr = imageGenerationFailureError(data)
 			return false
 		case "response.failed":
-			readErr = imageGenerationFailureError(data)
+			readErr = newImageResponseFailedError(data)
 			return false
 		}
 		return true
@@ -1892,7 +1927,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			setReadErr(err)
 			return false
 		case "response.failed":
-			err := imageGenerationFailureError(data)
+			err := newImageResponseFailedError(data)
 			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
 			setReadErr(err)
 			return false
@@ -1987,6 +2022,37 @@ func imageGenerationFailureError(payload []byte) error {
 		return fmt.Errorf("upstream image generation failed (%s): %s", code, message)
 	}
 	return fmt.Errorf("upstream image generation failed: %s", message)
+}
+
+type imageResponseFailedError struct {
+	cause   error
+	payload []byte
+}
+
+func newImageResponseFailedError(payload []byte) error {
+	return &imageResponseFailedError{cause: imageGenerationFailureError(payload), payload: append([]byte(nil), payload...)}
+}
+
+func (e *imageResponseFailedError) Error() string {
+	if e == nil || e.cause == nil {
+		return "upstream image generation failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *imageResponseFailedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func imageResponseFailedPayload(err error) []byte {
+	var failed *imageResponseFailedError
+	if !errors.As(err, &failed) || failed == nil {
+		return nil
+	}
+	return append([]byte(nil), failed.payload...)
 }
 
 func firstNonEmptyImageErrorField(values ...string) string {

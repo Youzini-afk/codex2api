@@ -8,6 +8,7 @@ import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import Modal from "../components/Modal";
 import ChannelLogo from "../components/ChannelLogo";
 import ModelLogo from "../components/ModelLogo";
+import OperationResultsModal from "../components/OperationResultsModal";
 import { cn } from "@/lib/utils";
 import GrokAccounts from "./GrokAccounts";
 import PageHeader from "../components/PageHeader";
@@ -42,6 +43,17 @@ import type {
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
+import {
+  collectAccountOperationResult,
+  resolveChannelBatchTestAccountIDs,
+  snapshotAccountOperationResults,
+  type AccountOperationResult,
+  type AccountOperationResultsState,
+} from "../lib/accountOperationResults";
+import {
+  readOperationResultsVisibility,
+  writeOperationResultsVisibility,
+} from "../lib/operationResultsPreference";
 import {
   formatLongUsageWindowLabel,
   needsUsageReload,
@@ -82,6 +94,7 @@ import {
   Search,
   Fingerprint,
   FolderOpen,
+  Layers,
   Cloud,
   Lock,
   Unlock,
@@ -120,6 +133,7 @@ import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import { useImportGroupIds } from "../hooks/useImportGroupIds";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
   accountMatchesGroupFilter,
@@ -638,6 +652,8 @@ type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
 interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
   action: BatchOperationAction;
+  status?: string;
+  http_status?: number;
   current?: number;
   total?: number;
   success?: number;
@@ -731,12 +747,22 @@ export default function Accounts() {
   // 由路由驱动（/accounts vs /accounts/grok），刷新浏览器后停留在当前视图。
   const location = useLocation();
   const navigate = useNavigate();
-  const providerView: "codex" | "grok" = location.pathname.replace(/\/+$/, "").endsWith("/accounts/grok")
+  const normalizedPath = location.pathname.replace(/\/+$/, "");
+  const providerView: "codex" | "grok" = normalizedPath.endsWith("/accounts/grok")
     ? "grok"
     : "codex";
   const setProviderView = useCallback(
     (view: "codex" | "grok") => {
       navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    },
+    [navigate],
+  );
+  // Codex 邀请视图同样由路由驱动（/accounts/invite），与 Grok 视图一致：
+  // 可直接分享链接、刷新浏览器停在原处、浏览器返回键能退回账号列表。
+  const showInvite = normalizedPath.endsWith("/accounts/invite");
+  const setShowInvite = useCallback(
+    (open: boolean) => {
+      navigate(open ? "/accounts/invite" : "/accounts");
     },
     [navigate],
   );
@@ -763,7 +789,7 @@ export default function Accounts() {
     "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | "schedulerPriority" | null
+    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -787,6 +813,15 @@ export default function Accounts() {
   const [batchTesting, setBatchTesting] = useState(false);
   const [operationProgress, setOperationProgress] =
     useState<OperationProgressState | null>(null);
+  const [operationResults, setOperationResults] =
+    useState<AccountOperationResultsState | null>(null);
+  const [showOperationResults, setShowOperationResults] = useState(
+    readOperationResultsVisibility,
+  );
+  const showOperationResultsRef = useRef(showOperationResults);
+  const operationResultMap = useRef<Map<number, AccountOperationResult>>(
+    new Map(),
+  );
   const operationProgressHideTimer = useRef<number | null>(null);
   const operationProgressFrame = useRef<number | null>(null);
   const operationProgressFlushTimer = useRef<number | null>(null);
@@ -888,7 +923,6 @@ export default function Accounts() {
     getInitialAnalysisVisibility,
   );
   const [showRecycleBin, setShowRecycleBin] = useState(false);
-  const [showInvite, setShowInvite] = useState(false);
   const [showEmailDomainTags, setShowEmailDomainTags] = useState(
     getInitialEmailDomainVisibility,
   );
@@ -996,6 +1030,12 @@ export default function Accounts() {
     EMPTY_ACCOUNT_GROUP_FILTER,
   );
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 导入/添加账号时直接绑定的分组（记住上次选择，添加弹窗与导入弹窗共用，与 allowDuplicate 同风格）。
+  const {
+    groupIds: importGroupIds,
+    setGroupIds: setImportGroupIds,
+    prune: pruneImportGroupIds,
+  } = useImportGroupIds();
   const [showGroupManager, setShowGroupManager] = useState(false);
   const [groupDraft, setGroupDraft] = useState<AccountGroupDraft>({
     id: null,
@@ -1119,13 +1159,15 @@ export default function Accounts() {
   }) => {
     const isTesting = testingProxyKey === testKey;
     const testDisabled = disabled || !value.trim() || testingProxyKey !== null;
+    const hasProxyPool = proxyPool.length > 0;
 
     return (
-      <div>
-        <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+      <div className="space-y-2.5">
+        <label className="block text-sm font-semibold text-muted-foreground">
           {label}
         </label>
-        <div className="flex flex-col gap-2 sm:flex-row">
+        {/* 第一行：手动填写代理 URL + 测试 */}
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
           <Input
             className="min-w-0 flex-1"
             placeholder={placeholder}
@@ -1134,12 +1176,6 @@ export default function Accounts() {
             onChange={(event: ChangeEvent<HTMLInputElement>) =>
               onChange(event.target.value)
             }
-          />
-          <ProxyPoolSelect
-            className="shrink-0 sm:w-[180px]"
-            proxies={proxyPool}
-            disabled={disabled}
-            onSelect={onChange}
           />
           <Button
             type="button"
@@ -1152,6 +1188,15 @@ export default function Accounts() {
             {isTesting ? t("accounts.testingProxy") : t("accounts.testProxy")}
           </Button>
         </div>
+        {/* 第二行：从代理池选择（有池条目时单独占一行，与上方 URL 输入左对齐） */}
+        {hasProxyPool ? (
+          <ProxyPoolSelect
+            className="w-full"
+            proxies={proxyPool}
+            disabled={disabled}
+            onSelect={onChange}
+          />
+        ) : null}
       </div>
     );
   };
@@ -1376,6 +1421,7 @@ export default function Accounts() {
         window.clearTimeout(operationProgressFlushTimer.current);
       }
       pendingOperationProgress.current = null;
+      operationResultMap.current.clear();
     };
   }, []);
 
@@ -1386,6 +1432,18 @@ export default function Accounts() {
     }
     setOperationProgress(null);
   }, []);
+
+  const handleOperationResultsVisibilityChange = useCallback(
+    (visible: boolean) => {
+      showOperationResultsRef.current = visible;
+      setShowOperationResults(visible);
+      writeOperationResultsVisibility(visible);
+      if (!visible) {
+        setOperationResults(null);
+      }
+    },
+    [],
+  );
 
   const scheduleOperationProgressClose = useCallback(() => {
     if (operationProgressHideTimer.current !== null) {
@@ -1399,6 +1457,9 @@ export default function Accounts() {
 
   const commitOperationProgressEvent = useCallback(
     (title: string, event: BatchOperationEvent) => {
+      const results = snapshotAccountOperationResults(
+        operationResultMap.current,
+      );
       setOperationProgress((prev) => ({
         show: true,
         action: event.action,
@@ -1414,6 +1475,16 @@ export default function Accounts() {
         message: event.error || event.message || prev?.message,
       }));
       if (event.type === "complete") {
+        if (
+          showOperationResultsRef.current &&
+          (event.action === "batch_test" ||
+            event.action === "batch_refresh")
+        ) {
+          setOperationResults({
+            action: event.action,
+            results,
+          });
+        }
         scheduleOperationProgressClose();
       }
     },
@@ -1431,6 +1502,10 @@ export default function Accounts() {
 
   const applyOperationProgressEvent = useCallback(
     (title: string, event: BatchOperationEvent) => {
+      collectAccountOperationResult(operationResultMap.current, event);
+      if (event.type === "start") {
+        setOperationResults(null);
+      }
       if (operationProgressHideTimer.current !== null) {
         window.clearTimeout(operationProgressHideTimer.current);
         operationProgressHideTimer.current = null;
@@ -1508,7 +1583,8 @@ export default function Accounts() {
       healthBars,
     ] =
       await Promise.all([
-        api.getAccounts(),
+        // Codex 页只拉非 Grok 账号，与 Grok 页 channel=grok 对称，减少大号池传输。
+        api.getAccounts({ channel: "codex" }),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
@@ -1598,7 +1674,8 @@ export default function Accounts() {
 
   useEffect(() => {
     setGroupFilter((current) => pruneAccountGroupFilter(current, allGroups));
-  }, [allGroups]);
+    pruneImportGroupIds(allGroups);
+  }, [allGroups, pruneImportGroupIds]);
 
   useEffect(() => {
     const missingUsageIds = accounts
@@ -1827,10 +1904,18 @@ export default function Accounts() {
       } else if (sortKey === "schedulerPriority") {
         diff = getSchedulerPriority(a) - getSchedulerPriority(b);
         if (diff === 0) return a.id - b.id;
+      } else if (sortKey === "group") {
+        const aMeta = getAccountGroupSortMeta(a, allGroups);
+        const bMeta = getAccountGroupSortMeta(b, allGroups);
+        diff = aMeta.order - bMeta.order;
+        if (diff === 0) {
+          diff = aMeta.key.localeCompare(bMeta.key, "zh");
+        }
+        if (diff === 0) return a.id - b.id;
       }
       return sortDir === "asc" ? diff : -diff;
     });
-  }, [filteredAccounts, sortDir, sortKey]);
+  }, [allGroups, filteredAccounts, sortDir, sortKey]);
 
   const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -1960,12 +2045,14 @@ export default function Accounts() {
             refresh_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           }
         : {
             ...addForm,
             session_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           };
     if (
       !payload.refresh_token?.trim() &&
@@ -2023,6 +2110,7 @@ export default function Accounts() {
         ...atForm,
         allow_duplicate: allowDuplicate,
         custom_headers: parsedCustomHeaders.value,
+        group_ids: importGroupIds,
       });
       setShowAdd(false);
       await readImportSSE(res);
@@ -2056,6 +2144,10 @@ export default function Accounts() {
     }));
   }, []);
 
+  const clearOpenAIModels = useCallback(() => {
+    setOpenAIForm((form) => ({ ...form, models: [] }));
+  }, []);
+
   const addEditOpenAIModelValues = useCallback((raw: string) => {
     const nextModels = parseModelTokens(raw);
     if (nextModels.length === 0) return;
@@ -2071,6 +2163,10 @@ export default function Accounts() {
       ...form,
       models: form.models.filter((item) => item !== model),
     }));
+  }, []);
+
+  const clearEditOpenAIModels = useCallback(() => {
+    setEditOpenAIForm((form) => ({ ...form, models: [] }));
   }, []);
 
   const handleFetchOpenAIModels = async () => {
@@ -2582,6 +2678,9 @@ export default function Accounts() {
         );
       }
       if (allowDuplicate) formData.append("allow_duplicate", "true");
+      if (importGroupIds.length > 0) {
+        formData.append("group_ids", JSON.stringify(importGroupIds));
+      }
       for (const f of files) formData.append("file", f);
       const res = await fetch("/api/admin/accounts/import", {
         method: "POST",
@@ -2891,11 +2990,11 @@ export default function Accounts() {
         const blob = new Blob([JSON.stringify(data, null, 2)], {
           type: "application/json",
         });
-        downloadBlob(blob, `codex2api-${ts}-${data.length}.json`);
+        downloadBlob(blob, `codex2api-codex-${ts}-${data.length}.json`);
       } else {
         const text = data.map((e) => e.refresh_token).join("\n");
         const blob = new Blob([text], { type: "text/plain" });
-        downloadBlob(blob, `codex2api-rt-${ts}-${data.length}.txt`);
+        downloadBlob(blob, `codex2api-codex-rt-${ts}-${data.length}.txt`);
       }
       showToast(t("accounts.exportSuccess", { count: data.length }));
     } catch (error) {
@@ -3554,9 +3653,7 @@ export default function Accounts() {
   const batchBaseConcurrencyInvalid =
     batchUpdateBaseConcurrency &&
     batchBaseConcurrencyTrimmed !== "" &&
-    (batchBaseConcurrencyValue === null ||
-      batchBaseConcurrencyValue < 1 ||
-      batchBaseConcurrencyValue > 50);
+    (batchBaseConcurrencyValue === null || batchBaseConcurrencyValue < 1);
   const batchSchedulerPriorityInvalid =
     batchUpdateSchedulerPriority &&
     isSchedulerPriorityInputInvalid(batchSchedulerPriorityInput);
@@ -3665,12 +3762,17 @@ export default function Accounts() {
   };
 
   const handleBatchTest = async (ids?: number[]) => {
-    if (ids && ids.length === 0) return;
+    const scopedIDs = resolveChannelBatchTestAccountIDs(
+      accounts,
+      "codex",
+      ids,
+    );
+    if (scopedIDs.length === 0) return;
     setBatchTesting(true);
     try {
       const result = await runStreamingAccountOperation(
         "/accounts/batch-test?stream=true",
-        ids ? { ids } : undefined,
+        { ids: scopedIDs },
         t("accounts.batchTestProgressTitle"),
       );
       showToast(
@@ -3927,9 +4029,7 @@ export default function Accounts() {
       parsedScoreBias > 200);
   const concurrencyInputInvalid =
     concurrencyMode === "custom" &&
-    (parsedBaseConcurrency === null ||
-      parsedBaseConcurrency < 1 ||
-      parsedBaseConcurrency > 50);
+    (parsedBaseConcurrency === null || parsedBaseConcurrency < 1);
   const reserve5hInputInvalid =
     reserve5hMode === "custom" &&
     (parsedReserve5h === null || parsedReserve5h < 1 || parsedReserve5h > 99);
@@ -4106,14 +4206,35 @@ export default function Accounts() {
     setAllGroups(res.groups ?? []);
   };
 
+  /** Inline create from multi-select (batch / quick / account editor). Returns new group id. */
+  const handleCreateGroupInline = async (
+    name: string,
+  ): Promise<number | null> => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      showToast(t("accounts.groupNameRequired"), "error");
+      return null;
+    }
+    try {
+      const res = await api.createAccountGroup({
+        name: trimmed,
+        color: ACCOUNT_GROUP_COLORS[allGroups.length % ACCOUNT_GROUP_COLORS.length],
+      });
+      await reloadGroups();
+      showToast(t("accounts.groupCreated"));
+      return res.id;
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
+      return null;
+    }
+  };
+
   const parsedGroupBaseConcurrency = parseIntegerInput(
     groupDraft.baseConcurrencyInput,
   );
   const groupBaseConcurrencyInvalid =
     groupDraft.baseConcurrencyInput.trim() !== "" &&
-    (parsedGroupBaseConcurrency === null ||
-      parsedGroupBaseConcurrency < 1 ||
-      parsedGroupBaseConcurrency > 50);
+    (parsedGroupBaseConcurrency === null || parsedGroupBaseConcurrency < 1);
 
   const resetGroupDraft = () => {
     setGroupDraft({
@@ -4254,7 +4375,13 @@ export default function Accounts() {
     // key 触发渠道切换时整块内容淡入过渡，切换器由 headerSlot 常驻不闪。
     return (
       <div key="provider-grok" className="animate-channel-switch-in">
-        <GrokAccounts headerSlot={providerSwitcher} />
+        <GrokAccounts
+          headerSlot={providerSwitcher}
+          showOperationResults={showOperationResults}
+          onShowOperationResultsChange={
+            handleOperationResultsVisibilityChange
+          }
+        />
       </div>
     );
   }
@@ -4285,6 +4412,12 @@ export default function Accounts() {
         progress={operationProgress}
         onClose={closeOperationProgress}
       />
+      <OperationResultsModal
+        state={showOperationResults ? operationResults : null}
+        accounts={accounts}
+        channel="codex"
+        onClose={() => setOperationResults(null)}
+      />
       <StateShell
         variant="page"
         loading={loading}
@@ -4306,6 +4439,7 @@ export default function Accounts() {
           {showInvite ? (
             <CodexInviteView
               accounts={accounts}
+              loading={loading}
               onClose={() => setShowInvite(false)}
             />
           ) : null}
@@ -4477,6 +4611,25 @@ export default function Accounts() {
                             : t("accounts.testConnection")}
                         </span>
                       </Button>
+                      <label
+                        className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-muted-foreground"
+                        title={t(
+                          "accounts.operationResultsPreferenceHint",
+                        )}
+                      >
+                        <Switch
+                          checked={showOperationResults}
+                          onCheckedChange={
+                            handleOperationResultsVisibilityChange
+                          }
+                          aria-label={t(
+                            "accounts.operationResultsPreference",
+                          )}
+                        />
+                        <span className="hidden lg:inline">
+                          {t("accounts.operationResultsPreference")}
+                        </span>
+                      </label>
                       <Button
                         variant="outline"
                         size="sm"
@@ -4834,6 +4987,35 @@ export default function Accounts() {
                     setPage(1);
                   }}
                 />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-w-0"
+                  aria-pressed={sortKey === "group"}
+                  title={t("accounts.groupSortHint")}
+                  onClick={() => {
+                    if (sortKey === "group") {
+                      setSortDir((current) =>
+                        current === "desc" ? "asc" : "desc",
+                      );
+                    } else {
+                      setSortKey("group");
+                      setSortDir("asc");
+                    }
+                    setPage(1);
+                  }}
+                >
+                  <Layers className="size-3.5" />
+                  <span className="truncate">
+                    {t("accounts.groupSort")}
+                  </span>
+                  {sortKey === "group" ? (
+                    <span aria-hidden="true">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                  ) : null}
+                </Button>
                 <Button
                   type="button"
                   variant="outline"
@@ -5298,8 +5480,26 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.groups && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.groupsLabel")}
+                          <TableHead
+                            className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                            onClick={() => {
+                              if (sortKey === "group") {
+                                setSortDir((current) =>
+                                  current === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("group");
+                                setSortDir("asc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.groupsLabel")}{" "}
+                            {sortKey === "group"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.priority && (
@@ -5684,6 +5884,7 @@ export default function Accounts() {
                                       }
                                       errorMessage={account.error_message}
                                     />
+                                    <UsingCreditsBadge account={account} />
                                     <AccountStatusCountdown account={account} />
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
@@ -6368,11 +6569,23 @@ export default function Accounts() {
                     onRemove={removeOpenAIModel}
                     emptyLabel={t("accounts.openaiModelsEmpty")}
                   />
-                  <p className="mt-1.5 text-xs text-muted-foreground">
-                    {t("accounts.openaiModelsHint", {
-                      count: openAIForm.models.length,
-                    })}
-                  </p>
+                  <div className="mt-1.5 flex items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">
+                      {t("accounts.openaiModelsHint", {
+                        count: openAIForm.models.length,
+                      })}
+                    </p>
+                    {openAIForm.models.length > 0 && (
+                      <button
+                        type="button"
+                        className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                        disabled={openAIModelsLoading || submitting}
+                        onClick={clearOpenAIModels}
+                      >
+                        {t("accounts.supportedModelsClearAll")}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {renderModelMappingEditor({
                   value: openAIModelMappingText,
@@ -6597,6 +6810,35 @@ export default function Accounts() {
                 )}
               </div>
             )}
+            {(addMethod === "rt" ||
+              addMethod === "st" ||
+              addMethod === "at") && (
+              <div className="mt-4 space-y-1.5 border-t border-border pt-4">
+                <label className="text-sm font-semibold text-muted-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
+              </div>
+            )}
           </Modal>
 
           <Modal
@@ -6632,6 +6874,31 @@ export default function Accounts() {
                 />
                 {t("accounts.allowDuplicate")}
               </label>
+              <div className="space-y-1.5 pt-1">
+                <label className="text-xs font-medium text-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <button
@@ -7320,11 +7587,23 @@ export default function Accounts() {
                         onRemove={removeEditOpenAIModel}
                         emptyLabel={t("accounts.openaiModelsEmpty")}
                       />
-                      <p className="mt-1.5 text-xs text-muted-foreground">
-                        {t("accounts.openaiModelsHint", {
-                          count: editOpenAIForm.models.length,
-                        })}
-                      </p>
+                      <div className="mt-1.5 flex items-center justify-between gap-2">
+                        <p className="text-xs text-muted-foreground">
+                          {t("accounts.openaiModelsHint", {
+                            count: editOpenAIForm.models.length,
+                          })}
+                        </p>
+                        {editOpenAIForm.models.length > 0 && (
+                          <button
+                            type="button"
+                            className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                            disabled={editOpenAIModelsLoading || editSubmitting}
+                            onClick={clearEditOpenAIModels}
+                          >
+                            {t("accounts.supportedModelsClearAll")}
+                          </button>
+                        )}
+                      </div>
                     </div>
                     {renderModelMappingEditor({
                       value: editOpenAIModelMappingText,
@@ -7833,7 +8112,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         <div className="text-sm font-semibold text-foreground">
                           {t("accounts.allowedAPIKeysLabel")}
                         </div>
@@ -7860,7 +8139,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         {renderProxyInput({
                           value: editProxyUrl,
                           testKey: "edit-account-proxy",
@@ -7925,6 +8204,11 @@ export default function Accounts() {
                             placeholder={t("accounts.groupsPlaceholder")}
                             emptyLabel={t("accounts.groupsNone")}
                             emptyHint={t("accounts.groupsSelectHint")}
+                            onCreateGroup={handleCreateGroupInline}
+                            createLabel={t("accounts.groupCreate")}
+                            createPlaceholder={t("accounts.groupNamePlaceholder")}
+                            creatingLabel={t("accounts.groupCreating")}
+                            createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                           />
                         </div>
                       </div>
@@ -8006,6 +8290,18 @@ export default function Accounts() {
                 </div>
                 <div className="mt-1">{t("accounts.groupQuickDesc")}</div>
               </div>
+              <div className="flex items-center justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={quickGroupSubmitting}
+                  onClick={() => setShowGroupManager(true)}
+                >
+                  <FolderOpen className="size-3" />
+                  {t("accounts.groupManage")}
+                </Button>
+              </div>
               <AccountGroupMultiSelect
                 groups={allGroups}
                 value={quickGroupIds}
@@ -8018,6 +8314,11 @@ export default function Accounts() {
                 emptyLabel={t("accounts.groupsNone")}
                 emptyHint={t("accounts.groupsSelectHint")}
                 disabled={quickGroupSubmitting}
+                onCreateGroup={handleCreateGroupInline}
+                createLabel={t("accounts.groupCreate")}
+                createPlaceholder={t("accounts.groupNamePlaceholder")}
+                creatingLabel={t("accounts.groupCreating")}
+                createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
               />
             </div>
           </Modal>
@@ -8383,22 +8684,35 @@ export default function Accounts() {
                       )}
                     </div>
                   </div>
-                  {batchMetaMode === "all" ? (
-                    <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
-                      <span>
-                        {t(
-                          batchUpdateGroups
-                            ? "common.enabled"
-                            : "common.disabled",
-                        )}
-                      </span>
-                      <Switch
-                        checked={batchUpdateGroups}
-                        onCheckedChange={setBatchUpdateGroups}
-                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
-                      />
-                    </label>
-                  ) : null}
+                  <div className="flex shrink-0 items-center gap-2">
+                    {batchUpdateGroups ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={() => setShowGroupManager(true)}
+                      >
+                        <FolderOpen className="size-3" />
+                        {t("accounts.groupManage")}
+                      </Button>
+                    ) : null}
+                    {batchMetaMode === "all" ? (
+                      <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                        <span>
+                          {t(
+                            batchUpdateGroups
+                              ? "common.enabled"
+                              : "common.disabled",
+                          )}
+                        </span>
+                        <Switch
+                          checked={batchUpdateGroups}
+                          onCheckedChange={setBatchUpdateGroups}
+                          aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
@@ -8425,6 +8739,13 @@ export default function Accounts() {
                         : "accounts.batchMetaFieldHint",
                     )}
                     disabled={!batchUpdateGroups}
+                    onCreateGroup={
+                      batchUpdateGroups ? handleCreateGroupInline : undefined
+                    }
+                    createLabel={t("accounts.groupCreate")}
+                    createPlaceholder={t("accounts.groupNamePlaceholder")}
+                    creatingLabel={t("accounts.groupCreating")}
+                    createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                   />
                 </div>
               </div>
@@ -8739,7 +9060,6 @@ export default function Accounts() {
                     <Input
                       type="number"
                       min={1}
-                      max={50}
                       step={1}
                       inputMode="numeric"
                       value={groupDraft.baseConcurrencyInput}
@@ -10284,6 +10604,26 @@ function getSchedulerPriority(account: AccountRow): number {
     : 0;
 }
 
+// UsingCreditsBadge 紧跟在限流徽章后面：账号显示仍是「限流」（用量窗口客观上确实打满了），
+// 这个积分徽章表示"正在用积分顶替限流，因此仍在参与调度"。
+// 后端 using_credits 已经算过全部前提（两个开关 + 当下确有余额 + 窗口真打满），
+// 这里只负责显示，不重算，避免两边判定漂移。
+function UsingCreditsBadge({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  if (!account.using_credits) return null;
+  // 纯图标：余额已经在邮箱下方的徽章里显示过，这里再写一遍是重复信息，
+  // 而且会把「限流 | 7d」和倒计时之间撑开。语义靠 title / aria-label 承载。
+  return (
+    <span
+      className="inline-flex size-5 shrink-0 items-center justify-center rounded-md border border-teal-500/30 bg-teal-500/10 text-teal-700 dark:text-teal-300"
+      title={t("accounts.usingCreditsBadgeTooltip")}
+      aria-label={t("accounts.usingCreditsBadge")}
+    >
+      <Coins className="size-3" />
+    </span>
+  );
+}
+
 function SchedulerPriorityBadge({ account }: { account: AccountRow }) {
   const { t } = useTranslation();
   const priority = getSchedulerPriority(account);
@@ -10368,6 +10708,10 @@ function isPremiumUsagePlan(planType?: string): boolean {
 type RateLimitWindow = "5h" | "7d";
 
 function isRateLimitedAccount(account: AccountRow): boolean {
+  // 积分顶替限流的账号：状态徽章仍写「限流」（用量窗口客观上确实打满了），但调度侧
+  // 照常放行。健康分类与筛选按"可用"计，否则一个正在正常干活的账号会被算进限流数、
+  // 被「限流」筛选捞出来，与旁边的积分徽章互相矛盾。
+  if (account.using_credits) return false;
   return getAccountRateLimitWindow(account) !== null;
 }
 
@@ -10457,7 +10801,11 @@ function getRateLimitedWindowStats(accounts: AccountRow[]): {
 } {
   const stats = accounts.reduce(
     (stats, account) => {
-      const window = getAccountRateLimitWindow(account);
+      // 走 isRateLimitedAccount 而不是直接取窗口：积分顶替限流的账号按可用计，
+      // 这样 5h + 7d 仍然等于总限流数，不会比汇总里的「限流」多出几个。
+      const window = isRateLimitedAccount(account)
+        ? getAccountRateLimitWindow(account)
+        : null;
       if (!window) {
         return stats;
       }
@@ -11390,6 +11738,26 @@ function resolveAccountGroups(
   return ids.map((id) => byID.get(id)).filter(Boolean) as AccountGroup[];
 }
 
+/** Sort key for clustering accounts that share the same group membership. */
+function getAccountGroupSortMeta(
+  account: { group_ids?: number[] | null },
+  groups: AccountGroup[],
+): { order: number; key: string } {
+  const resolved = resolveAccountGroups(account.group_ids ?? [], groups);
+  if (resolved.length === 0) {
+    // Ungrouped accounts sort after every named group in ascending order.
+    return { order: Number.MAX_SAFE_INTEGER, key: "" };
+  }
+  const sorted = [...resolved].sort((a, b) => {
+    if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+    return a.name.localeCompare(b.name, "zh");
+  });
+  return {
+    order: sorted[0].sort_order,
+    key: sorted.map((group) => group.name).join("\0"),
+  };
+}
+
 function GroupChipList({
   groups,
   onClick,
@@ -11674,6 +12042,7 @@ function AccountMobileCard({
               </span>
               <PlanBadge planType={account.plan_type} />
               <SchedulerPriorityBadge account={account} />
+              <UsingCreditsBadge account={account} />
               <AccountStatusCountdown account={account} />
               <ExpiryBadge
                 expiresAt={account.subscription_expires_at}
@@ -11989,7 +12358,8 @@ function AccountMobileCard({
                   detail={getAccountRateLimitWindow(account) ?? undefined}
                   errorMessage={account.error_message}
                 />
-                <div className="mt-1 flex min-h-6 items-center justify-end">
+                <div className="mt-1 flex min-h-6 flex-wrap items-center justify-end gap-1.5">
+                  <UsingCreditsBadge account={account} />
                   <AccountStatusCountdown account={account} />
                 </div>
               </div>
@@ -13067,17 +13437,20 @@ function getAccountStatusCountdownUntil(
   account: AccountRow,
 ): string | undefined {
   const status = account.status;
+  const rateLimited =
+    status === "rate_limited" ||
+    status === "rate_limited_5h" ||
+    status === "rate_limited_7d";
   if (
     account.cooldown_until &&
-    (status === "rate_limited" ||
-      status === "rate_limited_5h" ||
-      status === "rate_limited_7d" ||
-      status === "error" ||
-      status === "cooldown")
+    (rateLimited || status === "error" || status === "cooldown")
   ) {
     return account.cooldown_until;
   }
-  if (status === "quota_paused") {
+  // 限流态但没有 cooldown：积分顶替限流会主动释放本地用量判罚（cooldown_until 被清空），
+  // premium 5h 打满也是直接由用量窗口判定、从不落 cooldown。这两种情况下倒计时改用窗口
+  // 重置时间——徽章上写着「限流 | 7d」，右边就该显示它多久恢复，而不是整个消失。
+  if (rateLimited || status === "quota_paused") {
     const window = getAccountRateLimitWindow(account);
     if (window === "7d") {
       return account.reset_7d_at;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ChangeEvent, ReactNode } from "react";
 import {
@@ -23,6 +23,7 @@ import {
   Rows3,
   LayoutGrid,
   Upload,
+  Download,
   FileText,
   RotateCcw,
   Pencil,
@@ -32,22 +33,35 @@ import { api, getAdminKey } from "../api";
 import type { ProxyRow } from "../api";
 import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import type {
+  AccountGroup,
   AccountRow,
   AccountHealthBucket,
   AddGrokAccountRequest,
   GrokSSOImportItem,
 } from "../types";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import AccountGroupFilterSelect, {
+  EMPTY_ACCOUNT_GROUP_FILTER,
+  accountMatchesGroupFilter,
+  pruneAccountGroupFilter,
+  type AccountGroupFilterValue,
+} from "../components/AccountGroupFilterSelect";
+import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import { useImportGroupIds } from "../hooks/useImportGroupIds";
+import { useIsDesktop } from "../hooks/useMediaQuery";
 import AccountHealthBar from "../components/AccountHealthBar";
 import AccountUsageModal from "../components/AccountUsageModal";
 import Modal from "../components/Modal";
 import ModelLogo from "../components/ModelLogo";
+import OperationResultsModal from "../components/OperationResultsModal";
 import PageHeader from "../components/PageHeader";
+import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -59,9 +73,19 @@ import {
 import { useToast } from "../hooks/useToast";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { useOperationProgress } from "../hooks/useOperationProgress";
+import {
+  DEFAULT_PAGE_SIZE_OPTIONS,
+  usePersistedPageSize,
+} from "../hooks/usePersistedPageSize";
 import OperationProgressToast from "../components/OperationProgressToast";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
+import { resolveChannelBatchTestAccountIDs } from "../lib/accountOperationResults";
+import {
+  grokPlanFilterCategory,
+  resolveAccountGrokPlan,
+  type GrokPlanFilter,
+} from "../lib/grokPlan";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
@@ -84,6 +108,11 @@ const GROK_LIMITED_STATUSES = new Set([
 
 // 与 Codex 账号页一致的表格/卡片双布局，选择持久化到 localStorage。
 const GROK_VIEW_MODE_KEY = "codex2api:grok-accounts:view-mode";
+
+// 批量导入的分片大小。后端单次上限是 5000，但一次请求要串行落库/刷新几千条，
+// 墙钟时间会长到浏览器或反代先断开；切成小片可以让每次请求都在一分钟量级完成，
+// 同时给用户可见的进度，失败也只影响当前这一片。
+const GROK_IMPORT_CHUNK_SIZE = 200;
 type GrokViewMode = "table" | "grid";
 
 function getInitialGrokViewMode(): GrokViewMode {
@@ -105,10 +134,96 @@ type StatusFilter =
   | "disabled"
   | "banned"
   | "error";
-// 套餐筛选：free / 付费档（SuperGrok 等）/ api / 其它。
-type PlanFilter = "all" | "free" | "premium" | "api" | "other";
 type AuthFilter = "all" | "oauth" | "api_key";
 type DeviceStep = "idle" | "waiting";
+type GrokSortKey = "usage" | "requests" | "updated" | "group";
+type GrokSortDir = "asc" | "desc";
+
+const FALLBACK_GROUP_COLOR = "#2563eb";
+
+function normalizeGroupColor(color?: string): string {
+  const value = (color || "").trim();
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : FALLBACK_GROUP_COLOR;
+}
+
+// GrokRowHandlers 是行组件的全部动作回调。父组件用 ref 转发保证引用恒定,
+// 配合 memo 行组件让"勾选/单行 busy"只重渲染受影响的行。
+interface GrokRowHandlers {
+  toggleSelect: (id: number) => void;
+  openDetail: (account: AccountRow) => void;
+  test: (account: AccountRow) => void;
+  usage: (account: AccountRow) => void;
+  refresh: (account: AccountRow) => void;
+  toggleEnabled: (account: AccountRow) => void;
+  edit: (account: AccountRow) => void;
+  remove: (account: AccountRow) => void;
+  usageRefreshed: () => void;
+}
+
+function resolveAccountGroups(
+  ids: number[] | undefined | null,
+  groups: AccountGroup[],
+): AccountGroup[] {
+  if (!ids?.length || groups.length === 0) return [];
+  const byID = new Map(groups.map((group) => [group.id, group]));
+  return ids.map((id) => byID.get(id)).filter(Boolean) as AccountGroup[];
+}
+
+function accountUsageSortValue(account: AccountRow): number {
+  if (typeof account.usage_percent_7d === "number") return account.usage_percent_7d;
+  if (typeof account.usage_percent_5h === "number") return account.usage_percent_5h;
+  return -1;
+}
+
+function accountRequestsSortValue(account: AccountRow): number {
+  return (account.success_requests ?? 0) + (account.error_requests ?? 0);
+}
+
+function accountGroupSortKey(
+  account: AccountRow,
+  groups: AccountGroup[],
+): string {
+  const resolved = resolveAccountGroups(account.group_ids, groups);
+  if (resolved.length === 0) return "\uFFFF";
+  const sorted = [...resolved].sort((a, b) => {
+    if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+    return a.name.localeCompare(b.name, "zh");
+  });
+  return sorted.map((g) => g.name).join("\0");
+}
+
+function GrokGroupChips({ groups }: { groups: AccountGroup[] }) {
+  if (groups.length === 0) return null;
+  const visible = groups.slice(0, 3);
+  const hidden = groups.length - visible.length;
+  return (
+    <>
+      {visible.map((group) => {
+        const color = normalizeGroupColor(group.color);
+        return (
+          <span
+            key={group.id}
+            className="inline-flex max-w-[7.5rem] items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold"
+            style={{
+              backgroundColor: `${color}14`,
+              color,
+              boxShadow: `inset 0 0 0 1px ${color}33`,
+            }}
+            title={group.description || group.name}
+          >
+            <span className="size-1.5 shrink-0 rounded-full bg-current" />
+            <span className="truncate">{group.name}</span>
+          </span>
+        );
+      })}
+      {hidden > 0 ? (
+        <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
+          +{hidden}
+        </span>
+      ) : null}
+    </>
+  );
+}
 
 const EMPTY_FORM: AddGrokAccountRequest = {
   auth_kind: "oauth",
@@ -153,32 +268,26 @@ function shortHost(raw?: string | null): string {
   return GROK_DEFAULT_HOSTS.has(host) ? "" : host;
 }
 
-function isPremiumPlan(plan?: string | null): boolean {
-  const p = (plan ?? "").trim().toLowerCase();
-  return Boolean(p) && p !== "api" && p !== "free" && p !== "unknown";
-}
-
-// 套餐徽章：付费档（SuperGrok / Heavy）琥珀，free 绿色，api/unknown 中性。
+// 套餐徽章：使用后端解析出的官方 tier 展示名；付费档琥珀，Free 绿色。
 // 表格用常规尺寸、空值显示占位「—」；卡片用 compact 尺寸、空值不渲染。
 function GrokPlanBadge({
-  plan,
+  account,
   compact = false,
   className,
 }: {
-  plan?: string | null;
+  account: Pick<AccountRow, "plan_type" | "grok_plan">;
   compact?: boolean;
   className?: string;
 }) {
-  const raw = (plan ?? "").trim();
-  const key = raw.toLowerCase();
-  if (!raw) {
+  const plan = resolveAccountGrokPlan(account);
+  if (!plan) {
     return compact ? null : (
       <span className="text-[12px] text-muted-foreground">—</span>
     );
   }
-  const tone = isPremiumPlan(raw)
+  const tone = plan.paid
     ? "bg-amber-50 text-amber-800 ring-amber-600/20 dark:bg-amber-950 dark:text-amber-300 dark:ring-amber-400/20"
-    : key === "free"
+    : plan.key === "free"
       ? "bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-300 dark:ring-emerald-400/20"
       : "bg-muted text-muted-foreground ring-border";
   return (
@@ -192,7 +301,7 @@ function GrokPlanBadge({
         className,
       )}
     >
-      {raw}
+      {plan.display}
     </span>
   );
 }
@@ -233,30 +342,38 @@ function isAccountActive(account: AccountRow): boolean {
   );
 }
 
-// 套餐归类：free / 付费档（SuperGrok 等）/ api / 其它（空、unknown）。
-function planCategory(account: AccountRow): Exclude<PlanFilter, "all"> {
-  const p = (account.plan_type ?? "").trim().toLowerCase();
-  if (p === "free") return "free";
-  if (p === "api") return "api";
-  if (isPremiumPlan(p)) return "premium";
-  return "other";
-}
-
 export default function GrokAccounts({
   headerSlot,
+  showOperationResults = false,
+  onShowOperationResultsChange,
 }: {
   // headerSlot 由账号管理页注入 Codex/Grok 顶部切换器，渲染在标题旁。
   headerSlot?: ReactNode;
+  showOperationResults?: boolean;
+  onShowOperationResultsChange?: (visible: boolean) => void;
 } = {}) {
   const { t } = useTranslation();
   const { showToast } = useToast();
   // 与 Codex 账号页一致：用系统自定义确认弹窗，不用 window.confirm。
   const { confirm, confirmDialog } = useConfirmDialog();
   // 批量测试的右上角进度浮层，与 Codex 账号页共用同一实现。
-  const { operationProgress, runStreamingOperation, closeOperationProgress } =
-    useOperationProgress();
+  const {
+    operationProgress,
+    operationResults,
+    runStreamingOperation,
+    reportOperationEvent,
+    closeOperationProgress,
+    closeOperationResults,
+  } = useOperationProgress(showOperationResults);
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 导入/添加 Grok 账号时直接绑定的分组（与 Codex 账号页共用记忆，见 useImportGroupIds）。
+  const {
+    groupIds: importGroupIds,
+    setGroupIds: setImportGroupIds,
+    prune: pruneImportGroupIds,
+  } = useImportGroupIds();
   const [healthBars, setHealthBars] = useState<
     Record<string, AccountHealthBucket[]>
   >({});
@@ -304,6 +421,11 @@ export default function GrokAccounts({
   const ssoFileInputRef = useRef<HTMLInputElement | null>(null);
   const refreshFileInputRef = useRef<HTMLInputElement | null>(null);
   const [importBusy, setImportBusy] = useState(false);
+  // 分片导入的进度（done/total 为分片数）；单片导入时为 null。
+  const [importProgress, setImportProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [importResult, setImportResult] = useState<{
     total: number;
     imported: number;
@@ -329,15 +451,30 @@ export default function GrokAccounts({
   const [detailAccountId, setDetailAccountId] = useState<number | null>(null);
   const [batchTesting, setBatchTesting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [exporting, setExporting] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
   const selectAllRef = useRef<HTMLInputElement>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [authFilter, setAuthFilter] = useState<AuthFilter>("all");
-  const [planFilter, setPlanFilter] = useState<PlanFilter>("all");
+  const [planFilter, setPlanFilter] = useState<GrokPlanFilter>("all");
+  const [groupFilter, setGroupFilter] = useState<AccountGroupFilterValue>(
+    EMPTY_ACCOUNT_GROUP_FILTER,
+  );
+  const [sortKey, setSortKey] = useState<GrokSortKey | null>(null);
+  const [sortDir, setSortDir] = useState<GrokSortDir>("desc");
   const [cleaning, setCleaning] = useState(false);
   const [viewMode, setViewMode] = useState<GrokViewMode>(getInitialGrokViewMode);
+  const isDesktop = useIsDesktop();
+  // 与 Codex 账号页一致：客户端分页 + 本地记忆每页条数，避免 Grok 号池过大时一次渲染卡死。
+  const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = usePersistedPageSize(
+    "grok-accounts",
+    20,
+    pageSizeOptions,
+  );
 
   useEffect(() => {
     try {
@@ -349,9 +486,18 @@ export default function GrokAccounts({
 
   const reload = useCallback(async () => {
     try {
-      const res = await api.getAccounts();
-      const grokAccounts = res.accounts.filter((a) => a.grok_api);
+      // 服务端 channel=grok：不拉 Codex 全量，避免大号池下 Grok 页被拖垮。
+      const [res, groupsRes] = await Promise.all([
+        api.getAccounts({ channel: "grok" }),
+        api.listAccountGroups().catch(() => ({ groups: [] as AccountGroup[] })),
+      ]);
+      // 兜底再滤一次，兼容旧后端未识别 channel 时仍返回全量。
+      const grokAccounts = (res.accounts ?? []).filter((a) => a.grok_api);
+      const groups = groupsRes.groups ?? [];
       setAccounts(grokAccounts);
+      setAllGroups(groups);
+      setGroupFilter((current) => pruneAccountGroupFilter(current, groups));
+      pruneImportGroupIds(groups);
       // 选择集只保留仍然存在的账号，避免已删除账号残留在批量选择里。
       setSelected((prev) => {
         if (prev.size === 0) return prev;
@@ -380,6 +526,29 @@ export default function GrokAccounts({
     void reload();
   }, [reload]);
 
+  // 导入/添加账号后,后端的 billing 用量探针是异步的(OAuth 号还要先刷 AT,
+  // 通常 2~10s 才写回)。导入完成那一刻 reload 拿到的还是没有用量的账号,
+  // 这里按梯度静默补刷几次,把探针结果自动带出来,免得用户手动刷新。
+  const usageSettleTimersRef = useRef<number[]>([]);
+  const scheduleUsageSettleReloads = useCallback(() => {
+    usageSettleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    // 后端探针链 = 刷 AT + billing + 连通性测试(带并发闸),单号约 5~15s,
+    // 批量导入时更久;30s 档兜住多数场景,更大批量由用户手动刷新或定期探测收尾。
+    usageSettleTimersRef.current = [2500, 7000, 15000, 30000].map((delay) =>
+      window.setTimeout(() => {
+        void reload();
+      }, delay),
+    );
+  }, [reload]);
+  useEffect(
+    () => () => {
+      usageSettleTimersRef.current.forEach((timer) =>
+        window.clearTimeout(timer),
+      );
+    },
+    [],
+  );
+
   const stats = useMemo(() => {
     const total = accounts.length;
     const active = accounts.filter(isAccountActive).length;
@@ -404,6 +573,7 @@ export default function GrokAccounts({
   const filteredAccounts = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return accounts.filter((account) => {
+      const resolvedPlan = resolveAccountGrokPlan(account);
       if (statusFilter === "active" && !isAccountActive(account)) return false;
       if (statusFilter === "rate_limited" && !isAccountRateLimited(account))
         return false;
@@ -413,28 +583,113 @@ export default function GrokAccounts({
       if (authFilter === "oauth" && account.grok_auth_kind !== "oauth") return false;
       if (authFilter === "api_key" && account.grok_auth_kind !== "api_key")
         return false;
-      if (planFilter !== "all" && planCategory(account) !== planFilter)
+      if (
+        planFilter !== "all" &&
+        grokPlanFilterCategory(account) !== planFilter
+      )
         return false;
+      if (
+        !accountMatchesGroupFilter(account.group_ids ?? [], groupFilter)
+      ) {
+        return false;
+      }
       if (!q) return true;
+      const groupNames = resolveAccountGroups(account.group_ids, allGroups)
+        .map((g) => g.name)
+        .join(" ");
       const haystack = [
         account.name,
         account.email,
         String(account.id),
         ...(account.models ?? []),
         account.base_url,
+        account.plan_type,
+        resolvedPlan?.key,
+        resolvedPlan?.display,
+        account.error_message,
+        account.proxy_url,
+        groupNames,
       ]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
       return haystack.includes(q);
     });
-  }, [accounts, authFilter, planFilter, searchQuery, statusFilter]);
+  }, [
+    accounts,
+    allGroups,
+    authFilter,
+    groupFilter,
+    planFilter,
+    searchQuery,
+    statusFilter,
+  ]);
 
-  // 批量选择：全选/半选状态按当前过滤结果计算。
-  const filteredIds = useMemo(
-    () => filteredAccounts.map((a) => a.id),
-    [filteredAccounts],
+  const sortedAccounts = useMemo(() => {
+    if (!sortKey) return filteredAccounts;
+    return [...filteredAccounts].sort((a, b) => {
+      let diff = 0;
+      if (sortKey === "usage") {
+        diff = accountUsageSortValue(a) - accountUsageSortValue(b);
+      } else if (sortKey === "requests") {
+        diff = accountRequestsSortValue(a) - accountRequestsSortValue(b);
+      } else if (sortKey === "updated") {
+        diff =
+          new Date(a.updated_at || 0).getTime() -
+          new Date(b.updated_at || 0).getTime();
+      } else if (sortKey === "group") {
+        const nameDiff = accountGroupSortKey(a, allGroups).localeCompare(
+          accountGroupSortKey(b, allGroups),
+          "zh",
+        );
+        if (nameDiff !== 0) {
+          return sortDir === "asc" ? nameDiff : -nameDiff;
+        }
+        // Same group: higher usage first for scanability.
+        diff = accountUsageSortValue(b) - accountUsageSortValue(a);
+        if (diff !== 0) return diff;
+        return a.id - b.id;
+      }
+      if (diff === 0) return a.id - b.id;
+      return sortDir === "asc" ? diff : -diff;
+    });
+  }, [allGroups, filteredAccounts, sortDir, sortKey]);
+
+  // 筛选/排序变化时回到第 1 页，避免停留在空页。
+  useEffect(() => {
+    setPage(1);
+  }, [authFilter, groupFilter, planFilter, searchQuery, sortDir, sortKey, statusFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pagedAccounts = useMemo(
+    () =>
+      sortedAccounts.slice(
+        (currentPage - 1) * pageSize,
+        currentPage * pageSize,
+      ),
+    [currentPage, pageSize, sortedAccounts],
   );
+  const pagedAccountIds = useMemo(
+    () => pagedAccounts.map((a) => a.id),
+    [pagedAccounts],
+  );
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
+
+  // 批量选择：表头全选仅作用于当前页（与 Codex 账号页一致）。
+  const pageSelectedCount = useMemo(
+    () => pagedAccountIds.reduce((n, id) => n + (selected.has(id) ? 1 : 0), 0),
+    [pagedAccountIds, selected],
+  );
+  const allPageSelected =
+    pagedAccountIds.length > 0 && pageSelectedCount === pagedAccountIds.length;
+  const somePageSelected = pageSelectedCount > 0 && !allPageSelected;
+
   const detailAccount = useMemo(
     () =>
       detailAccountId == null
@@ -442,10 +697,11 @@ export default function GrokAccounts({
         : (accounts.find((a) => a.id === detailAccountId) ?? null),
     [accounts, detailAccountId],
   );
+  // 详情左右切换按完整排序列表，不限于当前页。
   const detailNavIndex = useMemo(() => {
     if (detailAccountId == null) return -1;
-    return filteredAccounts.findIndex((a) => a.id === detailAccountId);
-  }, [detailAccountId, filteredAccounts]);
+    return sortedAccounts.findIndex((a) => a.id === detailAccountId);
+  }, [detailAccountId, sortedAccounts]);
   const openAccountDetail = useCallback((account: AccountRow) => {
     setDetailAccountId(account.id);
   }, []);
@@ -454,12 +710,23 @@ export default function GrokAccounts({
   }, []);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex <= 0) return;
-    setDetailAccountId(filteredAccounts[detailNavIndex - 1]?.id ?? null);
-  }, [detailNavIndex, filteredAccounts]);
+    setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
+  }, [detailNavIndex, sortedAccounts]);
   const goDetailNext = useCallback(() => {
-    if (detailNavIndex < 0 || detailNavIndex >= filteredAccounts.length - 1) return;
-    setDetailAccountId(filteredAccounts[detailNavIndex + 1]?.id ?? null);
-  }, [detailNavIndex, filteredAccounts]);
+    if (detailNavIndex < 0 || detailNavIndex >= sortedAccounts.length - 1) return;
+    setDetailAccountId(sortedAccounts[detailNavIndex + 1]?.id ?? null);
+  }, [detailNavIndex, sortedAccounts]);
+
+  const toggleSort = useCallback((key: GrokSortKey) => {
+    setSortKey((current) => {
+      if (current === key) {
+        setSortDir((dir) => (dir === "desc" ? "asc" : "desc"));
+        return current;
+      }
+      setSortDir(key === "group" || key === "updated" ? "asc" : "desc");
+      return key;
+    });
+  }, []);
 
   useEffect(() => {
     if (detailAccountId == null) return;
@@ -468,20 +735,11 @@ export default function GrokAccounts({
     }
   }, [accounts, detailAccountId]);
 
-  const filteredSelectedCount = useMemo(
-    () => filteredIds.reduce((n, id) => n + (selected.has(id) ? 1 : 0), 0),
-    [filteredIds, selected],
-  );
-  const allFilteredSelected =
-    filteredIds.length > 0 && filteredSelectedCount === filteredIds.length;
-  const someFilteredSelected =
-    filteredSelectedCount > 0 && !allFilteredSelected;
-
   useEffect(() => {
     if (selectAllRef.current) {
-      selectAllRef.current.indeterminate = someFilteredSelected;
+      selectAllRef.current.indeterminate = somePageSelected;
     }
-  }, [someFilteredSelected]);
+  }, [somePageSelected]);
 
   const toggleSelect = useCallback((id: number) => {
     setSelected((prev) => {
@@ -495,16 +753,46 @@ export default function GrokAccounts({
   const toggleSelectAll = useCallback(() => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (allFilteredSelected) {
-        for (const id of filteredIds) next.delete(id);
+      if (allPageSelected) {
+        for (const id of pagedAccountIds) next.delete(id);
       } else {
-        for (const id of filteredIds) next.add(id);
+        for (const id of pagedAccountIds) next.add(id);
       }
       return next;
     });
-  }, [allFilteredSelected, filteredIds]);
+  }, [allPageSelected, pagedAccountIds]);
 
   const clearSelection = useCallback(() => setSelected(new Set()), []);
+
+  // 行回调经由 ref 转发:rowHandlers 引用恒定(memo 行不因父组件重渲染而失效),
+  // ref.current 每次渲染刷新,始终指向最新的处理函数。
+  const rowHandlersRef = useRef<GrokRowHandlers>(null as unknown as GrokRowHandlers);
+  rowHandlersRef.current = {
+    toggleSelect,
+    openDetail: openAccountDetail,
+    test: (account) => setTestingAccount(account),
+    usage: (account) => setUsageAccount(account),
+    refresh: (account) => void handleRefresh(account),
+    toggleEnabled: (account) => void handleToggleEnabled(account),
+    // openEdit/handleRefresh 等在组件体更靠后定义,这里一律用闭包延迟取值,避开 TDZ。
+    edit: (account) => openEdit(account),
+    remove: (account) => void handleDelete(account),
+    usageRefreshed: () => void reload(),
+  };
+  const rowHandlers = useMemo<GrokRowHandlers>(
+    () => ({
+      toggleSelect: (id) => rowHandlersRef.current.toggleSelect(id),
+      openDetail: (account) => rowHandlersRef.current.openDetail(account),
+      test: (account) => rowHandlersRef.current.test(account),
+      usage: (account) => rowHandlersRef.current.usage(account),
+      refresh: (account) => rowHandlersRef.current.refresh(account),
+      toggleEnabled: (account) => rowHandlersRef.current.toggleEnabled(account),
+      edit: (account) => rowHandlersRef.current.edit(account),
+      remove: (account) => rowHandlersRef.current.remove(account),
+      usageRefreshed: () => rowHandlersRef.current.usageRefreshed(),
+    }),
+    [],
+  );
 
   const credentialReady =
     addMethod === "api_key"
@@ -665,11 +953,13 @@ export default function GrokAccounts({
         // （用户从 API Key 模式切过来时不再上送）。
         base_url: isApiKey ? form.base_url : "",
         auth_kind: isApiKey ? "api_key" : "oauth",
+        group_ids: importGroupIds,
       });
       showToast(t("grok.addSuccess"));
       setShowAdd(false);
       resetAddForm();
       void reload();
+      scheduleUsageSettleReloads();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
     } finally {
@@ -687,11 +977,13 @@ export default function GrokAccounts({
         base_url: form.base_url?.trim() || undefined,
         models: form.models?.length ? form.models : undefined,
         proxy_url: form.proxy_url?.trim() || undefined,
+        group_ids: importGroupIds,
       });
       setSsoResult(res);
       if (res.imported > 0) {
         showToast(t("grok.ssoImportDone", { imported: res.imported, total: res.total }));
         void reload();
+        scheduleUsageSettleReloads();
       }
       if (res.imported === res.total) {
         // 全部成功：清空输入，方便继续导入下一批
@@ -712,24 +1004,108 @@ export default function GrokAccounts({
       failed: number;
       items: GrokSSOImportItem[];
     }>,
+    totalItems = 0,
+  ) => runImportChunks([fn], totalItems);
+
+  // runImportChunks 按分片顺序调用导入接口并合并结果。
+  // 分片是为了避开中间层超时：后端单次上限已放宽到 5000，但一个请求要串行落库
+  // 几千条，墙钟时间会长到浏览器/反代先断开，用户既看不到进度也不知道进了多少。
+  // 每片结束就把已合并的结果写回去，中途失败也能看到前面那些片的明细。
+  // totalItems 是全部待导入条数(调用方按文件/行数预先算好),用于右上角进度浮层
+  // (与 Codex 账号页批量操作同款);传 0 则进度条按分片完成时的累计条数走。
+  const runImportChunks = async (
+    chunks: Array<
+      () => Promise<{
+        total: number;
+        imported: number;
+        failed: number;
+        items: GrokSSOImportItem[];
+      }>
+    >,
+    totalItems = 0,
   ) => {
+    if (chunks.length === 0) return;
     setImportBusy(true);
     setImportResult(null);
     setShowImportPicker(false);
+    setImportProgress(
+      chunks.length > 1 ? { done: 0, total: chunks.length } : null,
+    );
+    const progressTitle = t("grok.importProgressTitle");
+    reportOperationEvent(progressTitle, {
+      type: "start",
+      action: "grok_import",
+      current: 0,
+      total: totalItems,
+    });
+    const merged = {
+      total: 0,
+      imported: 0,
+      failed: 0,
+      items: [] as GrokSSOImportItem[],
+    };
+    const reportMerged = (type: "progress" | "complete", error?: string) =>
+      reportOperationEvent(progressTitle, {
+        type,
+        action: "grok_import",
+        current: merged.total,
+        total: Math.max(totalItems, merged.total),
+        success: merged.imported,
+        failed: merged.failed,
+        error,
+      });
     try {
-      const res = await fn();
-      setImportResult(res);
-      if (res.imported > 0) {
+      for (let i = 0; i < chunks.length; i++) {
+        const res = await chunks[i]();
+        merged.total += res.total ?? 0;
+        merged.imported += res.imported ?? 0;
+        merged.failed += res.failed ?? 0;
+        merged.items = merged.items.concat(res.items ?? []);
+        if (chunks.length > 1) {
+          setImportProgress({ done: i + 1, total: chunks.length });
+        }
+        reportMerged(i === chunks.length - 1 ? "complete" : "progress");
+      }
+      // 全部成功时不再弹明细弹窗(右上角进度浮层已给出结果);
+      // 有失败才弹,保留逐号失败原因供排查。
+      if (merged.failed > 0) {
+        setImportResult({ ...merged, items: [...merged.items] });
+      }
+      if (merged.imported > 0) {
         showToast(
-          t("grok.fileImportDone", { imported: res.imported, total: res.total }),
+          t("grok.fileImportDone", {
+            imported: merged.imported,
+            total: merged.total,
+          }),
         );
         void reload();
+        scheduleUsageSettleReloads();
       }
     } catch (err) {
-      showToast(getErrorMessage(err), "error");
+      const message = getErrorMessage(err);
+      showToast(message, "error");
+      // 中途失败:浮层收尾并带上错误,已完成分片的结果留在弹窗里。
+      reportMerged("complete", message);
+      if (merged.total > 0) {
+        setImportResult({ ...merged, items: [...merged.items] });
+      }
+      if (merged.imported > 0) {
+        void reload();
+        scheduleUsageSettleReloads();
+      }
     } finally {
       setImportBusy(false);
+      setImportProgress(null);
     }
+  };
+
+  // chunkList 把待导入项切成固定大小的分片。
+  const chunkList = <T,>(items: T[], size: number): T[][] => {
+    const chunks: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+      chunks.push(items.slice(i, i + size));
+    }
+    return chunks;
   };
 
   // JSON 凭据文件（CPA / auth.json，可多选）
@@ -739,15 +1115,34 @@ export default function GrokAccounts({
       Array.from(fileList).map((file) => file.text()),
     );
     if (authFileInputRef.current) authFileInputRef.current.value = "";
-    await runImport(() => api.batchImportGrokAccounts({ files }));
+    await runImportChunks(
+      chunkList(files, GROK_IMPORT_CHUNK_SIZE).map(
+        (part) => () =>
+          api.batchImportGrokAccounts({
+            files: part,
+            group_ids: importGroupIds,
+          }),
+      ),
+      files.length,
+    );
   };
+
+  // countImportLines 统计文本导入的有效行数(空行/注释行不算),供进度条总数。
+  const countImportLines = (text: string) =>
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#")).length;
 
   // sso.txt（每行一个 sso token，自动转 Build 账号）
   const handleImportSsoFile = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
     const text = await fileList[0].text();
     if (ssoFileInputRef.current) ssoFileInputRef.current.value = "";
-    await runImport(() => api.importGrokSSO({ tokens: text }));
+    await runImport(
+      () => api.importGrokSSO({ tokens: text, group_ids: importGroupIds }),
+      countImportLines(text),
+    );
   };
 
   // refreshtoken.txt（每行一个 refresh_token，刷出 OAuth 账号）
@@ -755,7 +1150,26 @@ export default function GrokAccounts({
     if (!fileList || fileList.length === 0) return;
     const text = await fileList[0].text();
     if (refreshFileInputRef.current) refreshFileInputRef.current.value = "";
-    await runImport(() => api.importGrokRefreshTokens({ tokens: text }));
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    if (lines.length === 0) {
+      await runImport(() =>
+        api.importGrokRefreshTokens({ tokens: text, group_ids: importGroupIds }),
+      );
+      return;
+    }
+    await runImportChunks(
+      chunkList(lines, GROK_IMPORT_CHUNK_SIZE).map(
+        (part) => () =>
+          api.importGrokRefreshTokens({
+            tokens: part.join("\n"),
+            group_ids: importGroupIds,
+          }),
+      ),
+      lines.length,
+    );
   };
 
   const scheduleDevicePoll = useCallback(
@@ -781,6 +1195,7 @@ export default function GrokAccounts({
               setShowAdd(false);
               resetAddForm();
               void reload();
+              scheduleUsageSettleReloads();
               return;
             }
             // pending — continue
@@ -805,7 +1220,7 @@ export default function GrokAccounts({
         })();
       }, delay);
     },
-    [form.name, form.proxy_url, reload, showToast, stopDevicePoll, t],
+    [form.name, form.proxy_url, reload, scheduleUsageSettleReloads, showToast, stopDevicePoll, t],
   );
 
   const handleDeviceStart = async () => {
@@ -935,14 +1350,68 @@ export default function GrokAccounts({
     }
   };
 
+  // 导出 Grok 账号凭据：有勾选则导出选中，否则导出全部。
+  // 单账号后端给裸 JSON，多账号给 ZIP（内部每账号一个 <邮箱>.json）。
+  // 文件名取服务端 Content-Disposition，命名规则只在后端一处维护。
+  const handleExport = async () => {
+    if (accounts.length === 0) return;
+    const ids = selected.size > 0 ? Array.from(selected) : undefined;
+    setExporting(true);
+    try {
+      const { blob, filename } = await api.exportGrokAccounts(ids);
+      const count = ids ? ids.length : accounts.length;
+      const fallback = `codex2api-grok-${new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .slice(0, 19)}-${count}.${blob.type.includes("zip") ? "zip" : "json"}`;
+      downloadBlob(blob, filename || fallback);
+      showToast(t("grok.exportSuccess", { count }));
+    } catch (err) {
+      showToast(
+        t("grok.exportFailed", { error: getErrorMessage(err) }),
+        "error",
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const handleBatchTest = async (testIds?: number[]) => {
     if (accounts.length === 0) return;
+
+    // 必须显式传 ids，否则后端会连 Codex 账号一起测。
+    // 范围优先级：显式 ids → 已选 → 当前筛选 → 全部（后两者要确认）。
+    let ids: number[] = [];
+    if (testIds && testIds.length > 0) {
+      ids = testIds;
+    } else if (selected.size > 0) {
+      ids = Array.from(selected);
+    } else if (sortedAccounts.length < accounts.length) {
+      const confirmed = await confirm({
+        title: t("grok.batchTestFilteredTitle"),
+        description: t("grok.batchTestFilteredDesc", {
+          count: sortedAccounts.length,
+        }),
+        confirmText: t("accounts.batchTest"),
+      });
+      if (!confirmed) return;
+      ids = sortedAccounts.map((a) => a.id);
+    } else {
+      const confirmed = await confirm({
+        title: t("grok.batchTestAllTitle"),
+        description: t("grok.batchTestAllDesc", { count: accounts.length }),
+        confirmText: t("accounts.batchTest"),
+        tone: "destructive",
+        confirmVariant: "destructive",
+      });
+      if (!confirmed) return;
+      ids = accounts.map((a) => a.id);
+    }
+    ids = resolveChannelBatchTestAccountIDs(accounts, "grok", ids);
+    if (ids.length === 0) return;
+
     setBatchTesting(true);
     try {
-      // 未指定则测当前 Grok 账号全集——必须显式传 ids，否则后端会连 Codex 账号一起测。
-      const ids =
-        testIds && testIds.length > 0 ? testIds : accounts.map((a) => a.id);
-      // 流式调用驱动右上角进度浮层（与 Codex 账号页一致）。
       const result = await runStreamingOperation(
         "/accounts/batch-test?stream=true",
         { ids },
@@ -971,7 +1440,7 @@ export default function GrokAccounts({
 
   const handleBatchRefresh = async () => {
     // 仅 OAuth 账号可刷新（API Key 无 refresh_token），先过滤避免徒增失败计数。
-    const oauthIds = filteredAccounts
+    const oauthIds = sortedAccounts
       .filter((a) => selected.has(a.id) && a.grok_auth_kind === "oauth")
       .map((a) => a.id);
     if (oauthIds.length === 0) {
@@ -1113,6 +1582,12 @@ export default function GrokAccounts({
         progress={operationProgress}
         onClose={closeOperationProgress}
       />
+      <OperationResultsModal
+        state={showOperationResults ? operationResults : null}
+        accounts={accounts}
+        channel="grok"
+        onClose={closeOperationResults}
+      />
       <StateShell
         variant="page"
         loading={loading}
@@ -1147,7 +1622,12 @@ export default function GrokAccounts({
                 )}
                 <span className="hidden sm:inline">
                   {importBusy
-                    ? t("grok.fileImporting")
+                    ? importProgress
+                      ? t("grok.fileImportProgress", {
+                          done: importProgress.done,
+                          total: importProgress.total,
+                        })
+                      : t("grok.fileImporting")
                     : t("grok.fileImportBtn")}
                 </span>
               </Button>
@@ -1166,6 +1646,38 @@ export default function GrokAccounts({
                     : t("accounts.testConnection")}
                 </span>
               </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={exporting || accounts.length === 0}
+                onClick={() => void handleExport()}
+                title={t("grok.exportHint")}
+              >
+                {exporting ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Download className="size-3.5" />
+                )}
+                <span className="hidden sm:inline">
+                  {selected.size > 0
+                    ? t("grok.exportSelectedBtn", { count: selected.size })
+                    : t("grok.exportBtn")}
+                </span>
+              </Button>
+              <label
+                className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-muted-foreground"
+                title={t("accounts.operationResultsPreferenceHint")}
+              >
+                <Switch
+                  checked={showOperationResults}
+                  onCheckedChange={onShowOperationResultsChange}
+                  disabled={!onShowOperationResultsChange}
+                  aria-label={t("accounts.operationResultsPreference")}
+                />
+                <span className="hidden lg:inline">
+                  {t("accounts.operationResultsPreference")}
+                </span>
+              </label>
               <Button
                 variant="outline"
                 size="sm"
@@ -1304,8 +1816,9 @@ export default function GrokAccounts({
                 [
                   ["all", t("accounts.filterAll")],
                   ["free", t("grok.planFree")],
-                  ["premium", t("grok.planPremium")],
-                  ["api", t("grok.planApi")],
+                  ["supergrok", t("grok.planSuperGrok")],
+                  ["supergrok_heavy", t("grok.planSuperGrokHeavy")],
+                  ["supergrok_lite", t("grok.planSuperGrokLite")],
                   ["other", t("grok.planOther")],
                 ] as const
               ).map(([key, label]) => (
@@ -1313,6 +1826,7 @@ export default function GrokAccounts({
                   key={key}
                   type="button"
                   onClick={() => setPlanFilter(key)}
+                  aria-pressed={planFilter === key}
                   className={cn(
                     "shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors",
                     planFilter === key
@@ -1324,6 +1838,12 @@ export default function GrokAccounts({
                 </button>
               ))}
             </div>
+            <AccountGroupFilterSelect
+              className="w-full min-w-0 sm:w-40"
+              groups={allGroups}
+              value={groupFilter}
+              onChange={setGroupFilter}
+            />
             <div className="hidden shrink-0 items-center rounded-md border border-border bg-muted/50 p-0.5 lg:inline-flex lg:ml-auto">
               {(
                 [
@@ -1350,6 +1870,42 @@ export default function GrokAccounts({
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1">
+            {(
+              [
+                ["usage", t("grok.sortUsage"), t("grok.sortUsageHint")],
+                [
+                  "requests",
+                  t("grok.sortRequests"),
+                  t("grok.sortRequestsHint"),
+                ],
+                ["updated", t("grok.sortUpdated"), t("grok.sortUpdatedHint")],
+                ["group", t("grok.sortGroup"), t("grok.sortGroupHint")],
+              ] as const
+            ).map(([key, label, hint]) => (
+              <button
+                key={key}
+                type="button"
+                title={hint}
+                aria-pressed={sortKey === key}
+                onClick={() => toggleSort(key)}
+                className={cn(
+                  "inline-flex h-8 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors",
+                  sortKey === key
+                    ? "border-primary/30 bg-primary/10 text-primary"
+                    : "border-border bg-background text-muted-foreground hover:border-primary/25 hover:bg-accent/50 hover:text-foreground",
+                )}
+              >
+                {label}
+                {sortKey === key ? (
+                  <span aria-hidden="true">
+                    {sortDir === "desc" ? "↓" : "↑"}
+                  </span>
+                ) : null}
+              </button>
+            ))}
           </div>
         </div>
 
@@ -1443,7 +1999,7 @@ export default function GrokAccounts({
 
         <StateShell
           variant="section"
-          isEmpty={filteredAccounts.length === 0}
+          isEmpty={sortedAccounts.length === 0}
           emptyTitle={
             accounts.length === 0
               ? t("grok.emptyTitle")
@@ -1472,7 +2028,12 @@ export default function GrokAccounts({
                     <Upload className="size-3.5" />
                   )}
                   {importBusy
-                    ? t("grok.fileImporting")
+                    ? importProgress
+                      ? t("grok.fileImportProgress", {
+                          done: importProgress.done,
+                          total: importProgress.total,
+                        })
+                      : t("grok.fileImporting")
                     : t("grok.fileImportBtn")}
                 </Button>
               </div>
@@ -1484,6 +2045,8 @@ export default function GrokAccounts({
                   setStatusFilter("all");
                   setAuthFilter("all");
                   setPlanFilter("all");
+                  setGroupFilter(EMPTY_ACCOUNT_GROUP_FILTER);
+                  setSortKey(null);
                 }}
               >
                 {t("grok.clearFilters")}
@@ -1491,7 +2054,7 @@ export default function GrokAccounts({
             )
           }
         >
-          {viewMode === "table" ? (
+          {viewMode === "table" && isDesktop ? (
             <div className="data-table-shell hidden lg:block">
               <Table className="[&_td]:px-2.5 [&_th]:px-2.5 [&_td]:py-4">
                 <TableHeader>
@@ -1503,7 +2066,7 @@ export default function GrokAccounts({
                         className="size-4 cursor-pointer rounded border-border accent-primary"
                         aria-label={t("accounts.selectAll")}
                         title={t("accounts.selectAll")}
-                        checked={allFilteredSelected}
+                        checked={allPageSelected}
                         onChange={toggleSelectAll}
                       />
                     </TableHead>
@@ -1519,17 +2082,41 @@ export default function GrokAccounts({
                     <TableHead className="text-[13px] font-semibold">
                       {t("grok.colStatus")}
                     </TableHead>
-                    <TableHead className="text-[13px] font-semibold">
-                      {t("accounts.requests")}
+                    <TableHead
+                      className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                      onClick={() => toggleSort("requests")}
+                    >
+                      {t("accounts.requests")}{" "}
+                      {sortKey === "requests"
+                        ? sortDir === "desc"
+                          ? "↓"
+                          : "↑"
+                        : ""}
                     </TableHead>
-                    <TableHead className="min-w-[170px] text-[13px] font-semibold">
-                      {t("accounts.usage")}
+                    <TableHead
+                      className="min-w-[170px] cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                      onClick={() => toggleSort("usage")}
+                    >
+                      {t("accounts.usage")}{" "}
+                      {sortKey === "usage"
+                        ? sortDir === "desc"
+                          ? "↓"
+                          : "↑"
+                        : ""}
                     </TableHead>
                     <TableHead className="text-[13px] font-semibold">
                       {t("grok.colModels")}
                     </TableHead>
-                    <TableHead className="text-[13px] font-semibold">
-                      {t("grok.colUpdated")}
+                    <TableHead
+                      className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                      onClick={() => toggleSort("updated")}
+                    >
+                      {t("grok.colUpdated")}{" "}
+                      {sortKey === "updated"
+                        ? sortDir === "desc"
+                          ? "↓"
+                          : "↑"
+                        : ""}
                     </TableHead>
                     <TableHead className="text-right text-[13px] font-semibold">
                       {t("accounts.actions")}
@@ -1537,58 +2124,60 @@ export default function GrokAccounts({
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredAccounts.map((account, index) => (
-                    <GrokAccountTableRow
+                  {pagedAccounts.map((account, index) => (
+                    <MemoGrokAccountTableRow
                       key={account.id}
                       account={account}
-                      sequence={index + 1}
+                      allGroups={allGroups}
+                      sequence={(currentPage - 1) * pageSize + index + 1}
                       busy={busyId === account.id}
                       batchTesting={batchTesting}
                       selected={selected.has(account.id)}
                       detailOpen={detailAccountId === account.id}
-                      onToggleSelect={() => toggleSelect(account.id)}
-                      onOpenDetail={() => openAccountDetail(account)}
                       healthBuckets={healthBars[String(account.id)]}
-                      onTest={() => setTestingAccount(account)}
-                      onUsage={() => setUsageAccount(account)}
-                      onRefresh={() => void handleRefresh(account)}
-                      onToggleEnabled={() => void handleToggleEnabled(account)}
-                      onEdit={() => openEdit(account)}
-                      onDelete={() => void handleDelete(account)}
-                      onUsageRefreshed={() => void reload()}
+                      handlers={rowHandlers}
                     />
                   ))}
                 </TableBody>
               </Table>
             </div>
           ) : null}
-          <div
-            className={cn(
-              "grid grid-cols-1 gap-3 xl:grid-cols-2",
-              viewMode === "table" && "lg:hidden",
-            )}
-          >
-            {filteredAccounts.map((account, index) => (
-              <GrokAccountCard
-                key={account.id}
-                account={account}
-                sequence={index + 1}
-                busy={busyId === account.id}
-                batchTesting={batchTesting}
-                selected={selected.has(account.id)}
-                detailOpen={detailAccountId === account.id}
-                onToggleSelect={() => toggleSelect(account.id)}
-                onOpenDetail={() => openAccountDetail(account)}
-                onTest={() => setTestingAccount(account)}
-                onUsage={() => setUsageAccount(account)}
-                onRefresh={() => void handleRefresh(account)}
-                onToggleEnabled={() => void handleToggleEnabled(account)}
-                onEdit={() => openEdit(account)}
-                onDelete={() => void handleDelete(account)}
-                onUsageRefreshed={() => void reload()}
-              />
-            ))}
-          </div>
+          {/* 桌面 table 模式下卡片列表原先只是 CSS 隐藏(lg:hidden),React 仍然
+              渲染了整份 DOM——大号池下等于双倍渲染。按视口只渲染可见的那一份。 */}
+          {viewMode !== "table" || !isDesktop ? (
+            <div
+              className={cn(
+                "grid grid-cols-1 gap-3 xl:grid-cols-2",
+                viewMode === "table" && "lg:hidden",
+              )}
+            >
+              {pagedAccounts.map((account, index) => (
+                <MemoGrokAccountCard
+                  key={account.id}
+                  account={account}
+                  allGroups={allGroups}
+                  sequence={(currentPage - 1) * pageSize + index + 1}
+                  busy={busyId === account.id}
+                  batchTesting={batchTesting}
+                  selected={selected.has(account.id)}
+                  detailOpen={detailAccountId === account.id}
+                  handlers={rowHandlers}
+                />
+              ))}
+            </div>
+          ) : null}
+          <Pagination
+            page={currentPage}
+            totalPages={totalPages}
+            onPageChange={setPage}
+            totalItems={sortedAccounts.length}
+            pageSize={pageSize}
+            pageSizeOptions={pageSizeOptions}
+            onPageSizeChange={(nextPageSize) => {
+              setPageSize(nextPageSize);
+              setPage(1);
+            }}
+          />
         </StateShell>
       </StateShell>
 
@@ -2074,6 +2663,28 @@ export default function GrokAccounts({
               </div>
             </>
           )}
+          {addMethod !== "oauth_link" && (
+            <div className="space-y-1.5 border-t border-border pt-4">
+              <label className="block text-sm font-medium text-muted-foreground">
+                {t("accounts.importGroupsLabel")}
+              </label>
+              <AccountGroupMultiSelect
+                groups={allGroups}
+                value={importGroupIds}
+                onChange={setImportGroupIds}
+                allLabel={t("accounts.groupsUnbound")}
+                selectedLabel={t("accounts.groupsSelected", {
+                  count: importGroupIds.length,
+                })}
+                placeholder={t("accounts.importGroupsPlaceholder")}
+                emptyLabel={t("accounts.groupsNone")}
+                emptyHint={t("accounts.groupsSelectHint")}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("accounts.importGroupsHint")}
+              </p>
+            </div>
+          )}
         </div>
       </Modal>
 
@@ -2095,7 +2706,11 @@ export default function GrokAccounts({
 
       <AccountDetailSheet
         account={detailAccount}
-        groups={[]}
+        groups={
+          detailAccount
+            ? resolveAccountGroups(detailAccount.group_ids, allGroups)
+            : []
+        }
         healthBuckets={
           detailAccount ? healthBars[String(detailAccount.id)] : undefined
         }
@@ -2111,7 +2726,7 @@ export default function GrokAccounts({
         }
         canGoPrev={detailNavIndex > 0}
         canGoNext={
-          detailNavIndex >= 0 && detailNavIndex < filteredAccounts.length - 1
+          detailNavIndex >= 0 && detailNavIndex < sortedAccounts.length - 1
         }
         refreshing={detailAccount ? busyId === detailAccount.id : false}
         onClose={closeAccountDetail}
@@ -2167,6 +2782,26 @@ export default function GrokAccounts({
         <p className="mb-4 text-sm text-muted-foreground">
           {t("grok.importPickerDesc")}
         </p>
+        <div className="mb-4 space-y-1.5">
+          <label className="text-xs font-medium text-foreground">
+            {t("accounts.importGroupsLabel")}
+          </label>
+          <AccountGroupMultiSelect
+            groups={allGroups}
+            value={importGroupIds}
+            onChange={setImportGroupIds}
+            allLabel={t("accounts.groupsUnbound")}
+            selectedLabel={t("accounts.groupsSelected", {
+              count: importGroupIds.length,
+            })}
+            placeholder={t("accounts.importGroupsPlaceholder")}
+            emptyLabel={t("accounts.groupsNone")}
+            emptyHint={t("accounts.groupsSelectHint")}
+          />
+          <p className="text-[11px] text-muted-foreground">
+            {t("accounts.importGroupsHint")}
+          </p>
+        </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <button
             type="button"
@@ -2415,8 +3050,105 @@ export default function GrokAccounts({
   );
 }
 
+// Memo 包装层:props 全部是稳定引用/原始值(handlers 经 ref 转发恒定),
+// 勾选、单行 busy 等局部状态变化只重渲染受影响的行,而不是整页行×2。
+// groups 在包装层内按账号 memo 解析,避免父组件每次渲染生成新数组打穿 memo。
+const MemoGrokAccountTableRow = memo(function MemoGrokAccountTableRow({
+  account,
+  allGroups,
+  sequence,
+  busy,
+  batchTesting,
+  selected,
+  detailOpen,
+  healthBuckets,
+  handlers,
+}: {
+  account: AccountRow;
+  allGroups: AccountGroup[];
+  sequence: number;
+  busy: boolean;
+  batchTesting: boolean;
+  selected: boolean;
+  detailOpen: boolean;
+  healthBuckets?: AccountHealthBucket[];
+  handlers: GrokRowHandlers;
+}) {
+  const groups = useMemo(
+    () => resolveAccountGroups(account.group_ids, allGroups),
+    [account.group_ids, allGroups],
+  );
+  return (
+    <GrokAccountTableRow
+      account={account}
+      groups={groups}
+      sequence={sequence}
+      busy={busy}
+      batchTesting={batchTesting}
+      selected={selected}
+      detailOpen={detailOpen}
+      healthBuckets={healthBuckets}
+      onToggleSelect={() => handlers.toggleSelect(account.id)}
+      onOpenDetail={() => handlers.openDetail(account)}
+      onTest={() => handlers.test(account)}
+      onUsage={() => handlers.usage(account)}
+      onRefresh={() => handlers.refresh(account)}
+      onToggleEnabled={() => handlers.toggleEnabled(account)}
+      onEdit={() => handlers.edit(account)}
+      onDelete={() => handlers.remove(account)}
+      onUsageRefreshed={handlers.usageRefreshed}
+    />
+  );
+});
+
+const MemoGrokAccountCard = memo(function MemoGrokAccountCard({
+  account,
+  allGroups,
+  sequence,
+  busy,
+  batchTesting,
+  selected,
+  detailOpen,
+  handlers,
+}: {
+  account: AccountRow;
+  allGroups: AccountGroup[];
+  sequence: number;
+  busy: boolean;
+  batchTesting: boolean;
+  selected: boolean;
+  detailOpen: boolean;
+  handlers: GrokRowHandlers;
+}) {
+  const groups = useMemo(
+    () => resolveAccountGroups(account.group_ids, allGroups),
+    [account.group_ids, allGroups],
+  );
+  return (
+    <GrokAccountCard
+      account={account}
+      groups={groups}
+      sequence={sequence}
+      busy={busy}
+      batchTesting={batchTesting}
+      selected={selected}
+      detailOpen={detailOpen}
+      onToggleSelect={() => handlers.toggleSelect(account.id)}
+      onOpenDetail={() => handlers.openDetail(account)}
+      onTest={() => handlers.test(account)}
+      onUsage={() => handlers.usage(account)}
+      onRefresh={() => handlers.refresh(account)}
+      onToggleEnabled={() => handlers.toggleEnabled(account)}
+      onEdit={() => handlers.edit(account)}
+      onDelete={() => handlers.remove(account)}
+      onUsageRefreshed={handlers.usageRefreshed}
+    />
+  );
+});
+
 function GrokAccountCard({
   account,
+  groups = [],
   sequence,
   busy,
   batchTesting,
@@ -2433,6 +3165,7 @@ function GrokAccountCard({
   onUsageRefreshed,
 }: {
   account: AccountRow;
+  groups?: AccountGroup[];
   sequence: number;
   busy: boolean;
   batchTesting: boolean;
@@ -2565,7 +3298,8 @@ function GrokAccountCard({
               ? t("grok.authKindOAuthShort")
               : t("grok.authKindApiKey")}
           </span>
-          <GrokPlanBadge plan={account.plan_type} compact />
+          <GrokPlanBadge account={account} compact />
+          <GrokGroupChips groups={groups} />
           {disabled ? (
             <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300">
               <PowerOff className="mr-0.5 size-2.5" />
@@ -2733,6 +3467,7 @@ function GrokAccountActions({
 // 表格行：与 Codex 账号表格同风格的列表布局（仅桌面端渲染）。
 function GrokAccountTableRow({
   account,
+  groups = [],
   sequence,
   busy,
   batchTesting,
@@ -2750,6 +3485,7 @@ function GrokAccountTableRow({
   onUsageRefreshed,
 }: {
   account: AccountRow;
+  groups?: AccountGroup[];
   sequence: number;
   busy: boolean;
   batchTesting: boolean;
@@ -2846,6 +3582,11 @@ function GrokAccountTableRow({
                   : t("grok.authKindApiKey")}
               </span>
             </div>
+            {groups.length > 0 ? (
+              <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+                <GrokGroupChips groups={groups} />
+              </div>
+            ) : null}
             {host ? (
               <div
                 className="max-w-[200px] truncate font-mono text-[11px] text-muted-foreground/75"
@@ -2858,7 +3599,7 @@ function GrokAccountTableRow({
         </div>
       </TableCell>
       <TableCell className="text-center">
-        <GrokPlanBadge plan={account.plan_type} />
+        <GrokPlanBadge account={account} />
       </TableCell>
       <TableCell>
         <div className="space-y-1.5">
@@ -3761,4 +4502,16 @@ function CompactStat({
       </div>
     </button>
   );
+}
+
+// downloadBlob 触发浏览器下载（与 Codex 账号页同款实现）。
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }

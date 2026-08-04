@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -119,8 +120,13 @@ type Account struct {
 	GrokOIDCIssuer    string
 	GrokPrincipalType string
 	GrokPrincipalID   string
-	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头），仅运行时。
-	grokRateLimit *GrokRateLimitSnapshot
+	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头）。
+	// 内存实时更新;dirty 位驱动 store 后台循环按分钟批量落库(grok_rate_limit 凭据)。
+	grokRateLimit      *GrokRateLimitSnapshot
+	grokRateLimitDirty bool
+	// grokContextWindow 是上游 x-grok-context-window 响应头的观测值，用于推导
+	// 客户端压缩阈值。仅内存保留：值只能在收到响应后才知道，落库也救不了首个请求。
+	grokContextWindow int64
 	// grokFreeQuota 是免费额度耗尽 429 解析出的权威用量快照，随 credentials 落库。
 	grokFreeQuota  *GrokFreeQuotaSnapshot
 	Status         AccountStatus
@@ -160,6 +166,9 @@ type Account struct {
 	CreditsUnlimited           bool
 	CreditsOverageLimitReached bool
 	CreditsValid               bool
+	// creditsPersistedKey 是最近一次成功落库的积分快照指纹，用于跳过无变化的写库。
+	// 只比对四个业务字段，不含时间戳——否则每次探针都会写一次库。
+	creditsPersistedKey string
 	// resetCreditsProbedAt 记录最近一次成功 wham 用量探针的时间。
 	// 「主动重置次数」只能通过 wham 探针刷新（普通 /responses 流量不携带该字段），
 	// 因此用它独立判断重置次数是否过期，避免活跃账号因用量快照一直被流量刷新而长期不探针。
@@ -1559,8 +1568,125 @@ func resolveGroupBaseConcurrency(groupIDs []int64, s *Store) int64 {
 	return best
 }
 
+// creditsBalanceValue 解析 wham/usage 返回的积分余额字符串（形如 "1000.0000000000"）。
+// 解析不出来按 0 处理——余额读不懂就当没有，不拿它去放行调度。
+func creditsBalanceValue(raw string) float64 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// creditsAvailableLocked 判断账号当前是否还有可花的积分（需持有 mu 读锁）。
+//
+// CreditsValid=false 表示 wham 探针还没跑过、余额未知，这里按「没有积分」处理：
+// 宁可白等一个用量窗口，也不要把请求送进注定 429 的账号。
+// OverageLimitReached 是上游给的权威「超额额度已用尽」信号，优先于余额数字。
+func (a *Account) creditsAvailableLocked() bool {
+	if !a.CreditsValid || a.CreditsOverageLimitReached {
+		return false
+	}
+	if a.CreditsUnlimited {
+		return true
+	}
+	return a.CreditsHasCredits && creditsBalanceValue(a.CreditsBalance) > 0
+}
+
+// creditSkipsUsageWindowLocked 判断是否用积分顶替用量窗口限流。
+//
+// 两个开关只是「授权用积分顶」，真正放行还要求当下确实有积分可花：Codex 的行为是
+// 套餐额度用尽后转为消耗积分，积分归零就该恢复成真实限流，否则调度会一直把请求
+// 送给一个必然 429 的账号。
 func (a *Account) creditSkipsUsageWindowLocked() bool {
-	return a.CreditEnabled && a.CreditSkipUsageWindow
+	if !(a.CreditEnabled && a.CreditSkipUsageWindow) {
+		return false
+	}
+	return a.creditsAvailableLocked()
+}
+
+// UsingCredits 报告账号是否正在用积分顶替用量窗口限流。
+//
+// 这是与 RuntimeStatus 并列的独立信号，不是一种状态值：账号此刻的状态仍是 active
+// （确实可调度），这个标记只是解释「为什么窗口打满了还可用」。前端据此在状态徽章
+// 旁边并列一个「使用积分」徽章。
+func (a *Account) UsingCredits() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.usingCreditsLocked(time.Now())
+}
+
+// usingCreditsLocked 判断账号是否正处于「用积分顶替限流」状态：用量窗口本身已打满
+// （没有积分的话此刻就是 rate_limited / usage_exhausted），但积分可用所以仍在调度中。
+//
+// 上游驱动的 cooldown（真实 429）与 error 优先：真的被拒说明积分没顶住，
+// 此时状态已是限流/错误，不该再声称在用积分顶。
+func (a *Account) usingCreditsLocked(now time.Time) bool {
+	if !(a.CreditEnabled && a.CreditSkipUsageWindow) || !a.creditsAvailableLocked() {
+		return false
+	}
+	if a.Status == StatusError {
+		return false
+	}
+	// 上游驱动的 cooldown（真实 429）优先：真被拒说明积分没顶住。但本地用量窗口判罚
+	// 产生的 cooldown 不算——那正是积分要顶替的东西，一刀切会让徽章在最常见的场景
+	// （发现账号限流了才去开开关）永远不出现。
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) && !a.usageWindowCooldownLocked() {
+		return false
+	}
+	// 三条用量窗口限流路径都算：Free 7d 耗尽、premium 5h 打满、以及全套餐通用的
+	// 7d 打满（MarkUsage7dRateLimited 那条）。少算哪条，那条就会显示成普通 active。
+	return a.rawUsageExhaustedLocked() ||
+		a.rawPremium5hRateLimitedLocked(now) ||
+		a.rawUsageWindow7dExhaustedLocked(now)
+}
+
+// rawUsageExhaustedLocked 是不考虑任何跳过开关的 Free 7d 用量耗尽判定。
+func (a *Account) rawUsageExhaustedLocked() bool {
+	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
+}
+
+// usageWindowCooldownLocked 判断当前 cooldown 是否由本地用量窗口判罚产生，而非上游 429。
+//
+// 两者共用 "rate_limited" 这个 reason，光看 reason 分不开。可靠的区分点是判罚时长：
+// MarkUsage7dRateLimited 直接把 CooldownUtil 设成 Reset7dAt，而上游 429 的冷却时长
+// 来自 Retry-After / 限流决策，不会正好落在 7d 重置时刻上。留 2s 容差吸收计算抖动。
+func (a *Account) usageWindowCooldownLocked() bool {
+	if a.Status != StatusCooldown {
+		return false
+	}
+	switch a.CooldownReason {
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
+	default:
+		return false
+	}
+	if a.Reset7dAt.IsZero() {
+		return false
+	}
+	drift := a.CooldownUtil.Sub(a.Reset7dAt)
+	return drift > -2*time.Second && drift < 2*time.Second
+}
+
+// UsageWindowCooldown 报告当前 cooldown 是否由本地用量窗口判罚产生。
+func (a *Account) UsageWindowCooldown() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.usageWindowCooldownLocked()
+}
+
+// rawUsageWindow7dExhaustedLocked 判断 7d 窗口是否打满到会被 MarkUsage7dRateLimited
+// 判罚的程度（与那里的条件对齐：重置时间已过就不再判罚）。
+func (a *Account) rawUsageWindow7dExhaustedLocked(now time.Time) bool {
+	if !a.UsagePercent7dValid || a.UsagePercent7d < 100 {
+		return false
+	}
+	return a.Reset7dAt.IsZero() || a.Reset7dAt.After(now)
 }
 
 func (a *Account) recomputeEffectiveIgnoreUsageLimitStatus(global bool) {
@@ -1620,10 +1746,7 @@ func (a *Account) usageExhaustedLockedAt(now time.Time) bool {
 	if a.skipsUsageWindowLimitsLocked() {
 		return false
 	}
-	if !a.UsagePercent7dValid || !strings.EqualFold(a.PlanType, "free") || a.UsagePercent7d < 100 {
-		return false
-	}
-	return a.Reset7dAt.IsZero() || a.Reset7dAt.After(now)
+	return a.rawUsageExhaustedLocked() && (a.Reset7dAt.IsZero() || a.Reset7dAt.After(now))
 }
 
 // NeedsRefresh 检查 AT 是否需要刷新（过期前 5 分钟刷新）
@@ -1708,6 +1831,15 @@ func (a *Account) RuntimeStatusWithUsageProbeMaxAge(maxAge time.Duration) string
 	now := time.Now()
 	if a.healthTierLocked() == HealthTierBanned {
 		return "unauthorized"
+	}
+	// 用积分顶替限流时，显示仍是限流：用量窗口客观上确实打满了，谎称 active 会让人
+	// 以为额度没用完。真正的差别由并列的 UsingCredits 标记表达——前端在限流徽章后面
+	// 挂一个积分徽章，而调度侧（IsAvailable / 冷却）走的是被抑制后的判定，账号照常参与调度。
+	if a.usingCreditsLocked(now) {
+		if a.rawUsageExhaustedLocked() {
+			return "usage_exhausted"
+		}
+		return "rate_limited"
 	}
 	// Free 账号 7d 用量耗尽，优先于冷却状态展示
 	if a.usageExhaustedLocked() {
@@ -1921,6 +2053,104 @@ func (a *Account) GetCreditBalance() (balance string, hasCredits, unlimited, ove
 	return a.CreditsBalance, a.CreditsHasCredits, a.CreditsUnlimited, a.CreditsOverageLimitReached, a.CreditsValid
 }
 
+// CreditBalanceSnapshot 是落库到 credentials["codex_credits"] 的积分快照。
+// 积分只能由 wham 探针刷新（普通 /responses 流量不带 credits），不落库的话重启后
+// CreditsValid 归零 → 账号被当成「没积分」→ 积分顶替限流失效、且会被「清理限流账号」
+// 误删，直到下一轮 wham 探针落地才恢复。
+type CreditBalanceSnapshot struct {
+	Balance             string    `json:"balance"`
+	HasCredits          bool      `json:"has_credits"`
+	Unlimited           bool      `json:"unlimited"`
+	OverageLimitReached bool      `json:"overage_limit_reached"`
+	UpdatedAt           time.Time `json:"updated_at"`
+}
+
+// creditBalanceKey 是快照的比对指纹（不含时间戳）。
+func creditBalanceKey(balance string, hasCredits, unlimited, overageReached bool) string {
+	return fmt.Sprintf("%s|%t|%t|%t", balance, hasCredits, unlimited, overageReached)
+}
+
+// MarshalCreditBalanceSnapshot 序列化积分快照，供落库使用。
+func MarshalCreditBalanceSnapshot(snap CreditBalanceSnapshot) (string, error) {
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// RestoreCreditBalanceFromJSON 用库里的积分快照回填账号（重启后恢复）。
+// 空串/解析失败/未探测过（三个布尔全 false 且余额为空）都视为无快照，返回 false，
+// 保持 CreditsValid=false 的「未知」语义，不会凭空造出一个可用余额。
+func (a *Account) RestoreCreditBalanceFromJSON(raw string) bool {
+	if a == nil {
+		return false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	var snap CreditBalanceSnapshot
+	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+		return false
+	}
+	balance := strings.TrimSpace(snap.Balance)
+	if balance == "" && !snap.HasCredits && !snap.Unlimited && !snap.OverageLimitReached {
+		return false
+	}
+	a.mu.Lock()
+	a.CreditsBalance = snap.Balance
+	a.CreditsHasCredits = snap.HasCredits
+	a.CreditsUnlimited = snap.Unlimited
+	a.CreditsOverageLimitReached = snap.OverageLimitReached
+	a.CreditsValid = true
+	// 恢复值本来自库里，指纹一并对齐，避免启动后第一次探针又写一遍同样的内容。
+	a.creditsPersistedKey = creditBalanceKey(snap.Balance, snap.HasCredits, snap.Unlimited, snap.OverageLimitReached)
+	a.mu.Unlock()
+	return true
+}
+
+// PersistCreditBalance 写入积分快照并落库（值无变化时跳过写库）。
+// store 为 nil（单测/无库场景）时只更新内存，行为与 SetCreditBalance 一致。
+func (s *Store) PersistCreditBalance(acc *Account, balance string, hasCredits, unlimited, overageReached bool) {
+	if acc == nil {
+		return
+	}
+	acc.SetCreditBalance(balance, hasCredits, unlimited, overageReached)
+	if s == nil || s.db == nil {
+		return
+	}
+
+	key := creditBalanceKey(balance, hasCredits, unlimited, overageReached)
+	acc.mu.Lock()
+	if acc.creditsPersistedKey == key {
+		acc.mu.Unlock()
+		return
+	}
+	acc.creditsPersistedKey = key
+	acc.mu.Unlock()
+
+	raw, err := MarshalCreditBalanceSnapshot(CreditBalanceSnapshot{
+		Balance:             balance,
+		HasCredits:          hasCredits,
+		Unlimited:           unlimited,
+		OverageLimitReached: overageReached,
+		UpdatedAt:           time.Now(),
+	})
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		err = s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"codex_credits": raw})
+	}
+	if err != nil {
+		// 落库失败就清掉指纹，让下一次探针重试，而不是把"已持久化"错记下来。
+		acc.mu.Lock()
+		acc.creditsPersistedKey = ""
+		acc.mu.Unlock()
+		log.Printf("[账号 %d] 持久化积分快照失败: %v", acc.DBID, err)
+	}
+}
+
 // MarkResetCreditsProbed 记录最近一次成功 wham 用量探针的时间。
 // 调用方应在 wham 探针成功（拿到 usage）后调用，无论本次响应是否带 reset_credits 字段，
 // 因为「能成功拉到 wham」本身就代表重置次数已是最新。
@@ -2059,6 +2289,22 @@ func (a *Account) GroupIDSnapshot() []int64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return cloneInt64Slice(a.GroupIDs)
+}
+
+// InAnyGroup 判断账号是否属于给定分组集合中的任意一个。用于调度热路径上的分组匹配:
+// 与 GroupIDSnapshot 不同,它不复制切片,避免每个候选账号一次分配。
+func (a *Account) InAnyGroup(groups map[int64]struct{}) bool {
+	if a == nil || len(groups) == 0 {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, id := range a.GroupIDs {
+		if _, ok := groups[id]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // applyRefreshedPlanTypeLocked applies a plan parsed from refreshed tokens.
@@ -2592,9 +2838,15 @@ type Store struct {
 	apiKeyGroupsMu                     sync.RWMutex
 	apiKeyAllowedGroups                map[int64][]int64
 	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
+	apiKeyNoAffinityGroups             map[int64][]int64
+	apiKeyNoAffinityGroupSets          map[int64]map[int64]struct{}
 	apiKeyAllowedPlans                 map[int64][]string
 	apiKeyAllowedPlanSets              map[int64]map[string]struct{}
 	apiKeyUpstreamChannels             map[int64]string
+	promptFilterNewAPIBindingsMu       sync.RWMutex
+	promptFilterNewAPIBindings         map[int64]database.PromptFilterNewAPIBinding
+	promptRiskTrustMu                  sync.RWMutex
+	promptRiskTrustPolicies            map[string]database.PromptRiskTrustPolicy
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
 	usageProbeBatch                    atomic.Bool
@@ -2630,9 +2882,12 @@ type Store struct {
 	wg                  sync.WaitGroup
 
 	// 代理池
-	proxyPool        []string // 已启用的代理 URL 列表
-	proxyPoolEnabled bool     // 代理池是否开启
-	proxyRoundRobin  uint64   // 轮询计数器
+	proxyPoolReloadMu sync.Mutex
+	proxyPoolLoader   func(context.Context) ([]*database.ProxyRow, error)
+	proxyPool         []string // 已启用的代理 URL 列表
+	proxyPoolSet      map[string]struct{}
+	proxyPoolEnabled  bool   // 代理池是否开启
+	proxyRoundRobin   uint64 // 轮询计数器
 
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
 	fastScheduler                 atomic.Pointer[FastScheduler]
@@ -3102,18 +3357,22 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	}
 	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 	s := &Store{
-		globalProxy:             settings.ProxyURL,
-		maxConcurrency:          int64(settings.MaxConcurrency),
-		testConcurrency:         int64(settings.TestConcurrency),
-		db:                      db,
-		tokenCache:              tc,
-		backgroundRefreshWakeCh: make(chan struct{}, 1),
-		boundaryProbeWakeCh:     make(chan struct{}, 1),
-		stopCh:                  make(chan struct{}),
-		backgroundCtx:           backgroundCtx,
-		backgroundCancel:        backgroundCancel,
-		proxyPoolEnabled:        settings.ProxyPoolEnabled,
-		sessionBindings:         make(map[string]sessionAffinity),
+		globalProxy:                settings.ProxyURL,
+		maxConcurrency:             int64(settings.MaxConcurrency),
+		testConcurrency:            int64(settings.TestConcurrency),
+		db:                         db,
+		tokenCache:                 tc,
+		backgroundRefreshWakeCh:    make(chan struct{}, 1),
+		boundaryProbeWakeCh:        make(chan struct{}, 1),
+		stopCh:                     make(chan struct{}),
+		backgroundCtx:              backgroundCtx,
+		backgroundCancel:           backgroundCancel,
+		proxyPoolEnabled:           settings.ProxyPoolEnabled,
+		sessionBindings:            make(map[string]sessionAffinity),
+		promptFilterNewAPIBindings: make(map[int64]database.PromptFilterNewAPIBinding),
+	}
+	if db != nil {
+		s.proxyPoolLoader = db.ListEnabledProxies
 	}
 	s.testModel.Store(settings.TestModel)
 	s.testContent.Store(NormalizeTestContent(settings.TestContent))
@@ -3144,6 +3403,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetGrokAffinityMode(grokAffinityModeFromConfig(settings.GrokConfig))
 	s.SetGrokProbeConfig(grokProbeConfigFromConfig(settings.GrokConfig))
 	s.SetGrokMaxRateLimitRetries(grokMaxRateLimitRetriesFromConfig(settings.GrokConfig))
+	SetConfiguredGrokOAuthClientID(grokOAuthClientIDFromConfig(settings.GrokConfig))
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
@@ -3157,11 +3417,6 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
 	}
 	promptFilterCfg, promptFilterAdvancedRaw := promptFilterConfigFromSettings(settings)
-	if s.db != nil {
-		if secret, err := s.db.GetPromptFilterNewAPISecret(context.Background()); err == nil {
-			promptFilterCfg.Advanced.NewAPI.Secret = secret
-		}
-	}
 	if err := s.SetPromptFilterConfigWithAdvancedRaw(promptFilterCfg, promptFilterAdvancedRaw); err != nil {
 		// promptFilterAdvancedRaw is already validated by
 		// promptFilterConfigFromSettings. Keep a defensive fallback so a corrupt
@@ -3220,6 +3475,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 				urls = append(urls, p.URL)
 			}
 			s.proxyPool = urls
+			s.proxyPoolSet = buildProxyPoolSet(urls)
 			log.Printf("代理池已加载: %d 个活跃代理", len(urls))
 		}
 	}
@@ -3730,9 +3986,16 @@ func (s *Store) SetProxyPoolEnabled(enabled bool) {
 
 // ReloadProxyPool 从数据库重新加载代理池
 func (s *Store) ReloadProxyPool() error {
+	s.proxyPoolReloadMu.Lock()
+	defer s.proxyPoolReloadMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	proxies, err := s.db.ListEnabledProxies(ctx)
+	loader := s.proxyPoolLoader
+	if loader == nil {
+		return errors.New("proxy pool loader is not configured")
+	}
+	proxies, err := loader(ctx)
 	if err != nil {
 		return err
 	}
@@ -3742,9 +4005,44 @@ func (s *Store) ReloadProxyPool() error {
 	}
 	s.mu.Lock()
 	s.proxyPool = urls
+	s.proxyPoolSet = buildProxyPoolSet(urls)
 	s.mu.Unlock()
 	log.Printf("代理池已重新加载: %d 个活跃代理", len(urls))
 	return nil
+}
+
+// RemoveProxyURLs immediately removes proxies from the in-memory pool. It uses
+// the same serialization lock as ReloadProxyPool so an older reload snapshot
+// cannot publish the removed URLs afterward.
+func (s *Store) RemoveProxyURLs(proxyURLs []string) {
+	if s == nil {
+		return
+	}
+	removeSet := buildProxyPoolSet(proxyURLs)
+	if len(removeSet) == 0 {
+		return
+	}
+
+	s.proxyPoolReloadMu.Lock()
+	s.mu.Lock()
+	filtered := make([]string, 0, len(s.proxyPool))
+	for _, proxyURL := range s.proxyPool {
+		if _, remove := removeSet[strings.TrimSpace(proxyURL)]; !remove {
+			filtered = append(filtered, proxyURL)
+		}
+	}
+	s.proxyPool = filtered
+	s.proxyPoolSet = buildProxyPoolSet(filtered)
+	s.mu.Unlock()
+	s.proxyPoolReloadMu.Unlock()
+
+	s.sessionMu.Lock()
+	for key, binding := range s.sessionBindings {
+		if _, remove := removeSet[strings.TrimSpace(binding.proxyURL)]; remove {
+			delete(s.sessionBindings, key)
+		}
+	}
+	s.sessionMu.Unlock()
 }
 
 // GetAutoCleanUnauthorized 获取是否自动清理 401 账号
@@ -3932,6 +4230,9 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := s.loadFromDB(ctx); err != nil {
 		return err
 	}
+	if err := s.LoadPromptFilterNewAPIBindings(ctx); err != nil {
+		return fmt.Errorf("加载 NewAPI 平台绑定失败: %w", err)
+	}
 
 	if len(s.accounts) == 0 {
 		log.Println("⚠ 数据库中暂无账号，请通过管理后台添加")
@@ -4054,12 +4355,18 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		// API Key 凭据没有 AT，下方 at!="" 的恢复分支不会执行，这里补齐身份信息
 		account.AccountID = row.GetCredential("account_id")
 		account.Email = row.GetCredential("email")
-		account.PlanType = row.GetCredential("plan_type")
+		if strings.TrimSpace(apiKey) != "" {
+			account.PlanType = "api"
+		} else {
+			account.PlanType = GrokPlanTypeFromAccessToken(at)
+			if account.PlanType == "" {
+				if storedPlan, ok := ResolveGrokPlan(row.GetCredential("plan_type")); ok {
+					account.PlanType = storedPlan.Key
+				}
+			}
+		}
 		if strings.TrimSpace(apiKey) != "" || at != "" {
 			account.HealthTier = HealthTierHealthy
-		}
-		if account.PlanType == "" {
-			account.PlanType = "api"
 		}
 		// billing 探针的周/月用量随 credentials 落库，重启后在此恢复运行时快照
 		// （周额度占用 5h 槽位、月额度占用 7d 槽位，与探针写入端一致）
@@ -4083,6 +4390,14 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 			var snap GrokFreeQuotaSnapshot
 			if err := json.Unmarshal([]byte(raw), &snap); err == nil && snap.LimitTokens > 0 {
 				account.SetGrokFreeQuotaSnapshot(snap)
+			}
+		}
+		// 配额余量快照（x-ratelimit-* 头）重启后恢复,用量进度条不清零。
+		// markDirty=false:恢复值本来自库里,不需要再触发落库。
+		if raw := strings.TrimSpace(row.GetCredential("grok_rate_limit")); raw != "" {
+			var snap GrokRateLimitSnapshot
+			if err := json.Unmarshal([]byte(raw), &snap); err == nil && !snap.UpdatedAt.IsZero() {
+				account.setGrokRateLimitSnapshot(snap, false)
 			}
 		}
 	}
@@ -4131,7 +4446,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.AccessToken = at
 		account.AccountID = row.GetCredential("account_id")
 		account.Email = row.GetCredential("email")
-		account.PlanType = row.GetCredential("plan_type")
+		if !isGrokAccount {
+			account.PlanType = row.GetCredential("plan_type")
+		}
 		if account.Status != StatusError {
 			account.HealthTier = HealthTierHealthy
 		}
@@ -4206,6 +4523,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 			account.SetUsageSnapshot5hAt(parsed, resetAt, usageUpdated5hAt)
 		}
 	}
+	// 恢复积分余额快照：积分只有 wham 探针能刷，不恢复的话重启后账号会被判成
+	// 「没积分」——积分顶替限流失效，还会被「清理限流账号」当成真限流删掉。
+	account.RestoreCreditBalanceFromJSON(row.GetCredential("codex_credits"))
 	if threshold, ok := row.GetCredentialFloat64("auto_pause_5h_threshold"); ok {
 		account.AutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(threshold)
 	}
@@ -4276,6 +4596,8 @@ func (s *Store) StartBackgroundRefresh() {
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
+		// Grok 配额余量快照按分钟批量落库(逐请求都在变,不逐请求写库)。
+		grokRateLimitPersistTicker := time.NewTicker(time.Minute)
 		// 到点即探定时器：始终武装到「最近的限流冷却/窗口重置边界」，倒计时归零即探针刷新。
 		boundaryProbeTimer := time.NewTimer(time.Hour)
 		if !boundaryProbeTimer.Stop() {
@@ -4286,6 +4608,7 @@ func (s *Store) StartBackgroundRefresh() {
 		defer fullUsageCleanupTicker.Stop()
 		defer expiredCleanupTicker.Stop()
 		defer rebuildSchedulerTicker.Stop()
+		defer grokRateLimitPersistTicker.Stop()
 		defer boundaryProbeTimer.Stop()
 
 		resetRefreshTimer := func() {
@@ -4344,13 +4667,50 @@ func (s *Store) StartBackgroundRefresh() {
 				if s.FastSchedulerEnabled() {
 					s.rebuildFastScheduler()
 				}
+			case <-grokRateLimitPersistTicker.C:
+				s.flushGrokRateLimitSnapshots()
 			case <-s.stopCh:
+				// 退出前把未落库的余量快照写掉,容器重启后进度条不清零。
+				s.flushGrokRateLimitSnapshots()
 				return
 			case <-backgroundCtx.Done():
+				s.flushGrokRateLimitSnapshots()
 				return
 			}
 		}
 	}()
+}
+
+// flushGrokRateLimitSnapshots 把自上次落库后有更新的 Grok 配额余量快照批量写进
+// credentials(grok_rate_limit)。逐请求的 x-ratelimit 观测只更新内存并置脏位,
+// 由该函数按分钟节流落库;重启时在账号加载处恢复。
+func (s *Store) flushGrokRateLimitSnapshots() {
+	if s == nil || s.db == nil {
+		return
+	}
+	s.mu.RLock()
+	accounts := make([]*Account, len(s.accounts))
+	copy(accounts, s.accounts)
+	s.mu.RUnlock()
+
+	for _, acc := range accounts {
+		if !acc.IsGrokAPI() {
+			continue
+		}
+		snap, dirty := acc.TakeGrokRateLimitSnapshotIfDirty()
+		if !dirty {
+			continue
+		}
+		raw, err := json.Marshal(snap)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"grok_rate_limit": string(raw)}); err != nil {
+			log.Printf("[账号 %d] 持久化 grok_rate_limit 失败: %v", acc.DBID, err)
+		}
+		cancel()
+	}
 }
 
 // Stop 停止后台刷新
@@ -4399,6 +4759,10 @@ func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus stri
 		if acc == nil || acc.RuntimeStatus() != targetStatus {
 			continue
 		}
+		// 正在用积分顶替限流的账号显示为限流，但实际仍在正常调度——清理会误删好账号。
+		if acc.UsingCredits() {
+			continue
+		}
 		if match != nil && !match(acc) {
 			continue
 		}
@@ -4445,6 +4809,10 @@ func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
 		}
 		status := acc.RuntimeStatus()
 		if status != "rate_limited" && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
+			continue
+		}
+		// 同上：积分顶着的账号只是显示为限流，仍可正常调度，不该被"清理限流账号"删掉。
+		if acc.UsingCredits() {
 			continue
 		}
 
@@ -4783,11 +5151,15 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	if key == "" {
 		return
 	}
+	proxyURL = strings.TrimSpace(proxyURL)
+	if !s.affinityProxyStillValid(account.DBID, proxyURL) {
+		return
+	}
 	ttl := sessionAffinityTTL()
 	now := time.Now()
 	binding := sessionAffinity{
 		accountID:    account.DBID,
-		proxyURL:     strings.TrimSpace(proxyURL),
+		proxyURL:     proxyURL,
 		boundAt:      now,
 		requestCount: 0,
 		expiresAt:    now.Add(ttl),
@@ -4896,6 +5268,12 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	}
 
 	if ok {
+		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
+			s.UnbindSessionAffinity(key, binding.accountID)
+			ok = false
+		}
+	}
+	if ok {
 		expired := !binding.expiresAt.After(now)
 		// bounded 模式下追加逃逸条件检查
 		escape := false
@@ -4910,11 +5288,7 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 
 		if expired || escape {
-			s.sessionMu.Lock()
-			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
-				delete(s.sessionBindings, key)
-			}
-			s.sessionMu.Unlock()
+			s.UnbindSessionAffinity(key, binding.accountID)
 		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
 			// 命中粘性,记一次复用
 			s.sessionMu.Lock()
@@ -4927,6 +5301,10 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 	if binding, ok := s.getCachedSessionAffinity(key); ok {
+		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
+			s.UnbindSessionAffinity(key, binding.accountID)
+			return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+		}
 		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
 		cacheMode := mode
 		if override := s.resolveGrokAffinityOverride(binding.accountID); override != "" {
@@ -4946,6 +5324,59 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	}
 
 	return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+}
+
+// affinityProxyStillValid verifies that a sticky proxy still matches the
+// account's current explicit proxy or the current fallback proxy configuration.
+// This check applies to strict affinity too: affinity may keep an account sticky,
+// but it must never resurrect a proxy that has been removed or disabled.
+func (s *Store) affinityProxyStillValid(accountID int64, proxyURL string) bool {
+	if s == nil || accountID == 0 {
+		return false
+	}
+	proxyURL = strings.TrimSpace(proxyURL)
+
+	s.mu.RLock()
+	account := s.lookupByIDLocked(accountID)
+	poolEnabled := s.proxyPoolEnabled
+	poolHasEntries := len(s.proxyPool) > 0
+	poolContainsProxy := false
+	if poolHasEntries {
+		if s.proxyPoolSet != nil {
+			_, poolContainsProxy = s.proxyPoolSet[proxyURL]
+		} else {
+			// Backward-compatible fallback for tests or manually assembled stores.
+			for _, candidate := range s.proxyPool {
+				if proxyURL == strings.TrimSpace(candidate) {
+					poolContainsProxy = true
+					break
+				}
+			}
+		}
+	}
+	globalProxy := strings.TrimSpace(s.globalProxy)
+	s.mu.RUnlock()
+	if account == nil {
+		return false
+	}
+
+	if accountProxy := account.GetProxyURL(); accountProxy != "" {
+		return proxyURL == accountProxy
+	}
+	if poolEnabled && poolHasEntries {
+		return poolContainsProxy
+	}
+	return proxyURL == globalProxy
+}
+
+func buildProxyPoolSet(urls []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(urls))
+	for _, proxyURL := range urls {
+		if proxyURL = strings.TrimSpace(proxyURL); proxyURL != "" {
+			set[proxyURL] = struct{}{}
+		}
+	}
+	return set
 }
 
 // affinityAccountStillHealthy 检查一个粘性绑定的账号是否仍处于 healthy 桶。
@@ -5479,6 +5910,25 @@ func grokMaxRateLimitRetriesFromConfig(raw string) int {
 	return cfg.MaxRateLimitRetries
 }
 
+// GrokOAuthClientIDUnset 表示系统设置未配 client_id（回落到环境变量/内置默认）。
+const GrokOAuthClientIDUnset = ""
+
+// grokOAuthClientIDFromConfig 从 grok_config JSON 解析出 OAuth client_id。
+// 缺省/非法/含空白一律视为未配置，由 EffectiveGrokOAuthClientID 继续回落。
+func grokOAuthClientIDFromConfig(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return GrokOAuthClientIDUnset
+	}
+	var cfg struct {
+		OAuthClientID string `json:"oauth_client_id"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return GrokOAuthClientIDUnset
+	}
+	return NormalizeGrokOAuthClientID(cfg.OAuthClientID)
+}
+
 // SetGrokMaxRateLimitRetries 热更新 Grok 专属限流重试上限（<0 视为 0=跟随全局）。
 func (s *Store) SetGrokMaxRateLimitRetries(n int) {
 	if n < 0 {
@@ -5595,12 +6045,20 @@ func promptFilterConfigFromSettings(settings *database.SystemSettings) (promptfi
 		Model:          settings.PromptFilterReviewModel,
 		TimeoutSeconds: settings.PromptFilterReviewTimeoutSeconds,
 		FailClosed:     settings.PromptFilterReviewFailClosed,
+		Adapter:        cfg.Advanced.ReviewAdapter,
 	}
 	return promptfilter.NormalizeConfig(cfg), advancedRaw
 }
 
 func (s *Store) SetPromptFilterConfig(cfg promptfilter.Config) {
 	normalized := promptfilter.NormalizeConfig(cfg)
+	// Persisted custom rules are administrator-controlled input and may come
+	// from an older build that accepted invalid or over-broad regexes. Sanitize
+	// only when publishing a Store snapshot so request-time NormalizeConfig does
+	// not repeatedly compile/audit every rule.
+	var quarantined []promptfilter.PatternQuarantine
+	normalized.CustomPatterns, quarantined = promptfilter.SanitizeCustomPatterns(normalized.CustomPatterns)
+	logPromptFilterPatternQuarantines(quarantined)
 	advancedRaw := promptfilter.MarshalAdvancedConfig(normalized.Advanced)
 	if current, ok := s.promptFilterConfig.Load().(promptFilterConfigState); ok {
 		if merged, err := promptfilter.MarshalAdvancedConfigDocument(current.AdvancedRaw, normalized.Advanced); err == nil {
@@ -5615,12 +6073,21 @@ func (s *Store) SetPromptFilterConfig(cfg promptfilter.Config) {
 // The caller must persist successfully before invoking this method.
 func (s *Store) SetPromptFilterConfigWithAdvancedRaw(cfg promptfilter.Config, raw string) error {
 	normalized := promptfilter.NormalizeConfig(cfg)
+	var quarantined []promptfilter.PatternQuarantine
+	normalized.CustomPatterns, quarantined = promptfilter.SanitizeCustomPatterns(normalized.CustomPatterns)
+	logPromptFilterPatternQuarantines(quarantined)
 	advancedRaw, err := promptfilter.MarshalAdvancedConfigDocument(raw, normalized.Advanced)
 	if err != nil {
 		return err
 	}
 	s.promptFilterConfig.Store(promptFilterConfigState{Config: normalized, AdvancedRaw: advancedRaw})
 	return nil
+}
+
+func logPromptFilterPatternQuarantines(items []promptfilter.PatternQuarantine) {
+	for _, item := range items {
+		log.Printf("prompt filter: custom rule quarantined index=%d name=%q code=%s message=%s", item.Index, item.Name, item.Code, item.Message)
+	}
 }
 
 func (s *Store) GetPromptFilterConfig() promptfilter.Config {
@@ -6180,6 +6647,35 @@ func (s *Store) SetAPIKeyAllowedGroups(apiKeyID int64, groupIDs []int64) {
 	s.rebuildFastScheduler()
 }
 
+// SetAPIKeyNoAffinityGroups 设置未携带下游亲和头时可使用的分流组。
+// 这些组会加入 API Key 的账号授权并集；具体请求仍由 proxy 层按亲和头是否存在精确选池。
+func (s *Store) SetAPIKeyNoAffinityGroups(apiKeyID int64, groupIDs []int64) {
+	if apiKeyID <= 0 {
+		return
+	}
+	normalized := normalizeAllowedGroupIDs(groupIDs)
+	s.apiKeyGroupsMu.Lock()
+	if s.apiKeyNoAffinityGroups == nil {
+		s.apiKeyNoAffinityGroups = make(map[int64][]int64)
+	}
+	if s.apiKeyNoAffinityGroupSets == nil {
+		s.apiKeyNoAffinityGroupSets = make(map[int64]map[int64]struct{})
+	}
+	if int64SliceEqual(s.apiKeyNoAffinityGroups[apiKeyID], normalized) {
+		s.apiKeyGroupsMu.Unlock()
+		return
+	}
+	if len(normalized) == 0 {
+		delete(s.apiKeyNoAffinityGroups, apiKeyID)
+		delete(s.apiKeyNoAffinityGroupSets, apiKeyID)
+	} else {
+		s.apiKeyNoAffinityGroups[apiKeyID] = cloneInt64Slice(normalized)
+		s.apiKeyNoAffinityGroupSets[apiKeyID] = int64Set(normalized)
+	}
+	s.apiKeyGroupsMu.Unlock()
+	s.rebuildFastScheduler()
+}
+
 // SetAPIKeyAllowedPlans 设置某 API Key 的账号套餐白名单。plans 归一(小写、去空白、去重)
 // 后落入内存集合;为空表示不限套餐。仅当集合真正变化时才重建调度器,以免鉴权热路径
 // 每次请求都触发重建。
@@ -6267,6 +6763,8 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 	s.apiKeyGroupsMu.Lock()
 	s.apiKeyAllowedGroups = make(map[int64][]int64, len(keys))
 	s.apiKeyAllowedGroupSets = make(map[int64]map[int64]struct{}, len(keys))
+	s.apiKeyNoAffinityGroups = make(map[int64][]int64, len(keys))
+	s.apiKeyNoAffinityGroupSets = make(map[int64]map[int64]struct{}, len(keys))
 	s.apiKeyAllowedPlans = make(map[int64][]string, len(keys))
 	s.apiKeyAllowedPlanSets = make(map[int64]map[string]struct{}, len(keys))
 	s.apiKeyUpstreamChannels = make(map[int64]string, len(keys))
@@ -6275,6 +6773,11 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 		if len(normalized) > 0 {
 			s.apiKeyAllowedGroups[key.ID] = cloneInt64Slice(normalized)
 			s.apiKeyAllowedGroupSets[key.ID] = int64Set(normalized)
+		}
+		noAffinityGroups := normalizeAllowedGroupIDs(key.Limits.NoAffinityGroupIDs)
+		if len(noAffinityGroups) > 0 {
+			s.apiKeyNoAffinityGroups[key.ID] = cloneInt64Slice(noAffinityGroups)
+			s.apiKeyNoAffinityGroupSets[key.ID] = int64Set(noAffinityGroups)
 		}
 		plans := normalizeAllowedPlans(key.Limits.PlanAllow)
 		if len(plans) > 0 {
@@ -6298,6 +6801,7 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	}
 	s.apiKeyGroupsMu.RLock()
 	allowedGroups := s.apiKeyAllowedGroupSets[apiKeyID]
+	noAffinityGroups := s.apiKeyNoAffinityGroupSets[apiKeyID]
 	allowedPlans := s.apiKeyAllowedPlanSets[apiKeyID]
 	channel := s.apiKeyUpstreamChannels[apiKeyID]
 	s.apiKeyGroupsMu.RUnlock()
@@ -6327,6 +6831,9 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	}
 	for _, id := range acc.GroupIDs {
 		if _, ok := allowedGroups[id]; ok {
+			return true
+		}
+		if _, ok := noAffinityGroups[id]; ok {
 			return true
 		}
 	}
@@ -6475,6 +6982,26 @@ func (s *Store) ApplyAccountProxyURL(dbID int64, proxyURL string) bool {
 	acc.mu.Lock()
 	acc.ProxyURL = strings.TrimSpace(proxyURL)
 	acc.mu.Unlock()
+	return true
+}
+
+// ClearAccountProxyURLIfMatches clears an account proxy only when its current
+// runtime value still points to one of the removed URLs.
+func (s *Store) ClearAccountProxyURLIfMatches(dbID int64, proxyURLs []string) bool {
+	expected := buildProxyPoolSet(proxyURLs)
+	if len(expected) == 0 {
+		return false
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if _, ok := expected[strings.TrimSpace(acc.ProxyURL)]; !ok {
+		return false
+	}
+	acc.ProxyURL = ""
 	return true
 }
 
@@ -6866,6 +7393,30 @@ func (s *Store) ClearCooldown(acc *Account) {
 	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
 		log.Printf("[账号 %d] 清理账号状态失败: %v", acc.DBID, err)
 	}
+}
+
+// ReleaseUsageWindowCooldownForCredits 在积分门打开后释放由本地用量窗口判罚产生的 cooldown。
+//
+// 为什么需要：信用开关此前只阻止「进入」用量窗口 cooldown（MarkUsage7dRateLimited 早退），
+// 对已经在 cooldown 里的账号无效。而用户最自然的用法恰恰是「发现账号限流了才去开开关」，
+// 那时判罚已经落下，不主动释放就得干等到窗口重置——开关看起来完全没用。
+//
+// 只释放本地用量判罚（usageWindowCooldownLocked 用判罚时长与 Reset7dAt 对齐来识别），
+// 上游 429 的冷却不动。万一识别错放行了，上游会再拒一次并重新进入冷却，代价是一个请求。
+// 返回是否真的释放了。
+func (s *Store) ReleaseUsageWindowCooldownForCredits(acc *Account) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	acc.mu.RLock()
+	release := acc.creditSkipsUsageWindowLocked() && acc.usageWindowCooldownLocked()
+	acc.mu.RUnlock()
+	if !release {
+		return false
+	}
+	s.ClearCooldown(acc)
+	log.Printf("[账号 %d] 积分可用，已释放用量窗口限流冷却", acc.DBID)
+	return true
 }
 
 // ClearUsageLimitCooldownSince clears only a usage/rate-limit cooldown that

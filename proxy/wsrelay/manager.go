@@ -149,17 +149,16 @@ func (wc *WsConnection) recentInboundWithin(window time.Duration) bool {
 // IsExpired 检查连接是否过期
 func (wc *WsConnection) IsExpired() bool {
 	lastUsed := time.Unix(0, wc.lastUsed.Load())
-	return time.Since(lastUsed) > IdleTimeout
+	return time.Since(lastUsed) > connectionIdleTimeout()
 }
 
-// IsOverAge 检查连接是否超过最大寿命（MaxConnLifetime）。到龄连接不能再接新请求：
-// 上游按连接建立时间计 60 分钟寿命，撞线后 response.create 一律报错，但 Ping
-// 探活仍成功，必须按年龄主动识别。
+// IsOverAge 检查连接是否超过当前模式的最大寿命。到龄连接不能再接新请求：
+// 默认模式提前规避上游 60 分钟硬限制；弱网模式使用更短窗口主动轮换。
 func (wc *WsConnection) IsOverAge() bool {
 	if wc.createdAt == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, wc.createdAt)) > MaxConnLifetime
+	return time.Since(time.Unix(0, wc.createdAt)) > connectionMaxLifetime()
 }
 
 // IsConnected 检查是否已连接
@@ -331,10 +330,16 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-// evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）
+// evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）。
+// 有在途请求的连接/会话一律跳过：IsExpired 只看 lastUsed/LastActiveAt，上游长思考
+// 或 pong 丢失时会把活跃对象误判为空闲，直接 Close 会把在途流同秒批量截断
+// （issue #436）；等在途收尾（读路径业务帧静默上限 ActiveReadMaxTurnSilence 兜底）后下一轮再清。
 func (m *Manager) evictExpired() {
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)
+		if wc.session != nil && wc.session.PendingCount() > 0 {
+			return true
+		}
 		if wc.IsExpired() || !wc.IsConnected() || isRotatableOverAge(wc) {
 			m.connections.Delete(key)
 			wc.Close()
@@ -344,6 +349,9 @@ func (m *Manager) evictExpired() {
 
 	m.sessions.Range(func(key, value any) bool {
 		s := value.(*Session)
+		if s.PendingCount() > 0 {
+			return true
+		}
 		if s.IsExpired() || !s.IsConnected() {
 			m.sessions.Delete(key)
 			s.Close()
@@ -1008,7 +1016,7 @@ func (m *Manager) probe(wc *WsConnection) bool {
 	if fn != nil {
 		return fn(wc)
 	}
-	if wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
+	if !weakNetworkModeEnabled() && wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
 		return true
 	}
 	return probeConnection(wc)
@@ -1289,11 +1297,32 @@ func (m *Manager) SendHeartbeat(wc *WsConnection) error {
 	deadline := time.Now().Add(10 * time.Second)
 	err := wc.conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
 	if err != nil {
+		// 写路径故障 ≠ 读路径已死：有在途请求时只摘池禁止新复用，不关 socket、
+		// 不动 session——强关会把连接上全部在途流同秒截断（issue #436）。socket 的
+		// 最终关闭由读路径兜底（pump 读错误时 onReadFailure→DiscardConnection，
+		// 或上游 60 分钟连接寿命到期关闭）。
+		if wc.session != nil && wc.session.PendingCount() > 0 {
+			log.Printf("WebSocket Ping 失败 (account %d)，连接摘出池子，在途请求留给读路径裁决: %v", wc.session.AccountID, err)
+			m.removeConnectionFromPool(wc)
+			return err
+		}
 		log.Printf("WebSocket Ping 失败 (account %d): %v", wc.session.AccountID, err)
 		m.DiscardConnection(wc)
 		return err
 	}
 	return nil
+}
+
+// removeConnectionFromPool 只把连接从池中摘除（阻止后续复用），不关闭底层 socket、
+// 不停在途请求。CompareAndDelete 按连接指针精确删除，防止误删同 PoolKey 下已重建的新连接。
+func (m *Manager) removeConnectionFromPool(wc *WsConnection) {
+	if wc == nil || wc.PoolKey == "" {
+		return
+	}
+	m.connections.CompareAndDelete(wc.PoolKey, wc)
+	if wc.session != nil {
+		m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
+	}
 }
 
 // StartHeartbeat 启动连接心跳

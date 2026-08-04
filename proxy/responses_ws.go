@@ -92,6 +92,12 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 		), http.StatusUpgradeRequired)
 		return
 	}
+	if h != nil && h.store != nil {
+		cfg := h.promptFilterConfigForRequest(c)
+		if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, nil) {
+			return
+		}
+	}
 
 	conn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, newAPIPolicyWebSocketUpgradeHeaders())
 	if err != nil {
@@ -165,15 +171,26 @@ func stripNewAPIPolicyWebSocketEventID(payload []byte) ([]byte, string) {
 }
 
 func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.Conn, rawPayload []byte, policyEventID string, options *responsesWSForwardOptions) error {
+	if apiErr := h.refreshNewAPIWebSocketBinding(c, time.Now()); apiErr != nil {
+		_ = writeResponsesWSError(conn, apiErr)
+		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
+	}
 	// Each response.create is a separate logical request. Keep the verified
-	// connection identity, but never reuse a prior frame's config or body digest.
+	// connection identity only while its binding remains valid, and never reuse a
+	// prior frame's config or body digest.
 	resetPromptRequestSecurityFrame(c)
+	resetPromptPolicyRequestCorrelationID(c)
 	c.Set(promptGuardPolicyEventIDContextKey, policyEventID)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
+	// WebSocket turn metadata is frame-local. Cache a complete zero-or-set
+	// snapshot before any body rewrite so a later frame can never inherit the
+	// prior frame's compaction badges.
+	compactionMeta := requestBodyCompactionMeta(rawBody)
+	cacheRequestCompactionMeta(c, compactionMeta)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -235,7 +252,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	// 上下文压缩轮豁免首字超时看门狗（issue #381）：压缩首帧天然慢，超时换号无益。
-	bodySignalCompact := requestBodyHasCompactionTrigger(rawBody)
+	bodySignalCompact := compactionMeta.ProtocolTriggered
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -276,6 +293,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
+	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	wsRetrySettings := CurrentRuntimeSettings()
 	hideUpstreamErrors := wsRetrySettings.CodexWSHideErrors
@@ -310,6 +331,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
 			} else if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				apiErr = responsesWSUpstreamAPIError(lastStatusCode, lastBody)
+			} else if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+				// 候选被 scope 预算剔空（issue #439）：按限流语义回帧，而不是「无可用账号」。
+				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, msg, api.ErrorTypeRateLimit)
 			} else {
 				apiErr = api.NewAPIError(api.ErrCodeServiceUnavailable, noAvailableAccountMessage(effectiveModel), api.ErrorTypeServer)
 			}
@@ -317,6 +341,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
@@ -461,7 +486,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
+			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody, upstreamCyberPolicyAttempt{
+				Transport: upstreamPromptPolicyTransport(true, useWebsocket), StatusCode: resp.StatusCode,
+				AccountID: account.ID(), AttemptIndex: attempt + 1,
+			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := false
 			if silentRetryEnabled && attempt < maxRetries {
@@ -469,25 +497,26 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:            account.ID(),
-				Endpoint:             "/v1/responses",
-				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
-				StatusCode:           resp.StatusCode,
-				DurationMs:           durationMs,
-				ReasoningEffort:      reasoningEffort,
-				InboundEndpoint:      "/v1/responses",
-				UpstreamEndpoint:     "/v1/responses",
-				Stream:               true,
-				ViaWebsocket:         useWebsocket,
-				ServiceTier:          usageTiers.ServiceTier,
-				RequestedServiceTier: usageTiers.RequestedServiceTier,
-				ActualServiceTier:    usageTiers.ActualServiceTier,
-				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
-				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:              account.ID(),
+				Endpoint:               "/v1/responses",
+				Model:                  logModel,
+				EffectiveModel:         logEffectiveModel,
+				StatusCode:             resp.StatusCode,
+				DurationMs:             durationMs,
+				ReasoningEffort:        reasoningEffort,
+				InboundEndpoint:        "/v1/responses",
+				UpstreamEndpoint:       "/v1/responses",
+				Stream:                 true,
+				ViaWebsocket:           useWebsocket,
+				ServiceTier:            usageTiers.ServiceTier,
+				RequestedServiceTier:   usageTiers.RequestedServiceTier,
+				ActualServiceTier:      usageTiers.ActualServiceTier,
+				BillingServiceTier:     usageTiers.BillingServiceTier,
+				IsRetryAttempt:         shouldRetry,
+				AttemptIndex:           attempt + 1,
+				UpstreamErrorKind:      upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:           usageLogErrorMessage(resp.StatusCode, errBody),
+				PromptPolicyIncidentID: promptPolicyIncidentID,
 			})
 
 			if shouldRetry {
@@ -736,6 +765,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 	ttftGuard.Stop()
 	var responseFailedDecision codex429Decision
+	promptPolicyIncidentID := ""
 	if len(terminalFailurePayload) > 0 {
 		outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 		responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
@@ -744,7 +774,10 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 		// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 		// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
-		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
+		promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload), upstreamCyberPolicyAttempt{
+			Transport: upstreamPromptPolicyTransport(true, viaWebsocket), StatusCode: outcome.logStatusCode,
+			AccountID: account.ID(), AttemptIndex: fallbackAttempt,
+		}))
 	}
 	if fallbackLog != nil {
 		fallbackLog.LogHTTPAttemptCompletion("/v1/responses", account.ID(), fallbackAttempt, totalDuration, firstTokenMs, outcome.logStatusCode)
@@ -754,6 +787,13 @@ func (h *Handler) streamResponsesWSUpstream(
 		return &responsesWSRetryableStreamError{outcome: outcome}
 	}
 	if silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+		h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
+			AccountID: account.ID(), Endpoint: "/v1/responses", Model: model, EffectiveModel: logEffectiveModel,
+			StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+			InboundEndpoint: "/v1/responses", UpstreamEndpoint: "/v1/responses", Stream: true, ViaWebsocket: viaWebsocket,
+			AttemptIndex: fallbackAttempt, UpstreamErrorKind: outcome.failureKind,
+			ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+		}, promptPolicyIncidentID)
 		resp.Body.Close()
 		if !isFirstTokenTimeoutOutcome(outcome) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -780,22 +820,24 @@ func (h *Handler) streamResponsesWSUpstream(
 	usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
 	c.Set("x-service-tier", usageTiers.ServiceTier)
 	logInput := &database.UsageLogInput{
-		AccountID:            account.ID(),
-		Endpoint:             "/v1/responses",
-		Model:                model,
-		EffectiveModel:       logEffectiveModel,
-		StatusCode:           outcome.logStatusCode,
-		DurationMs:           totalDuration,
-		FirstTokenMs:         firstTokenMs,
-		ReasoningEffort:      reasoningEffort,
-		InboundEndpoint:      "/v1/responses",
-		UpstreamEndpoint:     "/v1/responses",
-		Stream:               true,
-		ViaWebsocket:         viaWebsocket,
-		ServiceTier:          usageTiers.ServiceTier,
-		RequestedServiceTier: usageTiers.RequestedServiceTier,
-		ActualServiceTier:    usageTiers.ActualServiceTier,
-		BillingServiceTier:   usageTiers.BillingServiceTier,
+		AccountID:              account.ID(),
+		Endpoint:               "/v1/responses",
+		Model:                  model,
+		EffectiveModel:         logEffectiveModel,
+		StatusCode:             outcome.logStatusCode,
+		DurationMs:             totalDuration,
+		FirstTokenMs:           firstTokenMs,
+		ReasoningEffort:        reasoningEffort,
+		InboundEndpoint:        "/v1/responses",
+		UpstreamEndpoint:       "/v1/responses",
+		Stream:                 true,
+		ViaWebsocket:           viaWebsocket,
+		ServiceTier:            usageTiers.ServiceTier,
+		RequestedServiceTier:   usageTiers.RequestedServiceTier,
+		ActualServiceTier:      usageTiers.ActualServiceTier,
+		BillingServiceTier:     usageTiers.BillingServiceTier,
+		PromptPolicyIncidentID: promptPolicyIncidentID,
+		AttemptIndex:           fallbackAttempt,
 	}
 	if outcome.logStatusCode != http.StatusOK {
 		logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
@@ -915,7 +957,7 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	errorCode := api.ErrorCode("prompt_blocked")
 	errorMessage := "Request contains content blocked by prompt filter"
 	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, nil); verified {
-		metadata := buildNewAPIPolicyDecisionMetadataForEvent(policyContext.Identity, evaluation.Decision, verdict, cfg, rawBody, endpoint, model, policyEventID)
+		metadata := buildNewAPIPolicyDecisionMetadataWithSecret(policyContext.Identity, evaluation.Decision, verdict, cfg, rawBody, endpoint, model, policyEventID, policyContext.VerificationSecret)
 		writeNewAPIPolicyDecisionHeaders(c, metadata)
 		_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
 		return true, true
