@@ -80,10 +80,14 @@ func (db *DB) ensurePromptFilterNewAPIBindingsTable(ctx context.Context) error {
 	if _, err := db.conn.ExecContext(ctx, ddl); err != nil {
 		return err
 	}
+	return normalizePromptFilterNewAPIBindings(ctx, db.conn)
+}
+
+func normalizePromptFilterNewAPIBindings(ctx context.Context, execer sqlExecer) error {
 	// Binding-level policy overrides were retired. Keep the legacy columns for
 	// a low-risk rolling migration, but neutralize all stored values so an old
 	// shadow/off row cannot silently override the unified GuardPipeline.
-	_, err := db.conn.ExecContext(ctx, `UPDATE prompt_filter_newapi_bindings SET policy_mode='inherit', policy_profile='inherit' WHERE policy_mode<>'inherit' OR policy_profile<>'inherit'`)
+	_, err := execer.ExecContext(ctx, `UPDATE prompt_filter_newapi_bindings SET policy_mode='inherit', policy_profile='inherit' WHERE policy_mode<>'inherit' OR policy_profile<>'inherit'`)
 	return err
 }
 

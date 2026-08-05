@@ -78,6 +78,8 @@ Codex2API 采用三层配置架构：
 | `DATABASE_NAME` | 是 | - | PostgreSQL 数据库名 |
 | `DATABASE_SCHEMA` | 否 | - | PostgreSQL schema；适合 Supabase 等多项目共享 database 的场景。配置后启动时自动 `CREATE SCHEMA IF NOT EXISTS` 并将所有连接的 `search_path` 指向该 schema。仅允许字母/数字/下划线，长度 ≤63；留空保持默认（通常是 `public`）。|
 | `DATABASE_SSLMODE` | 否 | disable | SSL 模式: disable/require/verify-full |
+| `DATABASE_AUTO_MIGRATE_FROM_SQLITE` | 否 | `false` | 一次性 SQLite→PostgreSQL 全量自动迁移开关。仅 `DATABASE_DRIVER=postgres` 有效；值非法、源文件不存在或目标已有业务数据都会拒绝启动 |
+| `DATABASE_MIGRATION_SQLITE_PATH` | 启用迁移时 | `DATABASE_PATH`；Zeabur 再回退 `/data/codex2api.db` | 只读 SQLite 源文件。显式值优先于旧的 `DATABASE_PATH` |
 
 也支持连接字符串形式，例如 `DATABASE_URL`、`POSTGRES_CONNECTION_STRING`、`POSTGRESQL_CONNECTION_STRING`。
 ### 生图工作台
@@ -107,6 +109,28 @@ Codex2API 采用三层配置架构：
 | `DATABASE_PATH` | 是 | - | SQLite 数据库文件路径，如 `/data/codex2api.db` |
 
 在 Zeabur 环境中，如果未配置数据库且未显式指定 `DATABASE_DRIVER`，会自动回退为 SQLite，并默认使用 `/data/codex2api.db`。
+
+#### 一次性 SQLite→PostgreSQL 自动迁移
+
+该能力默认关闭，并且只面向“现有 SQLite → 全新空 PostgreSQL”的一次性切换；不会 merge、覆盖或清空已有 PostgreSQL 数据。迁移会复制账号、凭据 JSON、API Key、设置、用量日志/基线、分组、代理、生图 metadata、prompt filter/candidate/policy/risk/trust 等当前业务表；`data_migrations` 和旧 `prompt_filter_secrets` 不复制。
+
+安全流程如下：
+
+1. **Suspend/停止所有仍会写旧 SQLite 的 Codex2API 实例**。实现使用 SQLite 只读一致性事务/快照，但无法取得跨进程排他锁；旧实例继续写入时，快照之后的新写入不会被迁移，因此不能把“在线迁移”视为安全流程。
+2. 在停写后优先创建 Zeabur 持久卷快照，或用 `sqlite3 /data/codex2api.db ".backup '/data/codex2api.pre-postgres.db'"` 生成一致备份，并确认新部署继续挂载原 `/data`。如果环境只能做文件级冷备，必须先确认所有 SQLite 进程已完全停止，并把主库与存在的 `codex2api.db-wal` / `codex2api.db-shm` 作为同一组备份；WAL 模式下单独 `cp` 主库文件不是安全备份。
+3. 创建全新的空 PostgreSQL，配置 PostgreSQL 和 Redis 连接；Redis 切换与数据库复制相互独立，不会迁移 Redis 缓存。
+4. 首次启动临时设置：
+
+   ```env
+   DATABASE_DRIVER=postgres
+   DATABASE_AUTO_MIGRATE_FROM_SQLITE=true
+   DATABASE_MIGRATION_SQLITE_PATH=/data/codex2api.db
+   ```
+
+5. 检查启动日志中的逐表行数和完成日志，再核验账号数、API Key、系统设置、历史用量、prompt/risk 数据和生图记录。首次操作仍必须 Suspend 旧服务并只保留一个新应用实例；PostgreSQL advisory lock 只是防止误启动的多个自动迁移 worker 重复初始化的附加保护，不代替停写和单实例要求。它覆盖目标预检、schema 初始化和导入；原始复制、行数校验、数据回填和完成 marker 在同一导入事务中。所有可预见的数据、语义与 marker 失败都先于最后的序列校正；PostgreSQL `setval` 本身不随事务回滚，因此极少数序列校正或提交结果不确定的错误可能留下 ID 空洞，但不会提交部分业务数据或完成 marker，修复后可重试。已有完成 marker 时会幂等跳过。
+6. 核验成功后把 `DATABASE_AUTO_MIGRATE_FROM_SQLITE` 改回 `false`（或删除）并重新部署；长期保留 SQLite 备份，不要删除或覆盖源文件。
+
+`/data/images`、`/data/backgrounds` 的实际文件不会搬运、改名或删除；迁移只复制图片 metadata 和相关设置。因此 PostgreSQL 切换后仍必须挂载原 `/data`。若源库没有任何真实业务数据（只有全零默认 baseline）、源文件缺失，或目标任一业务表非空，服务会 fail closed，不会启动一个空站。
 
 ### 缓存配置
 
@@ -415,11 +439,7 @@ curl -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/ops/overview
 
 ### Q: SQLite 和 PostgreSQL 可以切换吗？
 
-**A:** 可以，但需要：
-1. 停止服务
-2. 修改 DATABASE_DRIVER 和相关配置
-3. 启动服务（新数据库会重新初始化）
-4. 重新导入账号数据
+**A:** 可以。切到全新的空 PostgreSQL 时可使用上面的“一次性 SQLite→PostgreSQL 自动迁移”；必须先停写、备份，首次启动临时打开迁移开关，核验后关闭开关并保留旧库。目标已有业务数据时不会自动合并，需另行制定人工迁移方案。
 
 ### Q: 如何查看当前生效的配置？
 

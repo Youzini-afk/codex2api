@@ -42,7 +42,14 @@ func main() {
 	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label())
 
 	// 2. 初始化数据库
-	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN(), cfg.Database.Schema)
+	if cfg.Database.AutoMigrateFromSQLite {
+		log.Printf("SQLite→PostgreSQL 一次性自动迁移已启用；迁移完成前不会启动后台数据库写入器")
+	}
+	db, err := database.NewWithOptions(cfg.Database.Driver, cfg.Database.DSN(), database.Options{
+		Schema:                    cfg.Database.Schema,
+		AutoMigrateFromSQLite:     cfg.Database.AutoMigrateFromSQLite,
+		SQLiteMigrationSourcePath: cfg.Database.SQLiteMigrationSourcePath,
+	})
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}

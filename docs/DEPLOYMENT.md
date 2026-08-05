@@ -88,6 +88,30 @@ REDIS_URL=${REDIS_CONNECTION_STRING}
 
 也兼容分拆变量，例如 `POSTGRESQL_HOST`、`POSTGRES_PORT`、`POSTGRESQL_USERNAME`、`POSTGRES_PASSWORD`、`POSTGRES_DATABASE`、`REDIS_HOST`、`REDIS_PORT` 等。
 
+#### 从 Zeabur SQLite 一次性切换到 PostgreSQL + Redis
+
+不要直接把数据库连接变量改成 PostgreSQL 后在线滚动发布。按以下停机流程执行：
+
+1. 在 Zeabur **Suspend/停止旧 Codex2API 服务**，确保没有实例继续写 `/data/codex2api.db`。迁移读取 SQLite 的只读一致性快照，但实现无法对另一个进程取得排他锁；旧服务继续写入会造成快照之后的数据遗漏。
+2. 停写后优先创建 Zeabur 持久卷快照，或在可访问持久卷的终端执行 `sqlite3 /data/codex2api.db ".backup '/data/codex2api.db.pre-postgres-backup'"`。如果只能文件冷备，必须确认所有 SQLite 进程已完全停止，并将 `codex2api.db` 与存在的 `codex2api.db-wal`、`codex2api.db-shm` 一致复制；WAL 模式下不得把单独 `cp` 主库当作安全备份。不要移动、改名或删除原文件。
+3. 创建并绑定**全新的空 PostgreSQL** 与 Redis，同时继续把原持久卷挂载到 `/data`。Redis 只是缓存，Redis 切换与数据库迁移相互独立。
+4. 首次启动只保留一个应用实例，并临时配置：
+
+   ```env
+   DATABASE_DRIVER=postgres
+   DATABASE_URL=${POSTGRES_CONNECTION_STRING}
+   CACHE_DRIVER=redis
+   REDIS_URL=${REDIS_CONNECTION_STRING}
+   DATABASE_AUTO_MIGRATE_FROM_SQLITE=true
+   DATABASE_MIGRATION_SQLITE_PATH=/data/codex2api.db
+   ```
+
+5. 启动并查看日志。首次必须继续保持单实例：服务在目标空库预检通过后初始化 PostgreSQL schema，再在任何 usage log、prompt audit 或其他后台 writer 启动前迁移。日志只输出表名和行数；看到完成日志后，核验账号/API Key 数量、系统设置、历史用量、prompt/risk 数据和生图记录。PostgreSQL advisory lock 仅作为多个自动迁移 worker 被误启动时的附加串行保护，不代替 Suspend、停写和单实例流程。原始复制、校验、数据回填和完成 marker 位于同一导入事务；所有可预见的数据、语义与 marker 失败都发生在最后的序列校正之前。PostgreSQL `setval` 不随事务回滚，极少数序列校正或提交结果不确定的错误可能留下无害的 ID 空洞，但不会提交部分业务数据或完成 marker，修复后可重试。
+6. 核验成功后把 `DATABASE_AUTO_MIGRATE_FROM_SQLITE` 设为 `false`（或删除），再正常部署/扩容。完成 marker 会让重复首次启动幂等跳过，但迁移开关不应长期保留。
+7. 长期保留 SQLite 备份。`/data/images`、`/data/backgrounds` 实体文件不会被搬运或删除，只有图片 metadata/设置进入 PostgreSQL；因此成功后也必须继续挂载原 `/data`。
+
+源文件不存在、源库没有真实业务数据（只有全零默认 baseline），或目标 PostgreSQL 任一业务表已有数据时，应用会拒绝启动；它不会把错误路径当成功，也不会自动 merge/覆盖目标数据。
+
 **示例文件：**
 
 - 根目录 `.env.zeabur.example`
@@ -544,8 +568,9 @@ docker compose up -d
 ### SQLite 模式升级
 
 ```bash
-# 备份 SQLite 数据库
-cp /path/to/codex2api.db /path/to/codex2api.db.backup_$(date +%Y%m%d_%H%M%S)
+# 先停止所有写入实例，再生成 SQLite 一致备份
+docker compose -f docker-compose.sqlite.yml stop
+sqlite3 /path/to/codex2api.db ".backup '/path/to/codex2api.db.backup_$(date +%Y%m%d_%H%M%S)'"
 
 # 升级
 docker compose -f docker-compose.sqlite.yml pull
@@ -605,12 +630,11 @@ docker compose start codex2api
 ### SQLite 备份
 
 ```bash
-# 备份
+# 首选：SQLite 一致备份
 sqlite3 /data/codex2api.db ".backup '/backup/codex2api_$(date +%Y%m%d_%H%M%S).db'"
-
-# 或简单复制
-cp /data/codex2api.db /backup/codex2api_$(date +%Y%m%d_%H%M%S).db
 ```
+
+如果只能使用文件级冷备，必须先完全停止所有读写 SQLite 的进程，再把主库与存在的 `-wal` / `-shm` 文件作为一组一致复制。不要在 WAL 模式下单独复制主库文件。
 
 ### SQLite 恢复
 

@@ -351,19 +351,41 @@ type usageLogEntry struct {
 // New 创建数据库连接并自动建表。
 // schema 仅对 PostgreSQL 生效；为空时保持数据库默认 search_path。
 func New(driver string, dsn string, schema ...string) (*DB, error) {
+	options := Options{}
+	if len(schema) > 0 {
+		options.Schema = schema[0]
+	}
+	return NewWithOptions(driver, dsn, options)
+}
+
+// NewWithOptions 创建数据库连接，并在所有 DDL/ensure 完成后、任何后台写入器
+// 启动前执行可选的一次性 SQLite→PostgreSQL 数据迁移。
+func NewWithOptions(driver string, dsn string, options Options) (*DB, error) {
 	driver = normalizeDriver(driver)
 	driverName := driver
+	pgSchema := strings.TrimSpace(options.Schema)
+	if options.AutoMigrateFromSQLite {
+		if driver != "postgres" {
+			return nil, errors.New("SQLite to PostgreSQL auto-migration requires DATABASE_DRIVER=postgres")
+		}
+		validatedPath, err := validateSQLiteMigrationSource(options.SQLiteMigrationSourcePath)
+		if err != nil {
+			return nil, err
+		}
+		options.SQLiteMigrationSourcePath = validatedPath
+	}
 	if driver == "sqlite" {
 		if err := ensureSQLiteParentDir(dsn); err != nil {
 			return nil, fmt.Errorf("创建 SQLite 数据目录失败: %w", err)
 		}
 		driverName = "sqlite"
 		dsn = sqliteConnectDSN(dsn)
-	}
-
-	pgSchema := ""
-	if len(schema) > 0 {
-		pgSchema = strings.TrimSpace(schema[0])
+	} else if pgSchema != "" {
+		var err error
+		dsn, err = withPostgresSchemaDSN(dsn, pgSchema)
+		if err != nil {
+			return nil, err
+		}
 	}
 	sqliteSingleConn := driver == "sqlite" && strings.TrimSpace(dsn) == ":memory:"
 
@@ -396,6 +418,13 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	}
 
 	backgroundTaskCtx, backgroundTaskCancel := context.WithCancel(context.Background())
+	initialized := false
+	defer func() {
+		if !initialized {
+			backgroundTaskCancel()
+			_ = conn.Close()
+		}
+	}()
 	db := &DB{
 		conn:                 conn,
 		driver:               driver,
@@ -409,13 +438,32 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		db.sqliteWriteSem = make(chan struct{}, 1)
 	}
 	db.SetUsageLogConfig(defaultUsageLogMode, defaultUsageLogBatchSize, defaultUsageLogFlushIntervalSeconds)
+	initCtx := ctx
+	if options.AutoMigrateFromSQLite {
+		// Preserve the historical one-shot migration behavior for large SQLite
+		// files: initialization is synchronous and may legitimately exceed the
+		// short connection/DDL probe timeout used by ordinary startup.
+		initCtx = context.Background()
+	}
+	var migrationGuard *postgresAutoMigrationGuard
+	if options.AutoMigrateFromSQLite {
+		migrationGuard, err = db.beginPostgresAutoMigrationGuard(initCtx, pgSchema)
+		if err != nil {
+			return nil, fmt.Errorf("启动 SQLite→PostgreSQL 自动迁移保护失败: %w", err)
+		}
+		defer func() {
+			if migrationGuard != nil {
+				migrationGuard.close()
+			}
+		}()
+	}
 	if db.isSQLite() {
-		if err := db.configureSQLite(ctx); err != nil {
+		if err := db.configureSQLite(initCtx); err != nil {
 			return nil, fmt.Errorf("配置 SQLite 失败: %w", err)
 		}
 	} else {
 		// PostgreSQL: 统一会话时区为 UTC，确保 NOW() 和时间字面量一致
-		if _, err := conn.ExecContext(ctx, "SET timezone = 'UTC'"); err != nil {
+		if _, err := conn.ExecContext(initCtx, "SET timezone = 'UTC'"); err != nil {
 			return nil, fmt.Errorf("设置数据库时区失败: %w", err)
 		}
 		// 自定义 schema：确保 schema 存在并确认当前会话 search_path 已生效。
@@ -423,29 +471,37 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		// 这里仅做一次幂等的 CREATE SCHEMA + SET 兜底，便于首次部署时自动建好 schema。
 		if pgSchema != "" {
 			quoted := pq.QuoteIdentifier(pgSchema)
-			if _, err := conn.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
+			if _, err := conn.ExecContext(initCtx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
 				return nil, fmt.Errorf("创建数据库 schema 失败: %w", err)
 			}
-			if _, err := conn.ExecContext(ctx, "SET search_path TO "+quoted+", public"); err != nil {
+			if _, err := conn.ExecContext(initCtx, "SET search_path TO "+quoted+", public"); err != nil {
 				return nil, fmt.Errorf("设置 search_path 失败: %w", err)
 			}
 		}
 	}
-	if err := db.migrate(ctx); err != nil {
+	schemaOnlyAutoImport := migrationGuard != nil && !migrationGuard.completed
+	if schemaOnlyAutoImport {
+		err = db.migratePostgresSchema(initCtx)
+	} else {
+		err = db.migrate(initCtx)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
-	if err := db.ensurePromptFilterNewAPIBindingsTable(ctx); err != nil {
+	if err := db.ensurePromptFilterNewAPIBindingsTable(initCtx); err != nil {
 		return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
 	}
-	if err := db.ensurePromptRuleCandidatesTable(ctx); err != nil {
+	if err := db.ensurePromptRuleCandidatesTable(initCtx); err != nil {
 		return nil, fmt.Errorf("创建提示词规则候选表失败: %w", err)
 	}
-	if err := db.ensurePromptPolicyIncidentsTable(ctx); err != nil {
+	if err := db.ensurePromptPolicyIncidentsTable(initCtx); err != nil {
 		return nil, fmt.Errorf("创建提示词策略事件表失败: %w", err)
 	}
-
-	// 启动批量写入后台协程
-	db.startLogFlusher()
+	if options.AutoMigrateFromSQLite {
+		if err := db.ensurePromptRiskTrustTables(initCtx); err != nil {
+			return nil, fmt.Errorf("创建提示词风险信任表失败: %w", err)
+		}
+	}
 
 	baselineInsert := `
 		INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING
@@ -455,7 +511,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 			INSERT OR IGNORE INTO usage_stats_baseline (id) VALUES (1)
 		`
 	}
-	_, err = db.conn.ExecContext(ctx, `
+	_, err = db.conn.ExecContext(initCtx, `
 			CREATE TABLE IF NOT EXISTS usage_stats_baseline (
 				id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 				total_requests  BIGINT NOT NULL DEFAULT 0,
@@ -474,14 +530,34 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		return nil, fmt.Errorf("创建 usage_stats_baseline 表失败: %w", err)
 	}
 
-	// 确保 baseline 行存在
-	_, err = db.conn.ExecContext(ctx, baselineInsert)
+	if err := db.ensureUsageStatsBaselineBillingColumns(initCtx); err != nil {
+		return nil, err
+	}
+	if schemaOnlyAutoImport {
+		if err := db.autoMigrateSQLiteToPostgres(initCtx, options.SQLiteMigrationSourcePath, migrationGuard); err != nil {
+			return nil, fmt.Errorf("SQLite→PostgreSQL 自动迁移失败: %w", err)
+		}
+	} else if migrationGuard != nil && migrationGuard.completed {
+		log.Printf("SQLite→PostgreSQL migration already complete; skipping")
+	}
+
+	// 自动迁移需要在目标空库检查之前避免创建这条业务基线；迁移完成或默认启动路径
+	// 再幂等补齐它，保持历史初始化行为不变。
+	baselineCtx, baselineCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer baselineCancel()
+	_, err = db.conn.ExecContext(baselineCtx, baselineInsert)
 	if err != nil {
 		return nil, fmt.Errorf("初始化 usage_stats_baseline 失败: %w", err)
 	}
-	if err := db.ensureUsageStatsBaselineBillingColumns(ctx); err != nil {
-		return nil, err
+	if migrationGuard != nil {
+		if err := migrationGuard.close(); err != nil {
+			return nil, fmt.Errorf("释放 SQLite→PostgreSQL 自动迁移保护失败: %w", err)
+		}
+		migrationGuard = nil
 	}
+
+	// 所有同步初始化和可选数据迁移均完成后，才允许后台 writer 启动。
+	db.startLogFlusher()
 	db.promptFilterAudit = newPromptFilterAuditQueue(db)
 	db.promptFilterAudit.start()
 	db.RunBackgroundTask(func(taskCtx context.Context) {
@@ -490,6 +566,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		}
 	})
 
+	initialized = true
 	return db, nil
 }
 
@@ -739,6 +816,17 @@ func (db *DB) migrate(ctx context.Context) error {
 	if db.isSQLite() {
 		return db.migrateSQLite(ctx)
 	}
+	if err := db.migratePostgresSchema(ctx); err != nil {
+		return err
+	}
+	return db.runDataMigrationsWithTimeout()
+}
+
+// migratePostgresSchema applies PostgreSQL DDL and legacy structural cleanup
+// without recording or executing data_migrations. The auto-import path uses
+// this after its fail-closed target preflight, then runs semantic migrations
+// against the newly copied rows inside the import transaction.
+func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS accounts (
 		id            SERIAL PRIMARY KEY,
@@ -1258,7 +1346,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	if _, err = db.conn.ExecContext(migrateCtx, migrateQuery); err != nil {
 		return err
 	}
-	return db.runDataMigrationsWithTimeout()
+	return nil
 }
 
 // ==================== API Keys ====================

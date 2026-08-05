@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -235,12 +237,15 @@ func resetConfigEnv(t *testing.T) {
 		"DATABASE_DRIVER",
 		"DATABASE_URL",
 		"DATABASE_PATH",
+		"DATABASE_AUTO_MIGRATE_FROM_SQLITE",
+		"DATABASE_MIGRATION_SQLITE_PATH",
 		"DATABASE_HOST",
 		"DATABASE_PORT",
 		"DATABASE_USER",
 		"DATABASE_PASSWORD",
 		"DATABASE_NAME",
 		"DATABASE_SSLMODE",
+		"DATABASE_SCHEMA",
 		"POSTGRES_CONNECTION_STRING",
 		"POSTGRESQL_CONNECTION_STRING",
 		"POSTGRES_URL",
@@ -275,6 +280,103 @@ func resetConfigEnv(t *testing.T) {
 	}
 	for _, key := range keys {
 		t.Setenv(key, "")
+	}
+}
+
+func TestLoadSQLiteAutoMigrationDefaultsOff(t *testing.T) {
+	resetConfigEnv(t)
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("DATABASE_MIGRATION_SQLITE_PATH", filepath.Join(t.TempDir(), "missing.sqlite"))
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.AutoMigrateFromSQLite || cfg.Database.SQLiteMigrationSourcePath != "" {
+		t.Fatalf("migration unexpectedly enabled: %#v", cfg.Database)
+	}
+}
+
+func TestLoadSQLiteAutoMigrationPathPrecedence(t *testing.T) {
+	resetConfigEnv(t)
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("DATABASE_AUTO_MIGRATE_FROM_SQLITE", "true")
+	explicit := filepath.Join(t.TempDir(), "explicit.sqlite")
+	if err := os.WriteFile(explicit, []byte("placeholder"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATABASE_MIGRATION_SQLITE_PATH", explicit)
+	t.Setenv("DATABASE_PATH", filepath.Join(t.TempDir(), "fallback.sqlite"))
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Database.AutoMigrateFromSQLite || cfg.Database.SQLiteMigrationSourcePath != explicit {
+		t.Fatalf("migration config = enabled:%v path:%q", cfg.Database.AutoMigrateFromSQLite, cfg.Database.SQLiteMigrationSourcePath)
+	}
+}
+
+func TestLoadSQLiteAutoMigrationFallsBackToDatabasePath(t *testing.T) {
+	resetConfigEnv(t)
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("DATABASE_AUTO_MIGRATE_FROM_SQLITE", "1")
+	fallback := filepath.Join(t.TempDir(), "database-path.sqlite")
+	if err := os.WriteFile(fallback, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATABASE_PATH", fallback)
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.SQLiteMigrationSourcePath != fallback {
+		t.Fatalf("migration path=%q want=%q", cfg.Database.SQLiteMigrationSourcePath, fallback)
+	}
+}
+
+func TestLoadSQLiteAutoMigrationRejectsInvalidConfiguration(t *testing.T) {
+	t.Run("invalid boolean", func(t *testing.T) {
+		resetConfigEnv(t)
+		t.Setenv("DATABASE_HOST", "postgres")
+		t.Setenv("REDIS_ADDR", "redis:6379")
+		t.Setenv("DATABASE_AUTO_MIGRATE_FROM_SQLITE", "sometimes")
+		if _, err := Load("__not_exists__.env"); err == nil || !strings.Contains(err.Error(), "true/false") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	t.Run("missing source", func(t *testing.T) {
+		resetConfigEnv(t)
+		t.Setenv("DATABASE_HOST", "postgres")
+		t.Setenv("REDIS_ADDR", "redis:6379")
+		t.Setenv("DATABASE_AUTO_MIGRATE_FROM_SQLITE", "true")
+		t.Setenv("DATABASE_MIGRATION_SQLITE_PATH", filepath.Join(t.TempDir(), "missing.sqlite"))
+		if _, err := Load("__not_exists__.env"); err == nil || !strings.Contains(err.Error(), "源文件不可用") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	t.Run("sqlite target", func(t *testing.T) {
+		resetConfigEnv(t)
+		t.Setenv("DATABASE_DRIVER", "sqlite")
+		t.Setenv("DATABASE_PATH", filepath.Join(t.TempDir(), "source.sqlite"))
+		t.Setenv("CACHE_DRIVER", "memory")
+		t.Setenv("DATABASE_AUTO_MIGRATE_FROM_SQLITE", "true")
+		if _, err := Load("__not_exists__.env"); err == nil || !strings.Contains(err.Error(), "DATABASE_DRIVER=postgres") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}
+
+func TestResolveSQLiteMigrationSourcePathZeaburDefault(t *testing.T) {
+	if got := resolveSQLiteMigrationSourcePath("", "", true); got != "/data/codex2api.db" {
+		t.Fatalf("Zeabur migration path=%q", got)
+	}
+	if got := resolveSQLiteMigrationSourcePath("/explicit.db", "/database.db", true); got != "/explicit.db" {
+		t.Fatalf("explicit migration path=%q", got)
 	}
 }
 

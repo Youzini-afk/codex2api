@@ -278,17 +278,6 @@ func (db *DB) ensurePromptPolicyIncidentsTable(ctx context.Context) error {
 			return err
 		}
 	}
-	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_policy_incidents SET prompt_available = CASE WHEN COALESCE(prompt_text, '') <> '' OR COALESCE(prompt_preview, '') <> '' THEN true ELSE false END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
-		return err
-	}
-	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_policy_incidents SET local_comparison = CASE
-		WHEN local_evaluation_state = 'legacy_unknown' THEN 'legacy_unknown'
-		WHEN local_evaluation_state <> 'completed' THEN 'not_comparable'
-		WHEN local_outcome <> 'no_hit' THEN 'local_detected'
-		WHEN prompt_available THEN 'upstream_only'
-		ELSE 'evidence_unavailable' END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
-		return err
-	}
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_prompt_policy_incidents_request ON prompt_policy_incidents(request_correlation_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_policy_incidents_created ON prompt_policy_incidents(created_at)`,
@@ -304,21 +293,55 @@ func (db *DB) ensurePromptPolicyIncidentsTable(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := db.migrateLegacyPromptPolicyIncidents(ctx); err != nil {
+	if err := normalizePromptPolicyIncidentData(ctx, db.conn, false); err != nil {
 		return err
 	}
 	return db.ensurePromptRiskEventsTable(ctx)
 }
 
 func (db *DB) migrateLegacyPromptPolicyIncidents(ctx context.Context) error {
-	query := `INSERT INTO prompt_policy_incidents (
+	return migrateLegacyPromptPolicyIncidentsWithExecutor(ctx, db.conn, false)
+}
+
+func migrateLegacyPromptPolicyIncidentsWithExecutor(ctx context.Context, execer sqlExecer, allocateIDs bool) error {
+	idColumn := ""
+	idValue := ""
+	if allocateIDs {
+		// Imported explicit IDs do not advance a fresh PostgreSQL sequence. Use
+		// IDs above the imported maximum for legacy rows, then let the caller's
+		// final all-table sequence reset establish the runtime next values.
+		idColumn = "id, "
+		idValue = "(SELECT COALESCE(MAX(id), 0) FROM prompt_policy_incidents) + ROW_NUMBER() OVER (ORDER BY pfl.id), "
+	}
+	query := `INSERT INTO prompt_policy_incidents (` + idColumn + `
 		incident_id, created_at, endpoint, request_protocol, request_provider, model, api_key_id, api_key_name, api_key_masked,
 		upstream_error_code, upstream_error, local_evaluation_state, local_matched_patterns
-	) SELECT 'legacy-' || CAST(id AS TEXT), created_at, endpoint, request_protocol, request_provider, model, api_key_id, api_key_name, api_key_masked,
-		error_code, full_text, $1, '[]' FROM prompt_filter_logs WHERE source='upstream_cyber_policy'
+	) SELECT ` + idValue + `'legacy-' || CAST(pfl.id AS TEXT), pfl.created_at, pfl.endpoint, pfl.request_protocol, pfl.request_provider, pfl.model, pfl.api_key_id, pfl.api_key_name, pfl.api_key_masked,
+		pfl.error_code, pfl.full_text, $1, '[]' FROM prompt_filter_logs pfl WHERE pfl.source='upstream_cyber_policy'
+		AND NOT EXISTS (SELECT 1 FROM prompt_policy_incidents ppi WHERE ppi.incident_id='legacy-' || CAST(pfl.id AS TEXT))
 	ON CONFLICT(incident_id) DO NOTHING`
-	_, err := db.conn.ExecContext(ctx, query, PromptPolicyEvaluationLegacyUnknown)
+	_, err := execer.ExecContext(ctx, query, PromptPolicyEvaluationLegacyUnknown)
 	return err
+}
+
+func normalizePromptPolicyIncidentData(ctx context.Context, execer sqlExecer, allocateLegacyIDs bool) error {
+	// Import legacy rows first so the derived-field pass also covers incidents
+	// materialized from prompt_filter_logs during this same initialization.
+	if err := migrateLegacyPromptPolicyIncidentsWithExecutor(ctx, execer, allocateLegacyIDs); err != nil {
+		return err
+	}
+	if _, err := execer.ExecContext(ctx, `UPDATE prompt_policy_incidents SET prompt_available = CASE WHEN COALESCE(prompt_text, '') <> '' OR COALESCE(prompt_preview, '') <> '' THEN true ELSE false END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
+		return err
+	}
+	if _, err := execer.ExecContext(ctx, `UPDATE prompt_policy_incidents SET local_comparison = CASE
+		WHEN local_evaluation_state = 'legacy_unknown' THEN 'legacy_unknown'
+		WHEN local_evaluation_state <> 'completed' THEN 'not_comparable'
+		WHEN local_outcome <> 'no_hit' THEN 'local_detected'
+		WHEN prompt_available THEN 'upstream_only'
+		ELSE 'evidence_unavailable' END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
+		return err
+	}
+	return nil
 }
 
 func normalizePromptPolicyIncidentInput(input PromptPolicyIncidentInput) (PromptPolicyIncidentInput, error) {

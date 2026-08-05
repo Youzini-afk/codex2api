@@ -24,16 +24,18 @@ func IsValidSchemaName(name string) bool {
 
 // DatabaseConfig 数据库核心配置。
 type DatabaseConfig struct {
-	Driver           string
-	ConnectionString string
-	Path             string
-	Host             string
-	Port             int
-	User             string
-	Password         string
-	DBName           string
-	Schema           string // PostgreSQL schema（search_path）；空值保持数据库默认行为
-	SSLMode          string
+	Driver                    string
+	ConnectionString          string
+	Path                      string
+	Host                      string
+	Port                      int
+	User                      string
+	Password                  string
+	DBName                    string
+	Schema                    string // PostgreSQL schema（search_path）；空值保持数据库默认行为
+	SSLMode                   string
+	AutoMigrateFromSQLite     bool
+	SQLiteMigrationSourcePath string
 }
 
 // DSN 返回当前驱动的连接字符串。
@@ -201,6 +203,31 @@ func Load(envPath string) (*Config, error) {
 	if cfg.Database.Driver == "sqlite" && cfg.Database.Path == "" && zeaburEnv {
 		cfg.Database.Path = "/data/codex2api.db"
 	}
+	autoMigrate, err := parseStrictBoolEnv("DATABASE_AUTO_MIGRATE_FROM_SQLITE")
+	if err != nil {
+		return nil, err
+	}
+	cfg.Database.AutoMigrateFromSQLite = autoMigrate
+	if autoMigrate {
+		if cfg.Database.Driver != "postgres" {
+			return nil, fmt.Errorf("DATABASE_AUTO_MIGRATE_FROM_SQLITE 仅可在 DATABASE_DRIVER=postgres 时启用")
+		}
+		cfg.Database.SQLiteMigrationSourcePath = resolveSQLiteMigrationSourcePath(
+			os.Getenv("DATABASE_MIGRATION_SQLITE_PATH"),
+			cfg.Database.Path,
+			zeaburEnv,
+		)
+		if cfg.Database.SQLiteMigrationSourcePath == "" {
+			return nil, fmt.Errorf("已启用 DATABASE_AUTO_MIGRATE_FROM_SQLITE，但未配置 DATABASE_MIGRATION_SQLITE_PATH 或 DATABASE_PATH")
+		}
+		info, statErr := os.Stat(cfg.Database.SQLiteMigrationSourcePath)
+		if statErr != nil {
+			return nil, fmt.Errorf("SQLite 自动迁移源文件不可用 (%s): %w", cfg.Database.SQLiteMigrationSourcePath, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("SQLite 自动迁移源路径不是普通文件: %s", cfg.Database.SQLiteMigrationSourcePath)
+		}
+	}
 
 	// 缓存配置
 	cfg.Cache.Redis.URL = firstNonEmptyEnv("REDIS_URL", "REDIS_CONNECTION_STRING", "CACHE_URL")
@@ -306,6 +333,31 @@ func parseBoolEnv(value string) bool {
 	default:
 		return false
 	}
+}
+
+func parseStrictBoolEnv(name string) (bool, error) {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	switch value {
+	case "", "0", "false", "no", "n", "off":
+		return false, nil
+	case "1", "true", "yes", "y", "on":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s 必须是 true/false（也接受 1/0、yes/no、on/off），当前值为 %q", name, value)
+	}
+}
+
+func resolveSQLiteMigrationSourcePath(explicitPath, databasePath string, zeabur bool) string {
+	if path := strings.TrimSpace(explicitPath); path != "" {
+		return path
+	}
+	if path := strings.TrimSpace(databasePath); path != "" {
+		return path
+	}
+	if zeabur {
+		return "/data/codex2api.db"
+	}
+	return ""
 }
 
 func parseTrustedProxiesEnv(value string) []string {
