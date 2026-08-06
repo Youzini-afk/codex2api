@@ -35,13 +35,17 @@ func sendAnthropicError(c *gin.Context, statusCode int, errType, message string)
 // 用于正文已下发、无法整段静默重试的上游失败：下游网关/客户端（Claude Code 等）
 // 能识别 error 事件并自行重试；伪造 stop_reason=end_turn 的干净收尾会让下游把
 // 截断/失败响应当成功，既无从感知也无从重试（issue #435）。
-func writeAnthropicStreamErrorEvent(w *streamFlushWriter, errType, message string) error {
+func writeAnthropicStreamErrorEvent(w *streamFlushWriter, errType, message string, details ...gin.H) error {
+	errorBody := gin.H{
+		"type":    errType,
+		"message": message,
+	}
+	if len(details) > 0 && details[0] != nil {
+		errorBody["details"] = details[0]
+	}
 	payload, err := json.Marshal(gin.H{
-		"type": "error",
-		"error": gin.H{
-			"type":    errType,
-			"message": message,
-		},
+		"type":  "error",
+		"error": errorBody,
 	})
 	if err != nil {
 		payload = []byte(`{"type":"error","error":{"type":"api_error","message":"failed to encode stream error"}}`)
@@ -377,6 +381,10 @@ func (h *Handler) Messages(c *gin.Context) {
 				lastBody = errBody
 				continue
 			}
+			if isExplicitUpstreamCyberPolicy(errBody) {
+				sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", upstreamCyberPolicyResponseMessage(c))
+				return
+			}
 
 			// 最终错误：用 Anthropic 格式返回。
 			// 上游账号 401（OAuth token 失效）是账号侧问题，不是下游客户端凭证无效；
@@ -419,6 +427,8 @@ func (h *Handler) Messages(c *gin.Context) {
 		wroteAnyBody := false
 		var terminalFailurePayload []byte
 		var anthropicResp *anthropicResponse
+		promptPolicyIncidentID := ""
+		upstreamCyberPolicyLogged := false
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
@@ -497,7 +507,19 @@ func (h *Handler) Messages(c *gin.Context) {
 				// 与重试（issue #435）。按 Anthropic 协议改发流内 error 事件后中止转发。
 				if eventType == "response.failed" && wroteAnyBody && writeErr == nil {
 					failedOutcome := classifyResponseFailedOutcome(terminalFailurePayload)
-					if err := writeAnthropicStreamErrorEvent(streamWriter, mapHTTPStatusToAnthropicError(failedOutcome.logStatusCode), failedOutcome.failureMessage); err != nil {
+					var policyDetails gin.H
+					if isExplicitUpstreamCyberPolicy(terminalFailurePayload) {
+						promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/messages", model, responseFailedErrorBody(terminalFailurePayload), upstreamCyberPolicyAttempt{
+							Transport: upstreamPromptPolicyTransport(true, useWebsocket), StatusCode: failedOutcome.logStatusCode,
+							AccountID: account.ID(), AttemptIndex: attempt + 1,
+						}))
+						upstreamCyberPolicyLogged = true
+						failedOutcome.failureMessage = upstreamCyberPolicyResponseMessage(c)
+						if metadata, delegated := newAPIUpstreamCyberPolicyDecision(c); delegated {
+							policyDetails = gin.H{"codex2api_policy": newAPIPolicyDecisionDetails(metadata)}
+						}
+					}
+					if err := writeAnthropicStreamErrorEvent(streamWriter, mapHTTPStatusToAnthropicError(failedOutcome.logStatusCode), failedOutcome.failureMessage, policyDetails); err != nil {
 						writeErr = err
 					}
 					return false
@@ -601,13 +623,17 @@ func (h *Handler) Messages(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
-		promptPolicyIncidentID := ""
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
-			promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/messages", model, responseFailedErrorBody(terminalFailurePayload), upstreamCyberPolicyAttempt{
-				Transport: upstreamPromptPolicyTransport(isStream, useWebsocket), StatusCode: outcome.logStatusCode,
-				AccountID: account.ID(), AttemptIndex: attempt + 1,
-			}))
+			if !upstreamCyberPolicyLogged {
+				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/messages", model, responseFailedErrorBody(terminalFailurePayload), upstreamCyberPolicyAttempt{
+					Transport: upstreamPromptPolicyTransport(isStream, useWebsocket), StatusCode: outcome.logStatusCode,
+					AccountID: account.ID(), AttemptIndex: attempt + 1,
+				}))
+			}
+			if isExplicitUpstreamCyberPolicy(terminalFailurePayload) {
+				outcome.failureMessage = upstreamCyberPolicyResponseMessage(c)
+			}
 			// 流式 response.failed 也要把额度耗尽/限流账号冷却下来，
 			// 否则该账号会保持高分继续被调度（与 /v1/responses 路径保持一致）。
 			responseFailedDecision := h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)

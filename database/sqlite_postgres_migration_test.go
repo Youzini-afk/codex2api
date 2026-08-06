@@ -59,6 +59,15 @@ func TestDiscoverMigrationSourceTablesAndColumns(t *testing.T) {
 	}
 }
 
+func TestSQLitePostgresBusinessTablesIncludeConversationLocksButExcludeRollup(t *testing.T) {
+	if _, ok := sqlitePostgresBusinessTableSet["prompt_conversation_locks"]; !ok {
+		t.Fatal("prompt_conversation_locks must be copied as durable business state")
+	}
+	if _, ok := sqlitePostgresBusinessTableSet["usage_stats_rollup"]; ok {
+		t.Fatal("usage_stats_rollup is derived state and must not be copied")
+	}
+}
+
 func TestIntersectMigrationColumnsUsesTargetOrder(t *testing.T) {
 	source := []migrationSourceColumn{{Name: "enabled"}, {Name: "id"}, {Name: "legacy_only"}}
 	target := []migrationTargetColumn{{Name: "id"}, {Name: "name"}, {Name: "enabled"}}
@@ -392,6 +401,13 @@ func TestSQLiteToPostgresAutoMigrationIntegration(t *testing.T) {
 	if channels[77] != "codex" || channels[78] != "grok" {
 		t.Fatalf("usage channels=%v, want 77=codex 78=grok", channels)
 	}
+	var rollupRequests, rollupLastLogID int64
+	if err := db.conn.QueryRowContext(ctx, `SELECT r.total_requests, s.last_log_id FROM `+qualifiedMigrationTable(schema, "usage_stats_rollup")+` r CROSS JOIN `+qualifiedMigrationTable(schema, "usage_stats_rollup_state")+` s WHERE r.channel='' AND s.id=1 AND s.initialized=1`).Scan(&rollupRequests, &rollupLastLogID); err != nil {
+		t.Fatal(err)
+	}
+	if rollupRequests != 2 || rollupLastLogID != 78 {
+		t.Fatalf("startup usage rollup requests=%d last_log_id=%d, want 2/78", rollupRequests, rollupLastLogID)
+	}
 	var siteName string
 	var promptEnabled bool
 	if err := db.conn.QueryRowContext(ctx, `SELECT site_name, prompt_filter_enabled FROM `+qualifiedMigrationTable(schema, "system_settings")+` WHERE id=1`).Scan(&siteName, &promptEnabled); err != nil {
@@ -442,6 +458,21 @@ func TestSQLiteToPostgresAutoMigrationIntegration(t *testing.T) {
 	}
 	if nextPromptFilterLogID != 89 {
 		t.Fatalf("single-row prompt_filter_logs next id=%d, want 89", nextPromptFilterLogID)
+	}
+	var lockStatus, lockReason string
+	var lockTriggerCount, lockUnlockCount int64
+	if err := db.conn.QueryRowContext(ctx, `SELECT status, trigger_count, unlock_count, unlock_reason FROM `+qualifiedMigrationTable(schema, "prompt_conversation_locks")+` WHERE id=12`).Scan(&lockStatus, &lockTriggerCount, &lockUnlockCount, &lockReason); err != nil {
+		t.Fatal(err)
+	}
+	if lockStatus != PromptConversationLockStatusUnlocked || lockTriggerCount != 3 || lockUnlockCount != 1 || lockReason != "migration fixture unlock" {
+		t.Fatalf("conversation lock state=%q triggers=%d unlocks=%d reason=%q", lockStatus, lockTriggerCount, lockUnlockCount, lockReason)
+	}
+	var nextConversationLockID int64
+	if err := db.conn.QueryRowContext(ctx, `INSERT INTO `+qualifiedMigrationTable(schema, "prompt_conversation_locks")+` (lock_key, locked_at, created_at, updated_at) VALUES ($1, NOW(), NOW(), NOW()) RETURNING id`, strings.Repeat("b", 64)).Scan(&nextConversationLockID); err != nil {
+		t.Fatal(err)
+	}
+	if nextConversationLockID != 13 {
+		t.Fatalf("prompt_conversation_locks next id=%d, want 13", nextConversationLockID)
 	}
 	var firstEmptySequenceID int64
 	if err := db.conn.QueryRowContext(ctx, `INSERT INTO `+qualifiedMigrationTable(schema, "image_generation_jobs")+` DEFAULT VALUES RETURNING id`).Scan(&firstEmptySequenceID); err != nil {
@@ -756,6 +787,7 @@ func createMigrationIntegrationSource(t *testing.T, path string, invalidJSON boo
 		`CREATE TABLE prompt_filter_newapi_bindings (api_key_id INTEGER PRIMARY KEY, platform_code TEXT NOT NULL, platform_name TEXT NOT NULL, secret TEXT NOT NULL, enabled INTEGER, require_signed_identity INTEGER, policy_mode TEXT, policy_profile TEXT, updated_at TIMESTAMP)`,
 		`CREATE TABLE prompt_policy_incidents (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT NOT NULL UNIQUE, created_at TIMESTAMP, local_evaluation_state TEXT, local_outcome TEXT, prompt_text TEXT, local_comparison TEXT)`,
 		`CREATE TABLE prompt_filter_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP, source TEXT, endpoint TEXT, request_protocol TEXT, request_provider TEXT, model TEXT, api_key_id INTEGER, api_key_name TEXT, api_key_masked TEXT, error_code TEXT, full_text TEXT)`,
+		`CREATE TABLE prompt_conversation_locks (id INTEGER PRIMARY KEY AUTOINCREMENT, lock_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL, trigger_count INTEGER NOT NULL, unlock_count INTEGER NOT NULL, locked_at TIMESTAMP NOT NULL, unlocked_at TIMESTAMP NULL, unlock_reason TEXT NOT NULL, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)`,
 	}
 	for _, statement := range statements {
 		mustExecMigrationTest(t, db, statement)
@@ -774,6 +806,7 @@ func createMigrationIntegrationSource(t *testing.T, path string, invalidJSON boo
 	mustExecMigrationTest(t, db, `INSERT INTO prompt_filter_newapi_bindings (api_key_id, platform_code, platform_name, secret, enabled, require_signed_identity, policy_mode, policy_profile, updated_at) VALUES (7, 'legacy', 'Legacy', '01234567890123456789012345678901', 1, 0, 'shadow', 'strict', '2026-08-05T12:42:00Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO prompt_policy_incidents (id, incident_id, created_at, local_evaluation_state, local_outcome, prompt_text, local_comparison) VALUES (1, 'imported-incident', '2026-08-05T12:43:00Z', 'completed', 'no_hit', 'available evidence', '')`)
 	mustExecMigrationTest(t, db, `INSERT INTO prompt_filter_logs (id, created_at, source, endpoint, request_protocol, request_provider, model, api_key_id, api_key_name, api_key_masked, error_code, full_text) VALUES (88, '2026-08-05T12:44:00Z', 'upstream_cyber_policy', '/v1/responses', 'responses', 'openai', 'gpt-5.4', 0, '', '', 'cyber_policy', 'legacy full text')`)
+	mustExecMigrationTest(t, db, `INSERT INTO prompt_conversation_locks (id, lock_key, status, trigger_count, unlock_count, locked_at, unlocked_at, unlock_reason, created_at, updated_at) VALUES (12, ?, 'unlocked', 3, 1, '2026-08-05T12:45:00Z', '2026-08-05T12:46:00Z', 'migration fixture unlock', '2026-08-05T12:45:00Z', '2026-08-05T12:46:00Z')`, strings.Repeat("a", 64))
 	if invalidJSON {
 		// api_keys is deliberately copied after accounts and usage_logs. This
 		// conversion failure therefore proves earlier successful INSERT batches

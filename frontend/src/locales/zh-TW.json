@@ -1,5 +1,35 @@
 {
-  "common": {"success":"成功","failed":"失敗"},
+  "common": {"success":"成功","failed":"失敗","enabled":"開啟","disabled":"關閉"},
+  "accounts": {
+    "modelCooldownPolicy": "模型冷卻策略",
+    "clearAllModelCooldowns": "清除全部",
+    "modelCooldownEffective": "目前生效：{{mode}} · {{seconds}} 秒 · 退避{{backoff}}",
+    "modelCooldownModeOverride": "帳號覆蓋模式",
+    "modelCooldownInherit": "跟隨系統預設",
+    "saveModelCooldownPolicy": "儲存帳號冷卻策略",
+    "clearModelCooldown": "清除此模型冷卻",
+    "modelCooldownPolicySaved": "帳號模型冷卻策略已儲存",
+    "modelCooldownPolicySaveFailed": "儲存模型冷卻策略失敗：{{error}}",
+    "modelCooldownCleared": "已清除 {{model}} 的模型冷卻",
+    "allModelCooldownsCleared": "已清除 {{count}} 條模型冷卻"
+  },
+  "settings": {
+    "modelCooldownTitle": "模型 429 冷卻策略",
+    "modelCooldownDesc": "分別控制 API 直連上游與 OAuth 帳號池的模型級 429 冷卻。",
+    "relayModelCooldownTitle": "API 計畫 / 直連上游",
+    "relayModelCooldownDesc": "預設關閉持久化模型冷卻，偶發 429 只做換上游重試。",
+    "oauthModelCooldownTitle": "OAuth / 訂閱帳號池",
+    "oauthModelCooldownDesc": "可關閉、固定時長或使用指數退避。",
+    "modelCooldownMode": "冷卻模式",
+    "modelCooldownModeDesc": "關閉、固定或自適應。",
+    "modelCooldownModeOff": "關閉",
+    "modelCooldownModeFixed": "固定",
+    "modelCooldownModeAdaptive": "自適應",
+    "modelCooldownSeconds": "基礎時長",
+    "modelCooldownSecondsDesc": "範圍 1–1800 秒。",
+    "modelCooldownBackoff": "指數退避",
+    "modelCooldownBackoffDesc": "僅自適應模式生效。"
+  },
   "promptFilter": {
     "views": {"profiles":"風險畫像","intelligence":"CY 學習審核"},
     "coverageTitle": "目前防護涵蓋",
@@ -20,7 +50,7 @@
     "adaptiveReview": {
       "title": "自適應模型審核",
       "description": "新使用者先完整複核；已簽名人員在持續低風險後自動減少同步 DS 請求。本地規則與會話關聯始終執行，命中、CY 或風險上升會立即恢復完整複核。",
-      "defaults": "安全預設：10 次乾淨複核且觀察滿 24 小時後生效；5% 週期抽檢，最長 6 小時強制複核一次。",
+      "defaults": "目前策略：{{minClean}} 次乾淨複核且觀察滿 {{hours}} 小時後生效；{{sample}}% 週期抽檢，最長 {{forceHours}} 小時強制複核一次。",
       "activeBadge": "低風險人員自適應降頻"
     },
     "expertSettingsSummary": "底層與相容設定",
@@ -82,7 +112,7 @@
     "reviewApiKeyHint": "多個 Key 會輪詢分攤額度，遇到限流、無效 Key 或伺服器錯誤時自動切換。",
     "reviewRequestMode": "請求適配模式",
     "reviewModeChat": "Chat Completions 相容介面",
-    "reviewModeModerations": "Moderations（相容舊設定）",
+    "reviewModeModerations": "Moderations 相容介面",
     "reviewScope": "審核範圍",
     "reviewScopeOptions": {
       "all_requests": "所有可擷取輸入的請求",
@@ -90,8 +120,16 @@
       "local_blocks": "僅本機攔截判定"
     },
     "reviewConfidenceThreshold": "違規信心閾值",
+    "moderationThresholds": "風險閾值",
+    "moderationThresholdsHint": "依 OpenAI Moderations 分類調整命中閾值，分數達到或超過閾值即視為命中；不再使用上游 flagged 布林值決定攔截。",
+    "moderationThresholdsReset": "恢復預設閾值",
+    "moderationThresholdDefault": "預設 {{percent}}%",
     "reviewMaxConcurrent": "最大並行複核數",
     "reviewMaxTextLength": "單次複核最大字元數",
+    "reviewCircuitBreakerFailures": "連續失敗熔斷閾值",
+    "reviewCircuitBreakerSeconds": "熔斷恢復等待（秒）",
+    "reviewResilienceTitle": "審核效能與故障隔離",
+    "reviewResilienceDesc": "通常無需調整。連續失敗後快速停止等待外部模型，恢復視窗結束後僅允許一個探針請求。",
     "reviewSystemPrompt": "Agent / System Prompt",
     "reviewSystemPromptHint": "模型不可變的審核指令，只應輸出 confidence 與 reason JSON。",
     "reviewSystemPromptPlaceholder": "留空使用服務端維護的預設審核提示詞",
@@ -109,6 +147,9 @@
     "reviewTestEndpoint": "實際請求端點",
     "reviewTestLatency": "耗時",
     "reviewTestConfidence": "信心 / 閾值",
+    "reviewTestDecision": "判定分類分數 / 閾值",
+    "reviewTestHighestScore": "最高分類分數",
+    "reviewTestHighestCategory": "最高分類",
     "reviewTestReason": "模型原因",
     "intelligence": {
       "aiAnalyze": "AI 歸因",
@@ -177,6 +218,11 @@
       "recommendation": "營運建議",
       "person": "人員身份",
       "nonPerson": "非人員對象",
+      "activeProfile": "已有請求畫像",
+      "identityOnly": "僅身份目錄",
+      "noAttributedRequests": "暫無可歸因請求",
+      "profileState": "畫像狀態",
+      "identitySource": "身份匯入來源",
       "identityConfidence": "身份可信度",
       "miss": "漏檢",
       "block": "攔截",
@@ -194,6 +240,16 @@
       "allObjects": "全部畫像對象",
       "peopleProfilesHint": "預設只顯示可追溯至 NewAPI 使用者 ID 的人員畫像。",
       "nonPersonHint": "工作階段、Key、網路與上游帳號是環境對象，用於定位鏈路，不代表特定人員。",
+      "conversationLock": {
+        "title": "CYB 會話鎖",
+        "active": "對話已鎖定",
+        "description": "此工作階段曾收到上游明確的 cyber_policy。鎖定後的重複請求不會再次累計處罰；管理員確認誤判後可以主動解鎖。",
+        "unlock": "解鎖此對話",
+        "confirm": "確認解鎖此對話？原視窗中的上下文仍會保留，僅應在確認誤判後操作。",
+        "unlocked": "對話已解鎖",
+        "lockedAt": "鎖定時間",
+        "reason": "鎖定原因"
+      },
       "trust": {
         "title": "臨時自適應信任",
         "description": "只對本地規則判定乾淨的請求略過同步 DS 複核；本地高風險規則、週期畫像和 CY 回饋始終生效。達到門檻、到期或再次出現 CY 會自動恢復同步審核。",
@@ -206,7 +262,7 @@
       "subjects": {"newapi_user":"NewAPI 使用者","session":"工作階段","api_key":"API Key","client_ip":"客戶端網路","upstream_account":"上游帳號"},
       "levels": {"low":"低","observed":"觀察","elevated":"升高","high":"高","critical":"嚴重"},
       "actions": {"observe":"保持觀察","monitor":"持續監控","enhanced_review":"加強審核","rate_limit":"評估限速","require_signed_identity":"要求可信簽名身份","temporary_restriction_review":"評估臨時限制","account_rotation_review":"評估帳號輪換","account_routing_review":"檢查帳號路由"},
-      "events": {"review_cleared":"複核通過","local_block_strike":"本地攔截並計次","local_block":"本地攔截","local_warn":"本地警告","local_audit_hit":"本地審計命中","upstream_cy_confirmed_miss":"上游 CY：確認漏檢","upstream_cy_local_detected":"上游 CY：本地已識別","upstream_cy_upstream_only":"上游 CY：僅上游證據","upstream_cy_evidence_unavailable":"上游 CY：證據不可用","upstream_cy_not_comparable":"上游 CY：不可比較","upstream_cy_legacy_unknown":"上游 CY：歷史未知"}
+      "events": {"review_cleared":"複核通過","review_flagged_monitor":"模型命中（監控模式）","local_block_strike":"本地終局攔截","local_block":"歷史未確認攔截","local_block_unverified":"本地攔截（待確認）","local_block_cleared":"本地攔截（已修正）","local_warn":"本地警告","local_audit_hit":"本地審計命中","local_security_context_observed":"安全測試上下文觀察","upstream_cy_confirmed_miss":"上游 CY：確認漏檢","upstream_cy_local_detected":"上游 CY：本地已識別","upstream_cy_upstream_only":"上游 CY：僅上游證據","upstream_cy_evidence_unavailable":"上游 CY：證據不可用","upstream_cy_not_comparable":"上游 CY：不可比較","upstream_cy_legacy_unknown":"上游 CY：歷史未知"}
     },
     "saveRefreshFailed": "設定已儲存，但規則或日誌重新整理失敗；可稍後單獨重新整理頁面",
     "advancedConfigInvalidTitle": "進階防護設定無法解析",
@@ -252,6 +308,13 @@
 	"notScored": "未評分",
 	"localAuditLogsTitle": "本機過濾與非同步稽核日誌",
 	"refreshAllLogs": "重新整理全部日誌",
+	"clearCyberIncidents": "清空 CY 事件",
+	"clearReviewLogs": "清空複核歷史",
+	"clearLocalLogs": "清空本機日誌",
+	"cyberIncidentsCleared": "上游 CY 事件已清空，風險畫像已保留",
+	"reviewLogsCleared": "外部模型複核歷史已清空，風險畫像已保留",
+	"localLogsCleared": "本機過濾與非同步稽核日誌已清空，風險畫像已保留",
+	"logSummaryRefreshFailed": "日誌已清空，但概覽摘要重新整理失敗",
 	"sectionRefreshHint": "篩選、分頁與重新整理只更新目前區域。",
 	"noCyberIncidents": "暫無上游 CY 事件",
 	"cyberUpstream": "上游結果",
@@ -484,7 +547,12 @@
       "operationalMaxDiscount": "操作意圖最大降分",
       "operationalMaxDiscountHint": "已包含執行、投遞、竊取或繞過動作時仍允許的最大降分。建議設為 0，防止用「僅供研究」抵消明確惡意意圖。"
     },
-    "terminalCategoriesCollapsedDesc": "僅在需要將特定高風險分類設為終局證據時調整。",
+    "terminalPolicyTitle": "終局攔截策略",
+    "terminalCategoriesCollapsedDesc": "設定終局分類，以及二審通過後可放行的專用審計模型。",
+    "terminalBypassModels": "終局二審豁免模型",
+    "terminalBypassModelsHint": "以逗號分隔精確的請求模型 ID。僅對這些模型，二審明確通過後可以清除本地終局命中；二審錯誤或判定違規時仍會攔截。",
+    "conversationLockEnabled": "上游 CYB 後鎖定目前對話",
+    "cybStrikeEnabled": "允許上游 CYB 計入停用次數",
     "riskSimplifiedDesc": "依使用者、IP 與會話累計週期風險；預設關閉。",
     "outputSimplifiedDesc": "掃描串流輸出中的嚴格高風險訊號；預設關閉。",
     "extensions": {
@@ -569,6 +637,9 @@
       }
     },
     "help": {
+      "terminalBypassModels": "僅用於提示詞必然包含違規樣本的專用審計模型。依客戶端請求模型 ID 比對，不依映射後的上游模型比對。",
+      "conversationLockEnabled": "僅在上游明確回傳 cyber_policy 且簽名中繼資料含穩定會話指紋時鎖定。已鎖定請求不會重複累計 strike；沒有可靠視窗識別時不會猜測或誤鎖。",
+      "cybStrikeEnabled": "預設關閉。開啟後，只有上游明確回傳 cyber_policy 的決策才會簽為可計次；關閉時仍會稽核、提醒並依設定鎖定對話，但 NewAPI 不會因此累計次數或自動停用帳號。",
       "normalizationPanel": "對常見編碼和壓縮片段進行有界還原；位元組、片段和輪數上限可避免解碼炸彈拖垮服務。",
       "maxDecodedBytes": "單次請求所有還原結果允許占用的最大位元組數，達到上限後停止繼續解碼。",
       "maxEncodedBlocks": "單次請求最多嘗試還原的獨立編碼片段數，限制惡意批量小片段消耗。",

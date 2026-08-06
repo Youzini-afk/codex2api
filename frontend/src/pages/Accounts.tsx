@@ -203,6 +203,7 @@ type AccountGroupDraft = {
   baseConcurrencyInput: string;
   auto_pause_5h_threshold: number;
   auto_pause_7d_threshold: number;
+  proxyURLsInput: string;
 };
 
 function getDefaultAccountVisibleColumns(): Record<
@@ -1045,6 +1046,7 @@ export default function Accounts() {
     baseConcurrencyInput: "",
     auto_pause_5h_threshold: 0,
     auto_pause_7d_threshold: 0,
+    proxyURLsInput: "",
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
@@ -2973,8 +2975,15 @@ export default function Accounts() {
     setExporting(true);
     setShowExportPicker(false);
     try {
-      const params: { filter: "healthy" | "all"; ids?: number[] } = {
+      // Codex 账号页只导出 codex 渠道:不带 channel 时后端会把 Grok 账号一并
+      // 打进 codex 命名的导出文件(Grok 页有专属导出入口)。
+      const params: {
+        filter: "healthy" | "all";
+        ids?: number[];
+        channel: "codex";
+      } = {
         filter: scope === "healthy" ? "healthy" : "all",
+        channel: "codex",
       };
       if (scope === "selected") {
         params.ids = Array.from(selected);
@@ -3370,6 +3379,53 @@ export default function Accounts() {
         t("accounts.resetStatusFailed", { error: getErrorMessage(error) }),
         "error",
       );
+    }
+  };
+
+  const handleSaveModelCooldownPolicy = async (
+    account: AccountRow,
+    data: {
+      mode: "off" | "fixed" | "adaptive" | null;
+      seconds: number | null;
+      backoff_enabled: boolean | null;
+    },
+  ) => {
+    try {
+      await api.updateAccountModelCooldownPolicy(account.id, data);
+      showToast(t("accounts.modelCooldownPolicySaved"));
+      void reloadSilently();
+    } catch (error) {
+      showToast(
+        t("accounts.modelCooldownPolicySaveFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    }
+  };
+
+  const handleClearModelCooldown = async (
+    account: AccountRow,
+    model: string,
+  ) => {
+    try {
+      await api.clearAccountModelCooldown(account.id, model);
+      showToast(t("accounts.modelCooldownCleared", { model }));
+      void reloadSilently();
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
+    }
+  };
+
+  const handleClearAllModelCooldowns = async (account: AccountRow) => {
+    try {
+      const result = await api.clearAllAccountModelCooldowns(account.id);
+      showToast(
+        t("accounts.allModelCooldownsCleared", { count: result.cleared }),
+      );
+      void reloadSilently();
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
     }
   };
 
@@ -4245,6 +4301,7 @@ export default function Accounts() {
       baseConcurrencyInput: "",
       auto_pause_5h_threshold: 0,
       auto_pause_7d_threshold: 0,
+      proxyURLsInput: "",
     });
   };
 
@@ -4261,6 +4318,7 @@ export default function Accounts() {
           : "",
       auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
       auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
+      proxyURLsInput: (group.proxy_urls ?? []).join("\n"),
     });
   };
 
@@ -4286,6 +4344,10 @@ export default function Accounts() {
             : parsedGroupBaseConcurrency,
         auto_pause_5h_threshold: groupDraft.auto_pause_5h_threshold,
         auto_pause_7d_threshold: groupDraft.auto_pause_7d_threshold,
+        proxy_urls: groupDraft.proxyURLsInput
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean),
       };
       if (groupDraft.id === null) {
         await api.createAccountGroup(payload);
@@ -7261,7 +7323,10 @@ export default function Accounts() {
             <AccountUsageModal
               account={usageAccount}
               onClose={() => setUsageAccount(null)}
-              onCreditsReset={() => void reload()}
+              // 必须静默重拉：reload() 会把 StateShell 切成整页 loading，
+              // 而这个弹窗就渲染在 StateShell 里 —— 一开积分开关整个界面连同弹窗
+              // 就被卸载重建（用量数据重新拉、滚动位置丢失），观感就是"闪一下全刷新"。
+              onCreditsReset={() => void reloadSilently()}
             />
           )}
 
@@ -7338,6 +7403,18 @@ export default function Accounts() {
             onResetStatus={() => {
               if (!detailAccount) return;
               void handleResetStatus(detailAccount);
+            }}
+            onSaveModelCooldownPolicy={(data) => {
+              if (!detailAccount) return;
+              void handleSaveModelCooldownPolicy(detailAccount, data);
+            }}
+            onClearModelCooldown={(model) => {
+              if (!detailAccount) return;
+              void handleClearModelCooldown(detailAccount, model);
+            }}
+            onClearAllModelCooldowns={() => {
+              if (!detailAccount) return;
+              void handleClearAllModelCooldowns(detailAccount);
             }}
             onResetCredits={() => {
               if (!detailAccount) return;
@@ -9079,6 +9156,27 @@ export default function Accounts() {
                       {groupBaseConcurrencyInvalid
                         ? t("accounts.groupBaseConcurrencyRange")
                         : t("accounts.groupBaseConcurrencyHint")}
+                    </p>
+                  </label>
+                  <label className="block space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupProxyURLsLabel")}
+                    </span>
+                    <textarea
+                      className="w-full min-h-[80px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                      value={groupDraft.proxyURLsInput}
+                      onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                        setGroupDraft((draft) => ({
+                          ...draft,
+                          proxyURLsInput: event.target.value,
+                        }))
+                      }
+                      placeholder={t("accounts.groupProxyURLsPlaceholder")}
+                      rows={3}
+                      spellCheck={false}
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      {t("accounts.groupProxyURLsHint")}
                     </p>
                   </label>
                   <div className="space-y-1.5">

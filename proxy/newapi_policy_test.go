@@ -359,6 +359,116 @@ func TestWebSocketPolicyDecisionIDUsesLogicalFrameSequence(t *testing.T) {
 	}
 }
 
+func TestOnlyExplicitUpstreamCyberPolicyDecisionIsStrikeEligible(t *testing.T) {
+	cfg := promptGuardTestConfig()
+	cfg.Advanced.Enforcement.CYBStrikeEnabled = true
+	binding := database.PromptFilterNewAPIBinding{
+		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "gateway-a-secret", Enabled: true,
+		PolicyMode: database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileBalanced,
+	}
+	handler := newPromptFilterBindingTestHandler(t, cfg, []database.PromptFilterNewAPIBinding{binding})
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	c := signedBoundNewAPIPolicyContext(t, "upstream-cyb-request", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, body, 101, "gateway-a", "gateway-a-secret", "")
+	setIngressRequestBodyIfAbsent(c, body)
+
+	_, _ = handler.logUpstreamCyberPolicy(c, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy","message":"blocked"}}`))
+	metadata := policyDecisionMetadataFromHeaders(c.Writer.Header())
+	if metadata.ReasonCode != newAPIUpstreamCyberPolicyReasonCode || !metadata.StrikeEligible || metadata.Action != promptfilter.ActionBlock {
+		t.Fatalf("upstream CYB decision metadata = %+v", metadata)
+	}
+	if got, want := c.Writer.Header().Get("X-Codex2API-Policy-Response-Signature"), signNewAPIPolicyDecision("gateway-a-secret", metadata); got == "" || got != want {
+		t.Fatalf("upstream CYB signature = %q, want %q", got, want)
+	}
+
+	local := promptfilter.Decision{
+		Action: promptfilter.ActionBlock, Profile: promptfilter.GuardProfileStrict,
+		ReasonCode: "prompt_policy_match", StrikeEligible: true, Terminal: true,
+	}
+	localMetadata := buildNewAPIPolicyDecisionMetadataWithSecret(
+		newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8", RequestID: "local-policy-request"},
+		local, promptfilter.Verdict{Action: promptfilter.ActionBlock, FullText: "local match"}, cfg,
+		body, "/v1/responses", "gpt-5.5", "", "gateway-a-secret",
+	)
+	if localMetadata.StrikeEligible {
+		t.Fatalf("local prompt decision unexpectedly became strike eligible: %+v", localMetadata)
+	}
+}
+
+func TestUpstreamCyberPolicyStrikeRequiresExplicitCodex2APISwitch(t *testing.T) {
+	cfg := promptGuardTestConfig()
+	cfg.Advanced.Enforcement.CYBStrikeEnabled = false
+	binding := database.PromptFilterNewAPIBinding{
+		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "gateway-a-secret", Enabled: true,
+		PolicyMode: database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileBalanced,
+	}
+	handler := newPromptFilterBindingTestHandler(t, cfg, []database.PromptFilterNewAPIBinding{binding})
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	c := signedBoundNewAPIPolicyContext(t, "upstream-cyb-audit-only", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, body, 101, "gateway-a", "gateway-a-secret", "")
+	setIngressRequestBodyIfAbsent(c, body)
+
+	_, _ = handler.logUpstreamCyberPolicy(c, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy","message":"blocked"}}`))
+	metadata, delegated := newAPIUpstreamCyberPolicyDecision(c)
+	if !delegated || metadata.ReasonCode != newAPIUpstreamCyberPolicyReasonCode || metadata.StrikeEligible {
+		t.Fatalf("disabled CYB strike switch metadata = %+v delegated=%t", metadata, delegated)
+	}
+	if got := c.Writer.Header().Get("X-Codex2API-Policy-Strike-Eligible"); got != "false" {
+		t.Fatalf("strike eligibility header = %q, want false", got)
+	}
+	if message := newAPIPolicyDecisionAPIError(metadata).Message; !strings.Contains(message, "再次触发可能会停用账号") {
+		t.Fatalf("disabled CYB strike deterrence message = %q", message)
+	}
+}
+
+func TestResponseFailedCarriesSignedNewAPIPolicyDecisionWithoutDroppingUpstreamDetails(t *testing.T) {
+	cfg := promptGuardTestConfig()
+	metadata := buildNewAPIPolicyDecisionMetadataWithSecret(
+		newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8", RequestID: "stream-cyb-request"},
+		promptfilter.Decision{
+			Action: promptfilter.ActionBlock, Profile: promptfilter.GuardProfileBalanced,
+			ReasonCode: newAPIUpstreamCyberPolicyReasonCode, StrikeEligible: true, Terminal: true,
+		},
+		promptfilter.Verdict{Action: promptfilter.ActionBlock, FullText: "cyber_policy"},
+		cfg, []byte(`{"error":{"code":"cyber_policy"}}`), "/v1/responses", "gpt-5.5", "", "gateway-a-secret",
+	)
+	original := []byte(`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"blocked","details":{"upstream_trace":"trace-1"}}}}`)
+	decorated := attachNewAPIPolicyDecisionToResponseFailed(original, metadata)
+
+	if got := gjson.GetBytes(decorated, "response.error.code").String(); got != "cyber_policy" {
+		t.Fatalf("upstream error code = %q", got)
+	}
+	if got := gjson.GetBytes(decorated, "response.error.details.upstream_trace").String(); got != "trace-1" {
+		t.Fatalf("upstream details were dropped: %s", decorated)
+	}
+	policy := gjson.GetBytes(decorated, "response.error.details.codex2api_policy")
+	if policy.Get("decision_id").String() != metadata.DecisionID || !policy.Get("strike_eligible").Bool() {
+		t.Fatalf("signed stream decision missing: %s", decorated)
+	}
+	if got := policy.Get("response_signature").String(); got != signNewAPIPolicyDecision("gateway-a-secret", metadata) {
+		t.Fatalf("stream decision signature = %q", got)
+	}
+	translated, done := TranslateStreamChunk(decorated, "gpt-5.5", "chatcmpl-test", time.Now().Unix())
+	if !done || gjson.GetBytes(translated, "error.details.codex2api_policy.decision_id").String() != metadata.DecisionID {
+		t.Fatalf("chat stream translation dropped signed decision: %s", translated)
+	}
+}
+
+func TestOrdinaryUpstream400DoesNotEmitPolicyStrike(t *testing.T) {
+	cfg := promptGuardTestConfig()
+	binding := database.PromptFilterNewAPIBinding{
+		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "gateway-a-secret", Enabled: true,
+		PolicyMode: database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileBalanced,
+	}
+	handler := newPromptFilterBindingTestHandler(t, cfg, []database.PromptFilterNewAPIBinding{binding})
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	c := signedBoundNewAPIPolicyContext(t, "ordinary-400-request", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, body, 101, "gateway-a", "gateway-a-secret", "")
+	setIngressRequestBodyIfAbsent(c, body)
+
+	if incidentID, accepted := handler.logUpstreamCyberPolicy(c, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"invalid_request_error"}}`)); incidentID != "" || accepted {
+		t.Fatalf("ordinary 400 was treated as CYB: incident=%q accepted=%t", incidentID, accepted)
+	}
+	assertNoPromptPolicyPenaltyHeaders(t, c.Writer.Header())
+}
+
 func TestNewAPIPolicyDecisionAndEventSignatureGoldenVector(t *testing.T) {
 	metadata := newAPIPolicyDecisionMetadata{
 		RequestID: " req-1 ", DecisionID: " dec-1 ", EventID: " responses:7 ",
@@ -531,6 +641,40 @@ func TestNewAPIIdentitySecretsDoNotFallbackForUnboundKeyInBindingMode(t *testing
 	}
 }
 
+func TestPromptFilterBindingScopeControlsOnlyItsAPIKey(t *testing.T) {
+	cfg := promptGuardTestConfig()
+	cfg.Enabled = true
+	cfg.Review.Enabled = true
+	handler := newPromptFilterBindingTestHandler(t, cfg, []database.PromptFilterNewAPIBinding{
+		{APIKeyID: 101, PlatformCode: "full-review", Secret: "full-review-secret", Enabled: true, PromptFilterScope: database.PromptFilterScopeInherit},
+		{APIKeyID: 202, PlatformCode: "local-only", Secret: "local-only-secret", Enabled: true, PromptFilterScope: database.PromptFilterScopeLocalOnly},
+		{APIKeyID: 303, PlatformCode: "prompt-off", Secret: "prompt-off-secret", Enabled: true, PromptFilterScope: database.PromptFilterScopeOff},
+	})
+	requestConfig := func(apiKeyID int64) promptfilter.Config {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		c.Set(contextAPIKeyID, apiKeyID)
+		return handler.promptFilterConfigForRequest(c)
+	}
+
+	inherit := requestConfig(101)
+	if !inherit.Enabled || !inherit.Review.Enabled {
+		t.Fatalf("inherit scope changed global review: enabled=%v review=%v", inherit.Enabled, inherit.Review.Enabled)
+	}
+	localOnly := requestConfig(202)
+	if !localOnly.Enabled || localOnly.Review.Enabled || !localOnly.Advanced.NewAPI.Enabled {
+		t.Fatalf("local-only scope=%+v", localOnly)
+	}
+	off := requestConfig(303)
+	if off.Enabled || !off.Advanced.NewAPI.Enabled {
+		t.Fatalf("off scope disabled identity or retained prompt checks: enabled=%v newapi=%v", off.Enabled, off.Advanced.NewAPI.Enabled)
+	}
+	unbound := requestConfig(404)
+	if !unbound.Enabled || !unbound.Review.Enabled || unbound.Advanced.NewAPI.Enabled {
+		t.Fatalf("unbound key inherited wrong config: enabled=%v review=%v newapi=%v", unbound.Enabled, unbound.Review.Enabled, unbound.Advanced.NewAPI.Enabled)
+	}
+}
+
 func TestUnboundWebSocketIsNotRevokedByAnotherKeysBinding(t *testing.T) {
 	handler := newPromptFilterBindingTestHandler(t, promptGuardTestConfig(), []database.PromptFilterNewAPIBinding{{
 		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "gateway-a-secret", Enabled: true,
@@ -559,7 +703,8 @@ func TestUnboundWebSocketIsNotRevokedByAnotherKeysBinding(t *testing.T) {
 func TestBindingSnapshotRefreshesPolicyAndRevokesObsoleteWebSocketIdentity(t *testing.T) {
 	oldBinding := database.PromptFilterNewAPIBinding{
 		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "old-secret", Enabled: true, RequireSignedIdentity: true,
-		PolicyMode: database.PromptFilterPolicyModeWarn, PolicyProfile: database.PromptFilterPolicyProfileResearch,
+		PromptFilterScope: database.PromptFilterScopeInherit,
+		PolicyMode:        database.PromptFilterPolicyModeWarn, PolicyProfile: database.PromptFilterPolicyProfileResearch,
 	}
 	handler := newPromptFilterBindingTestHandler(t, promptGuardTestConfig(), []database.PromptFilterNewAPIBinding{oldBinding})
 	newConnection := func() *gin.Context {
@@ -581,7 +726,8 @@ func TestBindingSnapshotRefreshesPolicyAndRevokesObsoleteWebSocketIdentity(t *te
 	rotated := database.PromptFilterNewAPIBinding{
 		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "new-secret", PreviousSecret: "old-secret", PreviousSecretExpiresAt: &expiresAt,
 		Enabled: true, RequireSignedIdentity: true,
-		PolicyMode: database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileStrict,
+		PromptFilterScope: database.PromptFilterScopeLocalOnly,
+		PolicyMode:        database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileStrict,
 	}
 	handler.store.ReplacePromptFilterNewAPIBindings([]*database.PromptFilterNewAPIBinding{&rotated})
 	if apiErr := handler.refreshNewAPIWebSocketBinding(c, time.Now()); apiErr != nil {
@@ -595,6 +741,9 @@ func TestBindingSnapshotRefreshesPolicyAndRevokesObsoleteWebSocketIdentity(t *te
 	currentCfg := handler.promptFilterConfigForRequest(c)
 	if currentCfg.Advanced.Guard.Mode != promptfilter.GuardModeInherit || currentCfg.Advanced.Guard.DefaultProfile != promptfilter.GuardProfileBalanced {
 		t.Fatalf("binding changed unified policy: mode=%q profile=%q", currentCfg.Advanced.Guard.Mode, currentCfg.Advanced.Guard.DefaultProfile)
+	}
+	if currentCfg.Review.Enabled {
+		t.Fatal("websocket frame did not hot-refresh local-only review scope")
 	}
 
 	for _, tc := range []struct {

@@ -57,6 +57,7 @@ var sqlitePostgresBusinessTables = []string{
 	"prompt_filter_newapi_bindings",
 	"prompt_rule_candidate_evidence",
 	"prompt_policy_incidents",
+	"prompt_conversation_locks",
 	"prompt_risk_event_sources",
 	"prompt_risk_identities",
 	"prompt_risk_events",

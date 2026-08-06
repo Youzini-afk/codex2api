@@ -155,8 +155,9 @@ type compactToolCallOut struct {
 // openAIErrorResponse 错误响应
 type openAIErrorResponse struct {
 	Error struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
+		Message string          `json:"message"`
+		Type    string          `json:"type"`
+		Details json.RawMessage `json:"details,omitempty"`
 	} `json:"error"`
 }
 
@@ -3192,10 +3193,13 @@ func newFinalChunk(id, model string, created int64, finishReason string, usage *
 }
 
 // newErrorResponse 构建错误响应
-func newErrorResponse(message string) []byte {
+func newErrorResponse(message string, details ...json.RawMessage) []byte {
 	resp := openAIErrorResponse{}
 	resp.Error.Message = message
 	resp.Error.Type = "upstream_error"
+	if len(details) > 0 && len(details[0]) > 0 {
+		resp.Error.Details = details[0]
+	}
 	b, _ := json.Marshal(resp)
 	return b
 }
@@ -3225,7 +3229,11 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		if errMsg == "" {
 			errMsg = "Codex upstream error"
 		}
-		return newErrorResponse(errMsg), true
+		var details json.RawMessage
+		if raw := gjson.GetBytes(eventData, "response.error.details"); raw.Exists() && raw.IsObject() {
+			details = json.RawMessage(raw.Raw)
+		}
+		return newErrorResponse(errMsg, details), true
 
 	case "response.content_part.done", "response.output_item.done",
 		"response.created", "response.in_progress",
@@ -3343,7 +3351,11 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 		if errMsg == "" {
 			errMsg = "Codex upstream error"
 		}
-		return newErrorResponse(errMsg), true
+		var details json.RawMessage
+		if raw := parsed.Get("response.error.details"); raw.Exists() && raw.IsObject() {
+			details = json.RawMessage(raw.Raw)
+		}
+		return newErrorResponse(errMsg, details), true
 
 	case "response.content_part.done", "response.output_item.done",
 		"response.created", "response.in_progress",

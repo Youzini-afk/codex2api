@@ -77,6 +77,50 @@ func TestAccountEmailDomain(t *testing.T) {
 	}
 }
 
+func TestApplyAccountModelCooldownPolicyFromRowWithoutRuntimeAccount(t *testing.T) {
+	settings := database.ModelCooldownSettings{
+		RelayMode:           database.ModelCooldownModeFixed,
+		RelaySeconds:        7,
+		RelayBackoffEnabled: false,
+		OAuthMode:           database.ModelCooldownModeAdaptive,
+		OAuthSeconds:        300,
+		OAuthBackoffEnabled: true,
+	}
+
+	t.Run("persisted overrides", func(t *testing.T) {
+		row := &database.AccountRow{Credentials: map[string]interface{}{
+			"model_cooldown_mode_override":    database.ModelCooldownModeFixed,
+			"model_cooldown_seconds_override": "45",
+			"model_cooldown_backoff_override": false,
+		}}
+		var resp accountResponse
+		applyAccountModelCooldownPolicyFromRow(&resp, row, settings, false)
+		if resp.ModelCooldownModeOverride == nil || *resp.ModelCooldownModeOverride != database.ModelCooldownModeFixed {
+			t.Fatalf("mode override = %v, want fixed", resp.ModelCooldownModeOverride)
+		}
+		if resp.ModelCooldownSecondsOverride == nil || *resp.ModelCooldownSecondsOverride != 45 {
+			t.Fatalf("seconds override = %v, want 45", resp.ModelCooldownSecondsOverride)
+		}
+		if resp.ModelCooldownBackoffOverride == nil || *resp.ModelCooldownBackoffOverride {
+			t.Fatalf("backoff override = %v, want false", resp.ModelCooldownBackoffOverride)
+		}
+		if resp.ModelCooldownModeEffective != database.ModelCooldownModeFixed || resp.ModelCooldownSecondsEffective != 45 || resp.ModelCooldownBackoffEffective {
+			t.Fatalf("effective policy = %s/%d/%t, want fixed/45/false", resp.ModelCooldownModeEffective, resp.ModelCooldownSecondsEffective, resp.ModelCooldownBackoffEffective)
+		}
+	})
+
+	t.Run("relay defaults", func(t *testing.T) {
+		var resp accountResponse
+		applyAccountModelCooldownPolicyFromRow(&resp, &database.AccountRow{}, settings, true)
+		if resp.ModelCooldownModeOverride != nil || resp.ModelCooldownSecondsOverride != nil || resp.ModelCooldownBackoffOverride != nil {
+			t.Fatalf("unexpected overrides: mode=%v seconds=%v backoff=%v", resp.ModelCooldownModeOverride, resp.ModelCooldownSecondsOverride, resp.ModelCooldownBackoffOverride)
+		}
+		if resp.ModelCooldownModeEffective != database.ModelCooldownModeFixed || resp.ModelCooldownSecondsEffective != 7 || resp.ModelCooldownBackoffEffective {
+			t.Fatalf("effective relay policy = %s/%d/%t, want fixed/7/false", resp.ModelCooldownModeEffective, resp.ModelCooldownSecondsEffective, resp.ModelCooldownBackoffEffective)
+		}
+	})
+}
+
 func TestAccountAccessTokenTypeInfersCodexAT(t *testing.T) {
 	row := &database.AccountRow{Credentials: map[string]interface{}{
 		"access_token": "at-opaque-codex-token",
@@ -906,6 +950,167 @@ func TestGetUsageLogsRejectsInvalidCompactionFilters(t *testing.T) {
 			}
 			assertErrorMessage(t, recorder, test.wantError)
 		})
+	}
+}
+
+func TestGetUsageLogsRejectsInvalidDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "status",
+			query:     "status=6xx",
+			wantError: "status/status_code 参数无效",
+		},
+		{
+			name:      "retry",
+			query:     "retry=maybe",
+			wantError: "retry 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "websocket",
+			query:     "via_websocket=1",
+			wantError: "via_websocket 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "error only",
+			query:     "error_only=yes",
+			wantError: "error_only 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsAppliesDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "matching",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "server",
+			ErrorMessage:      "boom from upstream",
+			IsRetryAttempt:    true,
+			AttemptIndex:      1,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "wrong-kind",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "transport",
+			ErrorMessage:      "boom from transport",
+			IsRetryAttempt:    true,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:    accountID,
+			Endpoint:     "/v1/responses",
+			Model:        "canceled",
+			StatusCode:   499,
+			ErrorMessage: "client canceled",
+		},
+		{
+			AccountID:  accountID,
+			Endpoint:   "/v1/responses",
+			Model:      "success",
+			StatusCode: http.StatusOK,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=5xx&error_kind=server&retry=true&via_websocket=true&q=boom",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var page database.UsageLogPage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].Model != "matching" {
+		t.Fatalf("filtered page = total %d logs %+v, want matching only", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=499",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("499 status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode 499 response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 499 {
+		t.Fatalf("499 page = total %d logs %+v", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs/error-summary?start="+start+"&end="+end,
+		nil,
+	)
+	handler.GetUsageLogsErrorSummary(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var summary database.UsageErrorSummary
+	if err := json.Unmarshal(recorder.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if summary.TotalErrors != 3 || summary.Status5xx != 2 || summary.Canceled != 1 || summary.RetryAttempts != 2 {
+		t.Fatalf("summary = %+v, want total=3 5xx=2 canceled=1 retries=2", summary)
 	}
 }
 
@@ -2557,6 +2762,69 @@ func TestExportAccountsIncludesATOnly(t *testing.T) {
 	}
 	if at.AccessToken != "at_only_value" {
 		t.Fatalf("AT-only AccessToken = %q, want at_only_value", at.AccessToken)
+	}
+}
+
+// TestExportAccountsChannelScoped Codex 账号页导出必须能按渠道过滤:不带 channel
+// 时 Grok 账号会混进 codex 命名的导出文件(issue: 选 3 个 codex 导出得到 5 个)。
+func TestExportAccountsChannelScoped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+
+	codexID, err := db.InsertAccount(context.Background(), "codex-account", "rt_codex", "")
+	if err != nil {
+		t.Fatalf("insert codex account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), codexID, map[string]interface{}{
+		"email":        "codex@example.com",
+		"access_token": "at_codex",
+	}); err != nil {
+		t.Fatalf("update codex credentials: %v", err)
+	}
+
+	grokID, err := db.InsertAccount(context.Background(), "grok-account", "", "")
+	if err != nil {
+		t.Fatalf("insert grok account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), grokID, map[string]interface{}{
+		"email":         "grok@example.com",
+		"upstream_type": "grok",
+		"api_key":       "xai-test-key",
+	}); err != nil {
+		t.Fatalf("update grok credentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	export := func(query string) []map[string]any {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/export?"+query, nil)
+		handler.ExportAccounts(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d for %q: %s", recorder.Code, query, recorder.Body.String())
+		}
+		var entries []map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &entries); err != nil {
+			t.Fatalf("decode response for %q: %v", query, err)
+		}
+		return entries
+	}
+
+	codexOnly := export("filter=all&channel=codex")
+	if len(codexOnly) != 1 || codexOnly[0]["email"] != "codex@example.com" {
+		t.Fatalf("channel=codex entries = %v, want only the codex account", codexOnly)
+	}
+
+	grokOnly := export("filter=all&channel=grok")
+	if len(grokOnly) != 1 || grokOnly[0]["email"] != "grok@example.com" {
+		t.Fatalf("channel=grok entries = %v, want only the grok account", grokOnly)
+	}
+
+	// 缺省仍导出全部渠道:远程迁移依赖全量语义。
+	if all := export("filter=all"); len(all) != 2 {
+		t.Fatalf("default export entries = %d, want 2", len(all))
 	}
 }
 
