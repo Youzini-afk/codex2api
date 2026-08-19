@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/codex2api/security/promptfilter"
@@ -104,5 +105,14 @@ func TestDefaultBootstrapSettingsPreserveRuntimeDefaults(t *testing.T) {
 	}
 	if !settings.CodexCLIVersionSyncEnabled || settings.CodexCLIVersionSyncIntervalHours != 12 {
 		t.Fatalf("CLI sync defaults = (%t, %d), want (true, 12)", settings.CodexCLIVersionSyncEnabled, settings.CodexCLIVersionSyncIntervalHours)
+	}
+	for _, fragment := range []string{
+		`"follow_up_effort_enabled":false`,
+		`"follow_up_tool_effort":"medium"`,
+		`"follow_up_small_effort":"low"`,
+	} {
+		if !strings.Contains(settings.GrokConfig, fragment) {
+			t.Fatalf("GrokConfig = %q, missing %s", settings.GrokConfig, fragment)
+		}
 	}
 }

@@ -2,9 +2,13 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -15,6 +19,7 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const promptFilterAuditContextMaxRunes = 2000
@@ -38,6 +43,32 @@ type promptPolicyIncidentDetailResponse struct {
 	Matches   json.RawMessage                       `json:"matches"`
 	Candidate *database.PromptRuleCandidate         `json:"candidate,omitempty"`
 	Evidence  *database.PromptRuleCandidateEvidence `json:"evidence,omitempty"`
+}
+
+type promptPolicyAuditQueueHealth struct {
+	Enqueued      uint64 `json:"enqueued"`
+	Completed     uint64 `json:"completed"`
+	DroppedHigh   uint64 `json:"dropped_high"`
+	DroppedLow    uint64 `json:"dropped_low"`
+	Failed        uint64 `json:"failed"`
+	PendingHigh   int    `json:"pending_high"`
+	PendingLow    int    `json:"pending_low"`
+	RetainedBytes int64  `json:"retained_bytes"`
+}
+
+type promptPolicyAuditHealthResponse struct {
+	OK                      bool                             `json:"ok"`
+	Status                  string                           `json:"status"`
+	StorageReady            bool                             `json:"storage_ready"`
+	PromptFilterEnabled     bool                             `json:"prompt_filter_enabled"`
+	ReviewEnabled           bool                             `json:"review_enabled"`
+	ReviewFailClosed        bool                             `json:"review_fail_closed"`
+	ReviewPool              promptfilter.ReviewKeyPoolHealth `json:"review_pool"`
+	ConversationLockEnabled bool                             `json:"conversation_lock_enabled"`
+	IncidentCount           int                              `json:"incident_count"`
+	LatestIncidentID        string                           `json:"latest_incident_id,omitempty"`
+	LatestIncidentAt        *time.Time                       `json:"latest_incident_at,omitempty"`
+	Queue                   promptPolicyAuditQueueHealth     `json:"queue"`
 }
 
 type promptFilterTestRequest struct {
@@ -74,6 +105,8 @@ type promptReviewTestRequest struct {
 
 type promptReviewKeyTestResult struct {
 	KeyIndex             int                `json:"key_index"`
+	KeyID                string             `json:"key_id,omitempty"`
+	KeyMasked            string             `json:"key_masked,omitempty"`
 	OK                   bool               `json:"ok"`
 	Endpoint             string             `json:"endpoint,omitempty"`
 	Model                string             `json:"model,omitempty"`
@@ -88,6 +121,272 @@ type promptReviewKeyTestResult struct {
 	ModerationThresholds map[string]float64 `json:"moderation_thresholds,omitempty"`
 	LatencyMS            int64              `json:"latency_ms"`
 	Error                string             `json:"error,omitempty"`
+}
+
+type promptReviewAPIKeyDescriptor struct {
+	ID     string `json:"id"`
+	Index  int    `json:"index"`
+	Masked string `json:"masked"`
+}
+
+type promptReviewAPIKeysResponse struct {
+	Items []promptReviewAPIKeyDescriptor `json:"items"`
+	Count int                            `json:"count"`
+}
+
+type promptReviewProfileResponse struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	BaseURL       string    `json:"base_url"`
+	Model         string    `json:"model"`
+	RequestMode   string    `json:"request_mode"`
+	TimeoutSecond int       `json:"timeout_seconds"`
+	KeyCount      int       `json:"key_count"`
+	Active        bool      `json:"active"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type promptReviewProfilesResponse struct {
+	Profiles []promptReviewProfileResponse `json:"profiles"`
+}
+
+type promptReviewProfileRequest struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	BaseURL       string `json:"base_url"`
+	Model         string `json:"model"`
+	RequestMode   string `json:"request_mode"`
+	APIKey        string `json:"api_key"`
+	AdapterJSON   string `json:"adapter_json"`
+	TimeoutSecond int    `json:"timeout_seconds"`
+}
+
+func toPromptReviewProfileResponse(profile database.PromptReviewProfile) promptReviewProfileResponse {
+	return promptReviewProfileResponse{
+		ID: profile.ID, Name: profile.Name, BaseURL: profile.BaseURL, Model: profile.Model,
+		RequestMode: profile.RequestMode, TimeoutSecond: profile.TimeoutSecond,
+		KeyCount: len((promptfilter.ReviewConfig{APIKey: profile.APIKeys}).APIKeyList()),
+		Active:   profile.Active, CreatedAt: profile.CreatedAt, UpdatedAt: profile.UpdatedAt,
+	}
+}
+
+func promptReviewProfileAdapterJSON(raw string, fallback promptfilter.ReviewAdapterConfig) (string, promptfilter.ReviewAdapterConfig, error) {
+	adapter := fallback
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &adapter); err != nil {
+			return "", adapter, errors.New("adapter_json 无效")
+		}
+	}
+	adapter = promptfilter.NormalizeReviewAdapterConfig(adapter)
+	encoded, err := json.Marshal(adapter)
+	if err != nil {
+		return "", adapter, err
+	}
+	return string(encoded), adapter, nil
+}
+
+func (h *Handler) ListPromptReviewProfiles(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	profiles, err := h.db.ListPromptReviewProfiles(c.Request.Context())
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	items := make([]promptReviewProfileResponse, 0, len(profiles))
+	for _, profile := range profiles {
+		items = append(items, toPromptReviewProfileResponse(profile))
+	}
+	c.JSON(http.StatusOK, promptReviewProfilesResponse{Profiles: items})
+}
+
+func (h *Handler) SavePromptReviewProfile(c *gin.Context) {
+	if h == nil || h.db == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	var req promptReviewProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len([]rune(req.Name)) > 120 {
+		writeError(c, http.StatusBadRequest, "档案名称不能为空且不能超过 120 个字符")
+		return
+	}
+	current := h.store.GetPromptFilterConfig().Review
+	profileID := strings.TrimSpace(req.ID)
+	var existing *database.PromptReviewProfile
+	if profileID != "" {
+		var err error
+		existing, err = h.db.GetPromptReviewProfile(c.Request.Context(), profileID)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+	}
+	if profileID == "" {
+		profileID = uuid.NewString()
+	}
+	apiKeys := strings.TrimSpace(req.APIKey)
+	if apiKeys == "" {
+		if existing != nil {
+			apiKeys = existing.APIKeys
+		} else {
+			// 留空表示保存当前已生效的 Key，避免用户为了保存新档案而
+			// 必须再次粘贴现有 DeepSeek Key。
+			apiKeys = current.APIKey
+		}
+	}
+	baseURL := strings.TrimSpace(req.BaseURL)
+	if baseURL == "" && existing != nil {
+		baseURL = existing.BaseURL
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" && existing != nil {
+		model = existing.Model
+	}
+	requestMode := strings.TrimSpace(req.RequestMode)
+	if requestMode == "" && existing != nil {
+		requestMode = existing.RequestMode
+	}
+	if req.TimeoutSecond <= 0 && existing != nil {
+		req.TimeoutSecond = existing.TimeoutSecond
+	}
+	if req.TimeoutSecond <= 0 {
+		req.TimeoutSecond = current.TimeoutSeconds
+	}
+	adapterRaw := req.AdapterJSON
+	if strings.TrimSpace(adapterRaw) == "" && existing != nil {
+		adapterRaw = existing.AdapterJSON
+	}
+	if strings.TrimSpace(adapterRaw) == "" {
+		adapterRaw, _, _ = promptReviewProfileAdapterJSON("", current.Adapter)
+	}
+	canonicalAdapter, adapter, err := promptReviewProfileAdapterJSON(adapterRaw, current.Adapter)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	reviewCfg := current
+	reviewCfg.APIKey, reviewCfg.BaseURL, reviewCfg.Model = apiKeys, baseURL, model
+	reviewCfg.TimeoutSeconds, reviewCfg.Adapter = req.TimeoutSecond, adapter
+	reviewCfg = promptfilter.NormalizeReviewConfig(reviewCfg)
+	if err := promptfilter.ValidateReviewConfig(reviewCfg); err != nil {
+		writeError(c, http.StatusBadRequest, "Prompt 审核配置无效: "+err.Error())
+		return
+	}
+	profile := database.PromptReviewProfile{ID: profileID, Name: req.Name, BaseURL: reviewCfg.BaseURL, Model: reviewCfg.Model,
+		RequestMode: reviewCfg.Adapter.RequestMode, AdapterJSON: canonicalAdapter, APIKeys: reviewCfg.APIKey,
+		TimeoutSecond: reviewCfg.TimeoutSeconds, Active: existing != nil && existing.Active}
+	if err := h.db.UpsertPromptReviewProfile(c.Request.Context(), profile); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toPromptReviewProfileResponse(profile))
+}
+
+func (h *Handler) ActivatePromptReviewProfile(c *gin.Context) {
+	if h == nil || h.db == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	profile, err := h.db.GetPromptReviewProfile(c.Request.Context(), strings.TrimSpace(c.Param("profile_id")))
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if profile == nil {
+		writeError(c, http.StatusNotFound, "审核配置档案不存在")
+		return
+	}
+	var adapter promptfilter.ReviewAdapterConfig
+	if err := json.Unmarshal([]byte(profile.AdapterJSON), &adapter); err != nil {
+		writeError(c, http.StatusConflict, "审核配置档案中的适配器配置无效")
+		return
+	}
+	adapter = promptfilter.NormalizeReviewAdapterConfig(adapter)
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
+	settings, err := h.db.GetSystemSettings(c.Request.Context())
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if settings == nil {
+		writeError(c, http.StatusNotFound, "系统设置不存在")
+		return
+	}
+	patchRaw, _ := json.Marshal(map[string]any{"review_adapter": adapter})
+	document, err := promptfilter.MergeAdvancedConfigDocument(settings.PromptFilterAdvancedConfig, string(patchRaw))
+	if err != nil {
+		writeError(c, http.StatusConflict, "审核配置档案无法应用: "+err.Error())
+		return
+	}
+	settings.PromptFilterReviewAPIKey = profile.APIKeys
+	settings.PromptFilterReviewBaseURL = profile.BaseURL
+	settings.PromptFilterReviewModel = profile.Model
+	settings.PromptFilterReviewTimeoutSeconds = profile.TimeoutSecond
+	settings.PromptFilterAdvancedConfig = document.Raw
+	settings.PreservePromptFilterReviewAPIKey = false
+	if err := h.db.UpdateSystemSettings(c.Request.Context(), settings); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	runtimeCfg := h.store.GetPromptFilterConfig()
+	runtimeCfg.Review.APIKey, runtimeCfg.Review.BaseURL, runtimeCfg.Review.Model = profile.APIKeys, profile.BaseURL, profile.Model
+	runtimeCfg.Review.TimeoutSeconds, runtimeCfg.Review.Adapter = profile.TimeoutSecond, adapter
+	if err := h.store.SetPromptFilterConfigWithAdvancedRaw(runtimeCfg, document.Raw); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if err := h.db.SetPromptReviewProfileActive(c.Request.Context(), profile.ID); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	profile.Active = true
+	c.JSON(http.StatusOK, toPromptReviewProfileResponse(*profile))
+}
+
+func (h *Handler) DeletePromptReviewProfile(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	if err := h.db.DeletePromptReviewProfile(c.Request.Context(), strings.TrimSpace(c.Param("profile_id"))); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func promptReviewAPIKeyID(key string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
+	return hex.EncodeToString(sum[:])
+}
+
+// maskPromptReviewAPIKey 按 rune 切片(字节切会截断多字节字符),且只在
+// 前后缀不可能重叠、多数字符仍被遮蔽时(≥12 字符)才展示明文片段。
+func maskPromptReviewAPIKey(key string) string {
+	runes := []rune(strings.TrimSpace(key))
+	if len(runes) < 12 {
+		return "••••"
+	}
+	return string(runes[:3]) + "••••" + string(runes[len(runes)-4:])
+}
+
+func promptReviewAPIKeyDescriptors(keys []string) []promptReviewAPIKeyDescriptor {
+	items := make([]promptReviewAPIKeyDescriptor, 0, len(keys))
+	for index, key := range keys {
+		items = append(items, promptReviewAPIKeyDescriptor{
+			ID: promptReviewAPIKeyID(key), Index: index + 1, Masked: maskPromptReviewAPIKey(key),
+		})
+	}
+	return items
 }
 
 type promptReviewTestResponse struct {
@@ -265,6 +564,50 @@ func (h *Handler) ClearPromptPolicyIncidents(c *gin.Context) {
 		return
 	}
 	writeMessage(c, http.StatusOK, "上游 CY 事件已清空；风险画像已保留")
+}
+
+func (h *Handler) GetPromptPolicyAuditHealth(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "CY 审计存储不可用")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	incidents, total, err := h.db.ListPromptPolicyIncidentsPage(ctx, database.PromptPolicyIncidentQuery{Page: 1, PageSize: 1})
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	stats := h.db.PromptFilterAuditStats()
+	cfg := promptfilter.DefaultConfig()
+	if h.store != nil {
+		cfg = h.store.GetPromptFilterConfig()
+	}
+	response := promptPolicyAuditHealthResponse{
+		OK: true, Status: "healthy", StorageReady: true,
+		PromptFilterEnabled: cfg.Enabled, ReviewEnabled: cfg.Review.Enabled,
+		ReviewFailClosed: cfg.Review.FailClosed, ReviewPool: promptfilter.ReviewKeyPoolStatus(cfg.Review),
+		ConversationLockEnabled: cfg.Advanced.Enforcement.ConversationLockEnabled,
+		IncidentCount:           total,
+		Queue: promptPolicyAuditQueueHealth{
+			Enqueued: stats.Enqueued, Completed: stats.Completed, DroppedHigh: stats.DroppedHigh,
+			DroppedLow: stats.DroppedLow, Failed: stats.Failed, PendingHigh: stats.PendingHigh,
+			PendingLow: stats.PendingLow, RetainedBytes: stats.RetainedBytes,
+		},
+	}
+	// 主动关闭的功能不算故障（面板上已有独立的开关状态展示）；只有真实异常才降级：
+	// 审计队列丢高优/写入失败，或审查已启用但 key 池空配置/全冷却。
+	reviewPoolFault := response.ReviewEnabled && (response.ReviewPool.Configured == 0 || response.ReviewPool.Available == 0)
+	if reviewPoolFault || stats.DroppedHigh > 0 || stats.Failed > 0 {
+		response.OK = false
+		response.Status = "degraded"
+	}
+	if len(incidents) > 0 && incidents[0] != nil {
+		response.LatestIncidentID = incidents[0].IncidentID
+		latest := incidents[0].CreatedAt
+		response.LatestIncidentAt = &latest
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *Handler) ListPromptPolicyIncidents(c *gin.Context) {
@@ -460,6 +803,46 @@ func (h *Handler) TestPromptFilter(c *gin.Context) {
 	})
 }
 
+type promptReviewModelsRequest struct {
+	BaseURL        string `json:"base_url"`
+	APIKey         string `json:"api_key"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+// ListPromptReviewModels 从审查供应商拉取 OpenAI 兼容的模型列表,供前端选择审查模型。
+// base_url/api_key 允许携带表单草稿值覆盖已存配置,便于保存前先拉列表。
+func (h *Handler) ListPromptReviewModels(c *gin.Context) {
+	if h == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	var req promptReviewModelsRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	reviewCfg := h.store.GetPromptFilterConfig().Review
+	if key := strings.TrimSpace(req.APIKey); key != "" {
+		reviewCfg.APIKey = key
+	}
+	if baseURL := strings.TrimSpace(req.BaseURL); baseURL != "" {
+		reviewCfg.BaseURL = baseURL
+	}
+	if req.TimeoutSeconds > 0 {
+		reviewCfg.TimeoutSeconds = req.TimeoutSeconds
+	}
+	if len(promptfilter.NormalizeReviewConfig(reviewCfg).APIKeyList()) == 0 {
+		writeError(c, http.StatusBadRequest, "请先配置审查 API Key")
+		return
+	}
+	models, endpoint, err := promptfilter.DefaultReviewClient.ListReviewModels(c.Request.Context(), reviewCfg)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "拉取模型列表失败: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"endpoint": endpoint, "models": models})
+}
+
 func (h *Handler) TestPromptReviewConnection(c *gin.Context) {
 	var req promptReviewTestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -535,6 +918,7 @@ func (h *Handler) TestPromptReviewConnection(c *gin.Context) {
 			}(index, key)
 		}
 		results := make([]promptReviewKeyTestResult, len(keys))
+		descriptors := promptReviewAPIKeyDescriptors(keys)
 		allOK := true
 		var first promptfilter.ReviewOutcome
 		for range keys {
@@ -543,7 +927,8 @@ func (h *Handler) TestPromptReviewConnection(c *gin.Context) {
 				first = item.outcome
 			}
 			result := promptReviewKeyTestResult{
-				KeyIndex: item.index + 1, OK: item.err == nil, Flagged: item.outcome.Flagged,
+				KeyIndex: item.index + 1, KeyID: descriptors[item.index].ID, KeyMasked: descriptors[item.index].Masked,
+				OK: item.err == nil, Flagged: item.outcome.Flagged,
 				Endpoint: item.outcome.Endpoint, Model: item.outcome.Model, Confidence: item.outcome.Confidence,
 				Reason: item.outcome.Reason, HighestCategory: item.outcome.HighestCategory,
 				DecisionCategory: item.outcome.DecisionCategory, DecisionScore: item.outcome.DecisionScore,
@@ -591,6 +976,90 @@ func (h *Handler) TestPromptReviewConnection(c *gin.Context) {
 		LatencyMS:            time.Since(started).Milliseconds(),
 		KeyCount:             len(keys),
 	})
+}
+
+func (h *Handler) ListPromptReviewAPIKeys(c *gin.Context) {
+	if h == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	items := promptReviewAPIKeyDescriptors(h.store.GetPromptFilterConfig().Review.APIKeyList())
+	c.JSON(http.StatusOK, promptReviewAPIKeysResponse{Items: items, Count: len(items)})
+}
+
+func (h *Handler) DeletePromptReviewAPIKey(c *gin.Context) {
+	if h == nil || h.store == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	keyID := strings.ToLower(strings.TrimSpace(c.Param("key_id")))
+	if len(keyID) != sha256.Size*2 {
+		writeError(c, http.StatusBadRequest, "审查 Key 标识无效")
+		return
+	}
+	if _, err := hex.DecodeString(keyID); err != nil {
+		writeError(c, http.StatusBadRequest, "审查 Key 标识无效")
+		return
+	}
+
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
+	settings, err := h.db.GetSystemSettings(c.Request.Context())
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if settings == nil {
+		writeError(c, http.StatusNotFound, "审查 Key 不存在")
+		return
+	}
+	// storedRaw 保持数据库原值不做 trim:CAS 按原值精确比较,存量值若带
+	// 换行/制表符,trim 后将永远匹配不上而恒 409。
+	storedRaw := settings.PromptFilterReviewAPIKey
+	keys := (promptfilter.ReviewConfig{APIKey: storedRaw}).APIKeyList()
+	remaining := make([]string, 0, len(keys))
+	found := false
+	deletedMasked := ""
+	for _, key := range keys {
+		if promptReviewAPIKeyID(key) == keyID {
+			found = true
+			deletedMasked = maskPromptReviewAPIKey(key)
+			continue
+		}
+		remaining = append(remaining, key)
+	}
+	if !found {
+		writeError(c, http.StatusNotFound, "审查 Key 不存在或已被删除")
+		return
+	}
+	if settings.PromptFilterReviewEnabled && len(remaining) == 0 {
+		writeError(c, http.StatusConflict, "模型复核启用时不能删除最后一个审查 Key，请先关闭模型复核或添加替代 Key")
+		return
+	}
+	replacement := strings.Join(remaining, "\n")
+	runtimeCfg := h.store.GetPromptFilterConfig()
+	runtimeCfg.Review.APIKey = replacement
+	runtimeCfg = promptfilter.NormalizeConfig(runtimeCfg)
+	if err := promptfilter.ValidateReviewConfig(runtimeCfg.Review); err != nil {
+		writeError(c, http.StatusConflict, "删除后审查配置无效: "+err.Error())
+		return
+	}
+	swapped, err := h.db.CompareAndSwapPromptFilterReviewAPIKeys(c.Request.Context(), storedRaw, replacement)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if !swapped {
+		writeError(c, http.StatusConflict, "审查 Key 列表已被其他操作修改，请刷新后重试")
+		return
+	}
+	if err := h.store.SetPromptFilterConfigWithAdvancedRaw(runtimeCfg, h.store.GetPromptFilterAdvancedConfig()); err != nil {
+		writeError(c, http.StatusInternalServerError, "审查 Key 已保存，但运行时配置更新失败")
+		return
+	}
+	log.Printf("审查 Key 已删除: %s (来自 %s)，剩余 %d 个", deletedMasked, c.ClientIP(), len(remaining))
+	items := promptReviewAPIKeyDescriptors(remaining)
+	c.JSON(http.StatusOK, promptReviewAPIKeysResponse{Items: items, Count: len(items)})
 }
 
 func (h *Handler) TestPromptFilterRulePattern(c *gin.Context) {

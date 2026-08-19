@@ -7,7 +7,7 @@
  * - 展示：剩余 x 小时 / 1 天+（issue #383 产品化）
  */
 
-import type { AccountRow } from '../types'
+import type { AccountPressureForecastAnalysis, AccountRow } from '../types'
 
 export type RecoveryWindow = '5h' | '7d'
 export type RiskLevel = 'low' | 'medium' | 'high'
@@ -338,6 +338,61 @@ export function selectPoolRunway(
   return secondaryAt < primaryAt ? secondary : primary
 }
 
+/** Convert the fixed-size server aggregate into the existing runway model. */
+export function pressureForecastFromAnalysis(
+  source: AccountPressureForecastAnalysis,
+): PressureForecast {
+  return {
+    sampled: source.sampled,
+    threshold: source.threshold,
+    predictedAt: source.predicted_at,
+    predictedCount: source.predicted_count,
+    unknown: source.unknown,
+    rpm: source.rpm,
+    effectiveRpmLimit: source.effective_rpm_limit,
+    rpmPressure: source.rpm_pressure,
+    activePressure: source.active_pressure,
+    rateLimitPressure: source.rate_limit_pressure,
+    dispatchableAccounts: source.dispatchable_accounts,
+    avgConcurrency: source.avg_concurrency,
+    highPressureAt: source.high_pressure_at,
+    supplyShortageAt: source.supply_shortage_at,
+    riskLevel: source.risk_level,
+    confidence: source.confidence,
+  }
+}
+
+/** Dashboard variant that selects the tighter cached 5h/7d forecast. */
+export function selectPoolRunwayFromAnalysis(
+  forecasts: Record<RecoveryWindow, AccountPressureForecastAnalysis>,
+  nowMs: number,
+): PoolRunway {
+  const primary = buildPoolRunway(
+    pressureForecastFromAnalysis(forecasts['7d']),
+    nowMs,
+    '7d',
+  )
+  const fiveHourForecast = forecasts['5h']
+  if (fiveHourForecast.sampled <= 0 && fiveHourForecast.unknown <= 0) {
+    return primary
+  }
+  const secondary = buildPoolRunway(
+    pressureForecastFromAnalysis(fiveHourForecast),
+    nowMs,
+    '5h',
+  )
+  if (primary.pressureAt == null && secondary.pressureAt == null) {
+    return primary.riskLevel === 'high' || primary.riskLevel === 'medium'
+      ? primary
+      : secondary.riskLevel !== 'low'
+        ? secondary
+        : primary
+  }
+  if (primary.pressureAt == null) return secondary
+  if (secondary.pressureAt == null) return primary
+  return secondary.pressureAt < primary.pressureAt ? secondary : primary
+}
+
 function suggestAddAccounts(forecast: PressureForecast): number {
   if (forecast.dispatchableAccounts <= 0) return 0
   const rpmPerSlot = getRpmPerSlot(0) // use default; advice is approximate
@@ -406,10 +461,10 @@ export function isWindowRateLimitLike(account: AccountRow, windowKey: RecoveryWi
 function isShortRateLimitLike(account: AccountRow): boolean {
   const status = (account.status || '').toLowerCase()
   const reason = (account.cooldown_reason || '').toLowerCase()
-  if (status === 'rate_limited' || status === 'rate_limited_5h' || status === 'cooldown') {
+  if (status === 'rate_limited' || status === 'responses_rate_limited' || status === 'rate_limited_5h' || status === 'cooldown') {
     return true
   }
-  if (reason === 'rate_limited' || reason === 'rate_limited_5h') {
+  if (reason === 'rate_limited' || reason === 'responses_rate_limited' || reason === 'rate_limited_5h') {
     return true
   }
   return false

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestDiscoverMigrationSourceTablesAndColumns(t *testing.T) {
@@ -59,12 +59,19 @@ func TestDiscoverMigrationSourceTablesAndColumns(t *testing.T) {
 	}
 }
 
-func TestSQLitePostgresBusinessTablesIncludeConversationLocksButExcludeRollup(t *testing.T) {
+func TestSQLitePostgresBusinessTablesPreserveDurableStateButExcludeDerivedState(t *testing.T) {
 	if _, ok := sqlitePostgresBusinessTableSet["prompt_conversation_locks"]; !ok {
 		t.Fatal("prompt_conversation_locks must be copied as durable business state")
 	}
-	if _, ok := sqlitePostgresBusinessTableSet["usage_stats_rollup"]; ok {
-		t.Fatal("usage_stats_rollup is derived state and must not be copied")
+	for _, table := range []string{"account_daily_usage", "official_pricing_sync_config", "prompt_review_profiles"} {
+		if _, ok := sqlitePostgresBusinessTableSet[table]; !ok {
+			t.Fatalf("%s must be copied as durable source-of-truth state", table)
+		}
+	}
+	for _, table := range []string{"usage_stats_rollup", "usage_stats_rollup_state", "grok_account_fact_snapshots", "grok_model_catalog_items"} {
+		if _, ok := sqlitePostgresBusinessTableSet[table]; ok {
+			t.Fatalf("%s is derived state and must not be copied", table)
+		}
 	}
 }
 
@@ -89,8 +96,8 @@ func TestWithPostgresSchemaDSN(t *testing.T) {
 	if got, want := parsedURL.Query().Get("options"), `-c statement_timeout=5s -c search_path="Tenant_1",public`; got != want {
 		t.Fatalf("URL DSN decoded options=%q, want %q (dsn=%s)", got, want, urlDSN)
 	}
-	if _, err := pq.NewConnector(urlDSN); err != nil {
-		t.Fatalf("generated URL DSN rejected by lib/pq: %v", err)
+	if _, err := pgx.ParseConfig(urlDSN); err != nil {
+		t.Fatalf("generated URL DSN rejected by pgx: %v", err)
 	}
 	keywordDSN, err := withPostgresSchemaDSN(`host=localhost dbname=codex options='-c statement_timeout=5s'`, "Tenant_1")
 	if err != nil {
@@ -103,8 +110,8 @@ func TestWithPostgresSchemaDSN(t *testing.T) {
 	if want := `-c statement_timeout=5s -c search_path="Tenant_1",public`; !found || keywordOptions != want {
 		t.Fatalf("keyword DSN decoded options=%q found=%v, want %q (dsn=%s)", keywordOptions, found, want, keywordDSN)
 	}
-	if _, err := pq.NewConnector(keywordDSN); err != nil {
-		t.Fatalf("generated keyword DSN rejected by lib/pq: %v", err)
+	if _, err := pgx.ParseConfig(keywordDSN); err != nil {
+		t.Fatalf("generated keyword DSN rejected by pgx: %v", err)
 	}
 	if _, err := withPostgresSchemaDSN("host=localhost", "bad;schema"); err == nil {
 		t.Fatal("unsafe schema accepted")
@@ -267,12 +274,13 @@ func TestRunDataMigrationsInTxForcesRowsImportedAfterMarkers(t *testing.T) {
 		t.Fatalf("forced imported usage channel=%q, want grok", channel)
 	}
 	var markerCount int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM data_migrations WHERE version IN ($1,$2,$3,$4)`,
-		dataMigrationOAuthIdentityDedupeV1, dataMigrationOAuthIdentityDedupeV2, dataMigrationUsageLogChannelV1, dataMigrationWorkspaceIdentityV3).Scan(&markerCount); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM data_migrations WHERE version IN ($1,$2,$3,$4,$5)`,
+		dataMigrationOAuthIdentityDedupeV1, dataMigrationOAuthIdentityDedupeV2, dataMigrationUsageLogChannelV1,
+		dataMigrationWorkspaceIdentityV3, dataMigrationGroupChannelV1).Scan(&markerCount); err != nil {
 		t.Fatal(err)
 	}
-	if markerCount != 4 {
-		t.Fatalf("forced migration marker count=%d, want 4", markerCount)
+	if markerCount != 5 {
+		t.Fatalf("forced migration marker count=%d, want 5", markerCount)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
@@ -401,6 +409,30 @@ func TestSQLiteToPostgresAutoMigrationIntegration(t *testing.T) {
 	if channels[77] != "codex" || channels[78] != "grok" {
 		t.Fatalf("usage channels=%v, want 77=codex 78=grok", channels)
 	}
+	var groupChannel string
+	if err := db.conn.QueryRowContext(ctx, `SELECT channel FROM `+qualifiedMigrationTable(schema, "account_groups")+` WHERE id=10`).Scan(&groupChannel); err != nil {
+		t.Fatal(err)
+	}
+	if groupChannel != AccountGroupChannelGrok {
+		t.Fatalf("imported Grok group channel=%q, want grok", groupChannel)
+	}
+	var dailyCredits float64
+	var dailyTokens int64
+	var dailySettled bool
+	if err := db.conn.QueryRowContext(ctx, `SELECT credits, total_tokens, settled FROM `+qualifiedMigrationTable(schema, "account_daily_usage")+` WHERE account_id=41 AND day='2026-08-04'`).Scan(&dailyCredits, &dailyTokens, &dailySettled); err != nil {
+		t.Fatal(err)
+	}
+	if dailyCredits != 1.25 || dailyTokens != 1234 || !dailySettled {
+		t.Fatalf("daily usage credits=%v tokens=%d settled=%v", dailyCredits, dailyTokens, dailySettled)
+	}
+	var grokGeneration int64
+	var grokFamily string
+	if err := db.conn.QueryRowContext(ctx, `SELECT credential_generation, credential_family_id FROM `+qualifiedMigrationTable(schema, "accounts")+` WHERE id=42`).Scan(&grokGeneration, &grokFamily); err != nil {
+		t.Fatal(err)
+	}
+	if grokGeneration != 1 || strings.TrimSpace(grokFamily) == "" {
+		t.Fatalf("post-import Grok identity generation=%d family=%q", grokGeneration, grokFamily)
+	}
 	var rollupRequests, rollupLastLogID int64
 	if err := db.conn.QueryRowContext(ctx, `SELECT r.total_requests, s.last_log_id FROM `+qualifiedMigrationTable(schema, "usage_stats_rollup")+` r CROSS JOIN `+qualifiedMigrationTable(schema, "usage_stats_rollup_state")+` s WHERE r.channel='' AND s.id=1 AND s.initialized=1`).Scan(&rollupRequests, &rollupLastLogID); err != nil {
 		t.Fatal(err)
@@ -415,6 +447,23 @@ func TestSQLiteToPostgresAutoMigrationIntegration(t *testing.T) {
 	}
 	if siteName != "Migrated Site" || !promptEnabled {
 		t.Fatalf("settings site=%q enabled=%v", siteName, promptEnabled)
+	}
+	var pricingEnabled, includeGrok bool
+	var pricingInterval int
+	var pricingWarning string
+	if err := db.conn.QueryRowContext(ctx, `SELECT enabled, interval_minutes, include_grok, last_warning FROM `+qualifiedMigrationTable(schema, "official_pricing_sync_config")+` WHERE singleton_id=1`).Scan(&pricingEnabled, &pricingInterval, &includeGrok, &pricingWarning); err != nil {
+		t.Fatal(err)
+	}
+	if !pricingEnabled || pricingInterval != 720 || includeGrok || pricingWarning != "fixture warning" {
+		t.Fatalf("pricing config enabled=%v interval=%d include_grok=%v warning=%q", pricingEnabled, pricingInterval, includeGrok, pricingWarning)
+	}
+	var reviewName, reviewKey string
+	var reviewActive bool
+	if err := db.conn.QueryRowContext(ctx, `SELECT name, api_keys, active FROM `+qualifiedMigrationTable(schema, "prompt_review_profiles")+` WHERE id='review-main'`).Scan(&reviewName, &reviewKey, &reviewActive); err != nil {
+		t.Fatal(err)
+	}
+	if reviewName != "Review Main" || reviewKey != "secret-review-key" || !reviewActive {
+		t.Fatalf("review profile name=%q key=%q active=%v", reviewName, reviewKey, reviewActive)
 	}
 	var isPerson bool
 	if err := db.conn.QueryRowContext(ctx, `SELECT is_person FROM `+qualifiedMigrationTable(schema, "prompt_risk_events")+` WHERE id=9`).Scan(&isPerson); err != nil || !isPerson {
@@ -491,12 +540,20 @@ func TestSQLiteToPostgresAutoMigrationIntegration(t *testing.T) {
 		}
 	}
 	var migrationMarkerCount int
-	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+qualifiedMigrationTable(schema, "data_migrations")+` WHERE version IN ($1,$2,$3,$4)`,
-		dataMigrationOAuthIdentityDedupeV1, dataMigrationOAuthIdentityDedupeV2, dataMigrationUsageLogChannelV1, dataMigrationWorkspaceIdentityV3).Scan(&migrationMarkerCount); err != nil {
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+qualifiedMigrationTable(schema, "data_migrations")+` WHERE version IN ($1,$2,$3,$4,$5)`,
+		dataMigrationOAuthIdentityDedupeV1, dataMigrationOAuthIdentityDedupeV2, dataMigrationUsageLogChannelV1,
+		dataMigrationWorkspaceIdentityV3, dataMigrationGroupChannelV1).Scan(&migrationMarkerCount); err != nil {
 		t.Fatal(err)
 	}
-	if migrationMarkerCount != 4 {
-		t.Fatalf("current data migration markers=%d, want 4", migrationMarkerCount)
+	if migrationMarkerCount != 5 {
+		t.Fatalf("current data migration markers=%d, want 5", migrationMarkerCount)
+	}
+	var grokStateMarkerCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+qualifiedMigrationTable(schema, "data_migrations")+` WHERE version=$1`, dataMigrationGrokStateBackfillV1).Scan(&grokStateMarkerCount); err != nil {
+		t.Fatal(err)
+	}
+	if grokStateMarkerCount != 1 {
+		t.Fatalf("post-import Grok state marker count=%d, want 1", grokStateMarkerCount)
 	}
 	var completedMarkerCount int
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+qualifiedMigrationTable(schema, "sqlite_postgres_migrations")+` WHERE migration_name=$1`, sqlitePostgresMigrationName).Scan(&completedMarkerCount); err != nil {
@@ -541,11 +598,11 @@ func TestPostgresAutoMigrationGuardCanonicalSchemaAndUnlockIntegration(t *testin
 	schema := fmt.Sprintf("Guard_Schema_%d", time.Now().UnixNano())
 	cleanupPostgresMigrationSchema(t, dsn, schema)
 	defer cleanupPostgresMigrationSchema(t, dsn, schema)
-	admin, err := sql.Open("postgres", dsn)
+	admin, err := sql.Open(sqlOpenDriverName("postgres"), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := admin.Exec(`CREATE SCHEMA ` + pq.QuoteIdentifier(schema)); err != nil {
+	if _, err := admin.Exec(`CREATE SCHEMA ` + quotePostgresIdent(schema)); err != nil {
 		admin.Close()
 		t.Fatal(err)
 	}
@@ -555,7 +612,7 @@ func TestPostgresAutoMigrationGuardCanonicalSchemaAndUnlockIntegration(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool, err := sql.Open("postgres", schemaDSN)
+	pool, err := sql.Open(sqlOpenDriverName("postgres"), schemaDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +643,7 @@ func TestPostgresAutoMigrationGuardCanonicalSchemaAndUnlockIntegration(t *testin
 		t.Fatal(err)
 	}
 
-	other, err := sql.Open("postgres", dsn)
+	other, err := sql.Open(sqlOpenDriverName("postgres"), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +701,7 @@ func TestSQLiteToPostgresConcurrentAutoMigrationIntegration(t *testing.T) {
 			t.Fatalf("concurrent NewWithOptions: %v", err)
 		}
 	}
-	raw, err := sql.Open("postgres", dsn)
+	raw, err := sql.Open(sqlOpenDriverName("postgres"), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +758,7 @@ func TestSQLiteToPostgresAutoMigrationGuardsIntegration(t *testing.T) {
 	if _, err := NewWithOptions("postgres", dsn, Options{Schema: nonEmptySchema, AutoMigrateFromSQLite: true, SQLiteMigrationSourcePath: sourcePath}); err == nil || !strings.Contains(err.Error(), "not empty") {
 		t.Fatalf("non-empty target error=%v", err)
 	}
-	rawNonEmpty, err := sql.Open("postgres", dsn)
+	rawNonEmpty, err := sql.Open(sqlOpenDriverName("postgres"), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -736,7 +793,7 @@ func TestSQLiteToPostgresAutoMigrationGuardsIntegration(t *testing.T) {
 	if _, err := NewWithOptions("postgres", dsn, Options{Schema: failureSchema, AutoMigrateFromSQLite: true, SQLiteMigrationSourcePath: badSource}); err == nil {
 		t.Fatal("invalid JSON source unexpectedly migrated")
 	}
-	raw, err := sql.Open("postgres", dsn)
+	raw, err := sql.Open(sqlOpenDriverName("postgres"), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -781,9 +838,14 @@ func createMigrationIntegrationSource(t *testing.T, path string, invalidJSON boo
 	defer db.Close()
 	statements := []string{
 		`CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, platform TEXT, type TEXT, credentials TEXT NOT NULL, proxy_url TEXT, status TEXT, cooldown_until TIMESTAMP NULL, enabled INTEGER, locked INTEGER, created_at TIMESTAMP, updated_at TIMESTAMP)`,
+		`CREATE TABLE account_daily_usage (account_id INTEGER NOT NULL, day TEXT NOT NULL, credits REAL NOT NULL, total_tokens INTEGER NOT NULL, settled INTEGER NOT NULL, clients_json TEXT NOT NULL, models_json TEXT NOT NULL, synced_at TIMESTAMP NOT NULL, PRIMARY KEY (account_id, day))`,
+		`CREATE TABLE account_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, channel TEXT DEFAULT 'codex')`,
+		`CREATE TABLE account_group_members (account_id INTEGER NOT NULL, group_id INTEGER NOT NULL, PRIMARY KEY (account_id, group_id))`,
 		`CREATE TABLE usage_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER, endpoint TEXT, model TEXT, stream INTEGER, error_message TEXT NULL, created_at TIMESTAMP)`,
 		`CREATE TABLE system_settings (id INTEGER PRIMARY KEY, site_name TEXT, max_concurrency INTEGER, prompt_filter_enabled INTEGER)`,
+		`CREATE TABLE official_pricing_sync_config (singleton_id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL, interval_minutes INTEGER NOT NULL, include_openai INTEGER NOT NULL, include_grok INTEGER NOT NULL, last_success_at TIMESTAMP NULL, last_error TEXT NOT NULL, last_warning TEXT NOT NULL)`,
 		`CREATE TABLE prompt_risk_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP, source_type TEXT NOT NULL, source_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_key TEXT NOT NULL, is_person INTEGER, event_kind TEXT NOT NULL)`,
+		`CREATE TABLE prompt_review_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, request_mode TEXT NOT NULL, adapter_json TEXT NOT NULL, api_keys TEXT NOT NULL, timeout_seconds INTEGER NOT NULL, active INTEGER NOT NULL, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)`,
 		`CREATE TABLE prompt_filter_newapi_bindings (api_key_id INTEGER PRIMARY KEY, platform_code TEXT NOT NULL, platform_name TEXT NOT NULL, secret TEXT NOT NULL, enabled INTEGER, require_signed_identity INTEGER, policy_mode TEXT, policy_profile TEXT, updated_at TIMESTAMP)`,
 		`CREATE TABLE prompt_policy_incidents (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT NOT NULL UNIQUE, created_at TIMESTAMP, local_evaluation_state TEXT, local_outcome TEXT, prompt_text TEXT, local_comparison TEXT)`,
 		`CREATE TABLE prompt_filter_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP, source TEXT, endpoint TEXT, request_protocol TEXT, request_provider TEXT, model TEXT, api_key_id INTEGER, api_key_name TEXT, api_key_masked TEXT, error_code TEXT, full_text TEXT)`,
@@ -794,15 +856,20 @@ func createMigrationIntegrationSource(t *testing.T, path string, invalidJSON boo
 	}
 	credentials := `{"refresh_token":"secret-token","nested":{"ok":true}}`
 	mustExecMigrationTest(t, db, `INSERT INTO accounts (id, name, platform, type, credentials, proxy_url, status, cooldown_until, enabled, locked, created_at, updated_at) VALUES (41, 'legacy', 'openai', 'oauth', ?, '', 'active', NULL, 1, 0, '2026-08-05 12:34:56', '2026-08-05T12:35:56Z')`, credentials)
-	mustExecMigrationTest(t, db, `INSERT INTO accounts (id, name, platform, type, credentials, proxy_url, status, cooldown_until, enabled, locked, created_at, updated_at) VALUES (42, 'grok', 'xai', 'api', '{"api_key":"xai-secret"}', '', 'active', NULL, 1, 0, '2026-08-05T12:34:56Z', '2026-08-05T12:35:56Z')`)
+	mustExecMigrationTest(t, db, `INSERT INTO accounts (id, name, platform, type, credentials, proxy_url, status, cooldown_until, enabled, locked, created_at, updated_at) VALUES (42, 'grok', 'xai', 'api', '{"api_key":"xai-secret","upstream_type":"grok"}', '', 'active', NULL, 1, 0, '2026-08-05T12:34:56Z', '2026-08-05T12:35:56Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO accounts (id, name, platform, type, credentials, proxy_url, status, cooldown_until, enabled, locked, created_at, updated_at) VALUES (43, 'oauth-old', 'openai', 'oauth', '{"email":"dup@example.com","account_id":"same-oauth","access_token":"old"}', '', 'active', NULL, 1, 0, '2026-08-01T12:34:56Z', '2026-08-01T12:35:56Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO accounts (id, name, platform, type, credentials, proxy_url, status, cooldown_until, enabled, locked, created_at, updated_at) VALUES (44, 'oauth-new', 'openai', 'oauth', '{"email":"dup@example.com","account_id":"same-oauth","access_token":"new","refresh_token":"refresh"}', '', 'active', NULL, 1, 0, '2026-08-02T12:34:56Z', '2026-08-02T12:35:56Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO accounts (id, name, platform, type, credentials, proxy_url, status, cooldown_until, enabled, locked, created_at, updated_at) VALUES (45, 'workspace-old', 'openai', 'oauth', '{"email":"workspace@example.com","workspace_id":"ws-1","account_id":"first"}', '', 'active', NULL, 1, 0, '2026-08-03T12:34:56Z', '2026-08-03T12:35:56Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO accounts (id, name, platform, type, credentials, proxy_url, status, cooldown_until, enabled, locked, created_at, updated_at) VALUES (46, 'workspace-new', 'openai', 'oauth', '{"email":"workspace@example.com","workspace_id":"ws-1","account_id":"second"}', '', 'active', NULL, 1, 0, '2026-08-04T12:34:56Z', '2026-08-04T12:35:56Z')`)
+	mustExecMigrationTest(t, db, `INSERT INTO account_daily_usage (account_id, day, credits, total_tokens, settled, clients_json, models_json, synced_at) VALUES (41, '2026-08-04', 1.25, 1234, 1, '[{"name":"cli"}]', '[{"name":"gpt-5.4"}]', '2026-08-05T12:39:00Z')`)
+	mustExecMigrationTest(t, db, `INSERT INTO account_groups (id, name, channel) VALUES (10, 'Imported Grok', 'codex')`)
+	mustExecMigrationTest(t, db, `INSERT INTO account_group_members (account_id, group_id) VALUES (42, 10)`)
 	mustExecMigrationTest(t, db, `INSERT INTO usage_logs (id, account_id, endpoint, model, stream, error_message, created_at) VALUES (77, 41, '/v1/responses', 'gpt-5.4', 1, NULL, '2026-08-05T12:40:00Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO usage_logs (id, account_id, endpoint, model, stream, error_message, created_at) VALUES (78, 42, '/v1/responses', 'grok-4', 0, NULL, '2026-08-05T12:40:01Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO system_settings (id, site_name, max_concurrency, prompt_filter_enabled) VALUES (1, 'Migrated Site', 9, 1)`)
+	mustExecMigrationTest(t, db, `INSERT INTO official_pricing_sync_config (singleton_id, enabled, interval_minutes, include_openai, include_grok, last_success_at, last_error, last_warning) VALUES (1, 1, 720, 1, 0, '2026-08-05T12:40:30Z', '', 'fixture warning')`)
 	mustExecMigrationTest(t, db, `INSERT INTO prompt_risk_events (id, created_at, source_type, source_id, subject_type, subject_key, is_person, event_kind) VALUES (9, '2026-08-05T12:41:00Z', 'incident', 'source-1', 'newapi_user', 'user-1', 1, 'blocked')`)
+	mustExecMigrationTest(t, db, `INSERT INTO prompt_review_profiles (id, name, base_url, model, request_mode, adapter_json, api_keys, timeout_seconds, active, created_at, updated_at) VALUES ('review-main', 'Review Main', 'https://review.example/v1', 'review-model', 'chat_completions', '{}', 'secret-review-key', 20, 1, '2026-08-05T12:41:30Z', '2026-08-05T12:41:31Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO prompt_filter_newapi_bindings (api_key_id, platform_code, platform_name, secret, enabled, require_signed_identity, policy_mode, policy_profile, updated_at) VALUES (7, 'legacy', 'Legacy', '01234567890123456789012345678901', 1, 0, 'shadow', 'strict', '2026-08-05T12:42:00Z')`)
 	mustExecMigrationTest(t, db, `INSERT INTO prompt_policy_incidents (id, incident_id, created_at, local_evaluation_state, local_outcome, prompt_text, local_comparison) VALUES (1, 'imported-incident', '2026-08-05T12:43:00Z', 'completed', 'no_hit', 'available evidence', '')`)
 	mustExecMigrationTest(t, db, `INSERT INTO prompt_filter_logs (id, created_at, source, endpoint, request_protocol, request_provider, model, api_key_id, api_key_name, api_key_masked, error_code, full_text) VALUES (88, '2026-08-05T12:44:00Z', 'upstream_cyber_policy', '/v1/responses', 'responses', 'openai', 'gpt-5.4', 0, '', '', 'cyber_policy', 'legacy full text')`)
@@ -818,7 +885,7 @@ func createMigrationIntegrationSource(t *testing.T, path string, invalidJSON boo
 
 func cleanupPostgresMigrationSchema(t *testing.T, dsn, schema string) {
 	t.Helper()
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open(sqlOpenDriverName("postgres"), dsn)
 	if err != nil {
 		t.Logf("open PostgreSQL for cleanup: %v", err)
 		return
@@ -826,7 +893,7 @@ func cleanupPostgresMigrationSchema(t *testing.T, dsn, schema string) {
 	defer db.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+pq.QuoteIdentifier(schema)+` CASCADE`); err != nil {
+	if _, err := db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+quotePostgresIdent(schema)+` CASCADE`); err != nil {
 		t.Logf("cleanup schema %s: %v", schema, err)
 	}
 }

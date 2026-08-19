@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -53,35 +54,84 @@ type Handler struct {
 	systemUpdateOnce       sync.Once
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
+	executeUsageProbe      usageProbeRequestFunc
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
-	recordAccountEvent     func(int64, string, string)
-	proxyProbe             func(context.Context, string, string) proxyProbeResult
-	reloadProxyPoolFn      func() error
-	proxyBatchEventSender  func(*gin.Context, proxyBatchTestEvent) bool
-	proxyBatchTestMu       sync.Mutex
-	cpuSampler             *cpuSampler
-	memReader              memStatsReader
-	startedAt              time.Time
-	pgMaxConns             int
-	redisPoolSize          int
-	databaseDriver         string
-	databaseLabel          string
-	cacheDriver            string
-	cacheLabel             string
-	adminSecretEnv         string
-	sessionStore           *adminSessionStore
-	imageProxy             *proxy.Handler
+	queryWhamDailyUsage    func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
+	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
+	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
+	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
+	// （官方统计有滞后），让 page-stats 下发显式空态而不是无限触发回补。
+	whamDailyBackfillMu       sync.Mutex
+	whamDailyBackfillLast     map[int64]time.Time
+	whamDailyBackfillInFlight map[int64]struct{}
+	whamDailyBackfillFailedAt map[int64]time.Time
+	whamDailySyncedOnce       map[int64]struct{}
+	recordAccountEvent        func(int64, string, string)
+	proxyProbe                func(context.Context, string, string) proxyProbeResult
+	reloadProxyPoolFn         func() error
+	proxyBatchEventSender     func(*gin.Context, proxyBatchTestEvent) bool
+	proxyBatchTestMu          sync.Mutex
+	cpuSampler                *cpuSampler
+	memReader                 memStatsReader
+	startedAt                 time.Time
+	pgMaxConns                int
+	redisPoolSize             int
+	databaseDriver            string
+	databaseLabel             string
+	cacheDriver               string
+	cacheLabel                string
+	adminSecretEnv            string
+	sessionStore              *adminSessionStore
+	imageProxy                *proxy.Handler
+
+	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
+	// 在大文件导入时堆出成千上万个阻塞协程。
+	importProbeQueueMu sync.Mutex
+	importProbeQueue   []func(context.Context)
+	importProbeWorkers int
+	importProbeActive  atomic.Int32
+	importLoadMu       sync.Mutex
+	importLoadTier     importLoadTier
+	importLoadReady    bool
+	importLoadDBWait   int64
+	importLoadChanged  time.Time
+	importLoadBusyTill time.Time
+	importLoadNow      func() time.Time
+	importLoadSnapshot func() importRuntimeLoadSnapshot
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
 
-	// 账号请求统计缓存（30秒 TTL）
-	reqCountMu        sync.RWMutex
-	reqCountCache     map[int64]*database.AccountRequestCount
-	reqCountExpiresAt time.Time
+	// 账号请求统计缓存,按渠道分键(codex/grok 各自刷新互不牵连;旧全量路径
+	// 用 "all" 键)。分页路径 stale-while-revalidate,TTL 见 requestCountCacheTTL。
+	reqCountMu         sync.RWMutex
+	reqCountCache      map[string]*requestCountCacheEntry
+	reqCountRefreshMu  sync.Mutex
+	reqCountRefreshing map[string]bool
+	// 大池分批聚合的断点续跑半成品,见 requestCountStaging。
+	reqCountStagingMu sync.Mutex
+	reqCountStaging   map[string]*requestCountStaging
+
+	// 管理后台账号分页使用的轻量快照。快照按渠道缓存，只保存筛选、排序和
+	// 当前页定位所需的信息；完整账号响应仍只为当前页构建。
+	accountListCacheMu sync.RWMutex
+	accountListCache   map[string]*accountListSnapshot
+	accountListBuildMu sync.Mutex
+	// accountCachesGen 在账号变更时递增;重建协程安装快照前校验代数,
+	// 防止变更前就开始读库的在途重建把旧数据写回缓存。
+	accountCachesGen atomic.Uint64
+
+	// 分析图表使用固定大小的聚合结果，避免把完整号池传给浏览器。与账号
+	// 快照分开缓存，只有展开分析区或 Dashboard runway 时才会构建。
+	accountAnalysisCacheMu        sync.RWMutex
+	accountAnalysisCache          map[string]*accountAnalysisCacheEntry
+	accountAnalysisBuildMu        sync.Mutex
+	accountAnalysisTrafficMu      sync.RWMutex
+	accountAnalysisTraffic        map[string]*accountAnalysisTrafficCacheEntry
+	accountAnalysisTrafficBuildMu sync.Mutex
 
 	// 「主动重置次数」消耗操作的工作区级互斥锁（workspace -> *sync.Mutex），
 	// 串行化同一上游工作区的并发重置，避免重复消耗与次数计数竞态。
@@ -168,9 +218,11 @@ type chartCacheEntry struct {
 }
 
 const (
-	adminUsageStatsCacheNamespace  = "admin:usage-stats"
-	adminChartCacheNamespace       = "admin:chart-data"
-	adminAPIKeyAccountsNamespace   = "admin:api-key-accounts"
+	adminUsageStatsCacheNamespace = "admin:usage-stats"
+	adminChartCacheNamespace      = "admin:chart-data"
+	// v2:响应结构新增 reconciliation 字段,升版命名空间让 Redis 里
+	// 部署前写入的旧条目失效,避免零值对账在滚动窗口内展示。
+	adminAPIKeyAccountsNamespace   = "admin:api-key-accounts:v2"
 	adminAPIKeyStatsNamespace      = "admin:api-key-stats"
 	adminAccountWindowsNamespace   = "admin:account-usage-windows"
 	adminAPIKeyCacheNamespace      = "api-key"
@@ -179,8 +231,8 @@ const (
 	adminUsageRangeCacheTTL        = 35 * time.Second
 	adminChartCacheTTL             = 10 * time.Second
 	adminAccountWindowsCacheTTL    = 30 * time.Second
-	importFileSizeLimitBytes       = 20 * 1024 * 1024
-	importFileSizeLimitLabel       = "20MB"
+	importFileSizeLimitBytes       = 200 * 1024 * 1024
+	importFileSizeLimitLabel       = "200MB"
 	accountRefreshBatchConcurrency = 4
 )
 
@@ -260,11 +312,11 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	if account.IsCodexAgentIdentity() {
 		return
 	}
-	// AT / codex_at 账号的 OAuth 身份（email + workspace_id）在插入时无法从
+	// AT / codex_at 账号的 OAuth 身份（email + 有效工作区）在插入时无法从
 	// JWT 解出，由上面的 wham 探针补齐并落库。身份既已可知，此刻回查是否与
 	// 已有账号同一身份：若重复则把凭证合并进旧账号并软删本账号——与 RT 路径
 	// refreshImportedAccountAndProbe 对称，补上 AT 导入/添加事后无法去重的缺口。
-	// 合并按 email + workspace_id 身份进行（workspace_identity v3），并沿用
+	// 合并按 email + 有效工作区身份进行；Chatgpt-Account-Id 覆盖代表独立路由。
 	// 数据库生命周期 ctx 与串行合并锁（防并发导入互相软删）。
 	h.mergeRefreshedDuplicateIntoExistingContext(ctx, accountID, source)
 }
@@ -301,10 +353,308 @@ func (h *Handler) startDBBackgroundTaskWithParent(parent context.Context, task f
 	})
 }
 
+type importLoadTier uint8
+
+const (
+	importLoadLow importLoadTier = iota
+	importLoadMedium
+	importLoadHigh
+)
+
+const (
+	maxImportDBConcurrency    = 12
+	maxImportProbeConcurrency = 8
+	importPermitPollInterval  = 25 * time.Millisecond
+	importTierRecoveryDelay   = 5 * time.Second
+	importDBWaitBackoff       = 10 * time.Second
+)
+
+type importRuntimeLoadSnapshot struct {
+	RPM         int64
+	Active      int64
+	DBInUse     int
+	DBMaxOpen   int
+	DBWaitCount int64
+}
+
+type importConcurrencyLimits struct {
+	db    int
+	probe int
+}
+
+func (h *Handler) currentImportRuntimeLoad() importRuntimeLoadSnapshot {
+	if h == nil {
+		return importRuntimeLoadSnapshot{}
+	}
+	if h.importLoadSnapshot != nil {
+		return h.importLoadSnapshot()
+	}
+	var snapshot importRuntimeLoadSnapshot
+	if h.rateLimiter != nil {
+		snapshot.RPM = h.rateLimiter.GetCurrentRPM()
+		snapshot.Active = h.rateLimiter.GetActiveRequests()
+	}
+	if h.db != nil {
+		stats := h.db.Stats()
+		snapshot.DBInUse = stats.InUse
+		snapshot.DBMaxOpen = stats.MaxOpenConnections
+		snapshot.DBWaitCount = stats.WaitCount
+	}
+	return snapshot
+}
+
+func importDBUsagePercent(snapshot importRuntimeLoadSnapshot) int {
+	if snapshot.DBMaxOpen <= 0 || snapshot.DBInUse <= 0 {
+		return 0
+	}
+	return snapshot.DBInUse * 100 / snapshot.DBMaxOpen
+}
+
+// nextImportLoadTier 使用不同的升/降档阈值形成滞回：负载升高立即收紧，
+// 回落则必须越过更低阈值，避免临界 RPM 附近反复增减 worker。
+func nextImportLoadTier(current importLoadTier, initialized bool, snapshot importRuntimeLoadSnapshot, dbWaitIncreased bool) importLoadTier {
+	dbUsage := importDBUsagePercent(snapshot)
+	enterHigh := dbWaitIncreased || snapshot.RPM >= 600 || snapshot.Active >= 64 || dbUsage >= 70
+	enterMedium := snapshot.RPM >= 180 || snapshot.Active >= 16 || dbUsage >= 40
+	if !initialized {
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+
+	switch current {
+	case importLoadHigh:
+		if dbWaitIncreased || snapshot.RPM >= 400 || snapshot.Active >= 32 || dbUsage >= 50 {
+			return importLoadHigh
+		}
+		// 每次最多降一档，让恢复过程保持平滑。
+		return importLoadMedium
+	case importLoadMedium:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if snapshot.RPM < 120 && snapshot.Active < 8 && dbUsage < 25 {
+			return importLoadLow
+		}
+		return importLoadMedium
+	default:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+}
+
+func importLimitsForTier(tier importLoadTier, snapshot importRuntimeLoadSnapshot) importConcurrencyLimits {
+	limits := importConcurrencyLimits{db: maxImportDBConcurrency, probe: maxImportProbeConcurrency}
+	switch tier {
+	case importLoadHigh:
+		limits.db, limits.probe = 4, 4
+	case importLoadMedium:
+		limits.db, limits.probe = 8, 6
+	}
+	// 导入最多使用连接池的约四分之一；SQLite 小连接池也不会被导入独占。
+	if snapshot.DBMaxOpen > 0 {
+		poolShare := snapshot.DBMaxOpen / 4
+		if poolShare < 1 {
+			poolShare = 1
+		}
+		if limits.db > poolShare {
+			limits.db = poolShare
+		}
+	}
+	return limits
+}
+
+func (h *Handler) adaptiveImportLimits() importConcurrencyLimits {
+	if h == nil {
+		return importConcurrencyLimits{db: 4, probe: 4}
+	}
+	snapshot := h.currentImportRuntimeLoad()
+	now := time.Now()
+	if h.importLoadNow != nil {
+		now = h.importLoadNow()
+	}
+	h.importLoadMu.Lock()
+	defer h.importLoadMu.Unlock()
+
+	waitIncreased := h.importLoadReady && snapshot.DBWaitCount > h.importLoadDBWait
+	if waitIncreased {
+		h.importLoadBusyTill = now.Add(importDBWaitBackoff)
+	}
+	if now.Before(h.importLoadBusyTill) {
+		waitIncreased = true
+	}
+	nextTier := nextImportLoadTier(h.importLoadTier, h.importLoadReady, snapshot, waitIncreased)
+	if h.importLoadReady && nextTier < h.importLoadTier && now.Sub(h.importLoadChanged) < importTierRecoveryDelay {
+		nextTier = h.importLoadTier
+	}
+	if !h.importLoadReady || nextTier != h.importLoadTier {
+		h.importLoadChanged = now
+	}
+	h.importLoadTier = nextTier
+	h.importLoadReady = true
+	h.importLoadDBWait = snapshot.DBWaitCount
+	return importLimitsForTier(h.importLoadTier, snapshot)
+}
+
+func (h *Handler) importProbeWorkerCapacity() int {
+	capacity := maxImportProbeConcurrency
+	if h != nil && h.store != nil {
+		if configured := h.store.GetUsageProbeConcurrency(); configured > 0 && configured < capacity {
+			capacity = configured
+		}
+	}
+	return capacity
+}
+
+func (h *Handler) importProbeConcurrency() int {
+	limit := h.adaptiveImportLimits().probe
+	if capacity := h.importProbeWorkerCapacity(); limit > capacity {
+		limit = capacity
+	}
+	return limit
+}
+
+func acquireAdaptivePermit(ctx context.Context, active *atomic.Int32, limit func() int) bool {
+	ticker := time.NewTicker(importPermitPollInterval)
+	defer ticker.Stop()
+	for {
+		maxActive := limit()
+		if maxActive < 1 {
+			maxActive = 1
+		}
+		current := active.Load()
+		if current < int32(maxActive) && active.CompareAndSwap(current, current+1) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// runImportProbeTask 把导入预热放进进程内队列，并按当前导入并发上限启动 worker。
+// 排队任务只占一个函数引用，不会各自创建 goroutine；worker 在队列清空后退出。
+func (h *Handler) runImportProbeTask(fn func(context.Context)) {
+	if h == nil || fn == nil {
+		return
+	}
+	h.importProbeQueueMu.Lock()
+	h.importProbeQueue = append(h.importProbeQueue, fn)
+	if h.importProbeWorkers >= h.importProbeWorkerCapacity() {
+		h.importProbeQueueMu.Unlock()
+		return
+	}
+	h.importProbeWorkers++
+	h.importProbeQueueMu.Unlock()
+
+	if h.startDBBackgroundTask(h.runImportProbeWorker) {
+		return
+	}
+	h.importProbeQueueMu.Lock()
+	h.importProbeWorkers--
+	h.importProbeQueue = nil
+	h.importProbeQueueMu.Unlock()
+}
+
+func (h *Handler) runImportProbeWorker(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			h.importProbeQueueMu.Lock()
+			h.importProbeQueue = nil
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+
+		h.importProbeQueueMu.Lock()
+		if len(h.importProbeQueue) == 0 {
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+		fn := h.importProbeQueue[0]
+		h.importProbeQueue[0] = nil
+		h.importProbeQueue = h.importProbeQueue[1:]
+		h.importProbeQueueMu.Unlock()
+
+		if !acquireAdaptivePermit(ctx, &h.importProbeActive, h.importProbeConcurrency) {
+			continue
+		}
+		fn(ctx)
+		h.importProbeActive.Add(-1)
+	}
+}
+
+type adaptiveImportDBLimiter struct {
+	handler *Handler
+	active  atomic.Int32
+}
+
+func (l *adaptiveImportDBLimiter) acquire(ctx context.Context) bool {
+	if l == nil || l.handler == nil {
+		return false
+	}
+	return acquireAdaptivePermit(ctx, &l.active, func() int {
+		return l.handler.adaptiveImportLimits().db
+	})
+}
+
+func (l *adaptiveImportDBLimiter) release() {
+	if l != nil {
+		l.active.Add(-1)
+	}
+}
+
 func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
-	h.startDBBackgroundTask(func(ctx context.Context) {
+	h.runImportProbeTask(func(ctx context.Context) {
 		h.probeImportedAccountUsage(ctx, accountID, source)
 	})
+}
+
+// scheduleImportedAccountWarmup 导入后的换 AT / 用量探测。脚本批量加号和文件导入
+// 必须走同一道并发闸：裸 RT 换 AT 也会打上游，不限流会把网关和鉴权接口一起打满。
+func (h *Handler) scheduleImportedAccountWarmup(acc *auth.Account, id int64, source string) {
+	if h == nil || acc == nil || id <= 0 {
+		return
+	}
+	if acc.GetAccessToken() != "" {
+		h.triggerImportedAccountUsageProbe(id, source)
+		return
+	}
+	if h.store != nil && !h.store.GetLazyMode() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
+		})
+	}
+}
+
+// commitImportedRuntimeAccounts 一次写入内存池，再按需排队预热。逐条 AddAccount
+// 会反复抢号池写锁；预热必须在入池之后，refreshAccountByID 靠 DBID 回查运行时账号。
+func (h *Handler) commitImportedRuntimeAccounts(accounts []*auth.Account, source string, skipRefresh bool) {
+	if h == nil || h.store == nil || len(accounts) == 0 {
+		return
+	}
+	h.store.AddAccounts(accounts)
+	if skipRefresh {
+		return
+	}
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		h.scheduleImportedAccountWarmup(acc, acc.DBID, source)
+	}
 }
 
 func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source string) {
@@ -316,15 +666,34 @@ func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source s
 	}
 }
 
+// importRefreshTransientRetryLimit 是导入换 AT 瞬时失败(超时/代理抖动/上游
+// 5xx/刷新锁竞争)的额外重试次数。瞬时失败不能一次就标粘性 error——error 没有
+// 任何自动重试,语义反而比 RT 死透(有冷却自愈)更重;批量导入撞上代理抖动
+// 会把一批好号永久标死。
+const importRefreshTransientRetryLimit = 3
+
+// importRefreshTransientRetryDelay 是两次导入刷新重试的间隔。var 便于测试缩短。
+var importRefreshTransientRetryDelay = 2 * time.Minute
+
 func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID int64, source string) {
+	h.refreshImportedAccountWithRetry(ctx, accountID, source, 0)
+}
+
+func (h *Handler) refreshImportedAccountWithRetry(ctx context.Context, accountID int64, source string, attempt int) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	err := h.refreshAccountByID(refreshCtx, accountID)
+	// 导入路径在身份合并后会统一 probe；刷新内部不再先 probe 一次，避免每个
+	// 裸 RT 成功换票后连续打两次 wham/subscription 上游。
+	err := h.refreshAccountByIDWithProbe(refreshCtx, accountID, false)
 	cancel()
 	if err != nil {
-		log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+		log.Printf("导入账号 %d 刷新失败(第 %d 次): %v", accountID, attempt+1, err)
+		if h.scheduleImportedRefreshRetry(accountID, source, attempt, err) {
+			return
+		}
+		h.markImportedRefreshFailure(accountID, err)
 		return
 	}
 	log.Printf("导入账号 %d 刷新成功", accountID)
@@ -334,6 +703,53 @@ func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID 
 		return
 	}
 	h.probeImportedAccountUsage(ctx, accountID, source)
+}
+
+// scheduleImportedRefreshRetry 对瞬时刷新失败安排一次延迟重试:到点后重新走
+// 导入并发闸,不在闸内睡眠占槽。重试窗口内账号保持「刷新中」——这是真实状态
+// 且有界(最多 limit+1 次尝试)。永久失败或重试耗尽返回 false,交给调用方落状态。
+func (h *Handler) scheduleImportedRefreshRetry(accountID int64, source string, attempt int, err error) bool {
+	if h == nil || h.store == nil || err == nil {
+		return false
+	}
+	if auth.IsPermanentRefreshFailure(err) || attempt >= importRefreshTransientRetryLimit {
+		return false
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return false
+	}
+	time.AfterFunc(importRefreshTransientRetryDelay, func() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountWithRetry(ctx, accountID, source, attempt+1)
+		})
+	})
+	return true
+}
+
+// markImportedRefreshFailure 导入后换 AT 失败(瞬时失败已重试耗尽)时落状态，
+// 避免裸 RT 一直停在「刷新中」。会话作废 / RT 失效标未授权（时长由 unauthorized
+// 自适应 6/24h 策略决定，入参只是兜底）；其它失败标错误。
+func (h *Handler) markImportedRefreshFailure(accountID int64, err error) {
+	if h == nil || h.store == nil || err == nil {
+		return
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return
+	}
+	// store 的刷新路径对不可重试错误已经标过未授权冷却；再标一次会让
+	// FailureStreak 翻倍、自适应冷却直接跳 24h 档，并重复落库。
+	switch acc.RuntimeStatus() {
+	case "unauthorized", "error":
+		return
+	}
+	msg := err.Error()
+	if auth.IsPermanentRefreshFailure(err) {
+		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", msg)
+		return
+	}
+	h.store.MarkError(acc, msg)
 }
 
 // mergeRefreshedDuplicateIntoExisting 检查刚刷新完的新导入账号是否与已有账号
@@ -364,12 +780,19 @@ func (h *Handler) mergeRefreshedDuplicateIntoExistingContext(parent context.Cont
 		return false
 	}
 	email := strings.TrimSpace(newRow.GetCredential("email"))
-	workspaceID := openaiidentity.NormalizeWorkspaceID(newRow.GetCredential("workspace_id"))
-	if email == "" || workspaceID == "" {
+	effectiveWorkspaceID := openaiidentity.EffectiveWorkspaceID(
+		newRow.GetCredential("workspace_id"),
+		newRow.GetCredentialStringMap("custom_headers"),
+	)
+	if email == "" || effectiveWorkspaceID == "" {
 		return false
 	}
-	oldID, err := h.db.FindActiveAccountByOAuthIdentity(ctx, email, workspaceID, newID)
+	oldID, err := h.db.FindActiveAccountByOAuthRouteIdentity(ctx, email, effectiveWorkspaceID, newID)
 	if err != nil || oldID <= 0 {
+		return false
+	}
+	oldRow, err := h.db.GetAccountByID(ctx, oldID)
+	if err != nil || oldRow == nil {
 		return false
 	}
 
@@ -379,14 +802,22 @@ func (h *Handler) mergeRefreshedDuplicateIntoExistingContext(parent context.Cont
 			updates[key] = v
 		}
 	}
+	oldHeaders := oldRow.GetCredentialStringMap("custom_headers")
+	oldOverride := openaiidentity.WorkspaceOverrideFromHeaders(oldHeaders)
+	newOverride := openaiidentity.WorkspaceOverrideFromHeaders(newRow.GetCredentialStringMap("custom_headers"))
+	newTokenWorkspaceID := openaiidentity.NormalizeWorkspaceID(newRow.GetCredential("workspace_id"))
+	if oldOverride == "" && newOverride != "" && newTokenWorkspaceID != effectiveWorkspaceID {
+		// The duplicate is the same effective route only because the new row
+		// carries an explicit override. Preserve that route on the survivor
+		// before copying token-native identity fields from the new credentials.
+		updates["custom_headers"] = customHeadersWithWorkspaceOverride(oldHeaders, newOverride)
+	}
 	if len(updates) == 0 {
 		return false
 	}
 	proxyURL := strings.TrimSpace(newRow.ProxyURL)
 	if proxyURL == "" {
-		if oldRow, err := h.db.GetAccountByID(ctx, oldID); err == nil && oldRow != nil {
-			proxyURL = strings.TrimSpace(oldRow.ProxyURL)
-		}
+		proxyURL = strings.TrimSpace(oldRow.ProxyURL)
 	}
 	if err := h.db.UpdateOAuthAccountCredentials(ctx, oldID, updates, proxyURL); err != nil {
 		log.Printf("合并导入账号 %d 凭证到已有账号 %d 失败: %v", newID, oldID, err)
@@ -490,30 +921,38 @@ func parseUsageChannel(c *gin.Context) string {
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
-		store:          store,
-		cache:          tc,
-		db:             db,
-		cacheCfgStore:  db,
-		rateLimiter:    rl,
-		cpuSampler:     newCPUSampler(),
-		startedAt:      time.Now(),
-		databaseDriver: db.Driver(),
-		databaseLabel:  db.Label(),
-		cacheDriver:    tc.Driver(),
-		cacheLabel:     tc.Label(),
-		adminSecretEnv: adminSecretEnv,
-		sessionStore:   newAdminSessionStore(),
-		imageProxy:     proxy.NewHandler(store, db, nil, nil),
-		chartCacheData: make(map[string]*chartCacheEntry),
+		store:                store,
+		cache:                tc,
+		db:                   db,
+		cacheCfgStore:        db,
+		rateLimiter:          rl,
+		cpuSampler:           newCPUSampler(),
+		startedAt:            time.Now(),
+		databaseDriver:       db.Driver(),
+		databaseLabel:        db.Label(),
+		cacheDriver:          tc.Driver(),
+		cacheLabel:           tc.Label(),
+		adminSecretEnv:       adminSecretEnv,
+		sessionStore:         newAdminSessionStore(),
+		imageProxy:           proxy.NewHandler(store, db, nil, nil),
+		chartCacheData:       make(map[string]*chartCacheEntry),
+		accountListCache:     make(map[string]*accountListSnapshot),
+		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
+	store.SetUsageProbeCompletionFunc(handler.invalidateAccountSnapshotCaches)
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
 	handler.queryResetCredits = proxy.QueryWhamResetCredits
 	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
+	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
+	handler.whamDailyBackfillLast = make(map[int64]time.Time)
+	handler.whamDailyBackfillInFlight = make(map[int64]struct{})
+	handler.whamDailyBackfillFailedAt = make(map[int64]time.Time)
+	handler.whamDailySyncedOnce = make(map[int64]struct{})
 	handler.autoResetCreditsWake = make(chan struct{}, 1)
 	if db != nil {
 		handler.recordAccountEvent = db.InsertAccountEventAsync
@@ -569,8 +1008,18 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 	api := r.Group("/api/admin")
 	api.Use(h.adminAuthMiddleware())
+	api.Use(func(c *gin.Context) {
+		c.Next()
+		if shouldInvalidateAccountSnapshotCaches(c.Request.Method, c.Request.URL.Path, c.Writer.Status()) {
+			h.invalidateAccountSnapshotCaches()
+		}
+	})
 	api.GET("/stats", h.GetStats)
 	api.GET("/accounts", h.ListAccounts)
+	api.GET("/accounts/analysis", h.GetAccountAnalysis)
+	api.GET("/accounts/page-stats", h.GetAccountPageStats)
+	api.GET("/accounts/live", h.GetAccountLiveState)
+	api.GET("/accounts/:id", h.GetAccount)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
 	api.POST("/accounts/push-token", h.PushTokenAccount)
@@ -581,6 +1030,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
+	api.POST("/accounts/grok/batch-models", h.BatchUpdateGrokModels)
 	api.GET("/accounts/grok/export", h.ExportGrokAccounts)
 	api.POST("/accounts/grok/oauth/device/start", h.StartGrokDeviceAuth)
 	api.POST("/accounts/grok/oauth/device/poll", h.PollGrokDeviceAuth)
@@ -590,6 +1040,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/grok/oauth/auth-url", h.GenerateGrokAuthURL)        // 兼容旧客户端
 	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
 	api.PATCH("/accounts/:id/grok", h.UpdateGrokAccount)
+	api.GET("/accounts/:id/grok/state", h.GetGrokAccountState)
+	api.POST("/accounts/:id/grok/sync", h.SyncGrokAccountState)
+	api.POST("/accounts/:id/grok/capabilities/probe", h.ProbeGrokAccountCapabilities)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
@@ -616,6 +1069,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/accounts/:id/model-cooldowns/:model", h.ClearAccountModelCooldown)
 	api.POST("/accounts/:id/reset-credits", h.ResetCredits)
 	api.GET("/accounts/:id/reset-credits", h.GetResetCredits)
+	api.GET("/accounts/:id/wham-daily-usage", h.GetAccountWhamDailyUsage)
 	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/invite/eligibility", h.GetInviteEligibility)
 	api.GET("/accounts/:id/invite/tracking", h.GetInviteTracking)
@@ -678,6 +1132,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.GET("/prompt-policy/incidents", h.ListPromptPolicyIncidents)
 	api.DELETE("/prompt-policy/incidents", h.ClearPromptPolicyIncidents)
+	api.GET("/prompt-policy/incidents/health", h.GetPromptPolicyAuditHealth)
 	api.GET("/prompt-policy/incidents/:incident_id", h.GetPromptPolicyIncident)
 	api.GET("/prompt-policy/risk-profiles", h.ListPromptRiskProfiles)
 	api.GET("/prompt-policy/risk-profiles/:subject_type/:subject_key", h.GetPromptRiskProfile)
@@ -685,7 +1140,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/prompt-policy/risk-profiles/:subject_type/:subject_key/trust", h.RevokePromptRiskTrustPolicy)
 	api.POST("/prompt-policy/conversation-locks/:lock_key/unlock", h.UnlockPromptConversation)
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
+	api.GET("/prompt-filter/review/keys", h.ListPromptReviewAPIKeys)
+	api.DELETE("/prompt-filter/review/keys/:key_id", h.DeletePromptReviewAPIKey)
+	api.GET("/prompt-filter/review/profiles", h.ListPromptReviewProfiles)
+	api.POST("/prompt-filter/review/profiles", h.SavePromptReviewProfile)
+	api.POST("/prompt-filter/review/profiles/:profile_id/activate", h.ActivatePromptReviewProfile)
+	api.DELETE("/prompt-filter/review/profiles/:profile_id", h.DeletePromptReviewProfile)
 	api.POST("/prompt-filter/review/test", h.TestPromptReviewConnection)
+	api.POST("/prompt-filter/review/models", h.ListPromptReviewModels)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/prompt-filter/newapi-bindings", h.ListPromptFilterNewAPIBindings)
@@ -712,6 +1174,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/model-pricing", h.ListModelPricing)
 	api.PUT("/model-pricing", h.UpdateModelPricing)
 	api.POST("/model-pricing/sync", h.SyncModelPricing)
+	api.PUT("/model-pricing/official-sync/config", h.UpdateOfficialPricingSyncConfig)
+	api.POST("/model-pricing/official-sync", h.SyncOfficialPricingNow)
 	api.GET("/image-prompts", h.ListImagePromptTemplates)
 	api.POST("/image-prompts", h.CreateImagePromptTemplate)
 	api.PATCH("/image-prompts/:id", h.UpdateImagePromptTemplate)
@@ -804,7 +1268,9 @@ func (h *Handler) hasConfiguredAdminSecret(ctx context.Context) bool {
 
 // GetStats 获取仪表盘统计
 func (h *Handler) GetStats(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	// Large installations may need more than five seconds to aggregate the
+	// dashboard inputs. Keep the request bounded without failing normal loads.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	accounts, err := h.db.ListActive(ctx)
@@ -877,7 +1343,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			channel = database.UpstreamChannelGrok
 		}
 		usingCredits := false
-		if acc, ok := runtimeByID[row.ID]; ok {
+		acc := runtimeByID[row.ID]
+		if acc != nil {
 			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
 			cooldownReason = ""
 			// 积分顶替限流：状态仍报限流（窗口客观打满），但账号照常参与调度，按可用计。
@@ -900,6 +1367,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		case !usingCredits && isDashboardRateLimitedAccount(status, cooldownReason):
 			counts.rateLimited++
 			perChannel.rateLimited++
+		case isDashboardUnsampledAccount(row, acc):
+			// 未采样不当作可用：仪表盘「可用」与账号页正常/调度中对齐。
 		default:
 			counts.normal++
 			perChannel.normal++
@@ -913,13 +1382,39 @@ func isDashboardAbnormalAccount(status string) bool {
 	return status == "unauthorized" || status == "error"
 }
 
+func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bool {
+	if acc != nil {
+		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() {
+			return false
+		}
+		snapshot := acc.GetAccountListRuntimeSnapshot()
+		status := strings.ToLower(strings.TrimSpace(snapshot.Status))
+		if status == "unauthorized" || status == "error" {
+			return false
+		}
+		return !snapshot.UsagePercent5hValid && !snapshot.UsagePercent7dValid
+	}
+	if row == nil {
+		return false
+	}
+	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+	if strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(row.Status))
+	if status == "unauthorized" || status == "error" {
+		return false
+	}
+	return true
+}
+
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 	switch status {
-	case "rate_limited", "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
 		return true
 	}
 	switch cooldownReason {
-	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limited":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
 		return true
 	}
 	return false
@@ -928,11 +1423,15 @@ func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 // ==================== Accounts ====================
 
 type accountResponse struct {
+	DetailLoaded          bool   `json:"detail_loaded,omitempty"`
 	ID                    int64  `json:"id"`
 	Name                  string `json:"name"`
 	Email                 string `json:"email"`
 	EmailDomain           string `json:"email_domain,omitempty"`
 	ChatGPTAccountID      string `json:"chatgpt_account_id,omitempty"`
+	TokenWorkspaceID      string `json:"token_workspace_id,omitempty"`
+	WorkspaceIDOverride   string `json:"workspace_id_override,omitempty"`
+	EffectiveWorkspaceID  string `json:"effective_workspace_id,omitempty"`
 	PlanType              string `json:"plan_type"`
 	SubscriptionExpiresAt string `json:"subscription_expires_at,omitempty"`
 	Status                string `json:"status"`
@@ -958,6 +1457,7 @@ type accountResponse struct {
 	Models                        []string                    `json:"models,omitempty"`
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
+	CodexFingerprintMode          string                      `json:"codex_fingerprint_mode,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -982,6 +1482,8 @@ type accountResponse struct {
 	ErrorRequests                 int64                       `json:"error_requests"`
 	RetryErrorRequests            int64                       `json:"retry_error_requests"`
 	RateLimitAttempts             int64                       `json:"rate_limit_attempts"`
+	ErrorStatusCounts             map[string]int64            `json:"error_status_counts,omitempty"`
+	SuccessModelCounts            map[string]int64            `json:"success_model_counts,omitempty"`
 	UsagePercent7d                *float64                    `json:"usage_percent_7d"`
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
@@ -1043,10 +1545,12 @@ type modelCooldownResponse struct {
 }
 
 type accountUsageWindow struct {
-	Requests      int64   `json:"requests"`
-	Tokens        int64   `json:"tokens"`
-	AccountBilled float64 `json:"account_billed"`
-	UserBilled    float64 `json:"user_billed"`
+	Requests           int64            `json:"requests"`
+	Tokens             int64            `json:"tokens"`
+	AccountBilled      float64          `json:"account_billed"`
+	UserBilled         float64          `json:"user_billed"`
+	ModelCounts        map[string]int64 `json:"model_counts,omitempty"`
+	ModelSuccessCounts map[string]int64 `json:"model_success_counts,omitempty"`
 }
 
 func applyAccountModelCooldownPolicyFromRow(resp *accountResponse, row *database.AccountRow, settings database.ModelCooldownSettings, relayStyle bool) {
@@ -1122,339 +1626,214 @@ type schedulerBreakdownResponse struct {
 
 // ListAccounts 获取账号列表
 func (h *Handler) ListAccounts(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	view := strings.ToLower(strings.TrimSpace(c.Query("view")))
+	timeout := 5 * time.Second
+	if view == "page" {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 	defer cancel()
 
 	// ?view=lite — 轻量视图:只返回身份/绑定字段,跳过用量富化与探测触发。
 	// 供代理绑定弹窗等只需要"账号是谁、绑了哪条代理"的场景,大号池下不再传输
 	// 全量调度指标(代理页卡死问题)。
-	if strings.EqualFold(strings.TrimSpace(c.Query("view")), "lite") {
+	if view == "lite" {
 		h.listAccountsLite(c, ctx)
 		return
 	}
 
-	h.store.TriggerUsageProbeAsync()
-	h.store.TriggerRecoveryProbeAsync()
+	// The paged list is a read path and must never fan out probes across a
+	// 40k-account pool. Existing background schedulers and explicit refresh
+	// actions own probing; the legacy full response preserves its old behavior.
+	if view != "page" {
+		h.store.TriggerUsageProbeAsync()
+		h.store.TriggerRecoveryProbeAsync()
+	}
 
 	// Optional ?channel=codex|grok — server-side filter so Grok/Codex admin
 	// pages only transfer and enrich their own account set.
 	channel := parseUsageChannel(c)
-	rows, err := h.db.ListActiveByChannel(ctx, channel)
+	var pageSelection *accountPageSelection
+	var rows []*database.AccountRow
+	var err error
+	if view == "page" {
+		pageSelection, err = h.getAccountPageSelection(ctx, c, channel)
+		if err == nil {
+			rows = pageSelection.Rows
+		}
+	} else {
+		rows, err = h.db.ListActiveByChannel(ctx, channel)
+	}
 	if err != nil {
-		writeInternalError(c, err)
+		var queryErr *accountPageQueryError
+		if view == "page" && errors.As(err, &queryErr) {
+			writeError(c, http.StatusBadRequest, err.Error())
+		} else {
+			writeInternalError(c, err)
+		}
 		return
 	}
 
 	// 合并内存中的调度指标
 	accountMap := make(map[int64]*auth.Account)
-	for _, acc := range h.store.Accounts() {
-		accountMap[acc.DBID] = acc
+	if view == "page" {
+		for _, row := range rows {
+			if acc := h.store.FindByID(row.ID); acc != nil {
+				accountMap[row.ID] = acc
+			}
+		}
+	} else {
+		for _, acc := range h.store.Accounts() {
+			accountMap[acc.DBID] = acc
+		}
 	}
 
-	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
-	reqCounts := h.getCachedRequestCounts()
-	usage5h, usage7d := h.getAccountUsageWindows(ctx)
-	modelCooldownSettings := h.store.GetModelCooldownSettings()
+	var reqCounts map[int64]*database.AccountRequestCount
+	var usage5h, usage7d map[int64]*database.AccountTimeRangeUsage
+	if view == "page" {
+		pageIDs := make([]int64, 0, len(rows))
+		for _, row := range rows {
+			pageIDs = append(pageIDs, row.ID)
+		}
+		reqCounts, err = h.db.GetAccountRequestCountsByIDs(ctx, pageIDs)
+		if err != nil {
+			log.Printf("获取当前页账号请求统计失败: %v", err)
+			reqCounts = make(map[int64]*database.AccountRequestCount)
+		}
+		usage5h = make(map[int64]*database.AccountTimeRangeUsage)
+		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
+	} else {
+		// 旧全量接口保持原行为和缓存语义。
+		reqCounts = h.getCachedRequestCounts()
+		usage5h, usage7d = h.getAccountUsageWindows(ctx)
+	}
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
-		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
-		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
-		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
-		grokAuthKind := ""
-		var grokBilling json.RawMessage
-		if isGrokAccount {
-			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
-				grokAuthKind = auth.GrokAuthKindAPIKey
-			} else {
-				grokAuthKind = auth.GrokAuthKindOAuth
-			}
-			if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
-				grokBilling = json.RawMessage(detail)
-			}
-		}
-		email := row.GetCredential("email")
-		baseURL := row.GetCredential("base_url")
-		if isOpenAIResponsesAccount && email == "" {
-			email = baseURL
-		}
-		planType := row.GetCredential("plan_type")
-		if isOpenAIResponsesAccount && planType == "" {
-			planType = "api"
-		}
-		if isGrokAccount && grokAuthKind == auth.GrokAuthKindAPIKey {
-			planType = "api"
-		}
-		if isGrokAccount {
-			if runtimeAccount, ok := accountMap[row.ID]; ok {
-				if runtimePlan := runtimeAccount.GetPlanType(); runtimePlan != "" {
-					planType = runtimePlan
-				}
-			}
-		}
-		var grokPlan *auth.GrokPlan
-		if isGrokAccount {
-			if resolved, ok := auth.ResolveGrokPlan(planType); ok {
-				grokPlan = &resolved
-			}
-		}
-		codexClientMetadataMode := ""
-		if isOpenAIResponsesAccount {
-			codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
-		}
-		ignoreUsageLimitStatusOverride := row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
-		ignoreUsageLimitStatusEffective := h.store.IgnoreUsageLimitStatus()
-		if ignoreUsageLimitStatusOverride != nil {
-			ignoreUsageLimitStatusEffective = *ignoreUsageLimitStatusOverride
-		}
-		resp := accountResponse{
-			ID:                        row.ID,
-			Name:                      row.Name,
-			Email:                     email,
-			EmailDomain:               accountEmailDomain(email),
-			ChatGPTAccountID:          firstNonEmpty(row.GetCredential("chatgpt_account_id"), row.GetCredential("account_id")),
-			PlanType:                  planType,
-			SubscriptionExpiresAt:     row.GetCredential("subscription_expires_at"),
-			Status:                    row.Status,
-			ErrorMessage:              row.ErrorMessage,
-			ATOnly:                    !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
-			CreditEnabled:             row.CreditEnabled,
-			CreditSkipUsageWindow:     row.CreditSkipUsageWindow,
-			SkipWarmTier:              row.SkipWarmTier,
-			AccountType:               row.Type,
-			AccessTokenType:           accountAccessTokenType(row),
-			OpenAIResponsesAPI:        isOpenAIResponsesAccount,
-			GrokAPI:                   isGrokAccount,
-			AgentIdentity:             isAgentIdentityCredentialRow(row),
-			GrokAuthKind:              grokAuthKind,
-			GrokPlan:                  grokPlan,
-			GrokBilling:               grokBilling,
-			BaseURL:                   baseURL,
-			Models:                    row.GetCredentialStringSlice("models"),
-			ModelMapping:              row.GetCredential("model_mapping"),
-			CodexClientMetadataMode:   codexClientMetadataMode,
-			CustomHeaders:             row.GetCredentialStringMap("custom_headers"),
-			ProxyURL:                  row.ProxyURL,
-			Enabled:                   row.Enabled,
-			Locked:                    row.Locked,
-			AllowedAPIKeyIDs:          row.GetCredentialInt64Slice("allowed_api_key_ids"),
-			Tags:                      append([]string(nil), row.Tags...),
-			Note:                      row.Note,
-			ScoreBiasOverride:         nullableInt64Pointer(row.ScoreBiasOverride),
-			ScoreBiasEffective:        effectiveScoreBias(planType, row.ScoreBiasOverride),
-			BaseConcurrencyOverride:   nullableInt64Pointer(row.BaseConcurrencyOverride),
-			BaseConcurrencyEffective:  effectiveBaseConcurrency(row.BaseConcurrencyOverride, int64(h.store.GetMaxConcurrency())),
-			UsageReservePercent5h:     nullableInt64Pointer(row.UsageReservePercent5h),
-			UsageReservePercent7d:     nullableInt64Pointer(row.UsageReservePercent7d),
-			UsageReserveActiveWindows: []string{},
-			CreatedAt:                 row.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:                 row.UpdatedAt.Format(time.RFC3339),
-			CodexUsageUpdatedAt:       row.GetCredential("codex_usage_updated_at"),
-			Codex5HUsageUpdatedAt:     row.GetCredential("codex_5h_usage_updated_at"),
-			UsageLimitOverride:        ignoreUsageLimitStatusOverride,
-			UsageLimitEffective:       ignoreUsageLimitStatusEffective,
-		}
-		resp.AutoPause5hThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_5h_threshold")
-		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
-		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
-		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
-		resp.DispatchCountLimit = accountDispatchCountLimit(row)
-		resp.SchedulerPriority = accountSchedulerPriority(row)
-		// DB 中仍可见但因凭据缺失而未进入运行时池的账号，也必须返回持久化
-		// override 与正确的全局 effective 策略；运行时账号会在下方覆盖这些值。
-		applyAccountModelCooldownPolicyFromRow(&resp, row, modelCooldownSettings, isOpenAIResponsesAccount)
-		if acc, ok := accountMap[row.ID]; ok {
-			resp.ModelCooldownModeOverride, resp.ModelCooldownSecondsOverride, resp.ModelCooldownBackoffOverride = acc.GetModelCooldownPolicyOverride()
-			effectiveCooldownPolicy := h.store.ResolveModelCooldownPolicy(acc)
-			resp.ModelCooldownModeEffective = effectiveCooldownPolicy.Mode
-			resp.ModelCooldownSecondsEffective = effectiveCooldownPolicy.Seconds
-			resp.ModelCooldownBackoffEffective = effectiveCooldownPolicy.BackoffEnabled
-			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
-			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
-			if isGrokAccount {
-				if snap, hasSnap := acc.GetGrokRateLimitSnapshot(); hasSnap {
-					resp.GrokRateLimit = &snap
-				}
-				if snap, hasSnap := acc.GetGrokFreeQuotaSnapshot(); hasSnap {
-					resp.GrokFreeQuota = &snap
-				}
-			}
-			acc.Mu().RLock()
-			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
-			acc.Mu().RUnlock()
-			resp.ActiveRequests = acc.GetActiveRequests()
-			resp.TotalRequests = acc.GetTotalRequests()
-			debug := acc.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
-			resp.HealthTier = debug.HealthTier
-			resp.SchedulerScore = debug.SchedulerScore
-			resp.ConcurrencyCap = debug.DynamicConcurrencyLimit
-			if dispatchScore, ok := reflectFloat64Field(debug, "DispatchScore"); ok {
-				resp.DispatchScore = dispatchScore
-			}
-			if scoreBiasEffective, ok := reflectInt64Field(debug, "ScoreBiasEffective"); ok {
-				resp.ScoreBiasEffective = scoreBiasEffective
-			}
-			if baseConcurrencyEffective, ok := reflectInt64Field(debug, "BaseConcurrencyEffective"); ok {
-				resp.BaseConcurrencyEffective = baseConcurrencyEffective
-			}
-			resp.ScoreBreakdown = schedulerBreakdownResponse{
-				UnauthorizedPenalty: debug.Breakdown.UnauthorizedPenalty,
-				RateLimitPenalty:    debug.Breakdown.RateLimitPenalty,
-				TimeoutPenalty:      debug.Breakdown.TimeoutPenalty,
-				ServerPenalty:       debug.Breakdown.ServerPenalty,
-				FailurePenalty:      debug.Breakdown.FailurePenalty,
-				SuccessBonus:        debug.Breakdown.SuccessBonus,
-				UsagePenalty7d:      debug.Breakdown.UsagePenalty7d,
-				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
-				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
-				ExpiryUrgencyBonus:  debug.Breakdown.ExpiryUrgencyBonus,
-				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
-				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
-			}
-			if usagePct, ok := acc.GetUsagePercent7d(); ok {
-				resp.UsagePercent7d = &usagePct
-			}
-			if usagePct5h, ok := acc.GetUsagePercent5h(); ok {
-				resp.UsagePercent5h = &usagePct5h
-			}
-			if credits, ok := acc.GetRateLimitResetCredits(); ok {
-				resp.RateLimitResetCredits = &credits
-			}
-			if applicable, ok := acc.GetApplicableResetCredits(); ok {
-				resp.ApplicableResetCredits = &applicable
-			}
-			if balance, hasCredits, unlimited, overage, ok := acc.GetCreditBalance(); ok {
-				resp.CreditsBalance = &balance
-				resp.CreditsHasCredits = &hasCredits
-				resp.CreditsUnlimited = &unlimited
-				resp.CreditsOverageLimitReached = &overage
-			}
-			if snapshot := acc.GetDispatchCountSnapshot(); snapshot.Limit > 0 {
-				limit := snapshot.Limit
-				resp.DispatchCountLimit = &limit
-				resp.DispatchCountUsed = snapshot.Used
-				resp.DispatchCountLimited = snapshot.Limited
-				if !snapshot.ResetAt.IsZero() {
-					resp.DispatchCountResetAt = snapshot.ResetAt.Format(time.RFC3339)
-				}
+		accounts = append(accounts, h.buildAccountResponse(
+			row,
+			accountMap[row.ID],
+			reqCounts[row.ID],
+			usage5h[row.ID],
+			usage7d[row.ID],
+			view != "page",
+		))
+	}
+
+	if view != "page" {
+		billing5hWindows := make(map[int64]time.Time)
+		billing7dWindows := make(map[int64]time.Time)
+		for i := range accounts {
+			acc, ok := accountMap[accounts[i].ID]
+			if !ok {
+				continue
 			}
 			if t := acc.GetReset5hAt(); !t.IsZero() {
-				resp.Reset5hAt = t.Format(time.RFC3339)
+				billing5hWindows[accounts[i].ID] = t.Add(-5 * time.Hour)
 			}
 			if t := acc.GetReset7dAt(); !t.IsZero() {
-				resp.Reset7dAt = t.Format(time.RFC3339)
-			}
-			if sec := acc.GetWindow7dSeconds(); sec > 0 {
-				resp.Window7dSeconds = &sec
-				resp.Window7dKind = acc.Window7dKind()
-			}
-			if t := acc.GetLastUsedAt(); !t.IsZero() {
-				resp.LastUsedAt = t.Format(time.RFC3339)
-			}
-			if !debug.LastUnauthorizedAt.IsZero() {
-				resp.LastUnauthorizedAt = debug.LastUnauthorizedAt.Format(time.RFC3339)
-			}
-			if !debug.LastRateLimitedAt.IsZero() {
-				resp.LastRateLimitedAt = debug.LastRateLimitedAt.Format(time.RFC3339)
-			}
-			if !debug.LastTimeoutAt.IsZero() {
-				resp.LastTimeoutAt = debug.LastTimeoutAt.Format(time.RFC3339)
-			}
-			if !debug.LastServerErrorAt.IsZero() {
-				resp.LastServerErrorAt = debug.LastServerErrorAt.Format(time.RFC3339)
-			}
-			if reason, until := acc.GetCooldownSnapshot(); !until.IsZero() && until.After(time.Now()) {
-				resp.CooldownReason = reason
-				resp.CooldownUntil = until.Format(time.RFC3339)
-			}
-			resp.UsageReserveActiveWindows = acc.GetUsageReserveActiveWindows(h.store.GetUsageProbeMaxAge())
-			for _, cooldown := range acc.ActiveModelCooldowns() {
-				resp.ModelCooldowns = append(resp.ModelCooldowns, modelCooldownResponse{
-					Model:     cooldown.Model,
-					Reason:    cooldown.Reason,
-					ResetAt:   cooldown.ResetAt.Format(time.RFC3339),
-					Remaining: int64(time.Until(cooldown.ResetAt).Seconds()),
-				})
-			}
-			// 使用运行时状态（优先于 DB 状态）
-			resp.Status = acc.RuntimeStatusWithUsageProbeMaxAge(h.store.GetUsageProbeMaxAge())
-			resp.UsingCredits = acc.UsingCredits()
-			acc.Mu().RLock()
-			resp.ErrorMessage = acc.ErrorMsg
-			acc.Mu().RUnlock()
-		} else if row.CooldownUntil.Valid && row.CooldownUntil.Time.After(time.Now()) {
-			resp.CooldownReason = row.CooldownReason
-			resp.CooldownUntil = row.CooldownUntil.Time.Format(time.RFC3339)
-		}
-		if resp.DispatchScore == 0 {
-			resp.DispatchScore = dispatchScoreFallback(resp.SchedulerScore, resp.ScoreBiasEffective, resp.HealthTier, resp.Status)
-		}
-		if rc, ok := reqCounts[row.ID]; ok {
-			resp.SuccessRequests = rc.SuccessCount
-			resp.ErrorRequests = rc.ErrorCount
-			resp.RetryErrorRequests = rc.RetryErrorCount
-			resp.RateLimitAttempts = rc.RateLimitAttemptCount
-		}
-		if usage, ok := usage5h[row.ID]; ok {
-			resp.Usage5hDetail = &accountUsageWindow{
-				Requests:      usage.Requests,
-				Tokens:        usage.Tokens,
-				AccountBilled: usage.AccountBilled,
-				UserBilled:    usage.UserBilled,
+				// 长窗口起点 = reset - 真实周期。free/team 是月窗(约 30 天),
+				// 写死减 7 天会把起点算到未来,成本恒为 0 (issue #324)。
+				windowDur := 7 * 24 * time.Hour
+				if sec := acc.GetWindow7dSeconds(); sec > 0 {
+					windowDur = time.Duration(sec) * time.Second
+				}
+				billing7dWindows[accounts[i].ID] = t.Add(-windowDur)
 			}
 		}
-		if usage, ok := usage7d[row.ID]; ok {
-			resp.Usage7dDetail = &accountUsageWindow{
-				Requests:      usage.Requests,
-				Tokens:        usage.Tokens,
-				AccountBilled: usage.AccountBilled,
-				UserBilled:    usage.UserBilled,
-			}
-		}
-		accounts = append(accounts, resp)
-	}
 
-	billing5hWindows := make(map[int64]time.Time)
-	billing7dWindows := make(map[int64]time.Time)
-	for i := range accounts {
-		acc, ok := accountMap[accounts[i].ID]
-		if !ok {
-			continue
+		billed5h, billingErr := h.db.GetAccountsBilledSince(ctx, billing5hWindows)
+		if billingErr != nil {
+			log.Printf("批量获取账号 5h 成本失败: %v", billingErr)
+			billed5h = nil
 		}
-		if t := acc.GetReset5hAt(); !t.IsZero() {
-			billing5hWindows[accounts[i].ID] = t.Add(-5 * time.Hour)
+		billed7d, billingErr := h.db.GetAccountsBilledSince(ctx, billing7dWindows)
+		if billingErr != nil {
+			log.Printf("批量获取账号 7d 成本失败: %v", billingErr)
+			billed7d = nil
 		}
-		if t := acc.GetReset7dAt(); !t.IsZero() {
-			// 长窗口起点 = reset - 真实周期。free/team 是月窗(约 30 天),
-			// 写死减 7 天会把起点算到未来,成本恒为 0 (issue #324)。
-			windowDur := 7 * 24 * time.Hour
-			if sec := acc.GetWindow7dSeconds(); sec > 0 {
-				windowDur = time.Duration(sec) * time.Second
+		for i := range accounts {
+			if billed, ok := billed5h[accounts[i].ID]; ok {
+				accounts[i].Billed5h = &billed
 			}
-			billing7dWindows[accounts[i].ID] = t.Add(-windowDur)
+			if billed, ok := billed7d[accounts[i].ID]; ok {
+				accounts[i].Billed7d = &billed
+			}
 		}
 	}
 
-	billed5h, err := h.db.GetAccountsBilledSince(ctx, billing5hWindows)
-	if err != nil {
-		log.Printf("批量获取账号 5h 成本失败: %v", err)
-		billed5h = nil
+	if pageSelection != nil {
+		c.JSON(http.StatusOK, accountsPageResponse{
+			Accounts: accounts,
+			Page:     pageSelection.Page, PageSize: pageSelection.PageSize, Total: pageSelection.Total,
+			Summary: pageSelection.Summary, Facets: pageSelection.Facets,
+			SnapshotAt: pageSelection.SnapshotAt.Format(time.RFC3339), StatsState: pageSelection.StatsState,
+			DisabledSorts: pageSelection.DisabledSorts,
+		})
+		return
 	}
-	billed7d, err := h.db.GetAccountsBilledSince(ctx, billing7dWindows)
-	if err != nil {
-		log.Printf("批量获取账号 7d 成本失败: %v", err)
-		billed7d = nil
-	}
-	for i := range accounts {
-		if billed, ok := billed5h[accounts[i].ID]; ok {
-			accounts[i].Billed5h = &billed
-		}
-		if billed, ok := billed7d[accounts[i].ID]; ok {
-			accounts[i].Billed7d = &billed
-		}
-	}
-
 	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
+}
+
+// GetAccount returns the fully enriched representation for one account. Large
+// account pages call this endpoint only when a row is opened or after a
+// mutation, keeping expensive detail fields off the critical list path.
+// GET /api/admin/accounts/:id
+func (h *Handler) GetAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+
+	requestCounts, err := h.db.GetAccountRequestCountsByIDs(ctx, []int64{id})
+	if err != nil {
+		log.Printf("获取账号 %d 请求统计失败: %v", id, err)
+		requestCounts = make(map[int64]*database.AccountRequestCount)
+	}
+	now := time.Now()
+	usage5h, usage7d, err := h.db.GetAccountUsageWindowsByIDs(ctx, []int64{id}, now.Add(-5*time.Hour), now.AddDate(0, 0, -7))
+	if err != nil {
+		log.Printf("获取账号 %d 用量统计失败: %v", id, err)
+		usage5h = make(map[int64]*database.AccountTimeRangeUsage)
+		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
+	}
+
+	runtimeAccount := h.store.FindByID(id)
+	resp := h.buildAccountResponse(row, runtimeAccount, requestCounts[id], usage5h[id], usage7d[id], true)
+	if runtimeAccount != nil {
+		if resetAt := runtimeAccount.GetReset5hAt(); !resetAt.IsZero() {
+			if billed, billedErr := h.db.GetAccountBilledSince(ctx, id, resetAt.Add(-5*time.Hour)); billedErr == nil {
+				resp.Billed5h = &billed
+			} else {
+				log.Printf("获取账号 %d 5h 成本失败: %v", id, billedErr)
+			}
+		}
+		if resetAt := runtimeAccount.GetReset7dAt(); !resetAt.IsZero() {
+			windowDuration := 7 * 24 * time.Hour
+			if seconds := runtimeAccount.GetWindow7dSeconds(); seconds > 0 {
+				windowDuration = time.Duration(seconds) * time.Second
+			}
+			if billed, billedErr := h.db.GetAccountBilledSince(ctx, id, resetAt.Add(-windowDuration)); billedErr == nil {
+				resp.Billed7d = &billed
+			} else {
+				log.Printf("获取账号 %d 长窗口成本失败: %v", id, billedErr)
+			}
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // accountLiteResponse 是 ?view=lite 的账号条目:身份 + 绑定字段,无调度/用量指标。
@@ -1549,6 +1928,7 @@ type updateAccountSchedulerReq struct {
 	SchedulerPriority       json.RawMessage `json:"scheduler_priority"`
 	ProxyURL                json.RawMessage `json:"proxy_url"`
 	CustomHeaders           json.RawMessage `json:"custom_headers"`
+	CodexFingerprintMode    json.RawMessage `json:"codex_fingerprint_mode"`
 }
 
 type accountSchedulerUpdate struct {
@@ -1569,6 +1949,7 @@ type accountSchedulerUpdate struct {
 	SchedulerPriority       database.OptionalNullInt64
 	ProxyURL                database.OptionalString
 	CustomHeaders           optionalCustomHeaders
+	CodexFingerprintMode    database.OptionalString
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -1643,9 +2024,20 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	// null 视为重置为默认档 off。
+	codexFingerprintMode, err := parseOptionalStringField(req.CodexFingerprintMode, "codex_fingerprint_mode", validateCodexFingerprintMode)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if codexFingerprintMode.Set {
+		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
+	}
 	credentialUpdates := make(map[string]interface{})
 	if customHeaders.Set {
 		credentialUpdates["custom_headers"] = cloneCustomHeaders(customHeaders.Values)
+	}
+	if codexFingerprintMode.Set {
+		credentialUpdates[auth.CodexFingerprintModeCredentialKey] = codexFingerprintMode.Value
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -1702,8 +2094,17 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		SchedulerPriority:       schedulerPriority,
 		ProxyURL:                proxyURL,
 		CustomHeaders:           customHeaders,
+		CodexFingerprintMode:    codexFingerprintMode,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
+}
+
+// validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
+func validateCodexFingerprintMode(value string) error {
+	if value == "" || auth.IsValidCodexFingerprintMode(value) {
+		return nil
+	}
+	return errors.New("必须是 off、device、session 或 full")
 }
 
 func (u accountSchedulerUpdate) hasChanges() bool {
@@ -1722,7 +2123,9 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.UsageLimitOverride.Set ||
 		u.DispatchCountLimit.Set ||
 		u.SchedulerPriority.Set ||
-		u.ProxyURL.Set
+		u.ProxyURL.Set ||
+		u.CustomHeaders.Set ||
+		u.CodexFingerprintMode.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -1834,6 +2237,64 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
 			return
 		}
+		if len(update.GroupIDs.Values) > 0 {
+			row, err := h.db.GetAccountByID(ctx, id)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					writeError(c, http.StatusNotFound, "账号不存在")
+					return
+				}
+				writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+				return
+			}
+			if err := h.validateGroupChannelForRows(ctx, []*database.AccountRow{row}, update.GroupIDs.Values); err != nil {
+				writeError(c, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+	}
+
+	if update.CustomHeaders.Set {
+		h.mergeDuplicateMu.Lock()
+		defer h.mergeDuplicateMu.Unlock()
+
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+			return
+		}
+		seed := tokenCredentialSeedFromAccountRow(row)
+		previousOverride := openaiidentity.WorkspaceOverrideFromHeaders(seed.customHeaders)
+		seed.customHeaders = cloneCustomHeaders(update.CustomHeaders.Values)
+		seed = normalizeTokenCredentialSeed(seed)
+		nextOverride := openaiidentity.WorkspaceOverrideFromHeaders(seed.customHeaders)
+
+		if previousOverride != nextOverride {
+			if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+				duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id)
+				if err != nil {
+					writeError(c, http.StatusInternalServerError, "校验工作区路由失败: "+err.Error())
+					return
+				}
+				if duplicateID > 0 {
+					writeError(c, http.StatusConflict, fmt.Sprintf("该登录身份的目标工作区已存在 (id=%d)", duplicateID))
+					return
+				}
+			}
+			duplicateID, err := h.findCredentialWorkspaceRouteDuplicate(ctx, seed, id)
+			if err != nil {
+				writeError(c, http.StatusInternalServerError, "校验凭证工作区路由失败: "+err.Error())
+				return
+			}
+			if duplicateID > 0 {
+				writeError(c, http.StatusConflict, fmt.Sprintf("相同凭证的目标工作区已存在 (id=%d)", duplicateID))
+				return
+			}
+		}
 	}
 
 	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.UsageReservePercent5h, update.UsageReservePercent7d, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
@@ -1915,6 +2376,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
 	}
+	if update.CodexFingerprintMode.Set {
+		h.store.ApplyAccountCodexFingerprintMode(id, update.CodexFingerprintMode.Value)
+	}
 }
 
 type optionalCustomHeaders struct {
@@ -1968,7 +2432,11 @@ func normalizeCustomHeaders(headers map[string]string) (map[string]string, error
 		if len(value) > 8192 {
 			return nil, fmt.Errorf("custom_headers.%s 不能超过 8192 字符", name)
 		}
-		out[http.CanonicalHeaderKey(name)] = value
+		canonicalName := http.CanonicalHeaderKey(name)
+		if previous, exists := out[canonicalName]; exists && previous != value {
+			return nil, fmt.Errorf("custom_headers 包含大小写重复且值冲突的请求头: %s", canonicalName)
+		}
+		out[canonicalName] = value
 	}
 	if len(out) == 0 {
 		return nil, nil
@@ -2057,6 +2525,99 @@ func cloneCustomHeaders(headers map[string]string) map[string]string {
 		out[name] = value
 	}
 	return out
+}
+
+func customHeadersWithWorkspaceOverride(headers map[string]string, workspaceID string) map[string]string {
+	out := make(map[string]string, len(headers)+1)
+	for name, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(name), openaiidentity.ChatGPTAccountIDHeader) {
+			continue
+		}
+		out[name] = value
+	}
+	if workspaceID = strings.TrimSpace(workspaceID); workspaceID != "" {
+		out[openaiidentity.ChatGPTAccountIDHeader] = workspaceID
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func credentialWorkspaceRouteKey(kind, token string, customHeaders map[string]string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	return kind + "\x00" + token + "\x00" + openaiidentity.WorkspaceOverrideFromHeaders(customHeaders)
+}
+
+func tokenCredentialSeedWorkspaceRouteKeys(seed tokenCredentialSeed) []string {
+	seed = normalizeTokenCredentialSeed(seed)
+	keys := make([]string, 0, 3)
+	for _, credential := range []struct {
+		kind  string
+		token string
+	}{
+		{kind: "rt", token: seed.refreshToken},
+		{kind: "st", token: seed.sessionToken},
+		{kind: "at", token: seed.accessToken},
+	} {
+		if key := credentialWorkspaceRouteKey(credential.kind, credential.token, seed.customHeaders); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func accountCredentialWorkspaceRouteKeys(row *database.AccountRow) []string {
+	if row == nil {
+		return nil
+	}
+	return tokenCredentialSeedWorkspaceRouteKeys(tokenCredentialSeedFromAccountRow(row))
+}
+
+func (h *Handler) existingCredentialWorkspaceRouteKeys(ctx context.Context) (map[string]bool, error) {
+	if h == nil || h.db == nil {
+		return nil, fmt.Errorf("database is not configured")
+	}
+	rows, err := h.db.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	keys := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		for _, key := range accountCredentialWorkspaceRouteKeys(row) {
+			keys[key] = true
+		}
+	}
+	return keys, nil
+}
+
+func (h *Handler) findCredentialWorkspaceRouteDuplicate(ctx context.Context, seed tokenCredentialSeed, excludeID int64) (int64, error) {
+	candidateKeys := tokenCredentialSeedWorkspaceRouteKeys(seed)
+	if len(candidateKeys) == 0 {
+		return 0, nil
+	}
+	candidates := make(map[string]struct{}, len(candidateKeys))
+	for _, key := range candidateKeys {
+		candidates[key] = struct{}{}
+	}
+	rows, err := h.db.ListActive(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range rows {
+		if row.ID == excludeID {
+			continue
+		}
+		for _, key := range accountCredentialWorkspaceRouteKeys(row) {
+			if _, ok := candidates[key]; ok {
+				return row.ID, nil
+			}
+		}
+	}
+	return 0, nil
 }
 
 type optionalStringSlice struct {
@@ -2419,13 +2980,16 @@ func reflectInt64Field(value interface{}, field string) (int64, bool) {
 	}
 }
 
-// getCachedRequestCounts 返回带 30 秒 TTL 的账号请求统计缓存
+// getCachedRequestCounts preserves the legacy full-list behavior: a blocking
+// global aggregation cached under its own key, so it never contends with the
+// per-channel paged caches.
 func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCount {
+	const cacheKey = "all"
 	h.reqCountMu.RLock()
-	if h.reqCountCache != nil && time.Now().Before(h.reqCountExpiresAt) {
-		cached := h.reqCountCache
+	entry := h.reqCountCache[cacheKey]
+	if entry != nil && time.Now().Before(entry.expiresAt) {
 		h.reqCountMu.RUnlock()
-		return cached
+		return entry.counts
 	}
 	h.reqCountMu.RUnlock()
 
@@ -2436,12 +3000,7 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 		log.Printf("获取账号请求统计失败: %v", err)
 		return make(map[int64]*database.AccountRequestCount)
 	}
-
-	h.reqCountMu.Lock()
-	h.reqCountCache = counts
-	h.reqCountExpiresAt = time.Now().Add(30 * time.Second)
-	h.reqCountMu.Unlock()
-
+	h.storeRequestCountCache(cacheKey, counts, nil, time.Time{})
 	return counts
 }
 
@@ -2473,6 +3032,9 @@ type addAccountReq struct {
 	ProxyURL       string            `json:"proxy_url"`
 	CustomHeaders  map[string]string `json:"custom_headers"`
 	AllowDuplicate bool              `json:"allow_duplicate"`
+	// SkipRefresh 只入库、不换 AT、不打用量探测。大批量脚本导入时应打开，
+	// 避免每批 50 个裸 RT 立刻拉起无上限的上游刷新把网关打卡。
+	SkipRefresh bool `json:"skip_refresh"`
 	// GroupIDs 让添加时就把新账号绑进指定分组；重复跳过的账号不受影响。
 	GroupIDs json.RawMessage `json:"group_ids"`
 }
@@ -2495,47 +3057,39 @@ func splitAccountCredentialLines(raw string, sanitize bool) []string {
 // accountCredentialDedup 跟踪 RT/ST 原文去重（用于 RT/ST 单账号/批量添加路径）。
 // 身份型（OAuth）去重在文件导入与 AT 路径单独处理，这里只覆盖加入时无法解出身份的 RT/ST。
 type accountCredentialDedup struct {
-	existingRT map[string]bool
-	existingST map[string]bool
-	seenRT     map[string]bool
-	seenST     map[string]bool
+	existingRoutes map[string]bool
+	seenRoutes     map[string]bool
 }
 
 func (h *Handler) newAccountCredentialDedup(ctx context.Context) *accountCredentialDedup {
 	d := &accountCredentialDedup{
-		seenRT: make(map[string]bool),
-		seenST: make(map[string]bool),
+		seenRoutes: make(map[string]bool),
 	}
-	var err error
-	if d.existingRT, err = h.db.GetAllRefreshTokens(ctx); err != nil {
-		log.Printf("查询已有 RT 失败: %v", err)
-		d.existingRT = make(map[string]bool)
+	existingRoutes, err := h.existingCredentialWorkspaceRouteKeys(ctx)
+	if err != nil {
+		log.Printf("查询已有凭证工作区路由失败: %v", err)
+		existingRoutes = make(map[string]bool)
 	}
-	if d.existingST, err = h.db.GetAllSessionTokens(ctx); err != nil {
-		log.Printf("查询已有 ST 失败: %v", err)
-		d.existingST = make(map[string]bool)
-	}
+	d.existingRoutes = existingRoutes
 	return d
 }
 
 // checkAndMark 返回 true 表示该 seed 与已有库或本批次重复（应跳过）；非重复时记录其凭证。
 func (d *accountCredentialDedup) checkAndMark(seed tokenCredentialSeed) bool {
-	rt := strings.TrimSpace(seed.refreshToken)
-	st := strings.TrimSpace(seed.sessionToken)
-	if rt != "" {
-		if d.existingRT[rt] || d.seenRT[rt] {
-			return true
-		}
-	} else if st != "" {
-		if d.existingST[st] || d.seenST[st] {
+	keys := make([]string, 0, 2)
+	if key := credentialWorkspaceRouteKey("rt", seed.refreshToken, seed.customHeaders); key != "" {
+		keys = append(keys, key)
+	}
+	if key := credentialWorkspaceRouteKey("st", seed.sessionToken, seed.customHeaders); key != "" {
+		keys = append(keys, key)
+	}
+	for _, key := range keys {
+		if d.existingRoutes[key] || d.seenRoutes[key] {
 			return true
 		}
 	}
-	if rt != "" {
-		d.seenRT[rt] = true
-	}
-	if st != "" {
-		d.seenST[st] = true
+	for _, key := range keys {
+		d.seenRoutes[key] = true
 	}
 	return false
 }
@@ -2640,9 +3194,10 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	failCount := 0
 	duplicateCount := 0
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
 
 	var dedup *accountCredentialDedup
-	if !req.AllowDuplicate {
+	if !req.AllowDuplicate || openaiidentity.WorkspaceOverrideFromHeaders(customHeaders) != "" {
 		dedup = h.newAccountCredentialDedup(ctx)
 	}
 
@@ -2660,7 +3215,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			continue
 		}
 
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -2669,21 +3224,10 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual")
-
-		// 热加载：直接加入内存池
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		if newAcc.GetAccessToken() != "" {
-			h.triggerImportedAccountUsageProbe(id, "manual_add")
-		} else if !h.store.GetLazyMode() {
-			// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
-			h.startDBBackgroundTask(func(ctx context.Context) {
-				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
-			})
-		}
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	// 记录安全审计日志
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
@@ -2728,10 +3272,11 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 	defer cancel()
 
 	var dedup *accountCredentialDedup
-	if !req.AllowDuplicate {
+	if !req.AllowDuplicate || openaiidentity.WorkspaceOverrideFromHeaders(req.CustomHeaders) != "" {
 		dedup = h.newAccountCredentialDedup(ctx)
 	}
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
 
 	for i, seed := range seeds {
 		name := req.Name
@@ -2750,7 +3295,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 			continue
 		}
 
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -2763,24 +3308,15 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual")
-
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		if newAcc.GetAccessToken() != "" {
-			h.triggerImportedAccountUsageProbe(id, "manual_add")
-		} else if !h.store.GetLazyMode() {
-			h.startDBBackgroundTask(func(ctx context.Context) {
-				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
-			})
-		}
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 
 		sendImportEvent(c, importEvent{
 			Type: "progress", Current: i + 1, Total: total,
 			Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 		})
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
@@ -2897,17 +3433,20 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	updatedCount := 0
 	duplicateCount := 0
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
 
-	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + workspace_id，如 codex_at）
+	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 有效工作区，如 codex_at）
 	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
-	//（email + workspace_id）去重/更新。允许重复仅对 workspace_id 为空的账号生效。
-	existingATs := make(map[string]bool)
-	seenAT := make(map[string]bool)
-	if !req.AllowDuplicate {
-		if got, err := h.db.GetAllAccessTokens(ctx); err != nil {
-			log.Printf("查询已有 AT 失败: %v", err)
+	//（email + 有效工作区）去重/更新。显式 Chatgpt-Account-Id 可把同一 AT
+	// 拆成多个独立工作区路由；同一路由仍会更新已有账号。
+	existingATRoutes := make(map[string]bool)
+	seenATRoutes := make(map[string]bool)
+	workspaceOverrideKnown := openaiidentity.WorkspaceOverrideFromHeaders(customHeaders) != ""
+	if !req.AllowDuplicate || workspaceOverrideKnown {
+		if got, err := h.existingCredentialWorkspaceRouteKeys(ctx); err != nil {
+			log.Printf("查询已有凭证工作区路由失败: %v", err)
 		} else {
-			existingATs = got
+			existingATRoutes = got
 		}
 	}
 
@@ -2924,8 +3463,8 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			allowDuplicate: req.AllowDuplicate,
 			customHeaders:  customHeaders,
 		})
-		if seed.email != "" && seed.workspaceID != "" {
-			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -2938,21 +3477,23 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			} else {
 				successCount++
 				createdIDs.add(id)
+				pending = append(pending, newAcc)
 				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
 			}
 			continue
 		}
 
-		if !req.AllowDuplicate {
-			if existingATs[at] || seenAT[at] {
+		if !req.AllowDuplicate || workspaceOverrideKnown {
+			routeKey := credentialWorkspaceRouteKey("at", at, seed.customHeaders)
+			if existingATRoutes[routeKey] || seenATRoutes[routeKey] {
 				duplicateCount++
-				log.Printf("AT 账号 %d 已存在（access_token 重复），跳过", i+1)
+				log.Printf("AT 账号 %d 已存在（access_token 与目标工作区重复），跳过", i+1)
 				continue
 			}
-			seenAT[at] = true
+			seenATRoutes[routeKey] = true
 		}
 
-		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -2961,24 +3502,15 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
 		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
 		// 身份信息后续由 wham 用量查询补齐。
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		// 将解析/识别到的信息持久化到数据库。
-		if creds := tokenCredentialMap(seed); len(creds) > 0 {
-			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
-				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
-			}
-		}
-		// 触发 wham 用量探针：codex_at 的身份此刻未知，探针补齐身份后会回查
-		// 并合并同身份的已有账号（见 probeImportedAccountUsage）。
-		h.triggerImportedAccountUsageProbe(id, "manual_at")
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
+		pending = append(pending, newAcc)
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
 
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 
@@ -3153,13 +3685,14 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
-	existingATs := make(map[string]bool)
-	seenAT := make(map[string]bool)
-	if !req.AllowDuplicate {
-		if got, err := h.db.GetAllAccessTokens(ctx); err != nil {
-			log.Printf("查询已有 AT 失败: %v", err)
+	existingATRoutes := make(map[string]bool)
+	seenATRoutes := make(map[string]bool)
+	workspaceOverrideKnown := openaiidentity.WorkspaceOverrideFromHeaders(req.CustomHeaders) != ""
+	if !req.AllowDuplicate || workspaceOverrideKnown {
+		if got, err := h.existingCredentialWorkspaceRouteKeys(ctx); err != nil {
+			log.Printf("查询已有凭证工作区路由失败: %v", err)
 		} else {
-			existingATs = got
+			existingATRoutes = got
 		}
 	}
 
@@ -3170,6 +3703,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		})
 	}
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
 
 	for i, at := range tokens {
 		name := req.Name
@@ -3180,8 +3714,8 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		}
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
-		if seed.email != "" && seed.workspaceID != "" {
-			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -3192,22 +3726,24 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 			} else {
 				successCount++
 				createdIDs.add(id)
+				pending = append(pending, newAcc)
 				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
 			}
 			progress(i + 1)
 			continue
 		}
 
-		if !req.AllowDuplicate {
-			if existingATs[at] || seenAT[at] {
+		if !req.AllowDuplicate || workspaceOverrideKnown {
+			routeKey := credentialWorkspaceRouteKey("at", at, seed.customHeaders)
+			if existingATRoutes[routeKey] || seenATRoutes[routeKey] {
 				duplicateCount++
 				progress(i + 1)
 				continue
 			}
-			seenAT[at] = true
+			seenATRoutes[routeKey] = true
 		}
 
-		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -3217,18 +3753,12 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual_at")
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-		if creds := tokenCredentialMap(seed); len(creds) > 0 {
-			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
-				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
-			}
-		}
-		// 与非流式路径一致：探针补齐 codex_at 身份后回查合并同身份的已有账号。
-		h.triggerImportedAccountUsageProbe(id, "manual_at")
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
+		pending = append(pending, newAcc)
 		progress(i + 1)
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
 
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
@@ -3257,10 +3787,11 @@ type addOpenAIResponsesAccountReq struct {
 }
 
 type fetchOpenAIResponsesModelsReq struct {
-	AccountID int64  `json:"account_id"`
-	BaseURL   string `json:"base_url"`
-	APIKey    string `json:"api_key"`
-	ProxyURL  string `json:"proxy_url"`
+	AccountID     int64             `json:"account_id"`
+	BaseURL       string            `json:"base_url"`
+	APIKey        string            `json:"api_key"`
+	ProxyURL      string            `json:"proxy_url"`
+	CustomHeaders map[string]string `json:"custom_headers"`
 }
 
 func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
@@ -3414,6 +3945,9 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 		if strings.TrimSpace(req.ProxyURL) == "" {
 			req.ProxyURL = row.ProxyURL
 		}
+		if len(req.CustomHeaders) == 0 {
+			req.CustomHeaders = row.GetCredentialStringMap("custom_headers")
+		}
 	}
 	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
 	if err != nil {
@@ -3428,10 +3962,15 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL)
+	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -3564,7 +4103,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
 }
 
-func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -3582,6 +4121,14 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
+	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, baseURL+"|"+apiKey)
+	for name, value := range customHeaders {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		req.Header.Set(name, value)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -3684,15 +4231,18 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		return
 	}
 	if account.IsGrokAPI() {
-		// Grok 账号：用自身凭据拉取 Grok 上游模型目录
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+		// Grok 账号同步完整富目录到 catalog 表；响应 models 是可见目录，不覆盖账号白名单。
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 110*time.Second)
 		defer cancel()
-		models, err := proxy.FetchGrokModelIDs(ctx, account, h.store.ResolveProxyForAccount(account))
+		result, err := h.syncGrokAccountState(ctx, id)
 		if err != nil {
 			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Grok 上游模型目录失败: %s", err.Error()))
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"models": models})
+		if result.capabilityGeneration > 0 {
+			h.triggerGrokCapabilityProbeForGeneration(id, result.capabilityGeneration)
+		}
+		c.JSON(http.StatusOK, gin.H{"models": result.Models, "state": result.State, "errors": result.Errors})
 		return
 	}
 	if account.IsOpenAIResponsesAPI() {
@@ -3707,6 +4257,7 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
 		return
 	}
+	proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
 	models := auth.NormalizeAccountModels(proxy.ExtractManifestModelSlugs(manifest.Body))
 	if len(models) == 0 {
 		writeError(c, http.StatusBadGateway, "上游模型清单未返回可用模型")
@@ -3956,6 +4507,107 @@ func parseImportJSONTokens(data []byte) ([]importToken, error) {
 	return nil, nil
 }
 
+// parseUploadedImportJSONFile 打开上传的 JSON 文件并流式解析,不把整个文件读进
+// 内存。multipart 大文件(>32MB)由 ParseMultipartForm 落在临时文件,fh.Open()
+// 返回的 reader 直接喂给流式解析器。
+func parseUploadedImportJSONFile(fh *multipart.FileHeader) ([]importToken, error) {
+	f, err := fh.Open()
+	if err != nil {
+		return nil, fmt.Errorf("打开文件 %s 失败", fh.Filename)
+	}
+	defer f.Close()
+	return parseImportJSONTokensStream(f)
+}
+
+// parseImportJSONTokensStream 流式解析导入 JSON,避免把整个文件(可达 200MB)
+// 一次性读进内存 + 整体 Unmarshal。逐个数组元素解码,内存峰值降到单条账号量级。
+// 覆盖三种形态:顶层数组 [ {...} ]、sub2api 顶层对象 { "accounts": [ {...} ] }、
+// 单个平铺对象 { ... };无法流式判定时回退到全量 parseImportJSONTokens。
+func parseImportJSONTokensStream(r io.Reader) ([]importToken, error) {
+	// json.Decoder 不剥 UTF-8 BOM,而部分导出文件带 BOM(与全量路径的
+	// trimUTF8BOM 对齐):peek 前 3 字节,是 BOM 就丢弃。
+	br := bufio.NewReader(r)
+	if prefix, err := br.Peek(3); err == nil && prefix[0] == 0xef && prefix[1] == 0xbb && prefix[2] == 0xbf {
+		_, _ = br.Discard(3)
+	}
+	dec := json.NewDecoder(br)
+	first, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("invalid import json")
+	}
+	delim, ok := first.(json.Delim)
+	if !ok {
+		return nil, fmt.Errorf("invalid import json")
+	}
+
+	switch delim {
+	case '[':
+		// 顶层数组:逐个 jsonAccountEntry 解码。
+		var tokens []importToken
+		for dec.More() {
+			var entry jsonAccountEntry
+			if err := dec.Decode(&entry); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			tokens = append(tokens, jsonAccountEntriesToTokens([]jsonAccountEntry{entry})...)
+		}
+		return tokens, nil
+
+	case '{':
+		// 顶层对象:可能是 sub2api {accounts:[...]} 或单个平铺账号对象。
+		// 遍历顶层字段,accounts 数组逐元素流式解码;其余字段(通常很小)收集
+		// 成 RawMessage,遍历完若未见 accounts 则按单个平铺对象重建解析。
+		var tokens []importToken
+		sawAccounts := false
+		other := map[string]json.RawMessage{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			key, _ := keyTok.(string)
+			if key == "accounts" {
+				sawAccounts = true
+				arrTok, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				if d, ok := arrTok.(json.Delim); !ok || d != '[' {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				for dec.More() {
+					var account sub2apiAccountEntry
+					if err := dec.Decode(&account); err != nil {
+						return nil, fmt.Errorf("invalid import json")
+					}
+					tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+				}
+				if _, err := dec.Token(); err != nil { // consume ']'
+					return nil, fmt.Errorf("invalid import json")
+				}
+				continue
+			}
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			other[key] = raw
+		}
+		if sawAccounts {
+			return tokens, nil
+		}
+		// 没有 accounts 字段:这是单个平铺账号对象,用收集到的字段重建后按
+		// 平铺形态解析(单对象很小,无内存压力)。
+		objBytes, err := json.Marshal(other)
+		if err != nil {
+			return nil, fmt.Errorf("invalid import json")
+		}
+		return parseFlatJSONImportTokens(objBytes), nil
+	}
+
+	return nil, fmt.Errorf("invalid import json")
+}
+
 func parseFlatJSONImportTokens(data []byte) []importToken {
 	var entries []jsonAccountEntry
 	if err := json.Unmarshal(data, &entries); err == nil {
@@ -4027,6 +4679,16 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 
 	tokens := make([]importToken, 0, len(payload.Accounts))
 	for _, account := range payload.Accounts {
+		tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+	}
+	return tokens
+}
+
+// sub2apiAccountEntryToTokens 把单个 sub2api 账号条目转换成 importToken(0 或 1 个)。
+// 从 parseSub2APIJSONImportTokens 抽出,供流式解析逐元素复用,避免两份逻辑漂移。
+func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
+	var tokens []importToken
+	{
 		c := account.Credentials
 		rt := strings.TrimSpace(c.RefreshToken)
 		st := firstNonEmpty(c.SessionToken, c.SessionTokenCamel)
@@ -4049,8 +4711,7 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 			agentNode = agentIdentityNodeFromFlatCredentials(c.AuthMode, c.AgentRuntimeID, c.AgentPrivateKey, c.AgentTaskID, accID, c.ChatGPTUserID, email, planType, c.AgentFedRAMP)
 		}
 		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
-			tokens = append(tokens, tok)
-			continue
+			return append(tokens, tok)
 		}
 
 		if rt != "" || st != "" || at != "" {
@@ -4099,6 +4760,12 @@ func importCredentialFingerprint(refreshToken, sessionToken, accessToken string)
 func importTokenCredentialFingerprint(t importToken, conflicts map[string]bool) string {
 	seed := importTokenSeed(t, conflicts)
 	return importCredentialFingerprint(seed.refreshToken, seed.sessionToken, seed.accessToken)
+}
+
+func importTokenCredentialWorkspaceRouteKeys(t importToken, conflicts map[string]bool, customHeaders map[string]string) []string {
+	seed := importTokenSeed(t, conflicts)
+	seed.customHeaders = cloneCustomHeaders(customHeaders)
+	return tokenCredentialSeedWorkspaceRouteKeys(seed)
 }
 
 func importAccountCredentialFingerprint(row *database.AccountRow) string {
@@ -4334,19 +5001,7 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDupli
 			return
 		}
 
-		f, err := fh.Open()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("打开文件 %s 失败", fh.Filename))
-			return
-		}
-		data, err := io.ReadAll(f)
-		f.Close()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("读取文件 %s 失败", fh.Filename))
-			return
-		}
-
-		tokens, err := parseImportJSONTokens(data)
+		tokens, err := parseUploadedImportJSONFile(fh)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
 			return
@@ -4385,19 +5040,7 @@ func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, al
 			return
 		}
 
-		f, err := fh.Open()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("打开文件 %s 失败", fh.Filename))
-			return
-		}
-		data, err := io.ReadAll(f)
-		f.Close()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("读取文件 %s 失败", fh.Filename))
-			return
-		}
-
-		tokens, err := parseImportJSONTokens(data)
+		tokens, err := parseUploadedImportJSONFile(fh)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
 			return
@@ -4442,8 +5085,46 @@ type importEvent struct {
 	Warning string `json:"warning,omitempty"`
 }
 
-func sendImportEvent(c *gin.Context, e importEvent) {
-	sendSSEJSON(c, e)
+// sendImportEvent 推送一条导入进度事件；返回 false 表示下游连接已经写不进去了。
+func sendImportEvent(c *gin.Context, e importEvent) bool {
+	return sendSSEJSON(c, e)
+}
+
+// importProgressInterval 是导入进度事件的推送间隔。
+const importProgressInterval = 200 * time.Millisecond
+
+// runImportProgressPusher 按固定间隔推送导入进度，返回一个在推送协程退出后关闭的
+// channel。三种情况会停：导入结束（done 关闭）、下游断开（reqCtx 取消）、或者写
+// 失败。后两种必须停——导入本身还要继续跑完，但连接已经死了，继续写只会每个
+// 间隔刷一条 broken pipe 日志直到导入结束。
+//
+// 调用方在 close(done) 之后必须等返回的 channel 关闭再写收尾事件：gin 的
+// ResponseWriter 不支持并发写，两边同时写会让事件交错，前端解析不到 complete，
+// 进度条永远停在最后一个百分比。
+func runImportProgressPusher(reqCtx context.Context, done <-chan struct{}, interval time.Duration, snapshot func() importEvent, send func(importEvent) bool) <-chan struct{} {
+	stopped := make(chan struct{})
+	var clientGone <-chan struct{}
+	if reqCtx != nil {
+		clientGone = reqCtx.Done()
+	}
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !send(snapshot()) {
+					return
+				}
+			case <-clientGone:
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+	return stopped
 }
 
 func setupSSE(c *gin.Context) {
@@ -4709,7 +5390,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var newTokens []importToken
 	duplicateCount := ambiguousOAuthIdentityCount
 
-	if allowDuplicate {
+	workspaceOverrideKnown := openaiidentity.WorkspaceOverrideFromHeaders(importCustomHeaders) != ""
+	if allowDuplicate && !workspaceOverrideKnown {
 		knownCount := 0
 		for _, t := range tokens {
 			if importTokenOAuthIdentityKey(t, conflictingChatGPTIDs) == "" {
@@ -4723,6 +5405,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			if importTokenOAuthIdentityKey(t, conflictingChatGPTIDs) != "" {
 				knownUniqueCount++
 				seed := importTokenSeed(t, conflictingChatGPTIDs)
+				seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
 				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
 					log.Printf("查询已有 OAuth 身份失败: %v", err)
 				} else if duplicateID > 0 {
@@ -4739,36 +5422,18 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 		duplicateCount += knownCount - knownUniqueCount - ambiguousOAuthIdentityCount
 	} else {
-		existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
+		existingCredentialRoutes, err := h.existingCredentialWorkspaceRouteKeys(dedupeCtx)
 		if err != nil {
-			log.Printf("查询已有 RT 失败: %v", err)
-			existingRTs = make(map[string]bool)
-		}
-
-		// 存在 AT-only token 时额外查询已有 AT
-		hasAT := len(seenAT) > 0
-		var existingATs map[string]bool
-		if hasAT {
-			existingATs, err = h.db.GetAllAccessTokens(dedupeCtx)
-			if err != nil {
-				log.Printf("查询已有 AT 失败: %v", err)
-				existingATs = make(map[string]bool)
-			}
-		}
-		hasST := len(seenST) > 0
-		var existingSTs map[string]bool
-		if hasST {
-			existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx)
-			if err != nil {
-				log.Printf("查询已有 ST 失败: %v", err)
-				existingSTs = make(map[string]bool)
-			}
+			log.Printf("查询已有凭证工作区路由失败: %v", err)
+			existingCredentialRoutes = make(map[string]bool)
 		}
 
 		// 有 workspace/account + user/email 时，按复合身份查数据库已有账号；缺少 user/email 时才退回 workspace/account 旧逻辑。
 		hasScopedIdentity := false
 		for _, t := range unique {
-			if importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs) != "" && importTokenHasFineIdentity(t) {
+			seed := importTokenSeed(t, conflictingChatGPTIDs)
+			seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
+			if effectiveWorkspaceIDFromSeed(seed) == "" && importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs) != "" && importTokenHasFineIdentity(t) {
 				hasScopedIdentity = true
 				break
 			}
@@ -4786,7 +5451,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		// 只有导入条目缺少 user/email 这类更细粒度身份时，才按 chatgpt_account_id/account_id 查数据库已有账号。
 		hasChatGPTID := false
 		for _, t := range unique {
-			if importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs) != "" && !importTokenHasFineIdentity(t) {
+			seed := importTokenSeed(t, conflictingChatGPTIDs)
+			seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
+			if effectiveWorkspaceIDFromSeed(seed) == "" && importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs) != "" && !importTokenHasFineIdentity(t) {
 				hasChatGPTID = true
 				break
 			}
@@ -4801,11 +5468,12 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 
 		for _, t := range unique {
-			oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
-			if oauthIdentity != "" && (t.refreshToken != "" || t.sessionToken != "") {
-				seed := importTokenSeed(t, conflictingChatGPTIDs)
-				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
-					log.Printf("查询已有 OAuth 身份失败: %v", err)
+			seed := importTokenSeed(t, conflictingChatGPTIDs)
+			seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
+			if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+				duplicateID, identityErr := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0)
+				if identityErr != nil {
+					log.Printf("查询已有 OAuth 身份失败: %v", identityErr)
 				} else if duplicateID > 0 {
 					row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
 					if err != nil {
@@ -4814,52 +5482,52 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 						duplicateCount++
 						continue
 					}
+					// Same effective identity with rotated credentials is not a new
+					// account: keep it in the work set so the upsert path updates the
+					// existing row atomically.
+					newTokens = append(newTokens, t)
+					continue
 				}
-				newTokens = append(newTokens, t)
-				continue
 			}
-			if importTokenDBIdentityExists(t, existingIdentities) {
+
+			// Legacy exports may carry account/user identity but no token-derived
+			// workspace. Keep the fork's rotation-aware identity checks for those
+			// rows. Once an effective route is known, route-aware OAuth identity
+			// above takes precedence so a personal route cannot hide a team route.
+			if effectiveWorkspaceIDFromSeed(seed) == "" {
+				if importTokenDBIdentityExists(t, existingIdentities) {
+					duplicateCount++
+					continue
+				}
+				// Only entries without a finer user/email identity fall back to the
+				// historical workspace/account identifier.
+				if scope := importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs); scope != "" && !importTokenHasFineIdentity(t) && existingChatGPTIDs[scope] {
+					duplicateCount++
+					continue
+				}
+			}
+
+			routeKeys := importTokenCredentialWorkspaceRouteKeys(t, conflictingChatGPTIDs, importCustomHeaders)
+			isDuplicate := false
+			for _, key := range routeKeys {
+				if existingCredentialRoutes[key] {
+					isDuplicate = true
+					break
+				}
+			}
+			if isDuplicate {
 				duplicateCount++
 				continue
 			}
-			// 仅在没有 user/email 细粒度身份时，按 chatgpt_account_id/account_id 判定数据库内是否已存在该账号。
-			if scope := importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs); scope != "" && !importTokenHasFineIdentity(t) && existingChatGPTIDs[scope] {
-				duplicateCount++
-				continue
-			}
-			switch {
-			case t.refreshToken != "":
-				// 已经按 workspace/account 排除过重复账号；此处仅当条目没有 workspace/account 时才回退到 RT/ST 去重，
-				// 否则当多个不同账号共享同一 RT（部分导出工具的常见格式）时会被错误判定为重复。
-				if importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs) == "" && existingRTs[t.refreshToken] {
-					duplicateCount++
-				} else if importTokenAccountScopeForDedupe(t, conflictingChatGPTIDs) == "" && t.sessionToken != "" && existingSTs[t.sessionToken] {
-					duplicateCount++
-				} else if t.accessToken != "" && existingATs[t.accessToken] {
-					duplicateCount++
-				} else {
-					newTokens = append(newTokens, t)
-				}
-			case t.sessionToken != "":
-				if importTokenAccountScope(t) == "" && existingSTs[t.sessionToken] {
-					duplicateCount++
-				} else if t.accessToken != "" && existingATs[t.accessToken] {
-					duplicateCount++
-				} else {
-					newTokens = append(newTokens, t)
-				}
-			case t.accessToken != "":
-				if existingATs[t.accessToken] {
-					duplicateCount++
-				} else {
-					newTokens = append(newTokens, t)
-				}
+			newTokens = append(newTokens, t)
+			for _, key := range routeKeys {
+				existingCredentialRoutes[key] = true
 			}
 		}
 	}
 
 	total := len(unique) + ambiguousOAuthIdentityCount + len(agentTokens)
-	if allowDuplicate {
+	if allowDuplicate && !workspaceOverrideKnown {
 		total = len(tokens) + len(agentTokens)
 	}
 	duplicateCount += agentDuplicate
@@ -4890,37 +5558,53 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var current int64
 	// 本次真正新建的账号，收尾时统一绑分组（命中已有账号的分组不动）。
 	createdIDs := &importedAccountIDs{}
-	sem := make(chan struct{}, 20) // 并发插入上限
+	createdATIDs := &importedAccountIDs{}
+	createdRTIDs := &importedAccountIDs{}
+	type pendingRuntimeAccount struct {
+		account *auth.Account
+		source  string
+	}
+	var pendingMu sync.Mutex
+	pendingRuntime := make([]pendingRuntimeAccount, 0, len(newTokens))
+	addPendingRuntime := func(account *auth.Account, source string) {
+		if account == nil {
+			return
+		}
+		pendingMu.Lock()
+		pendingRuntime = append(pendingRuntime, pendingRuntimeAccount{account: account, source: source})
+		pendingMu.Unlock()
+	}
+	// 写库并发根据近一分钟代理流量与连接池压力动态调整。生产者在启动 goroutine
+	// 前先拿 permit，因此无论目标并发如何变化，都不会堆积等待中的 goroutine。
+	dbLimiter := &adaptiveImportDBLimiter{handler: h}
 	var wg sync.WaitGroup
 
-	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈
+	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈。
 	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cur := int(atomic.LoadInt64(&current))
-				suc := int(atomic.LoadInt64(&successCount))
-				upd := int(atomic.LoadInt64(&updatedCount))
-				fai := int(atomic.LoadInt64(&failCount))
-				sendImportEvent(c, importEvent{
-					Type: "progress", Current: cur + duplicateCount, Total: total,
-					Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
-				})
-			case <-done:
-				return
+	progressStopped := runImportProgressPusher(
+		c.Request.Context(), done, importProgressInterval,
+		func() importEvent {
+			return importEvent{
+				Type:      "progress",
+				Current:   int(atomic.LoadInt64(&current)) + duplicateCount,
+				Total:     total,
+				Success:   int(atomic.LoadInt64(&successCount)),
+				Updated:   int(atomic.LoadInt64(&updatedCount)),
+				Failed:    int(atomic.LoadInt64(&failCount)),
+				Duplicate: duplicateCount,
 			}
-		}
-	}()
+		},
+		func(e importEvent) bool { return sendImportEvent(c, e) },
+	)
 
 	for i, t := range newTokens {
-		sem <- struct{}{}
+		if !dbLimiter.acquire(context.Background()) {
+			break
+		}
 		wg.Add(1)
 		go func(idx int, tok importToken) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer dbLimiter.release()
 
 			name := tok.name
 
@@ -4931,7 +5615,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			if tok.accessToken != "" && tok.refreshToken == "" {
 				importSource = "import_at"
 			}
-			if seed.email != "" && seed.workspaceID != "" {
+			if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
 				if name == "" {
 					if importSource == "import_at" {
 						name = fmt.Sprintf("at-import-%d", idx+1)
@@ -4941,7 +5625,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				upsertCtx, upsertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, updated, err := h.upsertOAuthIdentityAccount(upsertCtx, name, proxyURL, seed, importSource)
+				id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(upsertCtx, name, proxyURL, seed, importSource)
 				upsertCancel()
 				if err != nil {
 					log.Printf("导入账号 %d/%d 更新或写入失败: %v", idx+1, len(newTokens), err)
@@ -4953,21 +5637,27 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				if updated {
 					// 已有账号只更新凭证，不计入"新增"，分组也保持原样。
 					atomic.AddInt64(&updatedCount, 1)
+					if h.store != nil {
+						if acc := h.store.FindByID(id); acc != nil {
+							h.applyImportedAccountUsageState(acc, importSource)
+							if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
+								h.runImportProbeTask(func(ctx context.Context) {
+									h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
+								})
+							}
+						}
+					}
 				} else {
 					atomic.AddInt64(&successCount, 1)
 					createdIDs.add(id)
+					if importSource == "import_at" {
+						createdATIDs.add(id)
+					} else {
+						createdRTIDs.add(id)
+					}
+					addPendingRuntime(newAcc, importSource)
 				}
 				atomic.AddInt64(&current, 1)
-				if h.store != nil {
-					if acc := h.store.FindByID(id); acc != nil {
-						h.applyImportedAccountUsageState(acc, importSource)
-						if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
-							h.startDBBackgroundTask(func(ctx context.Context) {
-								h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
-							})
-						}
-					}
-				}
 				return
 			}
 
@@ -4978,7 +5668,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, err := h.db.InsertATAccount(insertCtx, name, tok.accessToken, proxyURL)
+				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, h.newCodexAccountCredentials(seed), proxyURL)
 				insertCancel()
 
 				if err != nil {
@@ -4990,20 +5680,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 				atomic.AddInt64(&successCount, 1)
 				createdIDs.add(id)
+				createdATIDs.add(id)
 				atomic.AddInt64(&current, 1)
-				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
-				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
-				if len(tokenCredentialMap(seed)) > 0 {
-					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
-					_ = h.db.UpdateCredentials(credCtx, id, tokenCredentialMap(seed))
-					credCancel()
-				}
-				h.store.AddAccount(newAcc)
-				h.applyImportedAccountUsageState(newAcc, "import_at")
-				if newAcc.GetAccessToken() != "" {
-					h.triggerImportedAccountUsageProbe(id, "import_at")
-				}
+				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
+				addPendingRuntime(newAcc, "import_at")
 			} else {
 				// RT 导入路径；如果导入文件里同时带 AT，则先沿用它，后台调度到期前再刷新。
 				if name == "" {
@@ -5011,13 +5692,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				var id int64
-				var err error
-				if tok.refreshToken != "" {
-					id, err = h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
-				} else {
-					id, err = h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
-				}
+				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, h.newCodexAccountCredentials(seed), proxyURL)
 				insertCancel()
 
 				if err != nil {
@@ -5029,34 +5704,36 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 				atomic.AddInt64(&successCount, 1)
 				createdIDs.add(id)
+				createdRTIDs.add(id)
 				atomic.AddInt64(&current, 1)
-				h.db.InsertAccountEventAsync(id, "added", "import")
 
-				if len(tokenCredentialMap(seed)) > 0 {
-					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
-					if err := h.db.UpdateCredentials(credCtx, id, tokenCredentialMap(seed)); err != nil {
-						log.Printf("导入账号 %d 更新 token 信息失败: %v", id, err)
-					}
-					credCancel()
-				}
-				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
-				h.store.AddAccount(newAcc)
-				h.applyImportedAccountUsageState(newAcc, "import")
-
-				if newAcc.GetAccessToken() != "" {
-					h.triggerImportedAccountUsageProbe(id, "import")
-				} else if !h.store.GetLazyMode() {
-					// 后台异步刷新，不阻塞导入流程；刷新成功后立即做 wham 用量采样。
-					h.startDBBackgroundTask(func(ctx context.Context) {
-						h.refreshImportedAccountAndProbe(ctx, id, "import_refresh")
-					})
-				}
+				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
+				addPendingRuntime(newAcc, "import")
 			}
 		}(i, t)
 	}
 
 	wg.Wait()
+	h.db.BatchInsertAccountEventsAsync(createdATIDs.snapshot(), "added", "import_at")
+	h.db.BatchInsertAccountEventsAsync(createdRTIDs.snapshot(), "added", "import")
+	if len(pendingRuntime) > 0 && h.store != nil {
+		accounts := make([]*auth.Account, 0, len(pendingRuntime))
+		for _, pending := range pendingRuntime {
+			accounts = append(accounts, pending.account)
+		}
+		// 一个 Store 锁 + 一个 FastScheduler 锁提交整个批次，避免高 RPM 的 Acquire
+		// 在两个账号之间反复触发全桶排序。
+		h.store.AddAccounts(accounts)
+		for _, pending := range pendingRuntime {
+			h.applyImportedAccountUsageState(pending.account, pending.source)
+			h.scheduleImportedAccountWarmup(pending.account, pending.account.DBID, pending.source)
+		}
+	}
 	close(done)
+	// 等推送 goroutine 真正退出再写收尾事件：gin 的 ResponseWriter 不支持并发写，
+	// 只 close(done) 不等待的话，收尾事件可能和最后一帧进度事件交错，
+	// 前端解析不到 complete，进度条永远停在最后一个百分比。
+	<-progressStopped
 
 	// 发送完成事件（并入 Agent Identity 计数）
 	suc := int(atomic.LoadInt64(&successCount)) + agentSuccess
@@ -5169,14 +5846,41 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 }
 
 type batchAccountIDsRequest struct {
-	IDs []int64 `json:"ids"`
+	IDs      *[]int64                  `json:"ids"`
+	Selector *accountOperationSelector `json:"selector,omitempty"`
 }
 
 type batchUpdateAccountsReq struct {
 	updateAccountSchedulerReq
-	IDs     []int64 `json:"ids"`
-	Enabled *bool   `json:"enabled"`
-	Locked  *bool   `json:"locked"`
+	IDs      *[]int64                  `json:"ids"`
+	Selector *accountOperationSelector `json:"selector,omitempty"`
+	Enabled  *bool                     `json:"enabled"`
+	Locked   *bool                     `json:"locked"`
+}
+
+func (h *Handler) accountOperationIdentity(id int64) (string, string) {
+	h.accountListCacheMu.RLock()
+	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelGrok} {
+		snapshot := h.accountListCache[channel]
+		if snapshot == nil {
+			continue
+		}
+		index := sort.Search(len(snapshot.Items), func(index int) bool {
+			return snapshot.Items[index].ID >= id
+		})
+		if index < len(snapshot.Items) && snapshot.Items[index].ID == id {
+			item := snapshot.Items[index]
+			name := strings.TrimSpace(item.Row.Name)
+			email := strings.TrimSpace(item.Email)
+			h.accountListCacheMu.RUnlock()
+			return name, email
+		}
+	}
+	h.accountListCacheMu.RUnlock()
+	if h.store == nil {
+		return "", ""
+	}
+	return runtimeAccountOperationIdentity(h.store.FindByID(id))
 }
 
 // DeleteAccount 删除账号
@@ -5200,6 +5904,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	h.pruneAccountsFromSnapshotCaches([]int64{id})
 
 	writeMessage(c, http.StatusOK, "账号已删除")
 }
@@ -5296,7 +6001,7 @@ func (h *Handler) RestoreAccount(c *gin.Context) {
 			writeError(c, http.StatusNotFound, "回收站中不存在该账号")
 			return
 		}
-		if errors.Is(err, errDuplicateOAuthIdentity) {
+		if errors.Is(err, errDuplicateOAuthIdentity) || errors.Is(err, errDuplicateCredentialWorkspaceRoute) {
 			writeError(c, http.StatusConflict, "恢复失败: "+err.Error())
 			return
 		}
@@ -5313,9 +6018,10 @@ func (h *Handler) restoreAccountByID(ctx context.Context, id int64) error {
 		return err
 	}
 	seed := tokenCredentialSeedFromAccountRow(row)
-	if seed.email != "" && seed.workspaceID != "" {
-		h.mergeDuplicateMu.Lock()
-		defer h.mergeDuplicateMu.Unlock()
+	h.mergeDuplicateMu.Lock()
+	defer h.mergeDuplicateMu.Unlock()
+
+	if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
 		if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id); err != nil {
 			return err
 		} else if duplicateID > 0 {
@@ -5326,6 +6032,11 @@ func (h *Handler) restoreAccountByID(ctx context.Context, id int64) error {
 				return err
 			}
 		}
+	}
+	if duplicateID, err := h.findCredentialWorkspaceRouteDuplicate(ctx, seed, id); err != nil {
+		return err
+	} else if duplicateID > 0 {
+		return fmt.Errorf("%w: 已存在相同凭证和目标工作区的账号 (id=%d)，请先删除正常账号或清理回收站账号", errDuplicateCredentialWorkspaceRoute, duplicateID)
 	}
 
 	if err := h.db.RestoreAccount(ctx, id); err != nil {
@@ -5353,6 +6064,7 @@ func tokenCredentialSeedFromAccountRow(row *database.AccountRow) tokenCredential
 		idToken:               row.GetCredential("id_token"),
 		accountID:             firstNonEmpty(row.GetCredential("account_id"), row.GetCredential("chatgpt_account_id")),
 		workspaceID:           row.GetCredential("workspace_id"),
+		customHeaders:         row.GetCredentialStringMap("custom_headers"),
 		email:                 row.GetCredential("email"),
 		planType:              row.GetCredential("plan_type"),
 		expiresAtRaw:          row.GetCredential("expires_at"),
@@ -5433,7 +6145,24 @@ func (h *Handler) BatchDeleteAccounts(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	ids := uniqueAccountIDs(req.IDs)
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	var ids []int64
+	if req.IDs != nil {
+		ids = uniqueAccountIDs(*req.IDs)
+	}
+	if req.Selector != nil {
+		selectorCtx, selectorCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		resolvedIDs, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		selectorCancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		ids = resolvedIDs
+	}
 	if len(ids) == 0 {
 		writeError(c, http.StatusBadRequest, "请提供要删除的账号 ID 列表")
 		return
@@ -5496,6 +6225,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 	total := len(ids)
 	var success int64
 	var fail int64
+	deleted := make([]int64, 0, len(ids))
 
 	for i, id := range ids {
 		if ctx.Err() != nil {
@@ -5503,13 +6233,16 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 			break
 		}
 
+		accountName, accountEmail := h.accountOperationIdentity(id)
 		err := h.deleteAccountByID(ctx, id)
 		event := batchOperationEvent{
-			Type:      "progress",
-			Action:    "batch_delete",
-			Current:   i + 1,
-			Total:     total,
-			AccountID: id,
+			Type:         "progress",
+			Action:       "batch_delete",
+			Current:      i + 1,
+			Total:        total,
+			AccountID:    id,
+			AccountName:  accountName,
+			AccountEmail: accountEmail,
 		}
 		if err != nil {
 			fail++
@@ -5519,6 +6252,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 			}
 		} else {
 			success++
+			deleted = append(deleted, id)
 			event.Deleted = success
 			event.Message = "账号已删除"
 		}
@@ -5529,6 +6263,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 		}
 	}
 
+	h.pruneAccountsFromSnapshotCaches(deleted)
 	return success, fail
 }
 
@@ -5543,7 +6278,24 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		return
 	}
 
-	ids := uniqueAccountIDs(req.IDs)
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	var ids []int64
+	if req.IDs != nil {
+		ids = uniqueAccountIDs(*req.IDs)
+	}
+	if req.Selector != nil {
+		selectorCtx, selectorCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		resolvedIDs, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		selectorCancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		ids = resolvedIDs
+	}
 	if len(ids) == 0 {
 		writeError(c, http.StatusBadRequest, "请提供要更新的账号 ID 列表")
 		return
@@ -5593,6 +6345,27 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
 			return
 		}
+		if len(schedulerUpdate.GroupIDs.Values) > 0 {
+			rows, err := h.db.ListActive(ctx)
+			if err != nil {
+				writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+				return
+			}
+			idSet := make(map[int64]bool, len(ids))
+			for _, id := range ids {
+				idSet[id] = true
+			}
+			targetRows := make([]*database.AccountRow, 0, len(ids))
+			for _, row := range rows {
+				if idSet[row.ID] {
+					targetRows = append(targetRows, row)
+				}
+			}
+			if err := h.validateGroupChannelForRows(ctx, targetRows, schedulerUpdate.GroupIDs.Values); err != nil {
+				writeError(c, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 	}
 
 	updatedIDs, err := h.db.BatchUpdateAccountMetadata(ctx, ids, database.BatchAccountMetadataUpdate{
@@ -5615,7 +6388,11 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 	if h.store != nil {
 		for _, id := range updatedIDs {
 			if enabled.Set {
-				h.store.ApplyAccountEnabled(id, enabled.Value)
+				if !h.store.ApplyAccountEnabled(id, enabled.Value) && enabled.Value {
+					if err := h.store.LoadAccountByID(ctx, id); err != nil {
+						log.Printf("批量启用账号 %d 后加载进调度池失败: %v", id, err)
+					}
+				}
 			}
 			if locked.Set {
 				if acc := h.store.FindByID(id); acc != nil {
@@ -5668,7 +6445,24 @@ func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	ids := uniqueAccountIDs(req.IDs)
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	var ids []int64
+	if req.IDs != nil {
+		ids = uniqueAccountIDs(*req.IDs)
+	}
+	if req.Selector != nil {
+		selectorCtx, selectorCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		resolvedIDs, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		selectorCancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		ids = resolvedIDs
+	}
 	if len(ids) == 0 {
 		writeError(c, http.StatusBadRequest, "请提供要刷新的账号 ID 列表")
 		return
@@ -5688,6 +6482,10 @@ func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
 }
 
 func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	return h.refreshAccountByIDWithProbe(ctx, id, true)
+}
+
+func (h *Handler) refreshAccountByIDWithProbe(ctx context.Context, id int64, probeAfterRefresh bool) error {
 	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -5703,7 +6501,11 @@ func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
 	// 续费后 access/id token 里的 chatgpt_subscription_active_until 不一定立即更新（会滞后），
 	// 仅靠 token 刷新会让"有效期"长期停留在旧值；wham/usage 返回的是服务端当前订阅到期时间。
 	// （issue #300）
-	if probe := h.usageProbeFunc(); probe != nil && h.store != nil {
+	if probeAfterRefresh {
+		probe := h.usageProbeFunc()
+		if probe == nil || h.store == nil {
+			return nil
+		}
 		if acc := h.store.FindByID(id); acc != nil {
 			probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
 			if err := probe(probeCtx, acc); err != nil {
@@ -5767,23 +6569,24 @@ func (h *Handler) runBatchRefreshAccounts(ctx context.Context, ids []int64, onPr
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			accountName, accountEmail := h.accountOperationIdentity(id)
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
 				atomic.AddInt64(&fail, 1)
-				emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, "刷新已取消", true)
+				emitBatchRefreshProgress(onProgress, id, accountName, accountEmail, total, &completed, &success, &fail, "刷新已取消", true)
 				return
 			}
 			defer func() { <-sem }()
 
 			if err := h.refreshAccountByID(ctx, id); err != nil {
 				atomic.AddInt64(&fail, 1)
-				emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, err.Error(), true)
+				emitBatchRefreshProgress(onProgress, id, accountName, accountEmail, total, &completed, &success, &fail, err.Error(), true)
 				return
 			}
 
 			atomic.AddInt64(&success, 1)
-			emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, "账号刷新成功", false)
+			emitBatchRefreshProgress(onProgress, id, accountName, accountEmail, total, &completed, &success, &fail, "账号刷新成功", false)
 		}()
 	}
 
@@ -5794,6 +6597,8 @@ func (h *Handler) runBatchRefreshAccounts(ctx context.Context, ids []int64, onPr
 func emitBatchRefreshProgress(
 	onProgress func(batchOperationEvent),
 	accountID int64,
+	accountName string,
+	accountEmail string,
 	total int,
 	completedCount *int64,
 	successCount *int64,
@@ -5806,16 +6611,18 @@ func emitBatchRefreshProgress(
 	}
 	current := int(atomic.AddInt64(completedCount, 1))
 	event := batchOperationEvent{
-		Type:       "progress",
-		Action:     "batch_refresh",
-		Status:     "success",
-		HTTPStatus: http.StatusOK,
-		Current:    current,
-		Total:      total,
-		Success:    atomic.LoadInt64(successCount),
-		Failed:     atomic.LoadInt64(failedCount),
-		AccountID:  accountID,
-		Message:    message,
+		Type:         "progress",
+		Action:       "batch_refresh",
+		Status:       "success",
+		HTTPStatus:   http.StatusOK,
+		Current:      current,
+		Total:        total,
+		Success:      atomic.LoadInt64(successCount),
+		Failed:       atomic.LoadInt64(failedCount),
+		AccountID:    accountID,
+		AccountName:  accountName,
+		AccountEmail: accountEmail,
+		Message:      message,
 	}
 	if failed {
 		event.Status = "failed"
@@ -5942,6 +6749,29 @@ func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	}
 }
 
+func accountIsOverloadPaused(acc *auth.Account) bool {
+	if acc == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(acc.GetCooldownReason()), "overload_paused") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(acc.RuntimeStatus()), "overload_paused")
+}
+
+// resetAccountRuntimeStatus 清冷却/模型冷却。过载暂停只恢复调度，不能清用量快照，
+// 否则 free 账号（只有 30d 窗、没有 5h）列表额度条会先变成 "-"，要等下次探针才回来。
+func (h *Handler) resetAccountRuntimeStatus(ctx context.Context, acc *auth.Account) {
+	keepUsage := accountIsOverloadPaused(acc)
+	h.store.ClearCooldown(acc)
+	h.store.ClearAllModelCooldowns(acc)
+	if keepUsage {
+		return
+	}
+	acc.ClearUsageCache()
+	h.syncAccountPlanAfterReset(ctx, acc)
+}
+
 // ResetAccountStatus 重置单个账号状态为正常
 func (h *Handler) ResetAccountStatus(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -5956,10 +6786,7 @@ func (h *Handler) ResetAccountStatus(c *gin.Context) {
 		return
 	}
 
-	h.store.ClearCooldown(acc)
-	h.store.ClearAllModelCooldowns(acc)
-	acc.ClearUsageCache()
-	h.syncAccountPlanAfterReset(c.Request.Context(), acc)
+	h.resetAccountRuntimeStatus(c.Request.Context(), acc)
 	writeMessage(c, http.StatusOK, "账号状态已重置")
 }
 
@@ -5981,10 +6808,7 @@ func (h *Handler) BatchResetStatus(c *gin.Context) {
 			fail++
 			continue
 		}
-		h.store.ClearCooldown(acc)
-		h.store.ClearAllModelCooldowns(acc)
-		acc.ClearUsageCache()
-		h.syncAccountPlanAfterReset(c.Request.Context(), acc)
+		h.resetAccountRuntimeStatus(c.Request.Context(), acc)
 		success++
 	}
 
@@ -6303,10 +7127,11 @@ func (h *Handler) GetAPIKeyAccountStats(c *gin.Context) {
 
 	cacheKey := fmt.Sprintf("%d:%d:%d", id, rangeStart.Unix()/30, rangeEnd.Unix()/30)
 	type cachedResponse struct {
-		Items           []database.APIKeyAccountStat `json:"items"`
-		Groups          []apiKeyAccountGroupUsage    `json:"groups"`
-		Summary         apiKeyAccountUsageSummary    `json:"summary"`
-		MembershipBasis string                       `json:"membership_basis"`
+		Items           []database.APIKeyAccountStat     `json:"items"`
+		Groups          []apiKeyAccountGroupUsage        `json:"groups"`
+		Summary         apiKeyAccountUsageSummary        `json:"summary"`
+		Reconciliation  apiKeyAccountUsageReconciliation `json:"reconciliation"`
+		MembershipBasis string                           `json:"membership_basis"`
 	}
 	var response cachedResponse
 	if h.getRuntimeJSON(ctx, adminAPIKeyAccountsNamespace, cacheKey, &response) {
@@ -6323,7 +7148,7 @@ func (h *Handler) GetAPIKeyAccountStats(c *gin.Context) {
 		items = []database.APIKeyAccountStat{}
 	}
 	response.Items = items
-	response.Groups, response.Summary = aggregateAPIKeyAccountGroups(items)
+	response.Groups, response.Summary, response.Reconciliation = aggregateAPIKeyAccountGroups(items)
 	response.MembershipBasis = "current_and_deleted_last_membership"
 	h.setRuntimeJSON(ctx, adminAPIKeyAccountsNamespace, cacheKey, response, adminUsageRangeCacheTTL)
 	c.JSON(http.StatusOK, response)
@@ -6348,18 +7173,46 @@ type apiKeyAccountGroupUsage struct {
 	UserBilled    float64 `json:"user_billed"`
 }
 
+type apiKeyAccountUsageReconciliation struct {
+	GroupedTotal          apiKeyAccountUsageSummary `json:"grouped_total"`
+	Ungrouped             apiKeyAccountUsageSummary `json:"ungrouped"`
+	Duplicate             apiKeyAccountUsageSummary `json:"duplicate"`
+	UniqueGroupedAccounts int                       `json:"unique_grouped_accounts"`
+	MultiGroupAccounts    int                       `json:"multi_group_accounts"`
+}
+
 // aggregateAPIKeyAccountGroups uses current memberships for active accounts and
 // the retained last membership for recycle-bin accounts. If an account belongs
 // to multiple groups, its usage is intentionally included in each group; the
 // overall summary remains de-duplicated.
-func aggregateAPIKeyAccountGroups(items []database.APIKeyAccountStat) ([]apiKeyAccountGroupUsage, apiKeyAccountUsageSummary) {
+func aggregateAPIKeyAccountGroups(items []database.APIKeyAccountStat) ([]apiKeyAccountGroupUsage, apiKeyAccountUsageSummary, apiKeyAccountUsageReconciliation) {
 	groupMap := make(map[int64]*apiKeyAccountGroupUsage)
 	summary := apiKeyAccountUsageSummary{Accounts: len(items)}
+	reconciliation := apiKeyAccountUsageReconciliation{}
 	for _, item := range items {
 		summary.Requests += item.Requests
 		summary.TotalTokens += item.TotalTokens
 		summary.AccountBilled += item.AccountBilled
 		summary.UserBilled += item.UserBilled
+		groupCount := len(item.Groups)
+		if groupCount == 0 {
+			reconciliation.Ungrouped.Accounts++
+			reconciliation.Ungrouped.Requests += item.Requests
+			reconciliation.Ungrouped.TotalTokens += item.TotalTokens
+			reconciliation.Ungrouped.AccountBilled += item.AccountBilled
+			reconciliation.Ungrouped.UserBilled += item.UserBilled
+		} else {
+			reconciliation.UniqueGroupedAccounts++
+		}
+		if groupCount > 1 {
+			reconciliation.MultiGroupAccounts++
+			extraAssignments := int64(groupCount - 1)
+			reconciliation.Duplicate.Accounts += groupCount - 1
+			reconciliation.Duplicate.Requests += item.Requests * extraAssignments
+			reconciliation.Duplicate.TotalTokens += item.TotalTokens * extraAssignments
+			reconciliation.Duplicate.AccountBilled += item.AccountBilled * float64(extraAssignments)
+			reconciliation.Duplicate.UserBilled += item.UserBilled * float64(extraAssignments)
+		}
 		for _, group := range item.Groups {
 			total := groupMap[group.ID]
 			if total == nil {
@@ -6376,6 +7229,11 @@ func aggregateAPIKeyAccountGroups(items []database.APIKeyAccountStat) ([]apiKeyA
 	groups := make([]apiKeyAccountGroupUsage, 0, len(groupMap))
 	for _, group := range groupMap {
 		groups = append(groups, *group)
+		reconciliation.GroupedTotal.Accounts += group.Accounts
+		reconciliation.GroupedTotal.Requests += group.Requests
+		reconciliation.GroupedTotal.TotalTokens += group.TotalTokens
+		reconciliation.GroupedTotal.AccountBilled += group.AccountBilled
+		reconciliation.GroupedTotal.UserBilled += group.UserBilled
 	}
 	sort.Slice(groups, func(i, j int) bool {
 		if groups[i].UserBilled == groups[j].UserBilled {
@@ -6383,7 +7241,7 @@ func aggregateAPIKeyAccountGroups(items []database.APIKeyAccountStat) ([]apiKeyA
 		}
 		return groups[i].UserBilled > groups[j].UserBilled
 	})
-	return groups, summary
+	return groups, summary, reconciliation
 }
 
 // GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
@@ -7526,6 +8384,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
+		AllowLive:              in.AllowLive,
 		UpstreamChannel:        in.ResolveUpstreamChannel(),
 		ScopeLimits:            database.NormalizeAPIKeyScopeLimits(in.ScopeLimits),
 	}
@@ -7621,6 +8480,12 @@ func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
 // Key 永远选不到账号。
 var knownAPIKeyPlanFilters = map[string]struct{}{
 	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+	// Grok live /user.subscriptionTier values. These labels are authorization
+	// inputs only when auth.Store has a fresh live fact; JWT/archive labels never
+	// satisfy plan_allow. "api" is the explicit xAI API-key channel plan.
+	"api": {}, "supergrok": {}, "x_basic": {}, "x_premium": {},
+	"x_premium_plus": {}, "supergrok_heavy": {}, "supergrok_lite": {},
+	"supergrok_plus": {},
 }
 
 // cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
@@ -7823,7 +8688,15 @@ type settingsResponse struct {
 	CodexWSBusyAcquireMaxWaitSec        int    `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	GithubTokenConfigured               bool   `json:"github_token_configured"`
+	GithubProxyURL                      string `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       int    `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           int    `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          int    `json:"codex_overload_window_minutes"`
 	OverflowAutoCompactEnabled          bool   `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          bool   `json:"compact_via_responses_enabled"`
 	CodexPreflightSSEPassthroughEnabled bool   `json:"codex_preflight_sse_passthrough_enabled"`
 	FirstTokenExcludesWsAcquire         bool   `json:"first_token_excludes_ws_acquire"`
 	CodexContinueThinkingEnabled        bool   `json:"codex_continue_thinking_enabled"`
@@ -7834,10 +8707,14 @@ type settingsResponse struct {
 	CodexSyncedCLIVersion               string `json:"codex_synced_cli_version"`
 	SchedulerMode                       string `json:"scheduler_mode"`
 	AffinityMode                        string `json:"affinity_mode"`
+	SessionAffinitySpread               bool   `json:"session_affinity_spread"`
 	GrokAffinityMode                    string `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             int    `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           bool   `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              string `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             string `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   string `json:"grok_oauth_client_id"`
 	// GrokOAuthClientIDEnvOverride 为 true 时，环境变量 GROK_OAUTH_CLIENT_ID 正压着上面这个设置，
 	// 前端据此提示「当前以环境变量为准」。GrokOAuthClientIDEffective 是实际生效值。
@@ -7847,6 +8724,7 @@ type settingsResponse struct {
 	MaxRateLimitRetries                int                              `json:"max_rate_limit_retries"`
 	RetryIntervalMS                    int                              `json:"retry_interval_ms"`
 	TransportRetryPolicy               string                           `json:"transport_retry_policy"`
+	CodexFingerprintDefaultMode        string                           `json:"codex_fingerprint_default_mode"`
 	AllowRemoteMigration               bool                             `json:"allow_remote_migration"`
 	DatabaseDriver                     string                           `json:"database_driver"`
 	DatabaseLabel                      string                           `json:"database_label"`
@@ -7968,7 +8846,15 @@ type updateSettingsReq struct {
 	CodexWSBusyAcquireMaxWaitSec        *int     `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          *bool    `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int     `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               *int     `json:"codex_ws_stateless_slots"`
+	GithubToken                         *string  `json:"github_token"`
+	GithubProxyURL                      *string  `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           *bool    `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       *int     `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           *int     `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          *int     `json:"codex_overload_window_minutes"`
 	OverflowAutoCompactEnabled          *bool    `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          *bool    `json:"compact_via_responses_enabled"`
 	CodexPreflightSSEPassthroughEnabled *bool    `json:"codex_preflight_sse_passthrough_enabled"`
 	FirstTokenExcludesWsAcquire         *bool    `json:"first_token_excludes_ws_acquire"`
 	CodexContinueThinkingEnabled        *bool    `json:"codex_continue_thinking_enabled"`
@@ -7978,15 +8864,20 @@ type updateSettingsReq struct {
 	CodexCLIVersionSyncIntervalHours    *int     `json:"codex_cli_version_sync_interval_hours"`
 	SchedulerMode                       *string  `json:"scheduler_mode"`
 	AffinityMode                        *string  `json:"affinity_mode"`
+	SessionAffinitySpread               *bool    `json:"session_affinity_spread"`
 	GrokAffinityMode                    *string  `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             *int     `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           *bool    `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              *string  `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             *string  `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   *string  `json:"grok_oauth_client_id"`
 	MaxRetries                          *int     `json:"max_retries"`
 	MaxRateLimitRetries                 *int     `json:"max_rate_limit_retries"`
 	RetryIntervalMS                     *int     `json:"retry_interval_ms"`
 	TransportRetryPolicy                *string  `json:"transport_retry_policy"`
+	CodexFingerprintDefaultMode         *string  `json:"codex_fingerprint_default_mode"`
 	AllowRemoteMigration                *bool    `json:"allow_remote_migration"`
 	ModelMapping                        *string  `json:"model_mapping"`
 	CodexModelMapping                   *string  `json:"codex_model_mapping"`
@@ -8498,8 +9389,8 @@ func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
 	return normalizeBackgroundConfig(cfg)
 }
 
-// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试配置编码成 grok_config JSON 落库。
-func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string) string {
+// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试 + 续轮思考配置编码成 grok_config JSON 落库。
+func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string, followUp auth.GrokFollowUpEffortConfig) string {
 	mode := strings.TrimSpace(affinityMode)
 	switch mode {
 	case auth.AffinityModeFollow, auth.AffinityModeBounded, auth.AffinityModeOff, auth.AffinityModeStrict:
@@ -8515,12 +9406,16 @@ func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinut
 	if maxRateLimitRetries < 0 {
 		maxRateLimitRetries = 0
 	}
+	followUp = auth.NormalizeGrokFollowUpEffortConfig(followUp)
 	b, err := json.Marshal(map[string]any{
-		"affinity_mode":          mode,
-		"probe_enabled":          probeEnabled,
-		"probe_interval_minutes": probeIntervalMinutes,
-		"max_rate_limit_retries": maxRateLimitRetries,
-		"oauth_client_id":        auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"affinity_mode":            mode,
+		"probe_enabled":            probeEnabled,
+		"probe_interval_minutes":   probeIntervalMinutes,
+		"max_rate_limit_retries":   maxRateLimitRetries,
+		"oauth_client_id":          auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"follow_up_effort_enabled": followUp.Enabled,
+		"follow_up_tool_effort":    followUp.ToolEffort,
+		"follow_up_small_effort":   followUp.SmallEffort,
 	})
 	if err != nil {
 		return `{"affinity_mode":"strict"}`
@@ -8690,7 +9585,15 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubTokenConfigured:               h.store.GithubToken() != "",
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
 		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
@@ -8701,10 +9604,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
+		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		GrokOAuthClientID:                   auth.ConfiguredGrokOAuthClientID(),
 		GrokOAuthClientIDEnvOverride:        auth.GrokOAuthClientIDFromEnv() != "",
 		GrokOAuthClientIDEffective:          auth.EffectiveGrokOAuthClientID(),
@@ -8712,6 +9619,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,
 		DatabaseLabel:                       h.databaseLabel,
@@ -9244,8 +10152,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 5 {
 			v = 5
 		}
-		if v > 500 {
-			v = 500
+		if v > 5000 {
+			v = 5000
 		}
 		h.db.SetMaxOpenConns(v)
 		h.pgMaxConns = v
@@ -9257,8 +10165,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 5 {
 			v = 5
 		}
-		if v > 500 {
-			v = 500
+		if v > 5000 {
+			v = 5000
 		}
 		h.cache.SetPoolSize(v)
 		h.redisPoolSize = v
@@ -9395,10 +10303,58 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_busy_patience_sec = %d", v)
 	}
 
+	if req.CodexWSStatelessSlots != nil {
+		v := database.NormalizeCodexWSStatelessSlots(*req.CodexWSStatelessSlots)
+		h.store.SetCodexWSStatelessSlots(v)
+		runtimeCfg.CodexWSStatelessSlots = v
+		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
+	}
+
+	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
+	if req.GithubToken != nil {
+		v := strings.TrimSpace(*req.GithubToken)
+		h.store.SetGithubToken(v)
+		runtimeCfg.GithubToken = v
+		log.Printf("设置已更新: github_token configured=%t", v != "")
+	}
+	if req.GithubProxyURL != nil {
+		v := strings.TrimSpace(*req.GithubProxyURL)
+		h.store.SetGithubProxyURL(v)
+		runtimeCfg.GithubProxyURL = v
+		log.Printf("设置已更新: github_proxy_url = %s", v)
+	}
+
+	// Codex 过载熔断（配置只存 RuntimeSettings，热更新生效）
+	if req.CodexOverloadPauseEnabled != nil {
+		runtimeCfg.CodexOverloadPauseEnabled = *req.CodexOverloadPauseEnabled
+		log.Printf("设置已更新: codex_overload_pause_enabled = %t", *req.CodexOverloadPauseEnabled)
+	}
+	if req.CodexOverloadThresholdPercent != nil {
+		v := database.NormalizeCodexOverloadThresholdPercent(*req.CodexOverloadThresholdPercent)
+		runtimeCfg.CodexOverloadThresholdPercent = v
+		log.Printf("设置已更新: codex_overload_threshold_percent = %d", v)
+	}
+	if req.CodexOverloadPauseMinutes != nil {
+		v := database.NormalizeCodexOverloadPauseMinutes(*req.CodexOverloadPauseMinutes)
+		runtimeCfg.CodexOverloadPauseMinutes = v
+		log.Printf("设置已更新: codex_overload_pause_minutes = %d", v)
+	}
+	if req.CodexOverloadWindowMinutes != nil {
+		v := database.NormalizeCodexOverloadWindowMinutes(*req.CodexOverloadWindowMinutes)
+		runtimeCfg.CodexOverloadWindowMinutes = v
+		log.Printf("设置已更新: codex_overload_window_minutes = %d", v)
+	}
+
 	if req.OverflowAutoCompactEnabled != nil {
 		h.store.SetOverflowAutoCompactEnabled(*req.OverflowAutoCompactEnabled)
 		runtimeCfg.OverflowAutoCompact = *req.OverflowAutoCompactEnabled
 		log.Printf("设置已更新: overflow_auto_compact_enabled = %t", *req.OverflowAutoCompactEnabled)
+	}
+
+	if req.CompactViaResponsesEnabled != nil {
+		h.store.SetCompactViaResponsesEnabled(*req.CompactViaResponsesEnabled)
+		runtimeCfg.CompactViaResponses = *req.CompactViaResponsesEnabled
+		log.Printf("设置已更新: compact_via_responses_enabled = %t", *req.CompactViaResponsesEnabled)
 	}
 
 	if req.CodexPreflightSSEPassthroughEnabled != nil {
@@ -9455,6 +10411,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetAffinityMode(*req.AffinityMode)
 		log.Printf("设置已更新: affinity_mode = %s", *req.AffinityMode)
 	}
+	if req.SessionAffinitySpread != nil {
+		h.store.SetSessionAffinitySpread(*req.SessionAffinitySpread)
+		log.Printf("设置已更新: session_affinity_spread = %t", *req.SessionAffinitySpread)
+	}
 
 	if req.GrokAffinityMode != nil {
 		h.store.SetGrokAffinityMode(*req.GrokAffinityMode)
@@ -9478,6 +10438,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.GrokMaxRateLimitRetries != nil {
 		h.store.SetGrokMaxRateLimitRetries(*req.GrokMaxRateLimitRetries)
 		log.Printf("设置已更新: grok_max_rate_limit_retries = %d", h.store.GrokMaxRateLimitRetries())
+	}
+
+	if req.GrokFollowUpEffortEnabled != nil || req.GrokFollowUpToolEffort != nil || req.GrokFollowUpSmallEffort != nil {
+		cfg := h.store.GrokFollowUpEffortConfig()
+		if req.GrokFollowUpEffortEnabled != nil {
+			cfg.Enabled = *req.GrokFollowUpEffortEnabled
+		}
+		if req.GrokFollowUpToolEffort != nil {
+			cfg.ToolEffort = *req.GrokFollowUpToolEffort
+		}
+		if req.GrokFollowUpSmallEffort != nil {
+			cfg.SmallEffort = *req.GrokFollowUpSmallEffort
+		}
+		h.store.SetGrokFollowUpEffortConfig(cfg)
+		proxy.SetGrokFollowUpEffortConfig(h.store.GrokFollowUpEffortConfig())
+		log.Printf("设置已更新: grok_follow_up_effort enabled=%v tool=%s small=%s", cfg.Enabled, cfg.ToolEffort, cfg.SmallEffort)
 	}
 
 	// client_id 会拼进授权 URL 与 token 表单，含空白/控制字符或超长的直接拒绝，
@@ -9537,6 +10513,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := database.NormalizeTransportRetryPolicy(*req.TransportRetryPolicy)
 		h.store.SetTransportRetryPolicy(v)
 		log.Printf("设置已更新: transport_retry_policy = %s", v)
+	}
+
+	if req.CodexFingerprintDefaultMode != nil {
+		if err := validateCodexFingerprintMode(*req.CodexFingerprintDefaultMode); err != nil {
+			writeError(c, http.StatusBadRequest, "codex_fingerprint_default_mode "+err.Error())
+			return
+		}
+		v := auth.NormalizeCodexFingerprintMode(*req.CodexFingerprintDefaultMode)
+		h.store.SetCodexFingerprintDefaultMode(v)
+		log.Printf("设置已更新: codex_fingerprint_default_mode = %s", v)
 	}
 
 	if req.AllowRemoteMigration != nil {
@@ -9947,7 +10933,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubToken:                         h.store.GithubToken(),
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
 		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
@@ -9958,10 +10952,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
+		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                        h.store.GetModelMapping(),
 		CodexModelMapping:                   h.store.GetCodexModelMapping(),
@@ -9983,6 +10979,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterDisabledPatterns:        promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 		PromptFilterReviewEnabled:           promptFilterCfg.Review.Enabled,
 		PromptFilterReviewAPIKey:            promptFilterCfg.Review.APIKey,
+		PreservePromptFilterReviewAPIKey:    req.PromptFilterReviewAPIKey == nil || strings.TrimSpace(*req.PromptFilterReviewAPIKey) == "",
 		PromptFilterReviewBaseURL:           promptFilterCfg.Review.BaseURL,
 		PromptFilterReviewModel:             promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:    promptFilterCfg.Review.TimeoutSeconds,
@@ -10004,7 +11001,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
 		ImageStorageConfig:                  imgConfigJSON,
 		BackgroundConfig:                    encodeBackgroundConfig(bgCfg),
-		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID()),
+		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID(), h.store.GrokFollowUpEffortConfig()),
 		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
@@ -10186,7 +11183,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubTokenConfigured:               h.store.GithubToken() != "",
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
 		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
 		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
 		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
@@ -10197,14 +11202,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
+		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
 		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                      h.databaseDriver,
 		DatabaseLabel:                       h.databaseLabel,
@@ -10771,12 +11781,7 @@ func (h *Handler) CleanBanned(c *gin.Context) {
 
 // CleanRateLimited 一键清理所有限流账号（含 premium 5h、free 7d、usage_exhausted）
 func (h *Handler) CleanRateLimited(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	cleaned := h.store.CleanRateLimitedManual(ctx)
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+	h.cleanAccountTargets(c, h.store.CollectRateLimitedManualTargets(), "manual_clean")
 }
 
 // CleanError 清理错误（error）账号
@@ -10796,22 +11801,100 @@ func (h *Handler) CleanGrokError(c *gin.Context) {
 
 // cleanGrokByStatus 按运行时状态清理 Grok 账号，不影响其它平台
 func (h *Handler) cleanGrokByStatus(c *gin.Context, targetStatus string) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	cleaned := h.store.CleanGrokByRuntimeStatus(ctx, targetStatus)
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, (*auth.Account).IsGrokAPI), "auto_clean")
 }
 
 // cleanByStatus 按运行时状态清理账号
 func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, nil), "auto_clean")
+}
+
+func (h *Handler) cleanAccountTargets(c *gin.Context, targets []*auth.Account, eventReason string) {
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamCleanAccounts(c, targets, eventReason)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+	success, _ := h.runCleanAccounts(ctx, targets, eventReason, nil)
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", success), "cleaned": success})
+}
 
-	cleaned := h.store.CleanByRuntimeStatus(ctx, targetStatus)
+func (h *Handler) streamCleanAccounts(c *gin.Context, targets []*auth.Account, eventReason string) {
+	setupSSE(c)
+	total := len(targets)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "clean", Total: total})
+	success, fail := h.runCleanAccounts(c.Request.Context(), targets, eventReason, func(event batchOperationEvent) {
+		sendSSEJSON(c, event)
+	})
+	sendSSEJSON(c, batchOperationEvent{
+		Type:    "complete",
+		Action:  "clean",
+		Current: total,
+		Total:   total,
+		Success: success,
+		Failed:  fail,
+		Deleted: success,
+		Message: fmt.Sprintf("已清理 %d 个账号", success),
+	})
+}
 
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+func (h *Handler) runCleanAccounts(ctx context.Context, targets []*auth.Account, eventReason string, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(targets)
+	var success int64
+	var fail int64
+	deleted := make([]int64, 0, len(targets))
+
+	for i, acc := range targets {
+		if ctx.Err() != nil {
+			fail += int64(total - i)
+			break
+		}
+		if acc == nil {
+			fail++
+			if onProgress != nil {
+				onProgress(batchOperationEvent{
+					Type:    "progress",
+					Action:  "clean",
+					Current: i + 1,
+					Total:   total,
+					Success: success,
+					Failed:  fail,
+					Error:   "账号不存在",
+				})
+			}
+			continue
+		}
+
+		name, email := runtimeAccountOperationIdentity(acc)
+		err := h.store.SoftDeleteForClean(ctx, acc, eventReason)
+		event := batchOperationEvent{
+			Type:         "progress",
+			Action:       "clean",
+			Current:      i + 1,
+			Total:        total,
+			AccountID:    acc.DBID,
+			AccountName:  name,
+			AccountEmail: email,
+		}
+		if err != nil {
+			fail++
+			event.Error = err.Error()
+		} else {
+			success++
+			deleted = append(deleted, acc.DBID)
+			event.Deleted = success
+		}
+		event.Success = success
+		event.Failed = fail
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	h.pruneAccountsFromSnapshotCaches(deleted)
+	return success, fail
 }
 
 // ==================== Proxies ====================
@@ -10908,7 +11991,7 @@ func (h *Handler) AddProxies(c *gin.Context) {
 	})
 }
 
-// DeleteProxy 删除单个代理
+// DeleteProxy 删除单个代理，并立即解绑仍引用该 URL 的账号。
 func (h *Handler) DeleteProxy(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -10919,22 +12002,33 @@ func (h *Handler) DeleteProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.DeleteProxy(ctx, id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(c, http.StatusNotFound, "代理不存在")
-			return
-		}
+	result, err := h.db.RetireProxiesByIDs(ctx, []int64{id})
+	if err != nil {
 		writeError(c, http.StatusInternalServerError, "删除代理失败")
 		return
 	}
-
-	if err := h.store.ReloadProxyPool(); err != nil {
-		log.Printf("代理已删除，但代理池刷新失败: %v", err)
+	if result.Deleted == 0 {
+		writeError(c, http.StatusNotFound, "代理不存在")
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "代理已删除"})
+
+	if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+		log.Printf("代理已删除，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "代理已删除，但代理池刷新失败",
+			"deleted": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "代理已删除",
+		"deleted": result.Deleted,
+		"unbound": result.Unbound,
+	})
 }
 
-// UpdateProxy 更新代理（启用/禁用/改标签）
+// UpdateProxy 更新代理（启用/禁用/改标签/改 URL）
 func (h *Handler) UpdateProxy(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -10963,6 +12057,17 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	existing, err := h.db.GetProxy(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "获取代理信息失败")
+		return
+	}
+	oldURL := strings.TrimSpace(existing.URL)
+
 	if err := h.db.UpdateProxy(ctx, id, req.URL, req.Label, req.Enabled); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "代理不存在")
@@ -10972,8 +12077,31 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.ReloadProxyPool(); err != nil {
+	newURL := oldURL
+	if req.URL != nil {
+		newURL = strings.TrimSpace(*req.URL)
+	}
+	if newURL != "" && newURL != oldURL {
+		reboundIDs, rebindErr := h.db.RebindAccountProxyURLs(ctx, oldURL, newURL)
+		if rebindErr != nil {
+			writeError(c, http.StatusInternalServerError, "更新代理绑定失败")
+			return
+		}
+		if h.store != nil {
+			for _, accountID := range reboundIDs {
+				h.store.ApplyAccountProxyURL(accountID, newURL)
+			}
+		}
+		h.removeProxyURLsFromRuntime([]string{oldURL})
+	}
+	if req.Enabled != nil && !*req.Enabled {
+		h.removeProxyURLsFromRuntime([]string{newURL})
+	}
+
+	if err := h.reloadProxyPool(); err != nil {
 		log.Printf("代理已更新，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "代理已更新，但代理池刷新失败"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "代理已更新"})
 }
@@ -10991,14 +12119,26 @@ func (h *Handler) BatchDeleteProxies(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	deleted, err := h.db.DeleteProxies(ctx, req.IDs)
+	result, err := h.db.RetireProxiesByIDs(ctx, req.IDs)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "批量删除失败")
 		return
 	}
 
-	_ = h.store.ReloadProxyPool()
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已删除 %d 个代理", deleted), "deleted": deleted})
+	if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+		log.Printf("代理已批量删除，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "代理已删除，但代理池刷新失败",
+			"deleted": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已删除 %d 个代理", result.Deleted),
+		"deleted": result.Deleted,
+		"unbound": result.Unbound,
+	})
 }
 
 // CleanErrorProxies 一键清理测试错误的代理，并解绑引用这些代理的账号。
@@ -11014,12 +12154,16 @@ func (h *Handler) CleanErrorProxies(c *gin.Context) {
 	}
 
 	if h.store != nil {
-		for _, accountID := range result.UnboundAccountIDs {
-			h.store.ClearAccountProxyURLIfMatches(accountID, result.DeletedProxyURLs)
+		if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+			log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "错误代理已清理，但代理池刷新失败",
+				"cleaned": result.Deleted,
+				"unbound": result.Unbound,
+			})
+			return
 		}
-		h.removeProxyURLsFromRuntime(result.DeletedProxyURLs)
-	}
-	if err := h.reloadProxyPool(); err != nil {
+	} else if err := h.reloadProxyPool(); err != nil {
 		log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "错误代理已清理，但代理池刷新失败",

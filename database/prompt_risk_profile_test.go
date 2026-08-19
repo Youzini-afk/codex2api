@@ -498,7 +498,14 @@ func TestPromptRiskProfileAggregationStaysBoundedWithManyClearedEvents(t *testin
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// 性能界限门:30k 事件的聚合必须在 2s 内完成。-race 构建的开销是
+	// 5-20 倍(CI 的 2 核 runner 上实测超过 40s 也跑不完 2s 门),竞争
+	// 检测跑的是正确性不是性能,按倍率放宽。
+	deadline := 2 * time.Second
+	if raceDetectorEnabled {
+		deadline = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 	profiles, total, err := db.ListPromptRiskProfiles(ctx, PromptRiskProfileQuery{
 		Page: 1, PageSize: 20, SubjectType: PromptRiskSubjectNewAPIUser,
@@ -611,7 +618,7 @@ func TestPromptRiskSQLiteSchemaAndIndexes(t *testing.T) {
 		}
 		indexes[name] = true
 	}
-	for _, name := range []string{"idx_prompt_risk_events_subject", "idx_prompt_risk_events_created", "idx_prompt_risk_events_kind", "idx_prompt_risk_events_incident", "idx_prompt_risk_events_api_key", "idx_prompt_risk_events_account"} {
+	for _, name := range []string{"idx_prompt_risk_events_subject", "idx_prompt_risk_events_created", "idx_prompt_risk_events_kind", "idx_prompt_risk_events_incident", "idx_prompt_risk_events_api_key", "idx_prompt_risk_events_account", "idx_prompt_risk_events_request_match", "idx_prompt_risk_events_fingerprint_match"} {
 		if !indexes[name] {
 			t.Fatalf("prompt_risk_events missing index %q", name)
 		}
@@ -645,9 +652,53 @@ func TestPromptRiskPostgresMigrationDDL(t *testing.T) {
 		"ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS session_hash",
 		"idx_prompt_risk_events_subject",
 		"idx_prompt_risk_events_incident",
+		"idx_prompt_risk_events_request_match",
+		"idx_prompt_risk_events_fingerprint_match",
 	} {
 		if !strings.Contains(joined, fragment) {
 			t.Fatalf("postgres risk migration missing %q: %s", fragment, joined)
 		}
 	}
+}
+
+func TestPromptRiskReviewReconciliationUsesTargetedIndexes(t *testing.T) {
+	db, err := New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("New sqlite: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	assertPlanUses := func(query string, args []interface{}, indexName string) {
+		t.Helper()
+		rows, err := db.conn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, args...)
+		if err != nil {
+			t.Fatalf("explain query plan: %v", err)
+		}
+		defer rows.Close()
+		var plan strings.Builder
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatalf("scan query plan: %v", err)
+			}
+			plan.WriteString(detail)
+			plan.WriteByte('\n')
+		}
+		if !strings.Contains(plan.String(), indexName) {
+			t.Fatalf("query plan does not use %s:\n%s", indexName, plan.String())
+		}
+	}
+
+	assertPlanUses(`SELECT id FROM prompt_risk_events
+		WHERE request_correlation_id<>'' AND request_correlation_id=$1
+		AND subject_type=$2 AND subject_key=$3 AND event_kind=$4`,
+		[]interface{}{"request-1", PromptRiskSubjectAPIKey, "key-1", promptRiskEventReviewCleared},
+		"idx_prompt_risk_events_request_match")
+	assertPlanUses(`SELECT id FROM prompt_risk_events
+		WHERE request_correlation_id='' AND prompt_fingerprint<>'' AND prompt_fingerprint=$1
+		AND subject_type=$2 AND subject_key=$3 AND created_at >= $4 AND created_at <= $5 AND event_kind=$6`,
+		[]interface{}{"fingerprint-1", PromptRiskSubjectAPIKey, "key-1", time.Now().Add(-time.Minute), time.Now(), promptRiskEventReviewCleared},
+		"idx_prompt_risk_events_fingerprint_match")
 }

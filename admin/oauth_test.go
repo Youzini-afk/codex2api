@@ -140,6 +140,72 @@ func makeOAuthTestIDToken(email, accountID, planType string) string {
 	return "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(payload) + ".fake_signature"
 }
 
+func TestUpsertOAuthIdentitySeparatesEffectiveWorkspaceRoutes(t *testing.T) {
+	db := newTestAdminDB(t)
+	handler := &Handler{db: db}
+	ctx := context.Background()
+	idToken := makeOAuthTestIDToken("user@example.com", "personal-workspace", "team")
+
+	personalID, updated, err := handler.upsertOAuthIdentityAccount(ctx, "personal", "", tokenCredentialSeed{
+		accessToken: "personal-token",
+		idToken:     idToken,
+	}, "test")
+	if err != nil {
+		t.Fatalf("upsert personal: %v", err)
+	}
+	if updated {
+		t.Fatal("personal route unexpectedly updated an existing account")
+	}
+
+	teamSeed := tokenCredentialSeed{
+		accessToken: "shared-team-token",
+		idToken:     idToken,
+		customHeaders: map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}
+	teamID, updated, err := handler.upsertOAuthIdentityAccount(ctx, "team", "", teamSeed, "test")
+	if err != nil {
+		t.Fatalf("upsert team: %v", err)
+	}
+	if updated {
+		t.Fatal("team route unexpectedly updated the personal route")
+	}
+	if teamID == personalID {
+		t.Fatalf("team route id = personal route id = %d", teamID)
+	}
+
+	teamSeed.accessToken = "rotated-team-token"
+	gotID, updated, err := handler.upsertOAuthIdentityAccount(ctx, "team-again", "", teamSeed, "test")
+	if err != nil {
+		t.Fatalf("upsert same team route: %v", err)
+	}
+	if !updated || gotID != teamID {
+		t.Fatalf("same team route = id:%d updated:%t, want id:%d updated:true", gotID, updated, teamID)
+	}
+
+	personalRow, err := db.GetAccountByID(ctx, personalID)
+	if err != nil {
+		t.Fatalf("GetAccountByID personal: %v", err)
+	}
+	if got := personalRow.GetCredentialStringMap("custom_headers")["Chatgpt-Account-Id"]; got != "" {
+		t.Fatalf("personal route override = %q, want empty", got)
+	}
+	if got := personalRow.GetCredential("access_token"); got != "personal-token" {
+		t.Fatalf("personal access token = %q, want personal-token", got)
+	}
+	teamRow, err := db.GetAccountByID(ctx, teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID team: %v", err)
+	}
+	if got := teamRow.GetCredentialStringMap("custom_headers")["Chatgpt-Account-Id"]; got != "team-workspace" {
+		t.Fatalf("team route override = %q, want team-workspace", got)
+	}
+	if got := teamRow.GetCredential("access_token"); got != "rotated-team-token" {
+		t.Fatalf("team access token = %q, want rotated-team-token", got)
+	}
+}
+
 func TestExchangeOAuthCodeTriggersUsageProbe(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -754,5 +820,53 @@ func TestUpsertOAuthIdentityAccountClearsBanOnReimport(t *testing.T) {
 	acc.Mu().RUnlock()
 	if tier == auth.HealthTierBanned {
 		t.Fatalf("runtime HealthTier = %q, want not banned after reimport", tier)
+	}
+}
+
+// 重新授权(直接对已有账号 exchange-code)拿到新凭证后必须清除 error/401
+// 状态,与重新导入合并路径对齐;否则账号一直挂"异常"等一次可能失败的
+// 异步探针(issue #493)。限流冷却不受影响。
+func TestUpdateOAuthAccountCodeClearsErrorState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, cache.NewMemory(1), nil)
+	handler := &Handler{db: db, store: store}
+	handler.probeUsage = func(_ context.Context, _ *auth.Account) error { return nil }
+
+	newOAuthExchangeTestServer(t)
+
+	id := insertOAuthEditTestAccount(t, db, "oauth-errored", "old-refresh", "")
+	if err := db.SetError(context.Background(), id, "401 unauthorized"); err != nil {
+		t.Fatalf("SetError: %v", err)
+	}
+	if err := store.LoadAccountByID(context.Background(), id); err != nil {
+		t.Fatalf("LoadAccountByID: %v", err)
+	}
+
+	sessionID := "oauth-edit-clear-error-session"
+	globalOAuthStore.set(sessionID, &oauthSession{
+		State:        "state-clear-error",
+		CodeVerifier: "verifier-clear-error",
+		RedirectURI:  oauthDefaultRedirectURI,
+		CreatedAt:    time.Now(),
+	})
+	t.Cleanup(func() { globalOAuthStore.delete(sessionID) })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ctx.Request = newOAuthEditRequest(sessionID, "code-clear", "state-clear-error", "")
+
+	handler.UpdateOAuthAccountCode(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if !strings.EqualFold(row.Status, "active") || row.ErrorMessage != "" {
+		t.Fatalf("status=%q error=%q, want active with empty error", row.Status, row.ErrorMessage)
 	}
 }

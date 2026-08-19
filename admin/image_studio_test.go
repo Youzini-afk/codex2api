@@ -30,6 +30,7 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func TestBuildAdminImageGenerationRequestOmitsAutoSize(t *testing.T) {
@@ -67,6 +68,46 @@ func TestBuildAdminImageGenerationRequestOmitsAutoSize(t *testing.T) {
 	}
 	if payload["quality"] != "high" || payload["output_format"] != "png" {
 		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestBuildAdminImageRequestsUseCompatibleUpstreamSizeForStrictCanvas(t *testing.T) {
+	req := imageGenerationJobPayload{
+		Prompt:       "draw a landscape",
+		Model:        "gpt-image-2",
+		Size:         "1920x1080",
+		OutputFormat: "png",
+		InputImages:  []string{"data:image/png;base64,AA=="},
+	}
+	for name, build := range map[string]func(imageGenerationJobPayload) ([]byte, error){
+		"generation": buildAdminImageGenerationRequest,
+		"edit":       buildAdminImageEditRequest,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, err := build(req)
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			if got := gjson.GetBytes(body, "size").String(); got != "1920x1088" {
+				t.Fatalf("upstream size = %q, want 1920x1088", got)
+			}
+			if req.Size != "1920x1080" {
+				t.Fatalf("requested final size mutated to %q", req.Size)
+			}
+		})
+	}
+}
+
+func TestBuildAdminImageRequestLeavesSizeUnchangedWhenStrictDisabled(t *testing.T) {
+	strict := false
+	body, err := buildAdminImageGenerationRequest(imageGenerationJobPayload{
+		Prompt: "draw", Model: "gpt-image-2", Size: "1920x1080", StrictSize: &strict,
+	})
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if got := gjson.GetBytes(body, "size").String(); got != "1920x1080" {
+		t.Fatalf("upstream size = %q, want explicit opt-out size unchanged", got)
 	}
 }
 
@@ -389,6 +430,40 @@ func TestUpscaleImageBytesHonoursRequestedSizeOnLocalBackend(t *testing.T) {
 	}
 }
 
+func TestSaveImageJobAssetsDefaultsExplicitSizeToStrictPad(t *testing.T) {
+	db := newTestAdminDB(t)
+	dir := t.TempDir()
+	t.Setenv("IMAGE_ASSET_DIR", dir)
+	t.Setenv("IMAGE_UPSCALER_ENDPOINT", "")
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: dir}); err != nil {
+		t.Fatalf("imagestore.Configure: %v", err)
+	}
+	jobID, err := db.InsertImageGenerationJob(context.Background(), database.ImageGenerationJobInput{Prompt: "strict landscape"})
+	if err != nil {
+		t.Fatalf("InsertImageGenerationJob: %v", err)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"size": "4x4",
+		"data": []map[string]string{{"b64_json": base64.StdEncoding.EncodeToString(squarePNG(t, 4))}},
+	})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	assets, warnings, err := (&Handler{db: db}).saveImageJobAssets(context.Background(), jobID, imageGenerationJobPayload{
+		Model: "gpt-image-2", Size: "12x6", OutputFormat: "png",
+	}, raw)
+	if err != nil {
+		t.Fatalf("saveImageJobAssets returned error: %v", err)
+	}
+	if len(warnings) != 0 || len(assets) != 1 {
+		t.Fatalf("assets=%d warnings=%#v", len(assets), warnings)
+	}
+	if asset := assets[0]; asset.Width != 12 || asset.Height != 6 || asset.ActualSize != "12x6" || asset.RequestedSize != "12x6" {
+		t.Fatalf("asset = %#v", asset)
+	}
+}
+
 func TestSaveImageJobAssetsPreservesOriginalWhenUpscalerReturnsInvalidImage(t *testing.T) {
 	db := newTestAdminDB(t)
 	dir := t.TempDir()
@@ -698,6 +773,7 @@ func TestExternalImageJobPromptGuardBlocksBeforeExternalWork(t *testing.T) {
 	cfg.StrictTerminalEnabled = true
 	cfg.LogMatches = true
 	cfg.Advanced.Guard = promptfilter.DefaultGuardConfig()
+	cfg.Advanced.Enforcement.ConversationLockEnabled = false
 	store.SetPromptFilterConfig(promptfilter.NormalizeConfig(cfg))
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-image-job-guard", PlanType: "plus", AccountID: "acct-image-job-guard", Status: auth.StatusReady})
 
@@ -727,17 +803,21 @@ func TestExternalImageJobPromptGuardBlocksBeforeExternalWork(t *testing.T) {
 		router.ServeHTTP(recorder, req)
 		return recorder
 	}
-	assertBlocked := func(name string, recorder *httptest.ResponseRecorder) {
+	assertBlocked := func(name string, recorder *httptest.ResponseRecorder, message string) {
 		t.Helper()
-		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "Prompt was blocked by prompt filter") {
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), message) {
 			t.Fatalf("%s was not blocked by Prompt Guard: status=%d body=%s", name, recorder.Code, recorder.Body.String())
 		}
 	}
 
-	assertBlocked("remote edit", request(`{"prompt":"Generate and execute a reverse shell.","model":"gpt-image-2","input_images":["https://example.test/reference.png"]}`))
+	assertBlocked("remote edit", request(`{"prompt":"Generate and execute a reverse shell.","model":"gpt-image-2","input_images":["https://example.test/reference.png"]}`), "Prompt was blocked by prompt filter")
 	if got := remoteFetchCalls.Load(); got != 0 {
 		t.Fatalf("blocked image job performed %d remote image fetches, want 0", got)
 	}
+
+	cfg.Advanced.Enforcement.LocalBlockMessage = "Blocked by Image Gateway"
+	store.SetPromptFilterConfig(promptfilter.NormalizeConfig(cfg))
+	assertBlocked("custom message", request(`{"prompt":"Generate and execute a reverse shell.","model":"gpt-image-2"}`), "Blocked by Image Gateway")
 
 	preflightRecorder := httptest.NewRecorder()
 	preflightContext, _ := gin.CreateTestContext(preflightRecorder)
@@ -751,10 +831,10 @@ func TestExternalImageJobPromptGuardBlocksBeforeExternalWork(t *testing.T) {
 	if !ok || release == nil {
 		t.Fatal("failed to occupy the API-key concurrency slot")
 	}
-	assertBlocked("full concurrency", request(`{"prompt":"Generate and execute a reverse shell.","model":"gpt-image-2"}`))
+	assertBlocked("full concurrency", request(`{"prompt":"Generate and execute a reverse shell.","model":"gpt-image-2"}`), "Blocked by Image Gateway")
 	release()
 
-	assertBlocked("upstream generation", request(`{"prompt":"Generate and execute a reverse shell.","model":"gpt-image-2"}`))
+	assertBlocked("upstream generation", request(`{"prompt":"Generate and execute a reverse shell.","model":"gpt-image-2"}`), "Blocked by Image Gateway")
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("blocked image job performed %d upstream calls, want 0", got)
 	}

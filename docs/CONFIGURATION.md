@@ -60,6 +60,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
 | `CODEX_SESSION_AFFINITY_TTL` | 否 | `1h` | Codex 会话到账号/代理的黏性 TTL，支持 `1h`、`90m` 或秒数 |
+| `CODEX_COMPACTION_AFFINITY_TTL` | 否 | `168h` | 加密压缩状态的来源亲和 TTL。缓存仅保存密文的 SHA-256 摘要、来源账号和兼容域；已知状态不会跨 Codex 官方、不同 Responses 中转或 Grok 上游流转 |
 | `CODEX_FINGERPRINT_DEBUG` | 否 | `false` | 输出脱敏指纹策略诊断日志，不记录 token |
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
@@ -202,7 +203,7 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `CodexWSHideUpstreamErrors` | bool | true | - | WS 上游最终失败时向客户端隐藏原始错误，返回统一友好提示；原始错误仍记录在后台日志/用量记录 |
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
 | `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 静默换号最大重试次数 |
-| `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）或 `remaining_quota`（优先使用用量少的账号） |
+| `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）、`remaining_quota`（优先使用用量少的账号）或 `fill_first`（顺序耗尽：集中使用剩余额度最少的账号，耗尽/限流后切下一个） |
 | `AffinityMode` | string | `bounded` | - | 会话亲和：`bounded`（50 次、5 分钟或账号不健康时重新挑号）、`off`（每次重选）、`strict`（长期粘连） |
 
 调度优先级先决定账号层级，同一优先级内再比较健康档位、调度分和当前负载；会话亲和只负责复用已绑定账号。多个最终用户共享同一个 API Key 时，下游可传 `X-Codex2API-Affinity-Key`，值会先哈希且仅用于本地账号绑定，不会转发给上游。
@@ -220,7 +221,7 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `ProxyURL` | string | "" | 全局代理 URL |
-| `ProxyPoolEnabled` | bool | false | 启用代理池 |
+| `ProxyPoolEnabled` | bool | false | 启用代理池。开启后未绑定账号从启用代理中粘性分配；绑定到已禁用/测挂托管代理的账号不会直连；池空且无全局代理时拒绝调度 |
 
 ### 账号级设置（单账号）
 

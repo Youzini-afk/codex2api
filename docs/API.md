@@ -10,8 +10,9 @@
   - [Chat Completions](#1-chat-completions)
   - [Responses](#2-responses)
   - [Images](#3-images)
-  - [List Models](#4-list-models)
-  - [Health Check](#5-health-check)
+  - [Videos (Grok 生视频)](#4-videos-grok-生视频)
+  - [List Models](#5-list-models)
+  - [Health Check](#6-health-check)
 - [管理 API](#管理-api)
   - [统计接口](#统计接口)
   - [账号管理](#账号管理) — 添加 RT / AT 账号、批量导入、导出、迁移
@@ -34,6 +35,8 @@
 Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理后台 API。
 
 Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `service_tier:"priority"`；Anthropic 请求侧 `service_tier`（Priority Tier）不在此映射范围内。用量日志的 `service_tier` / `fast` 过滤反映该解析结果。
+
+**Service Tier 语义说明**：请求侧 `fast` / `priority` 会统一以 `priority` 转发上游，其余取值（`auto`/`default`/`flex`/`scale` 等）不转发。用量日志区分三个字段：`requested_service_tier`（客户端请求意图）、`actual_service_tier`（上游回传 Tier，原样取自 `response.completed.response.service_tier`）、`billing_service_tier`（计费采用值，由 Tier 计费策略 `BillingTierPolicy` 决定，默认 `actual`，上游未回传时回退按请求意图计）。注意：在 ChatGPT OAuth / Codex backend 路径上，Fast 由上游服务端路由处理，`service_tier` 不是端到端可校验字段——上游回传 `default` 并不代表 Fast 未生效（openai/codex#14204 官方说明；#494 的交错 A/B 实测在回传 `default` 时仍有约 1.5× 生成吞吐提升）。因此"上游回传 Tier"仅反映上游申报值，不能单独用于判断加速是否生效；`BillingTierPolicy=actual` 下此类请求按标准价计费。
 
 **Base URL:** `http://localhost:8080` (默认端口)
 
@@ -253,11 +256,61 @@ data: [DONE]
 }
 ```
 
+#### Grok 生图（grok-imagine 系列）
+
+同一个 `/v1/images/generations` / `/v1/images/edits` 端点也接受 Grok Imagine 模型，按模型名自动分派到 Grok 媒体上游（官方 REST），响应为标准 OpenAI Images 形状原样透传。
+
+**可用模型:**
+
+| 模型 | 说明 |
+| --- | --- |
+| `grok-imagine-image` | 标准档生图 |
+| `grok-imagine-image-quality` | 质量档生图（`grok-imagine` 是它的别名） |
+
+**Grok 专属参数:**
+
+| 参数 | 说明 |
+| --- | --- |
+| `aspect_ratio` | 宽高比，如 `16:9` / `1:1` |
+| `resolution` | `1k` / `2k`；未显式给出时，`size` 任一边 ≥2048 自动映射为 `2k`（`size` 字段本身不发给上游） |
+| `quality` | 上游质量档位 |
+| `n` | 生成张数 |
+| `response_format` | `url` / `b64_json` |
+
+**请求示例:**
+
+```json
+{
+  "model": "grok-imagine-image",
+  "prompt": "a red apple on a wooden table, studio lighting",
+  "response_format": "url",
+  "n": 1
+}
+```
+
+**响应示例（上游原样透传，含成本信息）:**
+
+```json
+{
+  "data": [
+    { "url": "https://imgen.x.ai/xai-imgen/....jpeg", "mime_type": "image/jpeg" }
+  ],
+  "usage": { "cost_in_usd_ticks": 200000000 }
+}
+```
+
+**注意事项:**
+
+- 需要**付费 Grok 账号**（API Key 或 SuperGrok/Heavy 等付费 OAuth 订阅）；free 计划账号上游直接 403。调度层优先选择付费凭据账号。
+- 不支持 `stream=true`（返回 400）。
+- 编辑（`/v1/images/edits`）源图最多 **3 张**（`images[].image_url` 支持 https URL 与 data URL）。
+- `upstream_channel=codex` 的 API Key 无法调用 grok-imagine 模型（403）。
+
 #### 编辑图片
 
 **端点:** `POST /v1/images/edits`
 
-**说明:** 支持 JSON `images[].image_url` 和 multipart `image` / `image[]` 上传。`mask.image_url` 或 multipart `mask` 可用于遮罩编辑。
+**说明:** 支持 JSON `images[].image_url` 和 multipart `image` / `image[]` 上传。`mask.image_url` 或 multipart `mask` 可用于遮罩编辑（遮罩仅 gpt-image 系列支持）。
 
 **JSON 请求示例:**
 
@@ -287,7 +340,91 @@ data: [DONE]
 }
 ```
 
-### 4. List Models
+### 4. Videos (Grok 生视频)
+
+基于 Grok Imagine 的视频生成，异步任务模式：创建返回 `request_id`，客户端轮询状态，产物经网关代理下载。需要**付费 Grok 账号**（free 计划上游 403）。
+
+**可用模型与操作支持矩阵**（上游实测）:
+
+| 操作 | `grok-imagine-video` | `grok-imagine-video-1.5` |
+| --- | --- | --- |
+| generations | ✓ | ✓（默认） |
+| edits | ✓（默认） | ✗ 上游 400 "not supported for this model" |
+| extensions | ✓（默认） | ✗ 同上 |
+
+`model` 省略时按操作自动选默认模型；xAI 公开 API 上的 `grok-imagine-video-1.5-preview` 也接受，转发时自动归一。
+
+#### 创建视频任务
+
+**端点:**
+
+- `POST /v1/videos/generations` — 文生视频 / 图生视频
+- `POST /v1/videos/edits` — 视频编辑（`video` 字段必填）
+- `POST /v1/videos/extensions` — 视频延展（`video` 字段必填）
+
+**请求参数:**
+
+| 参数 | 说明 |
+| --- | --- |
+| `model` | 可省略，generations 默认 `grok-imagine-video-1.5`，edits/extensions 默认 `grok-imagine-video` |
+| `prompt` | 提示词（generations 无图片输入时必填） |
+| `duration` | 时长秒数，1–15，默认 8 |
+| `resolution` | `480p` / `720p` / `1080p`（1080p 仅 1.5 且无参考图） |
+| `aspect_ratio` | 如 `16:9` / `9:16` / `1:1` |
+| `image` | 首帧图（图生视频），`{"url": "https://... 或 data:..."}` |
+| `reference_images` | 参考图数组（最多 7 张，与 `image` 互斥），元素为 URL 字符串或 `{"url": ...}` |
+| `video` | edits/extensions 的源视频，`{"url": ...}` |
+
+**请求示例:**
+
+```json
+{
+  "model": "grok-imagine-video-1.5",
+  "prompt": "ocean waves rolling onto a sandy beach at sunset, cinematic",
+  "duration": 4,
+  "resolution": "480p",
+  "aspect_ratio": "16:9"
+}
+```
+
+**响应:** `{"request_id": "1a293702-..."}`
+
+#### 查询任务状态
+
+**端点:** `GET /v1/videos/:request_id`
+
+由客户端轮询（建议间隔 2–5 秒）。状态机：`pending → done | failed | expired`。进行中响应形如 `{"status":"pending","progress":42}`（上游以 202 返回，网关统一按 200 透传，客户端只需看 `status` 字段）。**必须用创建任务的同一个 API Key 查询**，否则 404；任务绑定创建时选中的上游账号，绑定有效期 24 小时。
+
+**完成响应示例:**
+
+```json
+{
+  "status": "done",
+  "progress": 100,
+  "model": "grok-imagine-video-1.5",
+  "video": {
+    "url": "http://<gateway>/v1/videos/1a293702-.../content",
+    "duration": 4,
+    "respect_moderation": true
+  },
+  "usage": { "cost_in_usd_ticks": 3200000000 }
+}
+```
+
+`video.url` 已被重写为网关自己的 `/content` 代理地址（上游签名 URL 会过期，统一走网关下载）。
+
+#### 下载视频产物
+
+**端点:** `GET /v1/videos/:request_id/content`
+
+返回 `video/mp4` 字节流，支持 `Range` 请求（206）。网关优先匿名拉取上游签名资产 URL（仅限官方资产域白名单、禁跳转），失败时回退带凭据的上游下载端点。
+
+**注意事项:**
+
+- 网关不做后台轮询与产物落盘；重启后（内存缓存模式）或超过 24 小时，任务绑定丢失，状态查询返回 404。Redis 部署的绑定跨实例、跨重启有效。
+- `upstream_channel=codex` 的 API Key 无法调用视频端点（403）。
+
+### 5. List Models
 
 **端点:** `GET /v1/models`
 
@@ -305,12 +442,32 @@ data: [DONE]
     { "id": "gpt-5.3-codex", "object": "model", "owned_by": "openai" },
     { "id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai" },
     { "id": "gpt-5.2", "object": "model", "owned_by": "openai" },
-    { "id": "gpt-image-2", "object": "model", "owned_by": "openai" }
+    { "id": "gpt-image-2", "object": "model", "owned_by": "openai" },
+    { "id": "grok-imagine-image", "object": "model", "owned_by": "xai" },
+    { "id": "grok-imagine-video-1.5", "object": "model", "owned_by": "xai" }
   ]
 }
 ```
 
-### 5. Health Check
+池内存在 Grok 账号时会一并列出其文本模型（如 `grok-4.6`）与媒体模型（`grok-imagine-*`）。媒体模型与账号的文本模型白名单相互独立：白名单只声明文本模型不会关闭媒体能力；白名单里显式写了 `grok-imagine` 条目时以声明为准收窄。
+
+#### Grok 的 GPT 兼容别名
+
+Grok 账号编辑页支持账号级模型映射，可让只请求 GPT 模型名的客户端改走 Grok。例如：
+
+```json
+{
+  "gpt-5.5": "grok-4.5",
+  "gpt-5.4": "grok-4.5",
+  "gpt-5.3-codex": "grok-4.5"
+}
+```
+
+推荐逐个配置精确别名，不要默认使用 `gpt-*`，以免把未来的专用或媒体模型也纳入映射。别名目标必须存在于该 Grok 账号的可见模型目录中；显式 `models` 白名单会进一步收窄目标，隐藏或目录外模型不会因映射重新开放。账号尚未同步目录且未声明白名单时，仅使用保守的 Grok 默认模型集。满足这些条件的精确别名会出现在该 API Key 的 `GET /v1/models` 结果中。
+
+映射适用于普通 HTTP `POST /v1/responses`、`POST /v1/chat/completions` 和 `POST /v1/messages`。Responses WebSocket 与 `/v1/responses/compact` 不会路由到 Grok。Codex 客户端的 function、namespace、custom、deferred `additional_tools` 和 `tool_search` 可经现有协议桥接；Web Search、File Search、Code Interpreter、Shell、MCP、图片生成等托管工具仍取决于具体 Grok 上游及协议能力，不能仅靠模型别名获得 OpenAI 后端的等价能力。
+
+### 6. Health Check
 
 **端点:** `GET /health`
 
@@ -378,6 +535,9 @@ data: [DONE]
       "id": 1,
       "name": "account-1",
       "email": "user@example.com",
+      "token_workspace_id": "personal-workspace-id",
+      "workspace_id_override": "team-workspace-id",
+      "effective_workspace_id": "team-workspace-id",
       "plan_type": "pro",
       "status": "ready",
       "health_tier": "healthy",
@@ -435,6 +595,9 @@ data: [DONE]
 | base_concurrency_effective | integer      | 当前生效的基础并发值                                              |
 | skip_warm_tier             | bool         | 是否跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
 | allowed_api_key_ids        | integer[]    | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
+| token_workspace_id         | string       | Token 中识别出的默认工作区 ID                                    |
+| workspace_id_override      | string       | `Chatgpt-Account-Id` 指定的目标工作区；未指定时为空               |
+| effective_workspace_id     | string       | 实际路由工作区；优先使用覆盖值，否则使用 Token 默认工作区         |
 | credit_enabled             | bool         | 是否为信用计费模式账号                                            |
 | credit_skip_usage_window   | bool         | 是否跳过 7 天/5 小时用量窗口惩罚                                  |
 | billed_5h                  | number/null  | 过去 5 小时窗口内的累计计费金额（USD）                            |
@@ -561,6 +724,35 @@ data: [DONE]
 }
 ```
 
+#### POST /api/admin/accounts/grok/batch-models
+
+批量替换 Grok 账号的模型白名单。`ids` 会自动去重；非 Grok 或不存在的账号计入 `failed`，不中断整批。空数组表示清空显式白名单，之后按账号可见目录或首次同步前的保守默认模型集准入。
+
+**请求:**
+
+```json
+{
+  "ids": [1, 2, 3],
+  "models": ["grok-4.5"]
+}
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| ids | integer[] | 是 | 要更新的 Grok 账号 ID |
+| models | string[] | 否 | 替换后的模型白名单；省略或空数组表示清空显式白名单并恢复目录/默认集准入 |
+
+**响应:**
+
+```json
+{
+  "message": "已更新 3 个账号，失败 0 个",
+  "success": 3,
+  "failed": 0,
+  "models": ["grok-4.5"]
+}
+```
+
 #### POST /api/admin/accounts
 
 添加 Refresh Token 账号（支持批量）。
@@ -571,7 +763,10 @@ data: [DONE]
 {
   "name": "my-account",
   "refresh_token": "rt_xxxxxxxxxxxx",
-  "proxy_url": "http://proxy.example.com:8080"
+  "proxy_url": "http://proxy.example.com:8080",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "team-workspace-id"
+  }
 }
 ```
 
@@ -582,6 +777,9 @@ data: [DONE]
 | name          | string | 否   | 账号名称，批量时自动追加序号，默认 `account-{n}`       |
 | refresh_token | string | 是   | Refresh Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url     | string | 否   | 代理 URL                                               |
+| custom_headers | object | 否   | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
+
+同一份 RT 可以分别以“默认工作区”和多个 `Chatgpt-Account-Id` 路由加入账号池。额度、冷却、调度和统计按账号记录独立维护；同一登录身份下的相同目标工作区仍会去重。
 
 批量添加（使用换行分隔）:
 
@@ -635,7 +833,10 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 {
   "name": "my-at-account",
   "access_token": "eyJhbGciOiJSUzI1NiIs...",
-  "proxy_url": "http://proxy.example.com:8080"
+  "proxy_url": "http://proxy.example.com:8080",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "team-workspace-id"
+  }
 }
 ```
 
@@ -646,6 +847,9 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 | name         | string | 否   | 账号名称，批量时自动追加序号，默认 `at-account-{n}`   |
 | access_token | string | 是   | Access Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url    | string | 否   | 代理 URL                                              |
+| custom_headers | object | 否 | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
+
+同一个 AT 可以按不同目标工作区保存为多条独立路由。对于无法从 AT 解析登录身份的情况，系统至少会按“AT 原文 + 目标工作区”避免同一路由重复写入。
 
 批量添加:
 
@@ -1265,6 +1469,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 0,
   "transport_retry_policy": "rotate",
+  "codex_fingerprint_default_mode": "off",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
@@ -1301,6 +1506,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 500,
   "transport_retry_policy": "sticky",
+  "codex_fingerprint_default_mode": "session",
   "response_cache_local_max_bytes": 134217728,
   "response_cache_local_max_entry_bytes": 8388608,
   "response_cache_reconstruct_max_bytes": 134217728
@@ -1308,6 +1514,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 ```
 
 **响应:** 更新后的完整设置对象
+
+`codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
 
 Responses 上下文缓存字段使用原始字节数：
 
@@ -1370,11 +1578,11 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### DELETE /api/admin/proxies/:id
 
-删除代理。
+删除代理，并清空仍引用该 URL 的账号绑定。提交后立即从当前进程的运行时代理池剔除；若数据库快照重载失败，接口返回 HTTP `500` 和已完成的 `deleted` / `unbound` 数量，但不会把已删除代理重新投入调度。
 
 #### PATCH /api/admin/proxies/:id
 
-更新代理。
+更新代理。禁用会立刻从运行时代理池剔除该 URL，但保留账号上的 `proxy_url` 绑定——这些账号在重新启用前不会改走其它代理，也不会直连。修改 URL 时，仍指向旧 URL 的账号绑定会改写为新 URL。
 
 **请求:**
 
@@ -1387,7 +1595,7 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### POST /api/admin/proxies/batch-delete
 
-批量删除代理。
+批量删除代理，并解绑仍引用这些 URL 的账号。重载失败时的语义与单条删除相同。
 
 **请求:**
 

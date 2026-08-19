@@ -14,6 +14,8 @@ import type {
   AddOpenAIResponsesAccountRequest,
   AddGrokAccountRequest,
   UpdateGrokAccountRequest,
+  BatchUpdateGrokModelsRequest,
+  BatchUpdateGrokModelsResponse,
   FetchGrokModelsResponse,
   GrokDeviceStartRequest,
   GrokDeviceStartResponse,
@@ -23,6 +25,9 @@ import type {
   GrokSSOImportResponse,
   GrokBatchImportRequest,
   GrokBatchImportResponse,
+  GrokAccountState,
+  GrokStateSyncResponse,
+  GrokCapabilityProbeResponse,
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
@@ -30,6 +35,11 @@ import type {
   APIKeyScopeUsageItem,
   APIKeyScopeSummaryItem,
   AccountsResponse,
+  AccountAnalysisResponse,
+  AccountsPageParams,
+  AccountsPageResponse,
+  AccountPageStatsResponse,
+  AccountLiveStateResponse,
   ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
@@ -51,6 +61,8 @@ import type {
   MessageResponse,
   ModelSyncResponse,
   ModelPricingOverride,
+	OfficialPricingSyncConfig,
+	OfficialPricingSyncResult,
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
@@ -59,6 +71,7 @@ import type {
   PromptFilterLog,
   PromptFilterLogsResponse,
 	PromptPolicyIncidentDetailResponse,
+	PromptPolicyAuditHealth,
 	PromptPolicyIncidentsResponse,
   PromptFilterNewAPIBinding,
   PromptFilterNewAPIBindingsResponse,
@@ -67,9 +80,11 @@ import type {
   PromptFilterTestResponse,
   PromptReviewTestRequest,
   PromptReviewTestResponse,
+  PromptReviewAPIKeysResponse,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
+  WhamDailyUsageResponse,
   RuntimeStatusResponse,
   SiteBranding,
   StatsResponse,
@@ -88,7 +103,9 @@ import type {
   UsageLogsPagedResponse,
   UsageStats,
   AccountGroup,
+  AccountRow,
   AccountGroupsResponse,
+  AccountOperationSelector,
   AccountHealthBarsResponse,
   BatchUpdateAccountsRequest,
   BackgroundUploadResponse,
@@ -556,6 +573,39 @@ export const api = {
     const qs = searchParams.toString()
     return request<AccountsResponse>(`/accounts${qs ? `?${qs}` : ''}`)
   },
+  getAccountsPage: (params: AccountsPageParams, signal?: AbortSignal) => {
+    const searchParams = new URLSearchParams({
+      view: 'page',
+      page: String(params.page),
+      page_size: String(params.pageSize),
+    })
+    if (params.channel) searchParams.set('channel', params.channel)
+    if (params.search?.trim()) searchParams.set('search', params.search.trim())
+    if (params.status && params.status !== 'all') searchParams.set('status', params.status)
+    if (params.plan && params.plan !== 'all') searchParams.set('plan', params.plan)
+    if (params.authKind && params.authKind !== 'all') searchParams.set('auth_kind', params.authKind)
+    if (params.tag) searchParams.set('tag', params.tag)
+    if (params.emailDomain) searchParams.set('email_domain', params.emailDomain)
+    if (params.groupInclude?.length) searchParams.set('group_include', params.groupInclude.join(','))
+    if (params.groupExclude?.length) searchParams.set('group_exclude', params.groupExclude.join(','))
+    if (params.ungrouped) searchParams.set('ungrouped', 'true')
+    if (params.healthTier) searchParams.set('health_tier', params.healthTier)
+    if (params.proxyUrl) searchParams.set('proxy_url', params.proxyUrl)
+    if (params.proxyFilter && params.proxyFilter !== 'all') searchParams.set('proxy_filter', params.proxyFilter)
+    if (params.sort) searchParams.set('sort', params.sort)
+    if (params.order) searchParams.set('order', params.order)
+    return request<AccountsPageResponse>(`/accounts?${searchParams.toString()}`, { signal })
+  },
+  getAccountAnalysis: (channel: 'codex' | 'grok' = 'codex', signal?: AbortSignal) =>
+    request<AccountAnalysisResponse>(`/accounts/analysis?channel=${channel}`, { signal }),
+  getAccountPageStats: (ids: number[], signal?: AbortSignal) => {
+    const query = new URLSearchParams({ ids: ids.join(',') })
+    return request<AccountPageStatsResponse>(`/accounts/page-stats?${query}`, { signal })
+  },
+  getAccountLiveState: (ids: number[], signal?: AbortSignal) => {
+    const query = new URLSearchParams({ ids: ids.join(',') })
+    return request<AccountLiveStateResponse>(`/accounts/live?${query}`, { signal })
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
@@ -601,6 +651,23 @@ export const api = {
     }),
   updateGrokAccount: (id: number, data: UpdateGrokAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/grok`, { method: 'PATCH', body: JSON.stringify(data) }),
+  batchUpdateGrokModels: (data: BatchUpdateGrokModelsRequest) =>
+    request<BatchUpdateGrokModelsResponse>('/accounts/grok/batch-models', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getGrokAccountState: (id: number, signal?: AbortSignal) =>
+    request<GrokAccountState>(`/accounts/${id}/grok/state`, { signal }),
+  syncGrokAccountState: (id: number) =>
+    request<GrokStateSyncResponse>(`/accounts/${id}/grok/sync`, {
+      method: 'POST',
+      timeoutMs: 120_000,
+    }),
+  probeGrokAccountCapabilities: (id: number) =>
+    request<GrokCapabilityProbeResponse>(`/accounts/${id}/grok/capabilities/probe`, {
+      method: 'POST',
+      timeoutMs: 180_000,
+    }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   updateAccountNote: (id: number, note: string) =>
@@ -618,6 +685,8 @@ export const api = {
     }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  getAccount: (id: number, signal?: AbortSignal) =>
+    request<AccountRow>(`/accounts/${id}`, { signal }),
   forceUsageProbe: () =>
     request<{ triggered: boolean; concurrency: number; reason?: string; mode?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
   refreshAccountUsage: (id: number) =>
@@ -693,8 +762,16 @@ export const api = {
     }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
   getResetCredits: (id: number) =>
     request<ResetCreditsDetailResponse>(`/accounts/${id}/reset-credits`),
-  getAccountHealthBars: () =>
-    request<AccountHealthBarsResponse>('/accounts/health-bars'),
+  // 官方结算用量历史。默认读本地快照；refresh 时先打上游回补保留窗口再返回。
+  getWhamDailyUsage: (id: number, days = 30, refresh = false) => {
+    const search = new URLSearchParams({ days: String(days) })
+    if (refresh) search.set('refresh', '1')
+    return request<WhamDailyUsageResponse>(`/accounts/${id}/wham-daily-usage?${search.toString()}`)
+  },
+  getAccountHealthBars: (ids: number[] = []) => {
+    const query = ids.length > 0 ? `?ids=${ids.join(',')}` : ''
+    return request<AccountHealthBarsResponse>(`/accounts/health-bars${query}`)
+  },
   sendInvite: (id: number, data: { emails?: string[]; emails_text?: string; program_id?: string; entrypoint?: string; proxy_url?: string; max_emails?: number }) =>
     request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
   getInviteEligibility: (id: number, params?: { program_id?: string; entrypoint?: string; proxy_url?: string }) => {
@@ -718,8 +795,11 @@ export const api = {
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   batchDeleteAccounts: (ids: number[]) =>
     request<{ message: string; deleted: number; success: number; failed: number }>('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
-  batchRefreshAccounts: (ids: number[]) =>
-    request<{ message: string; success: number; failed: number }>('/accounts/batch-refresh', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchRefreshAccounts: (target: number[] | AccountOperationSelector) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-refresh', {
+      method: 'POST',
+      body: JSON.stringify(Array.isArray(target) ? { ids: target } : { selector: target }),
+    }),
   getAccountUsage: (id: number, days?: number) => {
     const search = new URLSearchParams()
     if (typeof days === 'number') search.set('days', String(days))
@@ -755,7 +835,7 @@ export const api = {
     }),
   deletePromptFilterNewAPIBinding: (apiKeyId: number) =>
     request<MessageResponse>(`/prompt-filter/newapi-bindings/${apiKeyId}`, { method: 'DELETE' }),
-  getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
+  getOpsOverview: (signal?: AbortSignal) => request<OpsOverviewResponse>('/ops/overview', { signal }),
   getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
   getSystemUpdate: () => request<SystemUpdateInfo>('/system/update', { timeoutMs: 20_000 }),
   performSystemUpdate: () =>
@@ -1038,6 +1118,8 @@ export const api = {
 	},
 	getPromptPolicyIncident: (incidentId: string) =>
 		request<PromptPolicyIncidentDetailResponse>(`/prompt-policy/incidents/${encodeURIComponent(incidentId)}`),
+	getPromptPolicyAuditHealth: () =>
+		request<PromptPolicyAuditHealth>('/prompt-policy/incidents/health'),
 	clearPromptPolicyIncidents: () =>
 		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
 	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string } = {}) => {
@@ -1059,12 +1141,35 @@ export const api = {
 		request<{ policy: import('./types').PromptRiskTrustPolicy }>(`/prompt-policy/risk-profiles/${encodeURIComponent(subjectType)}/${encodeURIComponent(subjectKey)}/trust`, { method: 'PUT', body: JSON.stringify(data) }),
 	revokePromptRiskTrust: (subjectType: string, subjectKey: string) =>
 		request<{ policy: import('./types').PromptRiskTrustPolicy }>(`/prompt-policy/risk-profiles/${encodeURIComponent(subjectType)}/${encodeURIComponent(subjectKey)}/trust`, { method: 'DELETE' }),
-	unlockPromptConversation: (lockKey: string, reason = '管理员主动解锁') =>
-		request<{ lock: import('./types').PromptConversationLock }>(`/prompt-policy/conversation-locks/${encodeURIComponent(lockKey)}/unlock`, { method: 'POST', body: JSON.stringify({ reason }) }),
+	unlockPromptConversation: (lockKey: string, reason = '管理员主动解锁', scope: 'conversation' | 'user_cooldown' = 'conversation') =>
+		request<{ lock: import('./types').PromptConversationLock; scope: string; unlocked_count: number }>(`/prompt-policy/conversation-locks/${encodeURIComponent(lockKey)}/unlock`, { method: 'POST', body: JSON.stringify({ reason, scope }) }),
   testPromptFilter: (data: { text: string; endpoint?: string; model?: string }) =>
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
   testPromptReview: (data: PromptReviewTestRequest) =>
     request<PromptReviewTestResponse>('/prompt-filter/review/test', { method: 'POST', body: JSON.stringify(data) }),
+  listPromptReviewModels: (data: { base_url?: string; api_key?: string; timeout_seconds?: number }) =>
+    request<{ endpoint: string; models: string[] }>('/prompt-filter/review/models', { method: 'POST', body: JSON.stringify(data) }),
+  getPromptReviewAPIKeys: () =>
+    request<PromptReviewAPIKeysResponse>('/prompt-filter/review/keys'),
+  deletePromptReviewAPIKey: (keyID: string) =>
+    request<PromptReviewAPIKeysResponse>(`/prompt-filter/review/keys/${encodeURIComponent(keyID)}`, { method: 'DELETE' }),
+  listPromptReviewProfiles: () =>
+    request<import('./types').PromptReviewProfilesResponse>('/prompt-filter/review/profiles'),
+  savePromptReviewProfile: (data: {
+    id?: string
+    name: string
+    base_url: string
+    model: string
+    request_mode: string
+    api_key?: string
+    adapter_json: string
+    timeout_seconds: number
+  }) =>
+    request<import('./types').PromptReviewProfile>('/prompt-filter/review/profiles', { method: 'POST', body: JSON.stringify(data) }),
+  activatePromptReviewProfile: (id: string) =>
+    request<import('./types').PromptReviewProfile>(`/prompt-filter/review/profiles/${encodeURIComponent(id)}/activate`, { method: 'POST' }),
+  deletePromptReviewProfile: (id: string) =>
+    request<{ ok: boolean }>(`/prompt-filter/review/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   testPromptFilterRulePattern: (data: { pattern: string; text: string }) =>
     request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>
@@ -1113,6 +1218,9 @@ export const api = {
       sync_url: string
       default_sync_url: string
       models_dev_url: string
+		official_openai_url: string
+		official_xai_url: string
+		official_sync_config: OfficialPricingSyncConfig
     }>('/model-pricing'),
   updateModelPricing: (payload: { model: string; reset?: boolean; pricing?: ModelPricingOverride }) =>
     request<{ model: string; reset: boolean }>('/model-pricing', {
@@ -1124,10 +1232,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ url: url ?? '' }),
     }),
-  batchTestAccounts: (ids?: number[]) =>
+	updateOfficialPricingSyncConfig: (config: Pick<OfficialPricingSyncConfig, 'enabled' | 'interval_minutes' | 'include_openai' | 'include_grok'>) =>
+		request<OfficialPricingSyncConfig>('/model-pricing/official-sync/config', {
+			method: 'PUT',
+			body: JSON.stringify(config),
+		}),
+	syncOfficialModelPricing: (sources: { include_openai: boolean; include_grok: boolean }) =>
+		request<OfficialPricingSyncResult>('/model-pricing/official-sync', {
+			method: 'POST',
+			body: JSON.stringify(sources),
+			timeoutMs: 95000,
+		}),
+  batchTestAccounts: (target?: number[] | AccountOperationSelector) =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', {
       method: 'POST',
-      body: ids ? JSON.stringify({ ids }) : undefined,
+      body: target
+        ? JSON.stringify(Array.isArray(target) ? { ids: target } : { selector: target })
+        : undefined,
     }),
   cleanBanned: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-banned', { method: 'POST' }),

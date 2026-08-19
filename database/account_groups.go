@@ -21,8 +21,24 @@ type AccountGroup struct {
 	// ProxyURLs 是组级代理列表(issue #479):组内账号未配置自身代理时按
 	// 账号 ID 粘性使用其中一条;空列表表示不设置,回退到全局代理链。
 	ProxyURLs []string
+	// Channel 是分组渠道(codex/grok,issue #487):分组按渠道隔离,
+	// 成员写入路径会校验账号平台与组渠道一致。
+	Channel   string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+const (
+	AccountGroupChannelCodex = "codex"
+	AccountGroupChannelGrok  = "grok"
+)
+
+// NormalizeAccountGroupChannel 归一分组渠道,空/非法一律按 codex。
+func NormalizeAccountGroupChannel(channel string) string {
+	if strings.EqualFold(strings.TrimSpace(channel), AccountGroupChannelGrok) {
+		return AccountGroupChannelGrok
+	}
+	return AccountGroupChannelCodex
 }
 
 func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
@@ -31,6 +47,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 			COALESCE(COUNT(a.id), 0),
 			COALESCE(g.auto_pause_5h_threshold, 0), COALESCE(g.auto_pause_7d_threshold, 0),
 			COALESCE(g.proxy_urls, '[]'),
+			COALESCE(g.channel, 'codex'),
 			g.created_at, g.updated_at
 		FROM account_groups g
 		LEFT JOIN account_group_members m ON m.group_id = g.id
@@ -38,7 +55,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 			AND a.status <> 'deleted'
 			AND COALESCE(a.error_message, '') <> 'deleted'
 		GROUP BY g.id, g.name, g.description, g.color, g.sort_order, g.base_concurrency_override,
-			g.auto_pause_5h_threshold, g.auto_pause_7d_threshold, g.proxy_urls, g.created_at, g.updated_at
+			g.auto_pause_5h_threshold, g.auto_pause_7d_threshold, g.proxy_urls, g.channel, g.created_at, g.updated_at
 		ORDER BY g.sort_order, g.name`)
 	if err != nil {
 		return nil, err
@@ -48,10 +65,11 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 	for rows.Next() {
 		var g AccountGroup
 		var createdRaw, updatedRaw, proxyRaw interface{}
-		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.BaseConcurrencyOverride, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &proxyRaw, &createdRaw, &updatedRaw); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.BaseConcurrencyOverride, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &proxyRaw, &g.Channel, &createdRaw, &updatedRaw); err != nil {
 			return nil, err
 		}
 		g.ProxyURLs = decodeTagsValue(proxyRaw)
+		g.Channel = NormalizeAccountGroupChannel(g.Channel)
 		var parseErr error
 		g.CreatedAt, parseErr = parseDBTimeValue(createdRaw)
 		if parseErr != nil {
@@ -102,6 +120,8 @@ type UpdateAccountGroupOpts struct {
 	BaseConcurrencyOverride OptionalNullInt64
 	// ProxyURLs 为 nil 表示不修改;空切片表示清空组代理。
 	ProxyURLs *[]string
+	// Channel 为 nil 表示不修改;handler 层保证仅空组可改渠道。
+	Channel *string
 }
 
 func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, description, color *string, opts *UpdateAccountGroupOpts, sortOrder ...*int64) error {
@@ -144,6 +164,9 @@ func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, descriptio
 		if opts.ProxyURLs != nil {
 			add("proxy_urls", encodeTagsJSON(*opts.ProxyURLs))
 		}
+		if opts.Channel != nil {
+			add("channel", NormalizeAccountGroupChannel(*opts.Channel))
+		}
 	}
 	if len(sets) == 0 {
 		return nil
@@ -173,48 +196,49 @@ func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, descriptio
 
 func (db *DB) DeleteAccountGroup(ctx context.Context, id int64, force ...bool) error {
 	allowMembers := len(force) > 0 && force[0]
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	ph := "$1"
-	if db.isSQLite() {
-		ph = "?"
-	}
-	var count int64
-	memberCountQuery := `
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		ph := "$1"
+		if db.isSQLite() {
+			ph = "?"
+		}
+		var count int64
+		memberCountQuery := `
 		SELECT COUNT(*)
 		FROM account_group_members m
 		JOIN accounts a ON a.id = m.account_id
 		WHERE m.group_id = ` + ph + ` AND a.status <> 'deleted' AND COALESCE(a.error_message, '') <> 'deleted'`
-	if err := tx.QueryRowContext(ctx, memberCountQuery, id).Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 && !allowMembers {
-		return ErrAccountGroupNotEmpty
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id = "+ph, id); err != nil {
-		return err
-	}
-	if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), id); err != nil {
-		return err
-	}
-	if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), APIKeyScopeTypeGroup, id); err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx, "DELETE FROM account_groups WHERE id = "+ph, id)
+		if err := tx.QueryRowContext(ctx, memberCountQuery, id).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 && !allowMembers {
+			return ErrAccountGroupNotEmpty
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id = "+ph, id); err != nil {
+			return err
+		}
+		if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), id); err != nil {
+			return err
+		}
+		if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), APIKeyScopeTypeGroup, id); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, "DELETE FROM account_groups WHERE id = "+ph, id)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return tx.Commit()
+	return nil
 }
 
 func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite bool, groupID int64) error {
@@ -334,34 +358,35 @@ func containsInt64(slice []int64, target int64) bool {
 }
 
 func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []int64) error {
-	tx, err := db.conn.BeginTx(ctx, nil)
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		ph := "$1"
+		insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
+		if db.isSQLite() {
+			ph = "?"
+			insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE account_id = "+ph, accountID); err != nil {
+			return err
+		}
+		seen := make(map[int64]struct{}, len(groupIDs))
+		for _, gid := range groupIDs {
+			if gid <= 0 {
+				continue
+			}
+			if _, ok := seen[gid]; ok {
+				continue
+			}
+			seen[gid] = struct{}{}
+			if _, err := tx.ExecContext(ctx, insertQ, accountID, gid); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	ph := "$1"
-	insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
-	if db.isSQLite() {
-		ph = "?"
-		insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE account_id = "+ph, accountID); err != nil {
-		return err
-	}
-	seen := make(map[int64]struct{}, len(groupIDs))
-	for _, gid := range groupIDs {
-		if gid <= 0 {
-			continue
-		}
-		if _, ok := seen[gid]; ok {
-			continue
-		}
-		seen[gid] = struct{}{}
-		if _, err := tx.ExecContext(ctx, insertQ, accountID, gid); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }
 
 // BatchSetAccountGroups 在单个事务里把一批账号的分组归属整体替换成 groupIDs。
@@ -374,15 +399,13 @@ func (db *DB) BatchSetAccountGroups(ctx context.Context, accountIDs []int64, gro
 	if len(accountIDs) == 0 || len(groupIDs) == 0 {
 		return nil
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return db.batchReplaceAccountGroups(ctx, tx, accountIDs, groupIDs)
+	})
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if err := db.batchReplaceAccountGroups(ctx, tx, accountIDs, groupIDs); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }
 
 func (db *DB) GetAccountGroupIDs(ctx context.Context, accountID int64) ([]int64, error) {

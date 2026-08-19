@@ -14,8 +14,13 @@ import (
 )
 
 func resetReviewCircuitBreakers() {
+	reviewKeyCursor.Store(0)
 	reviewCircuitBreakers.Range(func(key, _ any) bool {
 		reviewCircuitBreakers.Delete(key)
+		return true
+	})
+	reviewKeyCooldowns.Range(func(key, _ any) bool {
+		reviewKeyCooldowns.Delete(key)
 		return true
 	})
 }
@@ -29,6 +34,35 @@ func TestDefaultReviewPromptIsProviderNeutralAndTreatsInputAsData(t *testing.T) 
 		if !strings.Contains(DefaultReviewSystemPrompt, fragment) {
 			t.Fatalf("default review prompt missing calibration fragment %q", fragment)
 		}
+	}
+}
+
+func TestReviewHTTPStatusErrorSummarizesHTMLWithoutLeakingPage(t *testing.T) {
+	error := (&reviewHTTPStatusError{
+		status: 502, contentType: "text/html; charset=UTF-8",
+		summary: summarizeReviewHTTPBody("text/html", []byte("<html>proxy failure details</html>")),
+	}).Error()
+	if !strings.Contains(error, "status 502") || !strings.Contains(error, "HTML error page") {
+		t.Fatalf("error = %q, want status and HTML guidance", error)
+	}
+	if strings.Contains(error, "proxy failure details") {
+		t.Fatalf("error leaked upstream HTML body: %q", error)
+	}
+}
+
+func TestReviewTextReportsHTMLUpstreamErrorsBriefly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("<html><title>fanrenapi.com | 502: Bad gateway</title></html>"))
+	}))
+	defer server.Close()
+	client := ReviewClient{HTTPClient: server.Client()}
+	_, err := client.ReviewTextDetailed(context.Background(), "hello", ReviewConfig{
+		Enabled: true, APIKey: "test-key", BaseURL: server.URL, Model: "omni-moderation-latest", TimeoutSeconds: 2,
+	})
+	if err == nil || !strings.Contains(err.Error(), "HTML error page") || strings.Contains(err.Error(), "fanrenapi.com") {
+		t.Fatalf("unexpected upstream error: %v", err)
 	}
 }
 
@@ -249,6 +283,7 @@ func TestReviewCircuitBreakerFailsFastAndRecovers(t *testing.T) {
 		Model:          "review-model",
 		TimeoutSeconds: 2,
 		Adapter: ReviewAdapterConfig{
+			RequestMode:            ReviewRequestModeModerations,
 			CircuitBreakerFailures: 1,
 			CircuitBreakerSeconds:  30,
 		},
@@ -257,8 +292,8 @@ func TestReviewCircuitBreakerFailsFastAndRecovers(t *testing.T) {
 	if _, err := client.ReviewTextDetailed(context.Background(), "test", cfg); err == nil {
 		t.Fatal("first failed review returned nil error")
 	}
-	if _, err := client.ReviewTextDetailed(context.Background(), "test", cfg); err == nil || !strings.Contains(err.Error(), "circuit breaker is open") {
-		t.Fatalf("second review error = %v, want open circuit", err)
+	if _, err := client.ReviewTextDetailed(context.Background(), "test", cfg); err == nil || !strings.Contains(err.Error(), "key pool temporarily unavailable") {
+		t.Fatalf("second review error = %v, want unavailable key pool", err)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("open circuit reached upstream %d times, want 1", calls.Load())
@@ -276,6 +311,14 @@ func TestReviewCircuitBreakerFailsFastAndRecovers(t *testing.T) {
 	state.mu.Lock()
 	state.openUntil = time.Now().Add(-time.Second)
 	state.mu.Unlock()
+	keyValue, ok := reviewKeyCooldowns.Load(reviewKeyCooldownKey(endpoint, cfg.Model, "test-key"))
+	if !ok {
+		t.Fatal("review key cooldown state was not stored")
+	}
+	keyState := keyValue.(*reviewKeyCooldown)
+	keyState.mu.Lock()
+	keyState.until = time.Now().Add(-time.Second)
+	keyState.mu.Unlock()
 	failing.Store(false)
 	if _, err := client.ReviewTextDetailed(context.Background(), "test", cfg); err != nil {
 		t.Fatalf("half-open recovery probe failed: %v", err)
@@ -308,6 +351,7 @@ func TestReviewCircuitBreakerStopsQueuedRequestsBeforeUpstream(t *testing.T) {
 		Model:          "review-model",
 		TimeoutSeconds: 2,
 		Adapter: ReviewAdapterConfig{
+			RequestMode:            ReviewRequestModeModerations,
 			MaxConcurrent:          1,
 			CircuitBreakerFailures: 1,
 			CircuitBreakerSeconds:  30,
@@ -328,6 +372,254 @@ func TestReviewCircuitBreakerStopsQueuedRequestsBeforeUpstream(t *testing.T) {
 	wg.Wait()
 	if calls.Load() != 1 {
 		t.Fatalf("queued requests reached upstream %d times, want 1", calls.Load())
+	}
+}
+
+func TestReviewTextQuarantinesPaymentRequiredKeyAndUsesHealthyKeys(t *testing.T) {
+	resetReviewCircuitBreakers()
+	defer resetReviewCircuitBreakers()
+
+	var badCalls atomic.Int32
+	var goodCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer bad-key":
+			badCalls.Add(1)
+			http.Error(w, "payment required", http.StatusPaymentRequired)
+		case "Bearer good-key":
+			goodCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model": "review-model", "results": []map[string]any{{"flagged": false}},
+			})
+		default:
+			t.Fatalf("unexpected authorization header %q", r.Header.Get("Authorization"))
+		}
+	}))
+	defer server.Close()
+
+	cfg := ReviewConfig{
+		Enabled: true, APIKey: "bad-key\ngood-key", BaseURL: server.URL,
+		Model: "review-model", TimeoutSeconds: 2,
+		Adapter: ReviewAdapterConfig{RequestMode: ReviewRequestModeModerations},
+	}
+	client := ReviewClient{HTTPClient: server.Client()}
+	for range 3 {
+		if _, err := client.ReviewTextDetailed(context.Background(), "test", cfg); err != nil {
+			t.Fatalf("ReviewTextDetailed returned error: %v", err)
+		}
+	}
+	if badCalls.Load() != 1 {
+		t.Fatalf("quarantined 402 key was called %d times, want 1", badCalls.Load())
+	}
+	if goodCalls.Load() != 3 {
+		t.Fatalf("healthy key calls = %d, want 3", goodCalls.Load())
+	}
+}
+
+// 请求模式未显式配置时按模型推断:moderation 系列走 moderations,其余走
+// chat_completions;显式配置永远优先。
+func TestNormalizeReviewConfigInfersRequestModeFromModel(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+		mode  string
+		want  string
+	}{
+		{name: "default model infers chat", model: "", mode: "", want: ReviewRequestModeChatCompletions},
+		{name: "deepseek infers chat", model: "deepseek-v4-flash", mode: "", want: ReviewRequestModeChatCompletions},
+		{name: "moderation model stays moderations", model: "omni-moderation-latest", mode: "", want: ReviewRequestModeModerations},
+		{name: "explicit moderations retained", model: "deepseek-v4-flash", mode: ReviewRequestModeModerations, want: ReviewRequestModeModerations},
+		{name: "explicit chat retained", model: "omni-moderation-latest", mode: ReviewRequestModeChatCompletions, want: ReviewRequestModeChatCompletions},
+	}
+	for _, tc := range cases {
+		cfg := NormalizeReviewConfig(ReviewConfig{Model: tc.model, Adapter: ReviewAdapterConfig{RequestMode: tc.mode}})
+		if cfg.Adapter.RequestMode != tc.want {
+			t.Fatalf("%s: request mode = %q, want %q", tc.name, cfg.Adapter.RequestMode, tc.want)
+		}
+	}
+}
+
+func TestReviewModelsEndpoint(t *testing.T) {
+	cases := []struct {
+		base string
+		want string
+	}{
+		{base: "https://api.deepseek.com", want: "https://api.deepseek.com/v1/models"},
+		{base: "https://api.openai.com/v1", want: "https://api.openai.com/v1/models"},
+		{base: "https://gw.example.com/v1/chat/completions", want: "https://gw.example.com/v1/models"},
+		{base: "https://gw.example.com/v1/moderations", want: "https://gw.example.com/v1/models"},
+		{base: "https://gw.example.com/v1/models", want: "https://gw.example.com/v1/models"},
+		{base: "", want: DefaultReviewBaseURL + "/v1/models"},
+	}
+	for _, tc := range cases {
+		got, err := reviewModelsEndpoint(tc.base)
+		if err != nil {
+			t.Fatalf("reviewModelsEndpoint(%q): %v", tc.base, err)
+		}
+		if got != tc.want {
+			t.Fatalf("reviewModelsEndpoint(%q) = %q, want %q", tc.base, got, tc.want)
+		}
+	}
+	if _, err := reviewModelsEndpoint("ftp://example.com"); err == nil {
+		t.Fatal("non-http scheme was accepted")
+	}
+}
+
+func TestListReviewModelsFallsBackAcrossKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") == "Bearer bad-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"id": "deepseek-v4-flash"}, {"id": "deepseek-chat"}, {"id": "deepseek-chat"}},
+		})
+	}))
+	defer server.Close()
+	client := ReviewClient{HTTPClient: server.Client()}
+	models, endpoint, err := client.ListReviewModels(context.Background(), ReviewConfig{
+		APIKey: "bad-key\ngood-key", BaseURL: server.URL, TimeoutSeconds: 2,
+	})
+	if err != nil {
+		t.Fatalf("ListReviewModels: %v", err)
+	}
+	if endpoint != server.URL+"/v1/models" {
+		t.Fatalf("endpoint = %q", endpoint)
+	}
+	if len(models) != 2 || models[0] != "deepseek-chat" || models[1] != "deepseek-v4-flash" {
+		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestReviewKeyCooldownAllowsOnlyOneRecoveryProbe(t *testing.T) {
+	resetReviewCircuitBreakers()
+	defer resetReviewCircuitBreakers()
+	endpoint := "https://review.example/v1/chat/completions"
+	model := "review-model"
+	apiKey := "cooling-key"
+	quarantineReviewKey(endpoint, model, apiKey, http.StatusPaymentRequired, ReviewAdapterConfig{})
+	value, ok := reviewKeyCooldowns.Load(reviewKeyCooldownKey(endpoint, model, apiKey))
+	if !ok {
+		t.Fatal("quarantined key state was not stored")
+	}
+	state := value.(*reviewKeyCooldown)
+	state.mu.Lock()
+	state.until = time.Now().Add(-time.Second)
+	state.mu.Unlock()
+
+	first, _ := acquireReviewKeyCandidates(endpoint, model, []string{apiKey}, 0)
+	second, retryAfter := acquireReviewKeyCandidates(endpoint, model, []string{apiKey}, 0)
+	if len(first) != 1 || !first[0].probe {
+		t.Fatalf("first recovery candidate = %#v", first)
+	}
+	if len(second) != 0 || retryAfter != 0 {
+		t.Fatalf("concurrent recovery candidates = %#v retry=%s", second, retryAfter)
+	}
+	releaseReviewKeyProbe(endpoint, model, apiKey, ReviewAdapterConfig{CircuitBreakerSeconds: 5})
+	health := ReviewKeyPoolStatus(ReviewConfig{
+		Enabled: true, APIKey: apiKey, BaseURL: "https://review.example", Model: model,
+		Adapter: ReviewAdapterConfig{RequestMode: ReviewRequestModeChatCompletions},
+	})
+	if health.Configured != 1 || health.Available != 0 || health.CoolingDown != 1 || health.Probing != 0 || health.NextRetryAt == nil {
+		t.Fatalf("review key pool health = %+v", health)
+	}
+}
+
+func TestReviewTextAllKeysCoolingDownFailsFastWithoutCallingUpstream(t *testing.T) {
+	resetReviewCircuitBreakers()
+	defer resetReviewCircuitBreakers()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	cfg := ReviewConfig{
+		Enabled: true, APIKey: "bad-a\nbad-b", BaseURL: server.URL, Model: "review-model", TimeoutSeconds: 2,
+	}
+	endpoint, err := reviewEndpointForMode(cfg.BaseURL, NormalizeReviewConfig(cfg).Adapter.RequestMode)
+	if err != nil {
+		t.Fatalf("reviewEndpointForMode: %v", err)
+	}
+	for _, apiKey := range cfg.APIKeyList() {
+		quarantineReviewKey(endpoint, cfg.Model, apiKey, http.StatusPaymentRequired, cfg.Adapter)
+	}
+	if _, err := (ReviewClient{HTTPClient: server.Client()}).ReviewTextDetailed(context.Background(), "test", cfg); err == nil || !strings.Contains(err.Error(), "key pool temporarily unavailable") {
+		t.Fatalf("all-key outage error = %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("cooling key pool made %d upstream calls", calls.Load())
+	}
+	health := ReviewKeyPoolStatus(cfg)
+	if health.Available != 0 || health.CoolingDown != 2 || health.NextRetryAt == nil {
+		t.Fatalf("all-key outage health = %+v", health)
+	}
+}
+
+func TestReviewModelResponseErrorClearsKeyCooldown(t *testing.T) {
+	resetReviewCircuitBreakers()
+	defer resetReviewCircuitBreakers()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte("{not-json"))
+	}))
+	defer server.Close()
+	cfg := ReviewConfig{
+		Enabled: true, APIKey: "healthy-key", BaseURL: server.URL, Model: "review-model", TimeoutSeconds: 2,
+	}
+	endpoint, err := reviewEndpointForMode(cfg.BaseURL, NormalizeReviewConfig(cfg).Adapter.RequestMode)
+	if err != nil {
+		t.Fatalf("reviewEndpointForMode: %v", err)
+	}
+	// 模拟恢复探针路径：key 曾被隔离且冷却已到期。
+	quarantineReviewKey(endpoint, cfg.Model, "healthy-key", http.StatusPaymentRequired, cfg.Adapter)
+	value, ok := reviewKeyCooldowns.Load(reviewKeyCooldownKey(endpoint, cfg.Model, "healthy-key"))
+	if !ok {
+		t.Fatal("quarantined key state was not stored")
+	}
+	state := value.(*reviewKeyCooldown)
+	state.mu.Lock()
+	state.until = time.Now().Add(-time.Second)
+	state.mu.Unlock()
+	if _, err := (ReviewClient{HTTPClient: server.Client()}).ReviewTextDetailed(context.Background(), "test", cfg); err == nil {
+		t.Fatal("malformed review response unexpectedly succeeded")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("malformed-response attempts = %d, want 2", calls.Load())
+	}
+	// HTTP 2xx 已证明 key 健康：冷却应被清除而非重新计时。
+	health := ReviewKeyPoolStatus(cfg)
+	if health.Available != 1 || health.CoolingDown != 0 || health.Probing != 0 {
+		t.Fatalf("review key pool health = %+v, want key available again", health)
+	}
+}
+
+func TestReviewTextQuarantinesAllServerErrorKeys(t *testing.T) {
+	resetReviewCircuitBreakers()
+	defer resetReviewCircuitBreakers()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	cfg := ReviewConfig{
+		Enabled: true, APIKey: "server-a\nserver-b", BaseURL: server.URL, Model: "review-model", TimeoutSeconds: 2,
+		Adapter: ReviewAdapterConfig{CircuitBreakerFailures: 3, CircuitBreakerSeconds: 10},
+	}
+	if _, err := (ReviewClient{HTTPClient: server.Client()}).ReviewTextDetailed(context.Background(), "test", cfg); err == nil {
+		t.Fatal("all-server-error key pool unexpectedly succeeded")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("server-error key calls = %d, want 2", calls.Load())
+	}
+	health := ReviewKeyPoolStatus(cfg)
+	if health.Available != 0 || health.CoolingDown != 2 {
+		t.Fatalf("server-error key pool health = %+v", health)
 	}
 }
 

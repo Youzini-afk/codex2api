@@ -9,9 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	// Windows 与无 zoneinfo 的精简环境没有 IANA 时区库,内嵌兜底让 TZ=Asia/Shanghai
+	// 这类名字仍可解析(系统自带 zoneinfo 时优先用系统的)。issue #498。
+	_ "time/tzdata"
 
 	"github.com/codex2api/admin"
 	"github.com/codex2api/api"
@@ -30,6 +34,11 @@ import (
 //go:embed frontend/dist/*
 var frontendFS embed.FS
 
+func migrateOnlyEnabled() bool {
+	value := strings.TrimSpace(os.Getenv("CODEX_MIGRATE_ONLY"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
@@ -39,7 +48,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
-	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label())
+	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s, tz=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label(), time.Local)
 
 	// 2. 初始化数据库
 	if cfg.Database.AutoMigrateFromSQLite {
@@ -54,6 +63,10 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	if migrateOnlyEnabled() {
+		log.Println("数据库迁移完成，CODEX_MIGRATE_ONLY 已启用，进程退出")
+		return
+	}
 	switch cfg.Database.Driver {
 	case "sqlite":
 		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)
@@ -237,10 +250,7 @@ func main() {
 	case "memory":
 		tc = cache.NewMemory(redisPoolSize)
 	default:
-		redisAddr := cfg.Cache.Redis.Addr
-		if redisAddr == "" {
-			redisAddr = cfg.Cache.Redis.URL
-		}
+		redisAddr := redisConnectionTarget(cfg.Cache.Redis)
 		tc, err = cache.NewRedisWithOptions(cache.RedisOptions{
 			Addr:               redisAddr,
 			Username:           cfg.Cache.Redis.Username,
@@ -259,10 +269,7 @@ func main() {
 	case "memory":
 		log.Printf("%s 缓存已启用: pool_size=%d", cfg.Cache.Label(), redisPoolSize)
 	default:
-		redisTarget := cfg.Cache.Redis.Addr
-		if redisTarget == "" {
-			redisTarget = cfg.Cache.Redis.URL
-		}
+		redisTarget := redisConnectionTarget(cfg.Cache.Redis)
 		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), cache.RedactRedisAddr(redisTarget), redisPoolSize)
 	}
 	proxy.SetResponseContextCache(tc)
@@ -344,6 +351,10 @@ func main() {
 	adminHandler.StartAutoResetCredits(backgroundCtx)
 	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
 	adminHandler.StartGrokStatusProbe(backgroundCtx)
+	// 官方结算用量按天快照：上游只保留 7 天，不落库就永久丢失，长期历史全靠这个任务。
+	adminHandler.StartWhamDailyUsageProbe(backgroundCtx)
+	// 官方模型价目轮询默认关闭；启用后只在网络解析完成后做一次短数据库写入。
+	adminHandler.StartOfficialPricingSync(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -364,6 +375,16 @@ func main() {
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	// 账号导入端点(multipart 文件上传)单独放宽体积上限,默认 200MB,可用
+	// CODEX_MAX_IMPORT_BODY_SIZE_MB 覆盖。前端按大小分批发送,单批控制在此上限内。
+	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_IMPORT_BODY_SIZE_MB")); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			security.MaxImportBodySize = int64(mb) * 1024 * 1024
+		}
+	}
+	if security.MaxImportBodySize < int64(security.MaxRequestBodySize) {
+		security.MaxImportBodySize = int64(security.MaxRequestBodySize)
+	}
 	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
 	r.Use(security.RequestBodyDecompressor(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())
@@ -502,12 +523,29 @@ func main() {
 		c.Redirect(http.StatusFound, "/admin/")
 	})
 
-	// 健康检查
+	// 健康检查：只做非阻塞的尽力统计，避免账号热路径锁竞争拖死 liveness。
+	// 但账号池读锁连续超过门槛一次都拿不到时视为疑似死锁,降 503 让
+	// healthcheck 重启实例——否则死锁实例会一直以 200 留在服务里。
+	healthProbe := &healthLockProbe{}
 	r.GET("/health", func(c *gin.Context) {
+		available, total, countsComplete := store.HealthCountsNonBlocking()
+		blocked := healthProbe.observe(total >= 0, time.Now())
+		if blocked >= healthStoreLockStallThreshold {
+			c.JSON(503, gin.H{
+				"status":          "unavailable",
+				"reason":          "account store lock stalled",
+				"blocked_seconds": int(blocked / time.Second),
+				"available":       available,
+				"total":           total,
+				"counts_complete": countsComplete,
+			})
+			return
+		}
 		c.JSON(200, gin.H{
-			"status":    "ok",
-			"available": store.AvailableCount(),
-			"total":     store.AccountCount(),
+			"status":          "ok",
+			"available":       available,
+			"total":           total,
+			"counts_complete": countsComplete,
 		})
 	})
 
@@ -573,6 +611,16 @@ func main() {
 	}
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
+}
+
+// redisConnectionTarget keeps a configured redis:// / rediss:// URL intact so
+// go-redis can retain its scheme, ACL username and TLS settings. Split host
+// fields remain the fallback for deployments that do not provide a URL.
+func redisConnectionTarget(cfg config.RedisConfig) string {
+	if rawURL := strings.TrimSpace(cfg.URL); rawURL != "" {
+		return rawURL
+	}
+	return strings.TrimSpace(cfg.Addr)
 }
 
 // configureTrustedProxies 配置 Gin 的可信代理列表。

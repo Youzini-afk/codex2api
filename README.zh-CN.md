@@ -564,6 +564,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | --- | --- |
 | `round_robin`（默认） | 按健康层级轮询可用账号，权重按调度分排序 |
 | `remaining_quota` | 优先使用用量较低的账号；用量相同时轮询 |
+| `fill_first` | 持续集中使用剩余额度最少的账号，耗尽或限流后再切换到下一个（A → B → C） |
 
 **信用账号**（单账号标记）：
 
@@ -632,11 +633,13 @@ codex2api/
 
 ## Star History
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
-  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-</picture>
+<a href="https://star-history.dera.page/#james-6-23/codex2api&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+  </picture>
+</a>
 
 ---
 

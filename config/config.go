@@ -2,11 +2,13 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -53,7 +55,7 @@ func (d *DatabaseConfig) DSN() string {
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		d.Host, d.Port, d.User, d.Password, d.DBName, sslMode)
 	if d.Schema != "" {
-		// 通过 libpq options 在连接启动时设置 search_path，覆盖连接池中的所有连接。
+		// 通过 PostgreSQL startup options 在连接启动时设置 search_path，覆盖连接池中的所有连接。
 		// schema 已在 Load() 阶段做白名单校验，此处可安全拼接。
 		dsn += fmt.Sprintf(" options='-c search_path=%s,public'", d.Schema)
 	}
@@ -108,6 +110,23 @@ type Config struct {
 	TrustedProxies         []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
 }
 
+// applyTimezone 让 TZ 环境变量(含 .env 里的)真正作用于自然日限额等本地时间语义。
+// Go 的 time.Local 在进程首次格式化本地时间时就已锁定(main 里 config.Load 之前的
+// 启动日志即触发),godotenv 事后 os.Setenv 无法再影响它,必须显式覆盖 time.Local。
+func applyTimezone() {
+	tz := strings.TrimSpace(os.Getenv("TZ"))
+	tz = strings.TrimPrefix(tz, ":") // POSIX 允许 ":Asia/Shanghai" 写法
+	if tz == "" {
+		return
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		log.Printf("警告: TZ=%q 无法解析(%v),继续使用 %s", tz, err, time.Local)
+		return
+	}
+	time.Local = loc
+}
+
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
 func Load(envPath string) (*Config, error) {
 	// 尝试加载 .env 文件（可选，如果文件不存在则忽略并使用当前环境变量）
@@ -115,6 +134,7 @@ func Load(envPath string) (*Config, error) {
 		envPath = ".env"
 	}
 	_ = godotenv.Load(envPath)
+	applyTimezone()
 
 	cfg := &Config{
 		Port:               8080,

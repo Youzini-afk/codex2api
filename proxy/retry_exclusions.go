@@ -121,6 +121,12 @@ func (r *retryAccountExclusions) MarkHard(accountID int64) {
 }
 
 func (r *retryAccountExclusions) MarkSoftFirstTokenTimeout(accountID int64) {
+	r.MarkSoft(accountID)
+}
+
+// MarkSoft 把账号加入本次请求的软排除集：调度选号时跳过它，但账号池试完后由
+// ResetSoft 清空重来，不会永久搁置请求。用于"重试时暂时避开该账号但不惩罚它"。
+func (r *retryAccountExclusions) MarkSoft(accountID int64) {
 	if r == nil || accountID == 0 {
 		return
 	}
@@ -153,18 +159,84 @@ func (r *retryAccountExclusions) ForSelection() map[int64]bool {
 }
 
 func (h *Handler) nextRetryAccountForSession(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false)
+}
+
+func (h *Handler) nextRetryAccountForContinuation(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true)
+}
+
+// reconcileGraceWait bounds how long a missed request waits for the shared
+// background reconciliation. Waiting on the single-flight done channel never
+// queues work behind the database scan; it only spends this request's own
+// latency budget, so it can afford to cover a realistic full-pool scan.
+const reconcileGraceWait = 2 * time.Second
+
+// maxReconcileReentries caps how many completed reconciliations a single
+// request may ride back into the selection loop, so continuous cross-process
+// churn cannot pin a request in the loop beyond its context lifetime.
+const maxReconcileReentries = 3
+
+func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
+	reconcileReentries := 0
 	for {
 		exclude := exclusions.ForSelection()
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
+		var account *auth.Account
+		var stickyProxyURL string
+		if preserveBinding {
+			account, stickyProxyURL = h.store.NextForContinuationWithFilter(affinityKey, apiKeyID, exclude, filter)
+		} else {
+			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
+		}
 		if account != nil {
 			return account, stickyProxyURL
 		}
-		account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+		reconcileDone := h.store.TriggerDispatchStateReconcileAsync()
+		if preserveBinding {
+			account, stickyProxyURL = h.store.WaitForContinuationAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+		} else {
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+		}
 		if account != nil {
 			return account, stickyProxyURL
+		}
+		if reconcileDone == nil {
+			// The pre-wait trigger may have been throttled; after a long wait
+			// the in-memory state can be stale again, so give the post-wait
+			// moment one more chance to own or join a reconciliation.
+			reconcileDone = h.store.TriggerDispatchStateReconcileAsync()
+		}
+		// If the scheduler had no candidates and returned immediately, wait a
+		// bounded grace period for the shared background reconciliation, then
+		// re-enter the full selection loop (including the availability wait)
+		// so a repaired pool restores the old queueing semantics instead of
+		// granting a single immediate re-check. Requests never queue behind
+		// the database scan itself.
+		if reconcileDone != nil && reconcileReentries < maxReconcileReentries && ctx.Err() == nil {
+			timer := time.NewTimer(reconcileGraceWait)
+			reconciled := false
+			select {
+			case <-reconcileDone:
+				reconciled = true
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if reconciled && ctx.Err() == nil {
+				reconcileReentries++
+				continue
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, ""
 		}
 		if !exclusions.ResetSoft() {
 			return nil, ""

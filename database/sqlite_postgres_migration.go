@@ -17,8 +17,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"github.com/lib/pq"
 )
 
 const sqlitePostgresMigrationName = "sqlite-to-postgres-v1"
@@ -37,14 +35,17 @@ type Options struct {
 // order. Parent/singleton tables precede child and high-volume audit tables.
 var sqlitePostgresBusinessTables = []string{
 	"accounts",
+	"account_daily_usage",
 	"account_groups",
 	"proxies",
 	"system_settings",
+	"official_pricing_sync_config",
 	"model_registry",
 	"model_registry_sync",
 	"usage_stats_baseline",
 	"image_prompt_templates",
 	"prompt_rule_candidates",
+	"prompt_review_profiles",
 	"account_group_members",
 	"account_model_cooldowns",
 	"usage_logs",
@@ -97,7 +98,7 @@ func withPostgresSchemaDSN(dsn, schema string) (string, error) {
 	// search_path is parsed as a PostgreSQL identifier list, so an unquoted
 	// mixed-case schema would be folded to lower case. Quote the configured
 	// identifier exactly as the CREATE SCHEMA path does.
-	option := "-c search_path=" + pq.QuoteIdentifier(schema) + ",public"
+	option := "-c search_path=" + quotePostgresIdent(schema) + ",public"
 	trimmedDSN := strings.TrimSpace(dsn)
 	if strings.HasPrefix(trimmedDSN, "postgres://") || strings.HasPrefix(trimmedDSN, "postgresql://") {
 		parsed, err := url.Parse(trimmedDSN)
@@ -379,7 +380,7 @@ func requireEmptyExistingMigrationTarget(ctx context.Context, queryer interface 
 	rows, err := queryer.QueryContext(ctx, `
 		SELECT table_name FROM information_schema.tables
 		WHERE table_schema=$1 AND table_name=ANY($2)
-		ORDER BY table_name`, schema, pq.Array(sqlitePostgresBusinessTables))
+		ORDER BY table_name`, schema, sqlitePostgresBusinessTables)
 	if err != nil {
 		return fmt.Errorf("discover existing PostgreSQL migration target tables: %w", err)
 	}
@@ -565,7 +566,7 @@ func resolveMigrationTargetSchema(ctx context.Context, queryer interface {
 }
 
 func qualifiedMigrationTable(schema, table string) string {
-	return pq.QuoteIdentifier(schema) + "." + pq.QuoteIdentifier(table)
+	return quotePostgresIdent(schema) + "." + quotePostgresIdent(table)
 }
 
 func lockMigrationTargetTables(ctx context.Context, tx *sql.Tx, schema string) error {
@@ -661,7 +662,7 @@ func loadMigrationTargetColumns(ctx context.Context, tx *sql.Tx, schema string) 
 		       (is_identity='YES')
 		FROM information_schema.columns
 		WHERE table_schema=$1 AND table_name=ANY($2) AND is_generated='NEVER'
-		ORDER BY table_name, ordinal_position`, schema, pq.Array(sqlitePostgresBusinessTables))
+		ORDER BY table_name, ordinal_position`, schema, sqlitePostgresBusinessTables)
 	if err != nil {
 		return nil, fmt.Errorf("load PostgreSQL migration columns: %w", err)
 	}
@@ -731,7 +732,7 @@ func copyMigrationTable(ctx context.Context, sourceTx, targetTx *sql.Tx, schema,
 	quotedColumns := make([]string, len(intersection))
 	identityOverride := false
 	for i, column := range intersection {
-		quotedColumns[i] = pq.QuoteIdentifier(column.Name)
+		quotedColumns[i] = quotePostgresIdent(column.Name)
 		identityOverride = identityOverride || column.IsIdentity
 	}
 	sourceQuery := "SELECT " + strings.Join(quotedColumns, ", ") + " FROM " + quoteSQLiteMigrationIdentifier(table)
@@ -1024,7 +1025,7 @@ func resetMigrationSequences(ctx context.Context, tx *sql.Tx, schema string, tar
 			if !sequence.Valid || strings.TrimSpace(sequence.String) == "" {
 				continue
 			}
-			query := `SELECT setval($1::regclass, COALESCE(MAX(` + pq.QuoteIdentifier(column.Name) + `), 0) + 1, false) FROM ` + qualifiedTable
+			query := `SELECT setval($1::regclass, COALESCE(MAX(` + quotePostgresIdent(column.Name) + `), 0) + 1, false) FROM ` + qualifiedTable
 			if _, err := tx.ExecContext(ctx, query, sequence.String); err != nil {
 				return fmt.Errorf("reset PostgreSQL sequence for %s.%s: %w", table, column.Name, err)
 			}

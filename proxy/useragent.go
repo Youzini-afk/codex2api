@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/http"
 	"strings"
 	"unicode"
 )
@@ -123,6 +124,25 @@ func effectiveLatestCodexCLIVersion() string {
 
 func MinimalCodexCLIUserAgentForHeaders() string {
 	return replaceCodexUserAgentVersion(defaultCodexCLIUserAgent, effectiveLatestCodexCLIVersion())
+}
+
+// ApplyCodexModelDiscoveryHeaders applies the identity headers used by Codex
+// when it discovers models. Some Responses gateways apply their official
+// client policy to GET /v1/models before any request body exists, so the
+// installation ID cannot rely on client_metadata from /v1/responses.
+func ApplyCodexModelDiscoveryHeaders(headers http.Header, seed string) {
+	if headers == nil {
+		return
+	}
+	version := effectiveLatestCodexCLIVersion()
+	headers.Set("User-Agent", replaceCodexUserAgentVersion(defaultCodexCLIUserAgent, version))
+	headers.Set("Version", version)
+	headers.Set("Originator", Originator)
+	seed = strings.TrimSpace(seed)
+	if seed == "" {
+		seed = "default"
+	}
+	headers.Set(codexInstallationIDHeader, deriveStableCodexUUID("codex2api:model-discovery-installation:v1:"+seed))
 }
 
 func DefaultCodexUserAgentConfigJSON() string {
@@ -261,6 +281,13 @@ func codexUserAgentFromConfig(raw, versionFloor string) (userAgent, version stri
 		return "", "", false
 	}
 	if cfg.RawUserAgent != "" {
+		// raw UA 只贡献指纹形状；版本段可解析时抬升到当前生效的最新版
+		// （含远端同步值）再叠加最低版本门槛重建，避免照抄示例值后被钉死在旧版。
+		if _, rawVersion, parsed := parseCodexClientVersionDetails(cfg.RawUserAgent); parsed && rawVersion != "" {
+			rebuilt := effectiveCodexClientVersion(rawVersion, effectiveLatestCodexCLIVersion())
+			rebuilt = effectiveCodexClientVersion(rebuilt, versionFloor)
+			return replaceCodexUserAgentVersion(cfg.RawUserAgent, rebuilt), rebuilt, true
+		}
 		return cfg.RawUserAgent, codexVersionFromUserAgent(cfg.RawUserAgent, strings.TrimSpace(cfg.ClientVersion)), true
 	}
 	clientName := firstNonEmptyString(cfg.ClientName, latestCodexClientName)

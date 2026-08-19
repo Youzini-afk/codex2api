@@ -1,7 +1,9 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import type { ChangeEvent, ReactNode } from "react";
 import {
+  FolderOpen,
   Plus,
   RefreshCw,
   Trash2,
@@ -28,6 +30,7 @@ import {
   RotateCcw,
   Pencil,
   BarChart3,
+  Layers,
 } from "lucide-react";
 import { api, getAdminKey } from "../api";
 import type { ProxyRow } from "../api";
@@ -36,13 +39,26 @@ import type {
   AccountGroup,
   AccountRow,
   AccountHealthBucket,
+  AccountListSummary,
+  AccountOperationSelector,
   AddGrokAccountRequest,
+  BatchUpdateGrokModelsRequest,
   GrokSSOImportItem,
+  GrokAccountState,
+  GrokModelCatalogItem,
+  GrokProtocol,
+  AccountLiveStateResponse,
 } from "../types";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import RequestCountPills from "../components/RequestCountPills";
+import {
+  disabledAccountSurfaceClass,
+  disabledAccountTableRowClass,
+  renderDisabledAccountOverlay,
+} from "../components/AccountStateOverlay";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
-  accountMatchesGroupFilter,
+  isAccountGroupFilterEmpty,
   pruneAccountGroupFilter,
   type AccountGroupFilterValue,
 } from "../components/AccountGroupFilterSelect";
@@ -55,9 +71,11 @@ import Modal from "../components/Modal";
 import ModelLogo from "../components/ModelLogo";
 import OperationResultsModal from "../components/OperationResultsModal";
 import PageHeader from "../components/PageHeader";
+import { CompactStat } from "../components/CompactStat";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
+import { mergeAccountLiveState, useAccountLiveState } from "../hooks/useAccountLiveState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -80,15 +98,24 @@ import {
 import OperationProgressToast from "../components/OperationProgressToast";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
-import { resolveChannelBatchTestAccountIDs } from "../lib/accountOperationResults";
 import {
-  grokPlanFilterCategory,
   resolveAccountGrokPlan,
   type GrokPlanFilter,
 } from "../lib/grokPlan";
+import {
+  isLargePoolSortDisabled,
+  resolveDisabledAccountSorts,
+} from "../lib/accountListSort";
+import {
+  emptyModelMappingEntries,
+  parseModelMappingEntries,
+  serializeModelMappingEntries,
+  type ModelMappingEntry,
+} from "../lib/modelMapping";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
+  "grok-4.6",
   "grok-4.5",
   "grok-4",
   "grok-3-fast",
@@ -156,8 +183,9 @@ interface GrokRowHandlers {
   refresh: (account: AccountRow) => void;
   toggleEnabled: (account: AccountRow) => void;
   edit: (account: AccountRow) => void;
+  editGroups: (account: AccountRow) => void;
   remove: (account: AccountRow) => void;
-  usageRefreshed: () => void;
+  usageRefreshed: (account: AccountRow) => void;
 }
 
 function resolveAccountGroups(
@@ -170,6 +198,10 @@ function resolveAccountGroups(
 }
 
 function accountUsageSortValue(account: AccountRow): number {
+  const monthly = account.grok_billing?.monthly_percent;
+  if (typeof monthly === "number") return monthly;
+  const weekly = account.grok_billing?.weekly_percent;
+  if (typeof weekly === "number") return weekly;
   if (typeof account.usage_percent_7d === "number") return account.usage_percent_7d;
   if (typeof account.usage_percent_5h === "number") return account.usage_percent_5h;
   return -1;
@@ -192,12 +224,26 @@ function accountGroupSortKey(
   return sorted.map((g) => g.name).join("\0");
 }
 
-function GrokGroupChips({ groups }: { groups: AccountGroup[] }) {
-  if (groups.length === 0) return null;
+function GrokGroupChips({
+  groups,
+  onClick,
+  emptyLabel,
+}: {
+  groups: AccountGroup[];
+  onClick?: () => void;
+  emptyLabel?: string;
+}) {
+  if (groups.length === 0 && !onClick) return null;
   const visible = groups.slice(0, 3);
   const hidden = groups.length - visible.length;
-  return (
+  const content = (
     <>
+      {groups.length === 0 ? (
+        <span className="inline-flex items-center gap-1 rounded-md border border-dashed border-border px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
+          <Plus className="size-2.5" />
+          {emptyLabel}
+        </span>
+      ) : null}
       {visible.map((group) => {
         const color = normalizeGroupColor(group.color);
         return (
@@ -221,8 +267,27 @@ function GrokGroupChips({ groups }: { groups: AccountGroup[] }) {
           +{hidden}
         </span>
       ) : null}
+      {onClick && groups.length > 0 ? (
+        <Pencil className="mt-0.5 size-3 text-muted-foreground opacity-60 transition-opacity group-hover:opacity-100" />
+      ) : null}
     </>
   );
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className="group flex flex-wrap items-center gap-1 text-left"
+        onClick={(event) => {
+          event.stopPropagation();
+          onClick();
+        }}
+        title={emptyLabel}
+      >
+        {content}
+      </button>
+    );
+  }
+  return content;
 }
 
 const EMPTY_FORM: AddGrokAccountRequest = {
@@ -286,9 +351,9 @@ function GrokPlanBadge({
     );
   }
   const tone = plan.paid
-    ? "bg-amber-50 text-amber-800 ring-amber-600/20 dark:bg-amber-950 dark:text-amber-300 dark:ring-amber-400/20"
+    ? "bg-amber-500/10 text-amber-700 ring-amber-600/20 dark:bg-amber-500/20 dark:text-amber-300 dark:ring-amber-400/20"
     : plan.key === "free"
-      ? "bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-300 dark:ring-emerald-400/20"
+      ? "bg-emerald-500/10 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/20 dark:text-emerald-300 dark:ring-emerald-400/20"
       : "bg-muted text-muted-foreground ring-border";
   return (
     <span
@@ -342,7 +407,7 @@ function isAccountActive(account: AccountRow): boolean {
   );
 }
 
-export default function GrokAccounts({
+function GrokAccounts({
   headerSlot,
   showOperationResults = false,
   onShowOperationResultsChange,
@@ -354,6 +419,7 @@ export default function GrokAccounts({
 } = {}) {
   const { t } = useTranslation();
   const { showToast } = useToast();
+  const navigate = useNavigate();
   // 与 Codex 账号页一致：用系统自定义确认弹窗，不用 window.confirm。
   const { confirm, confirmDialog } = useConfirmDialog();
   // 批量测试的右上角进度浮层，与 Codex 账号页共用同一实现。
@@ -368,6 +434,12 @@ export default function GrokAccounts({
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 分组按渠道隔离(issue #487):Grok 页的分组选择器/筛选只出 grok 渠道分组;
+  // 徽标解析仍用全量,迁移前挂在 codex 组里的存量成员照常显示。
+  const grokGroups = useMemo(
+    () => allGroups.filter((group) => group.channel === "grok"),
+    [allGroups],
+  );
   // 导入/添加 Grok 账号时直接绑定的分组（与 Codex 账号页共用记忆，见 useImportGroupIds）。
   const {
     groupIds: importGroupIds,
@@ -379,6 +451,11 @@ export default function GrokAccounts({
   >({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [totalAccounts, setTotalAccounts] = useState(0);
+  const [serverSummary, setServerSummary] = useState<AccountListSummary | null>(null);
+  const [statsState, setStatsState] = useState<"ready" | "stale" | "warming">("warming");
+  const [disabledSorts, setDisabledSorts] = useState<string[]>([]);
+  const requestAbortRef = useRef<AbortController | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
 
   const [showAdd, setShowAdd] = useState(false);
@@ -447,15 +524,30 @@ export default function GrokAccounts({
 
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
+  const [quickGroupAccount, setQuickGroupAccount] = useState<AccountRow | null>(
+    null,
+  );
+  const [quickGroupIds, setQuickGroupIds] = useState<number[]>([]);
+  const [quickGroupSubmitting, setQuickGroupSubmitting] = useState(false);
   // 与 Codex 账号页一致：右侧详情 Sheet，按过滤后的列表顺序可左右切换。
   const [detailAccountId, setDetailAccountId] = useState<number | null>(null);
+  const [detailAccountData, setDetailAccountData] = useState<AccountRow | null>(null);
+  const [detailGrokState, setDetailGrokState] = useState<GrokAccountState | null>(null);
+  const [detailGrokStateLoading, setDetailGrokStateLoading] = useState(false);
+  const [detailGrokStateError, setDetailGrokStateError] = useState<string | null>(null);
+  const [detailGrokAction, setDetailGrokAction] = useState<"sync" | "probe" | null>(null);
+  const detailNavigationTargetRef = useRef<"first" | "last" | null>(null);
   const [batchTesting, setBatchTesting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [exporting, setExporting] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
+  const [batchModelsOpen, setBatchModelsOpen] = useState(false);
+  const [batchModelsDraft, setBatchModelsDraft] = useState<string[]>([]);
+  const [batchModelInput, setBatchModelInput] = useState("");
   const selectAllRef = useRef<HTMLInputElement>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [authFilter, setAuthFilter] = useState<AuthFilter>("all");
   const [planFilter, setPlanFilter] = useState<GrokPlanFilter>("all");
@@ -467,14 +559,37 @@ export default function GrokAccounts({
   const [cleaning, setCleaning] = useState(false);
   const [viewMode, setViewMode] = useState<GrokViewMode>(getInitialGrokViewMode);
   const isDesktop = useIsDesktop();
-  // 与 Codex 账号页一致：客户端分页 + 本地记忆每页条数，避免 Grok 号池过大时一次渲染卡死。
+  // 与 Codex 账号页一致：服务端分页 + 本地记忆每页条数。
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [page, setPage] = useState(1);
+  const [loadedPage, setLoadedPage] = useState(1);
   const [pageSize, setPageSize] = usePersistedPageSize(
     "grok-accounts",
     20,
     pageSizeOptions,
   );
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery);
+      setPage(1);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.listAccountGroups()
+      .then((response) => {
+        if (cancelled) return;
+        const groups = response.groups ?? [];
+        setAllGroups(groups);
+        setGroupFilter((current) => pruneAccountGroupFilter(current, groups));
+        pruneImportGroupIds(groups);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [pruneImportGroupIds]);
 
   useEffect(() => {
     try {
@@ -484,47 +599,139 @@ export default function GrokAccounts({
     }
   }, [viewMode]);
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (options?: { silent?: boolean }) => {
+    requestAbortRef.current?.abort();
+    const controller = new AbortController();
+    requestAbortRef.current = controller;
+    // silent 供后台补拉使用:不把整页切回 loading,避免统计追平时闪烁。
+    if (!options?.silent) setLoading(true);
     try {
-      // 服务端 channel=grok：不拉 Codex 全量，避免大号池下 Grok 页被拖垮。
-      const [res, groupsRes] = await Promise.all([
-        api.getAccounts({ channel: "grok" }),
-        api.listAccountGroups().catch(() => ({ groups: [] as AccountGroup[] })),
-      ]);
-      // 兜底再滤一次，兼容旧后端未识别 channel 时仍返回全量。
+      const res = await api.getAccountsPage({
+        channel: "grok",
+        page,
+        pageSize,
+        search: debouncedSearchQuery,
+        status: statusFilter,
+        authKind: authFilter,
+        plan: planFilter,
+        groupInclude: groupFilter.include,
+        groupExclude: groupFilter.exclude,
+        ungrouped: groupFilter.ungrouped,
+        sort: sortKey === "updated" ? "updated_at" : sortKey ?? undefined,
+        order: sortDir,
+      }, controller.signal);
+      if (controller.signal.aborted) return;
       const grokAccounts = (res.accounts ?? []).filter((a) => a.grok_api);
-      const groups = groupsRes.groups ?? [];
       setAccounts(grokAccounts);
-      setAllGroups(groups);
-      setGroupFilter((current) => pruneAccountGroupFilter(current, groups));
-      pruneImportGroupIds(groups);
+      setLoadedPage(res.page);
+      setTotalAccounts(res.total ?? 0);
+      setServerSummary(res.summary ?? null);
+      setStatsState(res.stats_state ?? "ready");
+      setDisabledSorts(res.disabled_sorts ?? []);
+      if (res.page !== page) setPage(res.page);
       // 选择集只保留仍然存在的账号，避免已删除账号残留在批量选择里。
-      setSelected((prev) => {
-        if (prev.size === 0) return prev;
-        const alive = new Set(grokAccounts.map((a) => a.id));
-        const next = new Set<number>();
-        for (const id of prev) if (alive.has(id)) next.add(id);
-        return next.size === prev.size ? prev : next;
-      });
       setError(null);
+      setLoading(false);
+      const pageIDs = grokAccounts.map((account) => account.id);
+      void api.getAccountHealthBars(pageIDs)
+        .then((bars) => {
+          if (!controller.signal.aborted) setHealthBars(bars.buckets ?? {});
+        })
+        .catch(() => undefined);
+      void api.getAccountPageStats(pageIDs, controller.signal)
+        .then((response) => {
+          if (controller.signal.aborted) return;
+          setAccounts((current) => current.map((account) => {
+            const stats = response.stats[String(account.id)];
+            return stats ? { ...account, ...stats } : account;
+          }));
+        })
+        .catch(() => undefined);
     } catch (err) {
+      if (controller.signal.aborted) return;
       const message = getErrorMessage(err);
       setError(message);
       showToast(message, "error");
+      setLoading(false);
     }
-    // 健康采样条 best-effort，失败不影响列表
-    try {
-      const bars = await api.getAccountHealthBars();
-      setHealthBars(bars.buckets ?? {});
-    } catch {
-      /* ignore */
+  }, [authFilter, debouncedSearchQuery, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, showToast, sortDir, sortKey, statusFilter]);
+
+  const refreshAccountRow = useCallback(async (id: number) => {
+    const account = await api.getAccount(id);
+    setAccounts((current) => current.map((item) => item.id === id ? account : item));
+    setDetailAccountData((current) => current?.id === id ? account : current);
+    return account;
+  }, []);
+  const refreshAfterAccountRemoval = useCallback((ids: number[]) => {
+    if (ids.length === 0) {
+      void reload({ silent: true });
+      return;
     }
-    setLoading(false);
-  }, [showToast]);
+    const drop = new Set(ids);
+    let remainingOnPage = 0;
+    setAccounts((current) => {
+      const next = current.filter((account) => !drop.has(account.id));
+      remainingOnPage = next.length;
+      return next;
+    });
+    setTotalAccounts((current) => Math.max(0, current - ids.length));
+    setServerSummary((current) =>
+      current
+        ? { ...current, total: Math.max(0, current.total - ids.length) }
+        : current,
+    );
+    if (remainingOnPage === 0 && page > 1) {
+      setPage(page - 1);
+      return;
+    }
+    void reload({ silent: true });
+  }, [page, reload]);
+  const visibleAccountIDs = useMemo(
+    () => accounts.map((account) => account.id),
+    [accounts],
+  );
+  const applyAccountLiveState = useCallback((response: AccountLiveStateResponse) => {
+    setAccounts((current) => mergeAccountLiveState(current, response));
+  }, []);
+  useAccountLiveState(visibleAccountIDs, applyAccountLiveState);
+  const loadAccountDetail = useCallback(
+    (account: AccountRow) =>
+      account.detail_loaded ? Promise.resolve(account) : api.getAccount(account.id),
+    [],
+  );
+  const openTestingAccount = useCallback((account: AccountRow) => {
+    void loadAccountDetail(account)
+      .then(setTestingAccount)
+      .catch((error) => showToast(getErrorMessage(error), "error"));
+  }, [loadAccountDetail, showToast]);
 
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  useEffect(() => () => requestAbortRef.current?.abort(), []);
+
+  // stats_state 补拉:与 Codex 页同理——统计缓存两层 stale-while-revalidate,
+  // 从 stale 转 ready 需要连续几次轮询;非 ready 时用 3s 短间隔静默追平,
+  // 带次数上限防后端统计查询持续失败时退化成常驻轮询。
+  const statsStaleRetriesRef = useRef(0);
+  useEffect(() => {
+    if (loading) return undefined;
+    if (statsState === "ready") {
+      statsStaleRetriesRef.current = 0;
+      return undefined;
+    }
+    const maxStatsRetries = disabledSorts.includes("requests") ? 60 : 5;
+    if (statsStaleRetriesRef.current >= maxStatsRetries) return undefined;
+    const timer = window.setTimeout(() => {
+      if (document.hidden) return;
+      statsStaleRetriesRef.current += 1;
+      void reload({ silent: true });
+    }, 3000);
+    return () => window.clearTimeout(timer);
+    // accounts 作为"每次响应都会变化"的信号:连续两次都返回 stale 时
+    // statsState 字符串不变,不依赖它定时器就不会被重新拉起。
+  }, [accounts, disabledSorts, loading, reload, statsState]);
 
   // 导入/添加账号后,后端的 billing 用量探针是异步的(OAuth 号还要先刷 AT,
   // 通常 2~10s 才写回)。导入完成那一刻 reload 拿到的还是没有用量的账号,
@@ -549,137 +756,49 @@ export default function GrokAccounts({
     [],
   );
 
-  const stats = useMemo(() => {
-    const total = accounts.length;
-    const active = accounts.filter(isAccountActive).length;
-    const rateLimited = accounts.filter(isAccountRateLimited).length;
-    const disabled = accounts.filter((a) => a.enabled === false).length;
-    const banned = accounts.filter(isAccountBanned).length;
-    const errorOnly = accounts.filter((a) => a.status === "error").length;
-    const oauth = accounts.filter((a) => a.grok_auth_kind === "oauth").length;
-    const apiKey = accounts.filter((a) => a.grok_auth_kind === "api_key").length;
-    return {
-      total,
-      active,
-      rateLimited,
-      disabled,
-      banned,
-      errorOnly,
-      oauth,
-      apiKey,
-    };
-  }, [accounts]);
+  const stats = {
+    total: serverSummary?.total ?? totalAccounts,
+    active: serverSummary?.active ?? 0,
+    rateLimited: serverSummary?.rate_limited ?? 0,
+    disabled: serverSummary?.disabled ?? 0,
+    banned: serverSummary?.banned ?? 0,
+    errorOnly: serverSummary?.error ?? 0,
+    oauth: serverSummary?.oauth ?? 0,
+    apiKey: serverSummary?.api_key ?? 0,
+  };
 
-  const filteredAccounts = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return accounts.filter((account) => {
-      const resolvedPlan = resolveAccountGrokPlan(account);
-      if (statusFilter === "active" && !isAccountActive(account)) return false;
-      if (statusFilter === "rate_limited" && !isAccountRateLimited(account))
-        return false;
-      if (statusFilter === "disabled" && account.enabled !== false) return false;
-      if (statusFilter === "banned" && !isAccountBanned(account)) return false;
-      if (statusFilter === "error" && account.status !== "error") return false;
-      if (authFilter === "oauth" && account.grok_auth_kind !== "oauth") return false;
-      if (authFilter === "api_key" && account.grok_auth_kind !== "api_key")
-        return false;
-      if (
-        planFilter !== "all" &&
-        grokPlanFilterCategory(account) !== planFilter
-      )
-        return false;
-      if (
-        !accountMatchesGroupFilter(account.group_ids ?? [], groupFilter)
-      ) {
-        return false;
-      }
-      if (!q) return true;
-      const groupNames = resolveAccountGroups(account.group_ids, allGroups)
-        .map((g) => g.name)
-        .join(" ");
-      const haystack = [
-        account.name,
-        account.email,
-        String(account.id),
-        ...(account.models ?? []),
-        account.base_url,
-        account.plan_type,
-        resolvedPlan?.key,
-        resolvedPlan?.display,
-        account.error_message,
-        account.proxy_url,
-        groupNames,
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(q);
-    });
-  }, [
-    accounts,
-    allGroups,
-    authFilter,
-    groupFilter,
-    planFilter,
-    searchQuery,
-    statusFilter,
-  ]);
-
-  const sortedAccounts = useMemo(() => {
-    if (!sortKey) return filteredAccounts;
-    return [...filteredAccounts].sort((a, b) => {
-      let diff = 0;
-      if (sortKey === "usage") {
-        diff = accountUsageSortValue(a) - accountUsageSortValue(b);
-      } else if (sortKey === "requests") {
-        diff = accountRequestsSortValue(a) - accountRequestsSortValue(b);
-      } else if (sortKey === "updated") {
-        diff =
-          new Date(a.updated_at || 0).getTime() -
-          new Date(b.updated_at || 0).getTime();
-      } else if (sortKey === "group") {
-        const nameDiff = accountGroupSortKey(a, allGroups).localeCompare(
-          accountGroupSortKey(b, allGroups),
-          "zh",
-        );
-        if (nameDiff !== 0) {
-          return sortDir === "asc" ? nameDiff : -nameDiff;
-        }
-        // Same group: higher usage first for scanability.
-        diff = accountUsageSortValue(b) - accountUsageSortValue(a);
-        if (diff !== 0) return diff;
-        return a.id - b.id;
-      }
-      if (diff === 0) return a.id - b.id;
-      return sortDir === "asc" ? diff : -diff;
-    });
-  }, [allGroups, filteredAccounts, sortDir, sortKey]);
+  // 服务端已完成全池筛选、排序和分页；浏览器只渲染当前页。
+  const sortedAccounts = accounts;
+  const pagedAccounts = accounts;
+  const currentGrokSelector = useMemo<AccountOperationSelector>(() => ({
+    channel: "grok",
+    search: debouncedSearchQuery || undefined,
+    status: statusFilter === "all" ? undefined : statusFilter,
+    auth_kind: authFilter === "all" ? undefined : authFilter,
+    plan: planFilter === "all" ? undefined : planFilter,
+    group_include: groupFilter.include.length > 0 ? groupFilter.include : undefined,
+    group_exclude: groupFilter.exclude.length > 0 ? groupFilter.exclude : undefined,
+    ungrouped: groupFilter.ungrouped || undefined,
+  }), [authFilter, debouncedSearchQuery, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, planFilter, statusFilter]);
+  const hasActiveGrokFilters = Boolean(
+    debouncedSearchQuery ||
+      statusFilter !== "all" ||
+      authFilter !== "all" ||
+      planFilter !== "all" ||
+      !isAccountGroupFilterEmpty(groupFilter),
+  );
 
   // 筛选/排序变化时回到第 1 页，避免停留在空页。
   useEffect(() => {
     setPage(1);
-  }, [authFilter, groupFilter, planFilter, searchQuery, sortDir, sortKey, statusFilter]);
+  }, [authFilter, groupFilter, planFilter, sortDir, sortKey, statusFilter]);
 
-  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(totalAccounts / pageSize));
   const currentPage = Math.min(page, totalPages);
-  const pagedAccounts = useMemo(
-    () =>
-      sortedAccounts.slice(
-        (currentPage - 1) * pageSize,
-        currentPage * pageSize,
-      ),
-    [currentPage, pageSize, sortedAccounts],
-  );
   const pagedAccountIds = useMemo(
     () => pagedAccounts.map((a) => a.id),
     [pagedAccounts],
   );
-
-  useEffect(() => {
-    if (page > totalPages) {
-      setPage(totalPages);
-    }
-  }, [page, totalPages]);
 
   // 批量选择：表头全选仅作用于当前页（与 Codex 账号页一致）。
   const pageSelectedCount = useMemo(
@@ -690,34 +809,66 @@ export default function GrokAccounts({
     pagedAccountIds.length > 0 && pageSelectedCount === pagedAccountIds.length;
   const somePageSelected = pageSelectedCount > 0 && !allPageSelected;
 
-  const detailAccount = useMemo(
+  const detailListAccount = useMemo(
     () =>
       detailAccountId == null
         ? null
         : (accounts.find((a) => a.id === detailAccountId) ?? null),
     [accounts, detailAccountId],
   );
-  // 详情左右切换按完整排序列表，不限于当前页。
+  const detailAccount =
+    detailAccountData?.id === detailAccountId
+      ? detailAccountData
+      : detailListAccount;
   const detailNavIndex = useMemo(() => {
     if (detailAccountId == null) return -1;
     return sortedAccounts.findIndex((a) => a.id === detailAccountId);
   }, [detailAccountId, sortedAccounts]);
   const openAccountDetail = useCallback((account: AccountRow) => {
+    setDetailAccountData(account);
     setDetailAccountId(account.id);
   }, []);
   const closeAccountDetail = useCallback(() => {
     setDetailAccountId(null);
+    setDetailAccountData(null);
+    setDetailGrokState(null);
+    setDetailGrokStateError(null);
   }, []);
   const goDetailPrev = useCallback(() => {
-    if (detailNavIndex <= 0) return;
-    setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
-  }, [detailNavIndex, sortedAccounts]);
+    if (detailNavIndex > 0) {
+      const target = sortedAccounts[detailNavIndex - 1] ?? null;
+      setDetailAccountData(target);
+      setDetailAccountId(target?.id ?? null);
+      return;
+    }
+    if (currentPage > 1) {
+      detailNavigationTargetRef.current = "last";
+      setPage(currentPage - 1);
+    }
+  }, [currentPage, detailNavIndex, sortedAccounts]);
   const goDetailNext = useCallback(() => {
-    if (detailNavIndex < 0 || detailNavIndex >= sortedAccounts.length - 1) return;
-    setDetailAccountId(sortedAccounts[detailNavIndex + 1]?.id ?? null);
-  }, [detailNavIndex, sortedAccounts]);
+    if (detailNavIndex >= 0 && detailNavIndex < sortedAccounts.length - 1) {
+      const target = sortedAccounts[detailNavIndex + 1] ?? null;
+      setDetailAccountData(target);
+      setDetailAccountId(target?.id ?? null);
+      return;
+    }
+    if (currentPage < totalPages) {
+      detailNavigationTargetRef.current = "first";
+      setPage(currentPage + 1);
+    }
+  }, [currentPage, detailNavIndex, sortedAccounts, totalPages]);
 
+  const resolvedDisabledSorts = useMemo(
+    () => resolveDisabledAccountSorts(disabledSorts, serverSummary?.total ?? totalAccounts),
+    [disabledSorts, serverSummary?.total, totalAccounts],
+  );
+  const usageSortBlocked = isLargePoolSortDisabled("requests", resolvedDisabledSorts);
   const toggleSort = useCallback((key: GrokSortKey) => {
+    if (isLargePoolSortDisabled(key, resolvedDisabledSorts)) {
+      showToast(t("accounts.largePoolSortDisabled"), "warning");
+      return;
+    }
     setSortKey((current) => {
       if (current === key) {
         setSortDir((dir) => (dir === "desc" ? "asc" : "desc"));
@@ -726,14 +877,89 @@ export default function GrokAccounts({
       setSortDir(key === "group" || key === "updated" ? "asc" : "desc");
       return key;
     });
-  }, []);
+  }, [resolvedDisabledSorts, showToast, t]);
+  // 禁用窗口(冷启动首轮聚合)只拦截新的排序点击,不清用户已选的排序:
+  // 后端会把被禁用的排序静默降级成默认序,聚合完成后自动按原选择恢复。
 
   useEffect(() => {
-    if (detailAccountId == null) return;
-    if (!accounts.some((a) => a.id === detailAccountId)) {
-      setDetailAccountId(null);
+    if (detailAccountId == null) return undefined;
+    const controller = new AbortController();
+    void api.getAccount(detailAccountId, controller.signal)
+      .then((account) => {
+        if (!controller.signal.aborted) setDetailAccountData(account);
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [detailAccountId, detailListAccount?.enabled, detailListAccount?.locked, detailListAccount?.status, detailListAccount?.updated_at]);
+
+  // Grok 控制面状态可能包含目录与能力明细，列表接口保持轻量；只有打开详情时才按需读取。
+  useEffect(() => {
+    if (detailAccountId == null) {
+      setDetailGrokState(null);
+      setDetailGrokStateError(null);
+      setDetailGrokStateLoading(false);
+      return undefined;
     }
-  }, [accounts, detailAccountId]);
+    const controller = new AbortController();
+    setDetailGrokState(null);
+    setDetailGrokStateError(null);
+    setDetailGrokStateLoading(true);
+    void api.getGrokAccountState(detailAccountId, controller.signal)
+      .then((state) => {
+        if (!controller.signal.aborted) setDetailGrokState(state);
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setDetailGrokStateError(getErrorMessage(error));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDetailGrokStateLoading(false);
+      });
+    return () => controller.abort();
+  }, [detailAccountId]);
+
+  const syncDetailGrokState = useCallback(async () => {
+    if (detailAccountId == null || detailGrokAction) return;
+    setDetailGrokAction("sync");
+    setDetailGrokStateError(null);
+    try {
+      const result = await api.syncGrokAccountState(detailAccountId);
+      setDetailGrokState(result.state);
+      showToast(t("grok.stateSyncDone", { count: result.models?.length ?? 0 }));
+      await refreshAccountRow(detailAccountId);
+    } catch (error) {
+      const message = getErrorMessage(error);
+      setDetailGrokStateError(message);
+      showToast(message, "error");
+    } finally {
+      setDetailGrokAction(null);
+    }
+  }, [detailAccountId, detailGrokAction, refreshAccountRow, showToast, t]);
+
+  const probeDetailGrokCapabilities = useCallback(async () => {
+    if (detailAccountId == null || detailGrokAction) return;
+    setDetailGrokAction("probe");
+    setDetailGrokStateError(null);
+    try {
+      const result = await api.probeGrokAccountCapabilities(detailAccountId);
+      setDetailGrokState(result.state);
+      showToast(t("grok.capabilityProbeDone", { count: result.results?.length ?? 0 }));
+    } catch (error) {
+      const message = getErrorMessage(error);
+      setDetailGrokStateError(message);
+      showToast(message, "error");
+    } finally {
+      setDetailGrokAction(null);
+    }
+  }, [detailAccountId, detailGrokAction, showToast, t]);
+
+  useEffect(() => {
+    const target = detailNavigationTargetRef.current;
+    if (!target || loadedPage !== page || accounts.length === 0) return;
+    const account = target === "first" ? accounts[0] : accounts[accounts.length - 1];
+    detailNavigationTargetRef.current = null;
+    setDetailAccountData(account ?? null);
+    setDetailAccountId(account?.id ?? null);
+  }, [accounts, loadedPage, page]);
 
   useEffect(() => {
     if (selectAllRef.current) {
@@ -770,14 +996,17 @@ export default function GrokAccounts({
   rowHandlersRef.current = {
     toggleSelect,
     openDetail: openAccountDetail,
-    test: (account) => setTestingAccount(account),
+    test: (account) => openTestingAccount(account),
     usage: (account) => setUsageAccount(account),
     refresh: (account) => void handleRefresh(account),
     toggleEnabled: (account) => void handleToggleEnabled(account),
     // openEdit/handleRefresh 等在组件体更靠后定义,这里一律用闭包延迟取值,避开 TDZ。
     edit: (account) => openEdit(account),
+    editGroups: (account) => openQuickGroupEditor(account),
     remove: (account) => void handleDelete(account),
-    usageRefreshed: () => void reload(),
+    usageRefreshed: (account) => {
+      void refreshAccountRow(account.id);
+    },
   };
   const rowHandlers = useMemo<GrokRowHandlers>(
     () => ({
@@ -788,11 +1017,40 @@ export default function GrokAccounts({
       refresh: (account) => rowHandlersRef.current.refresh(account),
       toggleEnabled: (account) => rowHandlersRef.current.toggleEnabled(account),
       edit: (account) => rowHandlersRef.current.edit(account),
+      editGroups: (account) => rowHandlersRef.current.editGroups(account),
       remove: (account) => rowHandlersRef.current.remove(account),
-      usageRefreshed: () => rowHandlersRef.current.usageRefreshed(),
+      usageRefreshed: (account) => rowHandlersRef.current.usageRefreshed(account),
     }),
     [],
   );
+
+  // 快速设置账号分组(issue #487):Grok 账号导入后也能补挂/调整分组,
+  // 与 Codex 账号页同一交互——点行内分组徽标打开,保存走 scheduler 接口。
+  const openQuickGroupEditor = (account: AccountRow) => {
+    setQuickGroupAccount(account);
+    setQuickGroupIds([...(account.group_ids ?? [])]);
+  };
+
+  const handleQuickGroupSave = async () => {
+    if (!quickGroupAccount) return;
+    setQuickGroupSubmitting(true);
+    try {
+      await api.updateAccountScheduler(quickGroupAccount.id, {
+        group_ids: quickGroupIds,
+      });
+      showToast(t("accounts.groupQuickSaveDone"));
+      await reload();
+      setQuickGroupAccount(null);
+      setQuickGroupIds([]);
+    } catch (error) {
+      showToast(
+        t("accounts.groupQuickSaveFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setQuickGroupSubmitting(false);
+    }
+  };
 
   const credentialReady =
     addMethod === "api_key"
@@ -871,21 +1129,32 @@ export default function GrokAccounts({
   const [editForm, setEditForm] = useState<{
     models: string[];
     base_url: string;
-    model_mapping: string;
     proxy_url: string;
-  }>({ models: [], base_url: "", model_mapping: "", proxy_url: "" });
+  }>({ models: [], base_url: "", proxy_url: "" });
+  const [editModelMappingEntries, setEditModelMappingEntries] = useState<
+    ModelMappingEntry[]
+  >(emptyModelMappingEntries);
   const [editModelDraft, setEditModelDraft] = useState("");
   const [editSubmitting, setEditSubmitting] = useState(false);
 
-  const openEdit = (account: AccountRow) => {
+  const populateEdit = (account: AccountRow) => {
     setEditAccount(account);
     setEditForm({
       models: account.models ?? [],
       base_url: account.base_url ?? "",
-      model_mapping: account.model_mapping ?? "",
       proxy_url: account.proxy_url ?? "",
     });
+    const parsedMapping = parseModelMappingEntries(account.model_mapping ?? "");
+    setEditModelMappingEntries(
+      parsedMapping.ok ? parsedMapping.entries : emptyModelMappingEntries(),
+    );
     setEditModelDraft("");
+  };
+
+  const openEdit = (account: AccountRow) => {
+    void loadAccountDetail(account)
+      .then(populateEdit)
+      .catch((error) => showToast(getErrorMessage(error), "error"));
   };
 
   const mergeModels = (existing: string[], incoming: string[]): string[] => {
@@ -910,6 +1179,23 @@ export default function GrokAccounts({
   const editRemoveModel = (model: string) =>
     setEditForm((f) => ({ ...f, models: f.models.filter((m) => m !== model) }));
 
+  const updateEditModelMapping = (
+    index: number,
+    field: keyof ModelMappingEntry,
+    value: string,
+  ) =>
+    setEditModelMappingEntries((entries) =>
+      entries.map((entry, entryIndex) =>
+        entryIndex === index ? { ...entry, [field]: value } : entry,
+      ),
+    );
+
+  const removeEditModelMapping = (index: number) =>
+    setEditModelMappingEntries((entries) => {
+      const next = entries.filter((_, entryIndex) => entryIndex !== index);
+      return next.length > 0 ? next : emptyModelMappingEntries();
+    });
+
   const editFillCommonModels = () =>
     setEditForm((f) => ({
       ...f,
@@ -918,6 +1204,11 @@ export default function GrokAccounts({
 
   const handleSaveEdit = async () => {
     if (!editAccount) return;
+    const modelMapping = serializeModelMappingEntries(editModelMappingEntries);
+    if (!modelMapping.ok) {
+      showToast(t("grok.modelMappingInvalid"), "error");
+      return;
+    }
     setEditSubmitting(true);
     try {
       const isApiKey = editAccount.grok_auth_kind === "api_key";
@@ -928,7 +1219,7 @@ export default function GrokAccounts({
         // OAuth 端点固定官方 cli-chat-proxy，Base URL 字段已隐藏；提交空值交
         // 后端规整为默认，避免持久化用户已看不到的自定义值。
         base_url: isApiKey ? editForm.base_url.trim() : "",
-        model_mapping: editForm.model_mapping.trim(),
+        model_mapping: modelMapping.value,
         proxy_url: editForm.proxy_url.trim(),
       });
       showToast(t("grok.editSaved"));
@@ -1273,7 +1564,7 @@ export default function GrokAccounts({
     const next = account.enabled === false;
     try {
       await api.toggleAccountEnabled(account.id, next);
-      await reload();
+      await refreshAccountRow(account.id);
     } catch (err) {
       showToast(getErrorMessage(err), "error");
     } finally {
@@ -1286,7 +1577,7 @@ export default function GrokAccounts({
     try {
       await api.refreshAccount(account.id);
       showToast(t("grok.refreshDone"));
-      await reload();
+      await refreshAccountRow(account.id);
     } catch (err) {
       showToast(getErrorMessage(err), "error");
     } finally {
@@ -1309,7 +1600,7 @@ export default function GrokAccounts({
     try {
       await api.deleteAccount(account.id);
       if (detailAccountId === account.id) setDetailAccountId(null);
-      await reload();
+      refreshAfterAccountRemoval([account.id]);
     } catch (err) {
       showToast(getErrorMessage(err), "error");
     } finally {
@@ -1323,7 +1614,7 @@ export default function GrokAccounts({
     try {
       await api.toggleAccountLock(account.id, next);
       showToast(next ? t("accounts.lockSuccess") : t("accounts.unlockSuccess"));
-      await reload();
+      await refreshAccountRow(account.id);
     } catch (err) {
       showToast(
         t("accounts.lockFailed", { error: getErrorMessage(err) }),
@@ -1339,7 +1630,7 @@ export default function GrokAccounts({
     try {
       await api.resetAccountStatus(account.id);
       showToast(t("accounts.resetStatusSuccess"));
-      await reload();
+      await refreshAccountRow(account.id);
     } catch (err) {
       showToast(
         t("accounts.resetStatusFailed", { error: getErrorMessage(err) }),
@@ -1359,7 +1650,7 @@ export default function GrokAccounts({
     setExporting(true);
     try {
       const { blob, filename } = await api.exportGrokAccounts(ids);
-      const count = ids ? ids.length : accounts.length;
+    const count = ids ? ids.length : totalAccounts;
       const fallback = `codex2api-grok-${new Date()
         .toISOString()
         .replace(/[:.]/g, "-")
@@ -1377,44 +1668,41 @@ export default function GrokAccounts({
   };
 
   const handleBatchTest = async (testIds?: number[]) => {
-    if (accounts.length === 0) return;
+    if (totalAccounts === 0 && selected.size === 0 && !testIds?.length) return;
 
     // 必须显式传 ids，否则后端会连 Codex 账号一起测。
     // 范围优先级：显式 ids → 已选 → 当前筛选 → 全部（后两者要确认）。
-    let ids: number[] = [];
+    let ids: number[] | null = null;
     if (testIds && testIds.length > 0) {
       ids = testIds;
     } else if (selected.size > 0) {
       ids = Array.from(selected);
-    } else if (sortedAccounts.length < accounts.length) {
+    } else if (hasActiveGrokFilters) {
       const confirmed = await confirm({
         title: t("grok.batchTestFilteredTitle"),
         description: t("grok.batchTestFilteredDesc", {
-          count: sortedAccounts.length,
+          count: totalAccounts,
         }),
         confirmText: t("accounts.batchTest"),
       });
       if (!confirmed) return;
-      ids = sortedAccounts.map((a) => a.id);
     } else {
       const confirmed = await confirm({
         title: t("grok.batchTestAllTitle"),
-        description: t("grok.batchTestAllDesc", { count: accounts.length }),
+        description: t("grok.batchTestAllDesc", { count: totalAccounts }),
         confirmText: t("accounts.batchTest"),
         tone: "destructive",
         confirmVariant: "destructive",
       });
       if (!confirmed) return;
-      ids = accounts.map((a) => a.id);
     }
-    ids = resolveChannelBatchTestAccountIDs(accounts, "grok", ids);
-    if (ids.length === 0) return;
+    if (ids && ids.length === 0) return;
 
     setBatchTesting(true);
     try {
       const result = await runStreamingOperation(
         "/accounts/batch-test?stream=true",
-        { ids },
+        ids ? { ids } : { selector: currentGrokSelector },
         t("accounts.batchTestProgressTitle"),
       );
       showToast(
@@ -1439,17 +1727,15 @@ export default function GrokAccounts({
   const selectedIds = useMemo(() => Array.from(selected), [selected]);
 
   const handleBatchRefresh = async () => {
-    // 仅 OAuth 账号可刷新（API Key 无 refresh_token），先过滤避免徒增失败计数。
-    const oauthIds = sortedAccounts
-      .filter((a) => selected.has(a.id) && a.grok_auth_kind === "oauth")
-      .map((a) => a.id);
-    if (oauthIds.length === 0) {
+    // Selected IDs are retained across pages; the server validates stale IDs.
+    // API-key accounts cannot refresh and are reported as failures by the job.
+    if (selectedIds.length === 0) {
       showToast(t("grok.batchNoOAuth"), "error");
       return;
     }
     setBatchBusy(true);
     try {
-      const res = await api.batchRefreshAccounts(oauthIds);
+      const res = await api.batchRefreshAccounts(selectedIds);
       showToast(
         t("accounts.batchRefreshDone", {
           success: res.success ?? 0,
@@ -1483,6 +1769,65 @@ export default function GrokAccounts({
       await reload();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const openBatchSetModels = () => {
+    if (selectedIds.length === 0) return;
+    setBatchModelsDraft([]);
+    setBatchModelInput("");
+    setBatchModelsOpen(true);
+  };
+
+  const batchAddModels = (raw: string) => {
+    const tokens = parseModelTokens(raw);
+    if (tokens.length === 0) return;
+    setBatchModelsDraft((current) => mergeModels(current, tokens));
+    setBatchModelInput("");
+  };
+
+  const batchRemoveModel = (model: string) =>
+    setBatchModelsDraft((current) => current.filter((item) => item !== model));
+
+  const batchTogglePreset = (model: string) => {
+    setBatchModelsDraft((current) => {
+      const exists = current.some(
+        (item) => item.toLowerCase() === model.toLowerCase(),
+      );
+      if (exists) {
+        return current.filter(
+          (item) => item.toLowerCase() !== model.toLowerCase(),
+        );
+      }
+      return mergeModels(current, [model]);
+    });
+  };
+
+  const handleBatchSetModels = async () => {
+    if (selectedIds.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const payload: BatchUpdateGrokModelsRequest = {
+        ids: selectedIds,
+        models: batchModelsDraft,
+      };
+      const res = await api.batchUpdateGrokModels(payload);
+      showToast(
+        t("grok.batchSetModelsDone", {
+          success: res.success ?? 0,
+          fail: res.failed ?? 0,
+        }),
+      );
+      setBatchModelsOpen(false);
+      clearSelection();
+      await reload();
+    } catch (err) {
+      showToast(
+        t("grok.batchSetModelsFailed", { error: getErrorMessage(err) }),
+        "error",
+      );
     } finally {
       setBatchBusy(false);
     }
@@ -1522,7 +1867,7 @@ export default function GrokAccounts({
         }),
       );
       clearSelection();
-      await reload();
+      await reload({ silent: true });
     } catch (err) {
       showToast(
         t("accounts.batchDeleteFailed", { error: getErrorMessage(err) }),
@@ -1545,8 +1890,12 @@ export default function GrokAccounts({
     if (!confirmed) return;
     setCleaning(true);
     try {
-      const res = await api.cleanGrokBanned();
-      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      const result = await runStreamingOperation(
+        "/accounts/grok/clean-banned?stream=true",
+        undefined,
+        t("grok.cleanBannedProgressTitle"),
+      );
+      showToast(t("grok.cleanDone", { count: result?.deleted ?? result?.success ?? 0 }));
       await reload();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
@@ -1566,8 +1915,12 @@ export default function GrokAccounts({
     if (!confirmed) return;
     setCleaning(true);
     try {
-      const res = await api.cleanGrokError();
-      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      const result = await runStreamingOperation(
+        "/accounts/grok/clean-error?stream=true",
+        undefined,
+        t("grok.cleanErrorProgressTitle"),
+      );
+      showToast(t("grok.cleanDone", { count: result?.deleted ?? result?.success ?? 0 }));
       await reload();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
@@ -1590,8 +1943,8 @@ export default function GrokAccounts({
       />
       <StateShell
         variant="page"
-        loading={loading}
-        error={error}
+        loading={loading && accounts.length === 0}
+        error={accounts.length === 0 ? error : null}
         onRetry={() => void reload()}
         loadingTitle={t("grok.loadingTitle")}
         loadingDescription={t("grok.loadingDesc")}
@@ -1634,7 +1987,7 @@ export default function GrokAccounts({
               <Button
                 variant="outline"
                 size="sm"
-                disabled={batchTesting || accounts.length === 0}
+                disabled={batchTesting || totalAccounts === 0}
                 onClick={() => void handleBatchTest()}
               >
                 <FlaskConical
@@ -1649,7 +2002,7 @@ export default function GrokAccounts({
               <Button
                 variant="outline"
                 size="sm"
-                disabled={exporting || accounts.length === 0}
+                disabled={exporting || totalAccounts === 0}
                 onClick={() => void handleExport()}
                 title={t("grok.exportHint")}
               >
@@ -1702,6 +2055,20 @@ export default function GrokAccounts({
           }
         />
 
+        {error && accounts.length > 0 ? (
+          <div className="mb-2 flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">
+            <span className="truncate">{error}</span>
+            <Button variant="outline" size="sm" onClick={() => void reload()}>
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : null}
+        {loading || resolvedDisabledSorts.length > 0 ? (
+          <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
+            <Loader2 className="size-3 animate-spin" />
+            {loading ? t("common.loading") : t("accounts.statsWarming")}
+          </div>
+        ) : null}
         <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
           <CompactStat
             label={t("grok.statTotal")}
@@ -1742,7 +2109,7 @@ export default function GrokAccounts({
         </div>
 
         <div className="toolbar-surface mb-3 flex flex-col gap-2.5">
-          <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <div className="flex items-center gap-1.5 overflow-x-auto [-mx-3] [px-3] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
               {t("accounts.filter")}
             </span>
@@ -1819,6 +2186,7 @@ export default function GrokAccounts({
                   ["supergrok", t("grok.planSuperGrok")],
                   ["supergrok_heavy", t("grok.planSuperGrokHeavy")],
                   ["supergrok_lite", t("grok.planSuperGrokLite")],
+                  ["supergrok_plus", t("grok.planSuperGrokPlus")],
                   ["other", t("grok.planOther")],
                 ] as const
               ).map(([key, label]) => (
@@ -1840,7 +2208,7 @@ export default function GrokAccounts({
             </div>
             <AccountGroupFilterSelect
               className="w-full min-w-0 sm:w-40"
-              groups={allGroups}
+              groups={grokGroups}
               value={groupFilter}
               onChange={setGroupFilter}
             />
@@ -1888,14 +2256,20 @@ export default function GrokAccounts({
               <button
                 key={key}
                 type="button"
-                title={hint}
+                title={
+                  key === "requests" && usageSortBlocked
+                    ? t("accounts.largePoolSortDisabled")
+                    : hint
+                }
                 aria-pressed={sortKey === key}
                 onClick={() => toggleSort(key)}
                 className={cn(
                   "inline-flex h-8 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors",
-                  sortKey === key
-                    ? "border-primary/30 bg-primary/10 text-primary"
-                    : "border-border bg-background text-muted-foreground hover:border-primary/25 hover:bg-accent/50 hover:text-foreground",
+                  key === "requests" && usageSortBlocked
+                    ? "cursor-not-allowed border-border bg-muted/40 text-muted-foreground"
+                    : sortKey === key
+                      ? "border-primary/30 bg-primary/10 text-primary"
+                      : "border-border bg-background text-muted-foreground hover:border-primary/25 hover:bg-accent/50 hover:text-foreground",
                 )}
               >
                 {label}
@@ -1939,6 +2313,17 @@ export default function GrokAccounts({
                   {batchTesting
                     ? t("accounts.batchTesting")
                     : t("accounts.batchTest")}
+                </span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={batchBusy || batchTesting}
+                onClick={openBatchSetModels}
+              >
+                <Layers className="size-3.5" />
+                <span className="hidden sm:inline">
+                  {t("grok.batchSetModels")}
                 </span>
               </Button>
               <Button
@@ -2083,7 +2468,17 @@ export default function GrokAccounts({
                       {t("grok.colStatus")}
                     </TableHead>
                     <TableHead
-                      className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                      className={cn(
+                        "select-none text-[13px] font-semibold transition-colors",
+                        usageSortBlocked
+                          ? "cursor-not-allowed text-muted-foreground"
+                          : "cursor-pointer hover:text-primary",
+                      )}
+                      title={
+                        usageSortBlocked
+                          ? t("accounts.largePoolSortDisabled")
+                          : t("grok.sortRequestsHint")
+                      }
                       onClick={() => toggleSort("requests")}
                     >
                       {t("accounts.requests")}{" "}
@@ -2170,7 +2565,7 @@ export default function GrokAccounts({
             page={currentPage}
             totalPages={totalPages}
             onPageChange={setPage}
-            totalItems={sortedAccounts.length}
+            totalItems={totalAccounts}
             pageSize={pageSize}
             pageSizeOptions={pageSizeOptions}
             onPageSizeChange={(nextPageSize) => {
@@ -2491,7 +2886,7 @@ export default function GrokAccounts({
                         className="flex items-start gap-1.5 text-xs"
                       >
                         {item.ok ? (
-                          <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+                          <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-[hsl(var(--success))]" />
                         ) : (
                           <XCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
                         )}
@@ -2669,7 +3064,7 @@ export default function GrokAccounts({
                 {t("accounts.importGroupsLabel")}
               </label>
               <AccountGroupMultiSelect
-                groups={allGroups}
+                groups={grokGroups}
                 value={importGroupIds}
                 onChange={setImportGroupIds}
                 allLabel={t("accounts.groupsUnbound")}
@@ -2704,6 +3099,79 @@ export default function GrokAccounts({
         />
       ) : null}
 
+      {/* 快速设置账号分组(issue #487):与 Codex 账号页同一交互 */}
+      <Modal
+        show={Boolean(quickGroupAccount)}
+        title={t("accounts.groupQuickTitle")}
+        contentClassName="sm:max-w-[520px]"
+        onClose={() => {
+          if (quickGroupSubmitting) return;
+          setQuickGroupAccount(null);
+          setQuickGroupIds([]);
+        }}
+        footer={
+          <>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={quickGroupSubmitting}
+              onClick={() => {
+                setQuickGroupAccount(null);
+                setQuickGroupIds([]);
+              }}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="button"
+              disabled={quickGroupSubmitting}
+              onClick={() => void handleQuickGroupSave()}
+            >
+              {quickGroupSubmitting
+                ? t("common.saving")
+                : quickGroupIds.length === 0
+                  ? t("accounts.groupQuickClear")
+                  : t("accounts.groupQuickSave")}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
+            <div className="font-semibold text-foreground">
+              {quickGroupAccount
+                ? quickGroupAccount.name || quickGroupAccount.email
+                : ""}
+            </div>
+            <div className="mt-1">{t("accounts.groupQuickDesc")}</div>
+          </div>
+          <div className="flex items-center justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={quickGroupSubmitting}
+              onClick={() => navigate("/accounts?groupManager=1")}
+            >
+              <FolderOpen className="size-3" />
+              {t("accounts.groupManage")}
+            </Button>
+          </div>
+          <AccountGroupMultiSelect
+            groups={grokGroups}
+            value={quickGroupIds}
+            onChange={setQuickGroupIds}
+            allLabel={t("accounts.groupsUnbound")}
+            selectedLabel={t("accounts.groupsSelected", {
+              count: quickGroupIds.length,
+            })}
+            placeholder={t("accounts.importGroupsPlaceholder")}
+            emptyLabel={t("accounts.groupsNone")}
+            emptyHint={t("accounts.groupsSelectHint")}
+          />
+        </div>
+      </Modal>
+
       <AccountDetailSheet
         account={detailAccount}
         groups={
@@ -2714,19 +3182,39 @@ export default function GrokAccounts({
         healthBuckets={
           detailAccount ? healthBars[String(detailAccount.id)] : undefined
         }
-        sequence={detailNavIndex >= 0 ? detailNavIndex + 1 : undefined}
+        sequence={
+          detailNavIndex >= 0
+            ? (currentPage - 1) * pageSize + detailNavIndex + 1
+            : undefined
+        }
         usageSlot={
           detailAccount ? (
             <GrokUsageCell
               account={detailAccount}
               detailed
-              onRefreshed={() => void reload()}
+              onRefreshed={() => {
+                void refreshAccountRow(detailAccount.id);
+              }}
             />
           ) : null
         }
-        canGoPrev={detailNavIndex > 0}
+        providerSlot={
+          detailAccount ? (
+            <GrokStateDetail
+              account={detailAccount}
+              state={detailGrokState}
+              loading={detailGrokStateLoading}
+              error={detailGrokStateError}
+              action={detailGrokAction}
+              onSync={() => void syncDetailGrokState()}
+              onProbe={() => void probeDetailGrokCapabilities()}
+            />
+          ) : null
+        }
+        canGoPrev={detailNavIndex > 0 || currentPage > 1}
         canGoNext={
-          detailNavIndex >= 0 && detailNavIndex < sortedAccounts.length - 1
+          (detailNavIndex >= 0 && detailNavIndex < sortedAccounts.length - 1) ||
+          currentPage < totalPages
         }
         refreshing={detailAccount ? busyId === detailAccount.id : false}
         onClose={closeAccountDetail}
@@ -2742,7 +3230,7 @@ export default function GrokAccounts({
         }}
         onTest={() => {
           if (!detailAccount) return;
-          setTestingAccount(detailAccount);
+          openTestingAccount(detailAccount);
         }}
         onRefresh={() => {
           if (!detailAccount) return;
@@ -2828,7 +3316,7 @@ export default function GrokAccounts({
             {t("accounts.importGroupsLabel")}
           </label>
           <AccountGroupMultiSelect
-            groups={allGroups}
+            groups={grokGroups}
             value={importGroupIds}
             onChange={setImportGroupIds}
             allLabel={t("accounts.groupsUnbound")}
@@ -2937,7 +3425,7 @@ export default function GrokAccounts({
               {importResult.items.map((item, index) => (
                 <div key={index} className="flex items-start gap-1.5 text-xs">
                   {item.ok ? (
-                    <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+                    <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-[hsl(var(--success))]" />
                   ) : (
                     <XCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
                   )}
@@ -2950,6 +3438,131 @@ export default function GrokAccounts({
             </div>
           </div>
         ) : null}
+      </Modal>
+
+      <Modal
+        show={batchModelsOpen}
+        title={t("grok.batchSetModelsTitle")}
+        contentClassName="sm:max-w-[560px]"
+        onClose={() => {
+          if (!batchBusy) setBatchModelsOpen(false);
+        }}
+        footer={
+          <>
+            <Button
+              variant="outline"
+              disabled={batchBusy}
+              onClick={() => setBatchModelsOpen(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              onClick={() => void handleBatchSetModels()}
+              disabled={batchBusy}
+            >
+              {batchBusy ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : null}
+              {t("grok.batchSetModelsApply", { count: selectedIds.length })}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            {t("grok.batchSetModelsDesc", { count: selectedIds.length })}
+          </p>
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <label className="text-sm font-medium text-muted-foreground">
+                {t("grok.models")}
+              </label>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={batchBusy || batchModelsDraft.length === 0}
+                onClick={() => setBatchModelsDraft([])}
+              >
+                {t("grok.batchSetModelsClear")}
+              </Button>
+            </div>
+            <p className="mb-2 text-xs text-muted-foreground">
+              {t("grok.batchSetModelsPresetHint")}
+            </p>
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              {DEFAULT_GROK_TEST_MODELS.map((model) => {
+                const isPicked = batchModelsDraft.some(
+                  (item) => item.toLowerCase() === model.toLowerCase(),
+                );
+                return (
+                  <button
+                    key={model}
+                    type="button"
+                    disabled={batchBusy}
+                    onClick={() => batchTogglePreset(model)}
+                    className={cn(
+                      "rounded-md px-2 py-1 font-mono text-[11px] font-medium ring-1 ring-inset transition-colors",
+                      isPicked
+                        ? "bg-primary/10 text-primary ring-primary/30"
+                        : "bg-muted/40 text-muted-foreground ring-border hover:bg-accent hover:text-foreground",
+                    )}
+                  >
+                    {model}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mb-2 flex gap-2">
+              <Input
+                placeholder={t("grok.modelsPlaceholder")}
+                value={batchModelInput}
+                disabled={batchBusy}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setBatchModelInput(e.target.value)
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    batchAddModels(batchModelInput);
+                  }
+                }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                disabled={batchBusy || !batchModelInput.trim()}
+                onClick={() => batchAddModels(batchModelInput)}
+              >
+                <Plus className="size-3.5" />
+              </Button>
+            </div>
+            {batchModelsDraft.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                {t("grok.batchSetModelsEmptyHint")}
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {batchModelsDraft.map((model) => (
+                  <span
+                    key={model}
+                    className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium"
+                  >
+                    {model}
+                    <button
+                      type="button"
+                      disabled={batchBusy}
+                      onClick={() => batchRemoveModel(model)}
+                      className="text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </Modal>
 
       <Modal
@@ -3041,6 +3654,68 @@ export default function GrokAccounts({
                   ))}
                 </div>
               )}
+            </div>
+
+            <div>
+              <label className="mb-2 block text-sm font-medium text-muted-foreground">
+                {t("grok.modelMapping")}
+              </label>
+              <div className="space-y-2">
+                {editModelMappingEntries.map((entry, index) => (
+                  <div
+                    key={index}
+                    className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+                  >
+                    <Input
+                      placeholder={t("grok.modelMappingFromPlaceholder")}
+                      value={entry.from}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        updateEditModelMapping(index, "from", event.target.value)
+                      }
+                    />
+                    <Input
+                      placeholder={t("grok.modelMappingToPlaceholder")}
+                      value={entry.to}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        updateEditModelMapping(index, "to", event.target.value)
+                      }
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className="h-10 w-10"
+                      onClick={() => removeEditModelMapping(index)}
+                      disabled={
+                        editModelMappingEntries.length === 1 &&
+                        !entry.from.trim() &&
+                        !entry.to.trim()
+                      }
+                      title={t("grok.modelMappingRemove")}
+                      aria-label={t("grok.modelMappingRemove")}
+                    >
+                      <X className="size-4" />
+                    </Button>
+                  </div>
+                ))}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setEditModelMappingEntries((entries) => [
+                      ...entries,
+                      { from: "", to: "" },
+                    ])
+                  }
+                >
+                  <Plus className="size-3.5" />
+                  {t("grok.modelMappingAdd")}
+                </Button>
+              </div>
+              <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                {t("grok.modelMappingHint")}
+              </p>
             </div>
 
             {/* OAuth 账号端点固定为官方 cli-chat-proxy，不显示 Base URL；
@@ -3136,8 +3811,9 @@ const MemoGrokAccountTableRow = memo(function MemoGrokAccountTableRow({
       onRefresh={() => handlers.refresh(account)}
       onToggleEnabled={() => handlers.toggleEnabled(account)}
       onEdit={() => handlers.edit(account)}
+      onEditGroups={() => handlers.editGroups(account)}
       onDelete={() => handlers.remove(account)}
-      onUsageRefreshed={handlers.usageRefreshed}
+      onUsageRefreshed={() => handlers.usageRefreshed(account)}
     />
   );
 });
@@ -3181,8 +3857,9 @@ const MemoGrokAccountCard = memo(function MemoGrokAccountCard({
       onRefresh={() => handlers.refresh(account)}
       onToggleEnabled={() => handlers.toggleEnabled(account)}
       onEdit={() => handlers.edit(account)}
+      onEditGroups={() => handlers.editGroups(account)}
       onDelete={() => handlers.remove(account)}
-      onUsageRefreshed={handlers.usageRefreshed}
+      onUsageRefreshed={() => handlers.usageRefreshed(account)}
     />
   );
 });
@@ -3202,6 +3879,7 @@ function GrokAccountCard({
   onRefresh,
   onToggleEnabled,
   onEdit,
+  onEditGroups,
   onDelete,
   onUsageRefreshed,
 }: {
@@ -3219,6 +3897,7 @@ function GrokAccountCard({
   onRefresh: () => void;
   onToggleEnabled: () => void;
   onEdit: () => void;
+  onEditGroups: () => void;
   onDelete: () => void;
   onUsageRefreshed: () => void;
 }) {
@@ -3237,9 +3916,8 @@ function GrokAccountCard({
           ? "border-primary/60 ring-1 ring-primary/30"
           : selected
             ? "border-primary/40 ring-1 ring-primary/20"
-            : disabled
-              ? "border-border/70 opacity-80"
-              : "border-border hover:border-border hover:shadow-md",
+            : "border-border hover:border-border hover:shadow-md",
+        disabledAccountSurfaceClass(account),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -3253,6 +3931,7 @@ function GrokAccountCard({
         onOpenDetail();
       }}
     >
+      {renderDisabledAccountOverlay(account, t)}
       <div className="flex flex-1 flex-col gap-3.5 p-4 sm:p-5">
         {/* Header: identity + status + actions */}
         <div className="flex min-w-0 items-start gap-3">
@@ -3269,10 +3948,7 @@ function GrokAccountCard({
             size={44}
             variant="ring"
             title="Grok"
-            className={cn(
-              "shrink-0 shadow-sm",
-              disabled && "opacity-60 grayscale",
-            )}
+            className="shrink-0 shadow-sm"
           />
 
           <div className="min-w-0 flex-1">
@@ -3284,6 +3960,15 @@ function GrokAccountCard({
                 status={disabled ? "paused" : (account.status ?? "unknown")}
                 errorMessage={account.error_message}
               />
+              {(account.active_requests ?? 0) > 0 && (
+                <span
+                  className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                  title={t("accounts.activeRequestsTooltip", { count: account.active_requests ?? 0 })}
+                >
+                  <span className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400" aria-hidden />
+                  {account.active_requests}
+                </span>
+              )}
             </div>
             <h3
               className="mt-1.5 break-all text-[15px] font-semibold leading-snug tracking-tight text-foreground transition-colors hover:text-primary sm:text-base"
@@ -3318,7 +4003,7 @@ function GrokAccountCard({
 
         {/* Meta badges */}
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+          <span className="inline-flex items-center gap-0.5 rounded-md bg-muted/60 px-1.5 py-0.5 text-[10px] font-medium text-foreground ring-1 ring-inset ring-border">
             <Sparkles className="size-2.5" />
             Grok
           </span>
@@ -3326,8 +4011,8 @@ function GrokAccountCard({
             className={cn(
               "inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset",
               isOAuth
-                ? "bg-violet-50 text-violet-700 ring-violet-600/20 dark:bg-violet-950 dark:text-violet-300 dark:ring-violet-400/20"
-                : "bg-sky-50 text-sky-700 ring-sky-600/20 dark:bg-sky-950 dark:text-sky-300 dark:ring-sky-400/20",
+                ? "bg-violet-500/10 text-violet-700 ring-violet-600/20 dark:bg-violet-500/20 dark:text-violet-300 dark:ring-violet-400/20"
+                : "bg-sky-500/10 text-sky-700 ring-sky-600/20 dark:bg-sky-500/20 dark:text-sky-300 dark:ring-sky-400/20",
             )}
           >
             {isOAuth ? (
@@ -3340,13 +4025,11 @@ function GrokAccountCard({
               : t("grok.authKindApiKey")}
           </span>
           <GrokPlanBadge account={account} compact />
-          <GrokGroupChips groups={groups} />
-          {disabled ? (
-            <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300">
-              <PowerOff className="mr-0.5 size-2.5" />
-              {t("accounts.disabled")}
-            </span>
-          ) : null}
+          <GrokGroupChips
+            groups={groups}
+            onClick={onEditGroups}
+            emptyLabel={t("accounts.groupQuickEdit")}
+          />
         </div>
 
         {/* Usage panel */}
@@ -3354,7 +4037,6 @@ function GrokAccountCard({
           <GrokUsageCell
             account={account}
             compact
-            detailed
             onRefreshed={onUsageRefreshed}
           />
         </div>
@@ -3522,6 +4204,7 @@ function GrokAccountTableRow({
   onRefresh,
   onToggleEnabled,
   onEdit,
+  onEditGroups,
   onDelete,
   onUsageRefreshed,
 }: {
@@ -3540,6 +4223,7 @@ function GrokAccountTableRow({
   onRefresh: () => void;
   onToggleEnabled: () => void;
   onEdit: () => void;
+  onEditGroups: () => void;
   onDelete: () => void;
   onUsageRefreshed: () => void;
 }) {
@@ -3549,13 +4233,17 @@ function GrokAccountTableRow({
   const models = account.models ?? [];
   const host = shortHost(account.base_url);
   const label = accountLabel(account);
+  const tableOverlay = renderDisabledAccountOverlay(account, t, {
+    compact: true,
+    markerOnly: true,
+  });
 
   return (
     <TableRow
       className={cn(
         "cursor-pointer",
-        disabled && "opacity-70",
         detailOpen ? "bg-primary/8" : selected && "bg-primary/5",
+        disabledAccountTableRowClass(account),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -3589,7 +4277,7 @@ function GrokAccountTableRow({
             size={32}
             variant="ring"
             title="Grok"
-            className={cn("shrink-0", disabled && "opacity-60 grayscale")}
+            className="shrink-0"
           />
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-1.5">
@@ -3608,8 +4296,8 @@ function GrokAccountTableRow({
                 className={cn(
                   "inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset",
                   isOAuth
-                    ? "bg-violet-50 text-violet-700 ring-violet-600/20 dark:bg-violet-950 dark:text-violet-300 dark:ring-violet-400/20"
-                    : "bg-sky-50 text-sky-700 ring-sky-600/20 dark:bg-sky-950 dark:text-sky-300 dark:ring-sky-400/20",
+                    ? "bg-violet-500/10 text-violet-700 ring-violet-600/20 dark:bg-violet-500/20 dark:text-violet-300 dark:ring-violet-400/20"
+                    : "bg-sky-500/10 text-sky-700 ring-sky-600/20 dark:bg-sky-500/20 dark:text-sky-300 dark:ring-sky-400/20",
                 )}
                 title={t("grok.authKind")}
               >
@@ -3623,11 +4311,13 @@ function GrokAccountTableRow({
                   : t("grok.authKindApiKey")}
               </span>
             </div>
-            {groups.length > 0 ? (
-              <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
-                <GrokGroupChips groups={groups} />
+            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+                <GrokGroupChips
+                  groups={groups}
+                  onClick={onEditGroups}
+                  emptyLabel={t("accounts.groupQuickEdit")}
+                />
               </div>
-            ) : null}
             {host ? (
               <div
                 className="max-w-[200px] truncate font-mono text-[11px] text-muted-foreground/75"
@@ -3642,34 +4332,28 @@ function GrokAccountTableRow({
       <TableCell className="text-center">
         <GrokPlanBadge account={account} />
       </TableCell>
-      <TableCell>
-        <div className="space-y-1.5">
-          <StatusBadge
-            status={disabled ? "paused" : (account.status ?? "unknown")}
-            errorMessage={account.error_message}
-          />
-          <AccountHealthBar buckets={healthBuckets} />
-        </div>
+      <TableCell data-account-state-cell="status">
+        {tableOverlay ?? (
+          <div className="space-y-1.5">
+            <StatusBadge
+              status={disabled ? "paused" : (account.status ?? "unknown")}
+              errorMessage={account.error_message}
+            />
+            {(account.active_requests ?? 0) > 0 && (
+              <span
+                className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                title={t("accounts.activeRequestsTooltip", { count: account.active_requests ?? 0 })}
+              >
+                <span className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400" aria-hidden />
+                {account.active_requests}
+              </span>
+            )}
+            <AccountHealthBar buckets={healthBuckets} />
+          </div>
+        )}
       </TableCell>
       <TableCell>
-        <div className="space-y-0.5 text-[13px]">
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <span className="font-medium text-emerald-600">
-              {account.success_requests ?? 0}
-            </span>
-            <span className="text-muted-foreground">/</span>
-            <span className="font-medium text-red-500">
-              {account.error_requests ?? 0}
-            </span>
-          </div>
-          {((account.retry_error_requests ?? 0) > 0 ||
-            (account.rate_limit_attempts ?? 0) > 0) && (
-            <div className="whitespace-nowrap text-[11px] text-muted-foreground">
-              retry {account.retry_error_requests ?? 0} · 429{" "}
-              {account.rate_limit_attempts ?? 0}
-            </div>
-          )}
-        </div>
+        <RequestCountPills account={account} compact />
       </TableCell>
       <TableCell className="min-w-[170px]">
         <GrokUsageCell account={account} onRefreshed={onUsageRefreshed} />
@@ -3738,6 +4422,351 @@ function grokFormatDollars(cents?: number | null): string {
   if (cents === null || cents === undefined || !Number.isFinite(cents))
     return "--";
   return `$${(cents / 100).toFixed(2)}`;
+}
+
+function grokStateRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function grokStateString(record: Record<string, unknown> | null, ...keys: string[]): string {
+  if (!record) return "";
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function grokStateOptionalBoolean(
+  record: Record<string, unknown> | null,
+  ...keys: string[]
+): boolean | null {
+  if (!record) return null;
+  for (const key of keys) {
+    if (typeof record[key] === "boolean") return record[key] as boolean;
+  }
+  return null;
+}
+
+function grokStateNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const record = grokStateRecord(value);
+  if (record && typeof record.val === "number" && Number.isFinite(record.val)) {
+    return record.val;
+  }
+  return null;
+}
+
+function findGrokStateFact(state: GrokAccountState | null, kind: string) {
+  if (!state) return undefined;
+  if (state.facts?.[kind]) return state.facts[kind];
+  return Object.values(state.facts ?? {}).find(
+    (fact) => fact.kind === kind || fact.kind.endsWith(`_${kind}`),
+  );
+}
+
+function latestGrokCatalog(state: GrokAccountState | null) {
+  if (!state?.catalogs?.length) return undefined;
+  return [...state.catalogs].sort((a, b) =>
+    (b.snapshot.observed_at ?? "").localeCompare(a.snapshot.observed_at ?? ""),
+  )[0];
+}
+
+function grokProtocolLabel(protocol: GrokProtocol | string): string {
+  if (protocol === "chat_completions") return "Chat Completions";
+  if (protocol === "messages") return "Messages";
+  if (protocol === "responses") return "Responses";
+  return protocol || "—";
+}
+
+function grokCapabilityTone(status?: string): string {
+  switch ((status ?? "").toLowerCase()) {
+    case "ok":
+      return "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+    case "unauthorized":
+    case "subscription_required":
+    case "exhausted":
+    case "unavailable":
+      return "bg-red-500/10 text-red-700 dark:text-red-300";
+    case "rate_limited":
+    case "version_required":
+      return "bg-amber-500/10 text-amber-700 dark:text-amber-300";
+    default:
+      return "bg-muted text-muted-foreground";
+  }
+}
+
+function GrokStateDetail({
+  account,
+  state,
+  loading,
+  error,
+  action,
+  onSync,
+  onProbe,
+}: {
+  account: AccountRow;
+  state: GrokAccountState | null;
+  loading: boolean;
+  error: string | null;
+  action: "sync" | "probe" | null;
+  onSync: () => void;
+  onProbe: () => void;
+}) {
+  const { t } = useTranslation();
+  const userFact = findGrokStateFact(state, "user");
+  const settingsFact = findGrokStateFact(state, "settings");
+  const billingFact = findGrokStateFact(state, "billing");
+  const user = grokStateRecord(userFact?.payload);
+  const settings = grokStateRecord(settingsFact?.payload);
+  const billingRoot = grokStateRecord(billingFact?.payload);
+  const billing = grokStateRecord(billingRoot?.config) ?? billingRoot;
+  const currentPeriod = grokStateRecord(billing?.currentPeriod ?? billing?.current_period);
+
+  const livePlan = grokStateString(user, "subscriptionTier", "subscription_tier");
+  const settingsPlan = grokStateString(
+    settings,
+    "subscription_tier_display",
+    "subscriptionTierDisplay",
+  );
+  const jwtPlan = state?.identity?.jwt_tier ?? "";
+  const archivePlan = state?.identity?.archive_plan ?? account.plan_type ?? "";
+  const allowAccess = grokStateOptionalBoolean(settings, "allow_access", "allowAccess");
+  const accessLabel =
+    allowAccess === true
+      ? t("grok.accessAllowed")
+      : allowAccess === false
+        ? t("grok.accessGated")
+        : t("grok.accessUnknown");
+  const accessTone =
+    allowAccess === true
+      ? "text-emerald-700 dark:text-emerald-300"
+      : allowAccess === false
+        ? "text-red-700 dark:text-red-300"
+        : "text-muted-foreground";
+
+  const periodType = grokStateString(currentPeriod, "type") || t("grok.billingPeriodUnknown");
+  const periodStart = grokStateString(currentPeriod, "start");
+  const periodEnd =
+    grokStateString(currentPeriod, "end") ||
+    grokStateString(billing, "billingPeriodEnd", "billing_period_end");
+  const usagePercent = grokStateNumber(
+    billing?.creditUsagePercent ?? billing?.credit_usage_percent,
+  );
+  const prepaid = grokStateNumber(billing?.prepaidBalance ?? billing?.prepaid_balance);
+  const onDemandCap = grokStateNumber(billing?.onDemandCap ?? billing?.on_demand_cap);
+  const onDemandUsed = grokStateNumber(billing?.onDemandUsed ?? billing?.on_demand_used);
+
+  const catalog = latestGrokCatalog(state);
+  const visibleModels = (catalog?.items ?? []).filter((item) => item.hidden !== true);
+  const primaryModel: GrokModelCatalogItem | undefined =
+    visibleModels.find((item) => item.model_id === settings?.default_model) ?? visibleModels[0];
+  const primaryBackend = primaryModel?.api_backend ?? "";
+  const protocols: GrokProtocol[] = ["responses", "chat_completions", "messages"];
+
+  return (
+    <section className="space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+          {t("grok.stateTitle")}
+        </h3>
+        <div className="flex items-center gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={loading || action !== null}
+            onClick={onSync}
+            title={t("grok.stateSyncHint")}
+          >
+            <RefreshCw className={cn("size-3", action === "sync" && "animate-spin")} />
+            {action === "sync" ? t("grok.stateSyncing") : t("grok.stateSync")}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={loading || action !== null || visibleModels.length === 0}
+            onClick={onProbe}
+            title={t("grok.capabilityProbeHint")}
+          >
+            <FlaskConical className={cn("size-3", action === "probe" && "animate-pulse")} />
+            {action === "probe" ? t("grok.capabilityProbing") : t("grok.capabilityProbe")}
+          </Button>
+        </div>
+      </div>
+
+      <div className="space-y-3 rounded-xl border border-border bg-card p-3">
+        {loading ? (
+          <div className="flex items-center gap-2 py-3 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" />
+            {t("grok.stateLoading")}
+          </div>
+        ) : null}
+        {error ? (
+          <div className="rounded-lg bg-red-500/10 px-2.5 py-2 text-xs text-red-700 dark:text-red-300">
+            {error}
+          </div>
+        ) : null}
+        {!loading && !state ? (
+          <div className="py-2 text-xs text-muted-foreground">{t("grok.stateEmpty")}</div>
+        ) : null}
+
+        {state ? (
+          <>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                [t("grok.planLive"), livePlan || "—", userFact?.observed_at],
+                [t("grok.planSettings"), settingsPlan || "—", settingsFact?.observed_at],
+                [
+                  t("grok.planJwt"),
+                  jwtPlan
+                    ? `${jwtPlan}${state.identity?.jwt_tier_trust === "verified" ? "" : ` · ${t("grok.planUnverified")}`}`
+                    : "—",
+                  undefined,
+                ],
+                [t("grok.planArchive"), archivePlan || "—", undefined],
+              ].map(([label, value, observedAt]) => (
+                <div key={String(label)} className="min-w-0 rounded-lg bg-muted/35 px-2.5 py-2">
+                  <div className="text-[10px] text-muted-foreground">{label}</div>
+                  <div className="mt-0.5 truncate text-xs font-semibold" title={String(value)}>
+                    {value}
+                  </div>
+                  {observedAt ? (
+                    <div className="mt-0.5 text-[9px] text-muted-foreground/75">
+                      {formatRelativeTime(String(observedAt))}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-border px-2.5 py-2 text-xs">
+              <div>
+                <div className="font-semibold">{t("grok.accessGate")}</div>
+                <div className="mt-0.5 text-[10px] text-muted-foreground">
+                  {allowAccess === null
+                    ? t("grok.accessUnknownHint")
+                    : settingsFact?.observed_at
+                      ? formatBeijingTime(settingsFact.observed_at, "")
+                      : "—"}
+                </div>
+              </div>
+              <span className={cn("font-semibold", accessTone)}>{accessLabel}</span>
+            </div>
+
+            <div className="space-y-1.5 rounded-lg border border-border px-2.5 py-2 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold">{t("grok.billingCurrentPeriod")}</span>
+                <span className="text-[10px] text-muted-foreground">{periodType}</span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+                <span className="text-muted-foreground">{t("grok.billingUsage")}</span>
+                <span className="text-right tabular-nums">
+                  {usagePercent === null ? "—" : `${usagePercent.toFixed(1)}%`}
+                </span>
+                <span className="text-muted-foreground">{t("grok.billingPeriod")}</span>
+                <span className="text-right" title={[periodStart, periodEnd].filter(Boolean).join(" ~ ")}>
+                  {periodEnd ? formatBeijingTime(periodEnd, "") : "—"}
+                </span>
+                <span className="text-muted-foreground">{t("grok.billingPrepaid")}</span>
+                <span className="text-right tabular-nums">
+                  {prepaid === null ? "—" : grokFormatDollars(Math.abs(prepaid))}
+                </span>
+                <span className="text-muted-foreground">{t("grok.billingPayg")}</span>
+                <span className="text-right tabular-nums">
+                  {onDemandCap === null
+                    ? "—"
+                    : `${grokFormatDollars(Math.abs(onDemandUsed ?? 0))} / ${grokFormatDollars(Math.abs(onDemandCap))}`}
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-2 rounded-lg border border-border px-2.5 py-2 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <span className="font-semibold">{t("grok.catalogTitle")}</span>
+                  <span className="ml-1.5 text-[10px] text-muted-foreground">
+                    {t("grok.catalogModels", { count: visibleModels.length })}
+                  </span>
+                </div>
+                <span className="rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                  {primaryBackend ? grokProtocolLabel(primaryBackend) : t("grok.catalogBackendUnknown")}
+                </span>
+              </div>
+              {visibleModels.length > 0 ? (
+                <div className="flex flex-wrap gap-1">
+                  {visibleModels.slice(0, 8).map((item) => (
+                    <span
+                      key={`${item.origin}:${item.model_id}`}
+                      className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                      title={`${item.model_id} · ${grokProtocolLabel(item.api_backend ?? "")}`}
+                    >
+                      {item.model_id}
+                    </span>
+                  ))}
+                  {visibleModels.length > 8 ? (
+                    <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      +{visibleModels.length - 8}
+                    </span>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="text-[10px] text-muted-foreground">{t("grok.catalogEmpty")}</div>
+              )}
+
+              <div className="grid grid-cols-1 gap-1.5 pt-1 sm:grid-cols-3">
+                {protocols.map((protocol) => {
+                  const capability = state.capabilities
+                    ?.filter((item) => item.protocol === protocol)
+                    .sort((a, b) => (b.observed_at ?? "").localeCompare(a.observed_at ?? ""))[0];
+                  const native = capability?.status === "ok";
+                  const route = native
+                    ? t("grok.capabilityNative")
+                    : primaryBackend
+                      ? protocol === primaryBackend
+                        ? t("grok.capabilityCatalogRoute")
+                        : t("grok.capabilityConverted", {
+                            backend: grokProtocolLabel(primaryBackend),
+                          })
+                      : t("grok.capabilityUnrouted");
+                  return (
+                    <div key={protocol} className="rounded-md bg-muted/35 px-2 py-1.5">
+                      <div className="truncate text-[10px] font-semibold">
+                        {grokProtocolLabel(protocol)}
+                      </div>
+                      <span
+                        className={cn(
+                          "mt-1 inline-flex max-w-full rounded px-1 py-0.5 text-[9px] font-semibold",
+                          grokCapabilityTone(capability?.status),
+                        )}
+                        title={capability?.provider_code || capability?.status || route}
+                      >
+                        {capability?.status || t("grok.capabilityUntested")}
+                      </span>
+                      <div className="mt-1 truncate text-[9px] text-muted-foreground" title={route}>
+                        {route}
+                      </div>
+                      {capability?.observed_at ? (
+                        <div
+                          className="mt-0.5 truncate text-[9px] text-muted-foreground/75"
+                          title={formatBeijingTime(capability.observed_at, "")}
+                        >
+                          {formatRelativeTime(capability.observed_at)}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        ) : null}
+      </div>
+    </section>
+  );
 }
 
 function GrokUsageCell({
@@ -4027,21 +5056,21 @@ function GrokUsageCell({
 }
 
 function grokUsageBarColor(pct: number): string {
-  if (pct >= 90) return "bg-red-500";
-  if (pct >= 70) return "bg-amber-500";
-  return "bg-emerald-500";
+  if (pct >= 90) return "bg-destructive";
+  if (pct >= 70) return "bg-[hsl(var(--warning))]";
+  return "bg-[hsl(var(--success))]";
 }
 
 function grokUsageTrackColor(pct: number): string {
-  if (pct >= 90) return "bg-red-500/15";
-  if (pct >= 70) return "bg-amber-500/15";
-  return "bg-emerald-500/15";
+  if (pct >= 90) return "bg-destructive/15";
+  if (pct >= 70) return "bg-[hsl(var(--warning))]/15";
+  return "bg-[hsl(var(--success))]/15";
 }
 
 function grokUsageTextColor(pct: number): string {
-  if (pct >= 90) return "text-red-600 dark:text-red-400";
-  if (pct >= 70) return "text-amber-700 dark:text-amber-400";
-  return "text-emerald-700 dark:text-emerald-400";
+  if (pct >= 90) return "text-destructive";
+  if (pct >= 70) return "text-[hsl(var(--warning))]";
+  return "text-[hsl(var(--success))]";
 }
 
 function grokFormatResetAt(
@@ -4392,9 +5421,9 @@ function GrokTestConnectionModal({
   const statusIconSpin = status === "connecting" || status === "streaming";
   const statusColor = {
     connecting: "text-muted-foreground",
-    streaming: "text-blue-500",
-    success: "text-emerald-500",
-    error: "text-red-500",
+    streaming: "text-[hsl(var(--info))]",
+    success: "text-[hsl(var(--success))]",
+    error: "text-destructive",
   }[status];
 
   return (
@@ -4466,82 +5495,12 @@ function GrokTestConnectionModal({
         )}
 
         {status === "error" && errorMsg ? (
-          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+          <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
             {errorMsg}
           </div>
         ) : null}
       </div>
     </Modal>
-  );
-}
-
-function CompactStat({
-  label,
-  chipLabel,
-  value,
-  tone,
-  active = false,
-  onClick,
-}: {
-  label: string;
-  chipLabel?: string;
-  value: number;
-  tone: "neutral" | "success" | "warning" | "danger";
-  active?: boolean;
-  onClick?: () => void;
-}) {
-  const toneStyle = {
-    neutral: {
-      chip: "bg-muted text-muted-foreground",
-      dot: "bg-slate-500",
-    },
-    success: {
-      chip: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-      dot: "bg-emerald-500",
-    },
-    warning: {
-      chip: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
-      dot: "bg-amber-500",
-    },
-    danger: {
-      chip: "bg-red-500/10 text-red-700 dark:text-red-300",
-      dot: "bg-red-500",
-    },
-  }[tone];
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "flex min-h-[72px] w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-2 text-left shadow-sm transition-[border-color,box-shadow,background-color,transform] duration-200 sm:min-h-[84px] sm:gap-3 sm:px-3 sm:py-2.5",
-        active
-          ? "border-primary/40 bg-primary/5 shadow-sm ring-1 ring-primary/25"
-          : "border-border bg-card/85 hover:border-border hover:bg-card hover:shadow-sm",
-        onClick &&
-          "cursor-pointer active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-      )}
-    >
-      <div className="min-w-0">
-        <div className="truncate text-[11px] font-medium text-muted-foreground sm:text-[12px]">
-          {label}
-        </div>
-        <div className="mt-1.5 text-[22px] font-semibold leading-none tracking-tight text-foreground tabular-nums sm:text-[26px]">
-          {value}
-        </div>
-      </div>
-      <div
-        className={cn(
-          "inline-flex items-center gap-1.5 rounded-full px-1.5 py-0.5 text-[11px] font-medium sm:px-2 sm:py-1 sm:text-[12px]",
-          toneStyle.chip,
-        )}
-      >
-        <span className={cn("size-1.5 rounded-full", toneStyle.dot)} />
-        <span className="max-w-[4.5rem] truncate sm:max-w-none">
-          {chipLabel ?? label}
-        </span>
-      </div>
-    </button>
   );
 }
 
@@ -4556,3 +5515,6 @@ function downloadBlob(blob: Blob, filename: string) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+// memo 边界:宿主 Accounts 组件的 codex 侧状态变化不应连带整棵 Grok 视图重渲染。
+export default memo(GrokAccounts);

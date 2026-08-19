@@ -3,17 +3,21 @@ package admin
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/openaiidentity"
 	"github.com/gin-gonic/gin"
 )
 
@@ -459,7 +463,7 @@ func TestValidateImportFileSize(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected oversized file error, got nil")
 	}
-	if got, want := err.Error(), "文件 too-big.txt 大小超过 20MB"; got != want {
+	if got, want := err.Error(), "文件 too-big.txt 大小超过 200MB"; got != want {
 		t.Fatalf("error = %q, want %q", got, want)
 	}
 }
@@ -1329,6 +1333,180 @@ func TestAddAccountStreamReportsProgressAndProbesAfterRefresh(t *testing.T) {
 	}
 }
 
+func TestAddAccountSkipRefreshDoesNotWarmup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	t.Cleanup(store.Stop)
+	var refreshed atomic.Int64
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(context.Context, int64) error {
+			refreshed.Add(1)
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			t.Fatal("usage probe should not run when skip_refresh is set")
+			return nil
+		},
+	}
+
+	body := bytes.NewBufferString(`{"refresh_token":"rt-skip-1\nrt-skip-2","skip_refresh":true}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", body)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if got := refreshed.Load(); got != 0 {
+		t.Fatalf("refresh count = %d, want 0", got)
+	}
+	if store.AccountCount() != 2 {
+		t.Fatalf("runtime accounts = %d, want 2", store.AccountCount())
+	}
+}
+
+func TestAddAccountRTRefreshUsesImportProbeGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", UsageProbeConcurrency: 1,
+	})
+	store.SetUsageProbeConcurrency(1)
+	t.Cleanup(store.Stop)
+
+	var current atomic.Int64
+	var maxConcurrent atomic.Int64
+	var finished atomic.Int64
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(context.Context, int64) error {
+			n := current.Add(1)
+			for {
+				prev := maxConcurrent.Load()
+				if n <= prev || maxConcurrent.CompareAndSwap(prev, n) {
+					break
+				}
+			}
+			time.Sleep(80 * time.Millisecond)
+			current.Add(-1)
+			finished.Add(1)
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	body := bytes.NewBufferString(`{"refresh_token":"rt-gate-1\nrt-gate-2\nrt-gate-3\nrt-gate-4"}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", body)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	deadline := time.After(2 * time.Second)
+	for finished.Load() < 4 {
+		select {
+		case <-deadline:
+			t.Fatalf("finished refreshes = %d, want 4", finished.Load())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if got := maxConcurrent.Load(); got != 1 {
+		t.Fatalf("max concurrent refreshes = %d, want 1", got)
+	}
+}
+
+func TestImportedATAndRTWarmupsReserveCapacityAtHighProbeSetting(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", UsageProbeConcurrency: 64,
+	})
+	store.SetUsageProbeConcurrency(64)
+	t.Cleanup(store.Stop)
+
+	var current atomic.Int64
+	var maxConcurrent atomic.Int64
+	var finished atomic.Int64
+	work := func() {
+		n := current.Add(1)
+		for {
+			previous := maxConcurrent.Load()
+			if n <= previous || maxConcurrent.CompareAndSwap(previous, n) {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+		current.Add(-1)
+		finished.Add(1)
+	}
+
+	handler := &Handler{
+		store: store,
+		importLoadSnapshot: func() importRuntimeLoadSnapshot {
+			return importRuntimeLoadSnapshot{RPM: 1000, DBMaxOpen: 100}
+		},
+		refreshAccount: func(_ context.Context, id int64) error {
+			work()
+			account := store.FindByID(id)
+			if account == nil {
+				return fmt.Errorf("account %d not found", id)
+			}
+			account.Mu().Lock()
+			account.AccessToken = fmt.Sprintf("refreshed-at-%d", id)
+			account.Mu().Unlock()
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			work()
+			return nil
+		},
+	}
+
+	accounts := make([]*auth.Account, 0, 8)
+	for id := int64(1); id <= 8; id++ {
+		account := &auth.Account{DBID: id, RefreshToken: fmt.Sprintf("rt-%d", id)}
+		if id <= 4 {
+			account.AccessToken = fmt.Sprintf("at-%d", id)
+		}
+		accounts = append(accounts, account)
+	}
+	handler.commitImportedRuntimeAccounts(accounts, "test_import", false)
+
+	// 4 个 AT 各探测一次；4 个 RT 各刷新并探测一次。
+	const wantFinished = 12
+	deadline := time.Now().Add(3 * time.Second)
+	for finished.Load() < wantFinished {
+		if time.Now().After(deadline) {
+			t.Fatalf("finished warmup operations = %d, want %d", finished.Load(), wantFinished)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// 等待一个完整 worker 周期，确保 RT 刷新内部没有偷偷多跑一次 probe。
+	time.Sleep(100 * time.Millisecond)
+	if got := finished.Load(); got != wantFinished {
+		t.Fatalf("finished warmup operations = %d, want exactly %d (RT refresh probed twice)", got, wantFinished)
+	}
+	const wantHighLoadConcurrency = 4
+	if got := maxConcurrent.Load(); got > wantHighLoadConcurrency {
+		t.Fatalf("max concurrent import warmups = %d, want <= %d", got, wantHighLoadConcurrency)
+	}
+	if got := handler.importProbeConcurrency(); got != wantHighLoadConcurrency {
+		t.Fatalf("import probe concurrency = %d, want %d at high load", got, wantHighLoadConcurrency)
+	}
+}
+
 func newMultipartJSONRequest(t *testing.T, filename string, content string) *http.Request {
 	t.Helper()
 
@@ -1399,6 +1577,59 @@ func TestImportAccountsCommonAllowsDuplicateWithoutWorkspace(t *testing.T) {
 	}
 }
 
+func TestImportAccountsCommonSeparatesCredentialWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	t.Cleanup(store.Stop)
+	handler := &Handler{db: db, store: store}
+
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "personal", map[string]interface{}{
+		"refresh_token": "rt-import-shared",
+	}, ""); err != nil {
+		t.Fatalf("Insert personal: %v", err)
+	}
+
+	runImport := func(workspaceID string, allowDuplicate bool) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+		headers := map[string]string(nil)
+		if workspaceID != "" {
+			headers = map[string]string{"Chatgpt-Account-Id": workspaceID}
+		}
+		handler.importAccountsCommon(ctx, []importToken{{
+			refreshToken: "rt-import-shared",
+		}}, "", allowDuplicate, headers)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("workspace %q status = %d: %s", workspaceID, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	runImport("team-a", false)
+	runImport("team-a", true)
+	runImport("team-b", false)
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("active rows = %d, want personal + team-a + team-b", len(rows))
+	}
+	gotRoutes := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		gotRoutes[openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers"))] = true
+	}
+	for _, workspaceID := range []string{"", "team-a", "team-b"} {
+		if !gotRoutes[workspaceID] {
+			t.Fatalf("persisted routes = %#v, missing %q", gotRoutes, workspaceID)
+		}
+	}
+}
+
 // TestAddAccountDedupsRefreshToken 验证：RT 单账号添加默认按 RT 原文对已有库去重。
 func TestAddAccountDedupsRefreshToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1451,6 +1682,78 @@ func TestAddAccountDedupsRefreshToken(t *testing.T) {
 	}
 	if rows, _ := db.ListActive(context.Background()); len(rows) != 2 {
 		t.Fatalf("active rows = %d, want 2 (duplicate allowed)", len(rows))
+	}
+}
+
+func TestAddAccountSeparatesRefreshTokenWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	t.Cleanup(store.Stop)
+	handler := &Handler{db: db, store: store}
+
+	add := func(workspaceID string, allowDuplicate bool) map[string]interface{} {
+		payload := map[string]interface{}{
+			"refresh_token":   "rt-shared-route",
+			"allow_duplicate": allowDuplicate,
+		}
+		if workspaceID != "" {
+			payload["custom_headers"] = map[string]string{
+				"Chatgpt-Account-Id": workspaceID,
+			}
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", bytes.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.AddAccount(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		var response map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return response
+	}
+
+	if response := add("", false); response["success"] != float64(1) {
+		t.Fatalf("personal add = %#v, want success=1", response)
+	}
+	if response := add("team-a", false); response["success"] != float64(1) {
+		t.Fatalf("team-a add = %#v, want success=1", response)
+	}
+	if response := add("team-a", true); response["duplicate"] != float64(1) {
+		t.Fatalf("team-a duplicate = %#v, want duplicate=1 even with allow_duplicate", response)
+	}
+	if response := add("team-b", false); response["success"] != float64(1) {
+		t.Fatalf("team-b add = %#v, want success=1", response)
+	}
+	if response := add("", false); response["duplicate"] != float64(1) {
+		t.Fatalf("personal duplicate = %#v, want duplicate=1", response)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("active rows = %d, want personal + team-a + team-b", len(rows))
+	}
+	gotRoutes := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		gotRoutes[openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers"))] = true
+	}
+	for _, workspaceID := range []string{"", "team-a", "team-b"} {
+		if !gotRoutes[workspaceID] {
+			t.Fatalf("persisted routes = %#v, missing %q", gotRoutes, workspaceID)
+		}
 	}
 }
 
@@ -1520,6 +1823,129 @@ func TestAddATAccountCountsUpdateNotNew(t *testing.T) {
 	}
 }
 
+func TestAddOpaqueATPersistsAndDeduplicatesWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	t.Cleanup(store.Stop)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	add := func(workspaceID string, allowDuplicate bool) map[string]interface{} {
+		payload := map[string]interface{}{
+			"access_token":    "at-opaque-shared",
+			"allow_duplicate": allowDuplicate,
+		}
+		if workspaceID != "" {
+			payload["custom_headers"] = map[string]string{
+				"Chatgpt-Account-Id": workspaceID,
+			}
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/at", bytes.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.AddATAccount(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		var response map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return response
+	}
+
+	if response := add("", false); response["success"] != float64(1) {
+		t.Fatalf("personal add = %#v, want success=1", response)
+	}
+	if response := add("team-a", false); response["success"] != float64(1) {
+		t.Fatalf("team-a add = %#v, want success=1", response)
+	}
+	if response := add("team-a", true); response["duplicate"] != float64(1) {
+		t.Fatalf("team-a duplicate = %#v, want duplicate=1 even with allow_duplicate", response)
+	}
+	if response := add("team-b", false); response["success"] != float64(1) {
+		t.Fatalf("team-b add = %#v, want success=1", response)
+	}
+	if response := add("", false); response["duplicate"] != float64(1) {
+		t.Fatalf("personal duplicate = %#v, want duplicate=1", response)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("active rows = %d, want personal + team-a + team-b", len(rows))
+	}
+	gotRoutes := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		if got := row.GetCredential("access_token"); got != "at-opaque-shared" {
+			t.Fatalf("access_token = %q, want at-opaque-shared", got)
+		}
+		if got := row.GetCredential("access_token_type"); got != accessTokenTypeCodexAT {
+			t.Fatalf("access_token_type = %q, want %s", got, accessTokenTypeCodexAT)
+		}
+		gotRoutes[openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers"))] = true
+	}
+	for _, workspaceID := range []string{"", "team-a", "team-b"} {
+		if !gotRoutes[workspaceID] {
+			t.Fatalf("persisted routes = %#v, missing %q", gotRoutes, workspaceID)
+		}
+	}
+}
+
+func TestStreamAddOpaqueATPersistsWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	t.Cleanup(store.Stop)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	body := []byte(`{
+		"access_token": "at-opaque-stream",
+		"custom_headers": {"chatgpt-account-id": "team-stream"}
+	}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/at?stream=true", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddATAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active rows = %d, want 1", len(rows))
+	}
+	headers := rows[0].GetCredentialStringMap("custom_headers")
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(headers); got != "team-stream" {
+		t.Fatalf("workspace override = %q, want team-stream", got)
+	}
+}
+
 // RT 刷新后 workspace 身份可知时，应把新凭证合并进已有账号。
 func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1537,6 +1963,21 @@ func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert old: %v", err)
+	}
+	groupID, err := db.CreateAccountGroup(
+		context.Background(),
+		"repair-target",
+		"",
+		"",
+		0,
+		0,
+		sql.NullInt64{},
+	)
+	if err != nil {
+		t.Fatalf("CreateAccountGroup: %v", err)
+	}
+	if err := db.SetAccountGroups(context.Background(), oldID, []int64{groupID}); err != nil {
+		t.Fatalf("SetAccountGroups old: %v", err)
 	}
 
 	// 新导入的 RT 账号：刷新完成后身份与旧账号相同
@@ -1568,6 +2009,13 @@ func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	if got := oldRow.GetCredential("codex_7d_used_percent"); got != "42.5" {
 		t.Fatalf("codex_7d_used_percent = %q, want 42.5 (用量统计必须保留)", got)
 	}
+	runtimeOld := store.FindByID(oldID)
+	if runtimeOld == nil {
+		t.Fatal("merged survivor missing from runtime store")
+	}
+	if got := runtimeOld.GroupIDSnapshot(); len(got) != 1 || got[0] != groupID {
+		t.Fatalf("survivor runtime groups = %v, want [%d]", got, groupID)
+	}
 
 	rows, err := db.ListActive(context.Background())
 	if err != nil {
@@ -1575,6 +2023,129 @@ func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != oldID {
 		t.Fatalf("active rows = %d (first id %d), want 1 row with id %d", len(rows), rows[0].ID, oldID)
+	}
+}
+
+func TestMergeRefreshedDuplicateKeepsDifferentWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{db: db, store: store}
+
+	personalID, err := db.InsertAccountWithCredentials(context.Background(), "personal", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "solo@example.com",
+		"workspace_id": "personal-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert personal: %v", err)
+	}
+	teamID, err := db.InsertAccountWithCredentials(context.Background(), "team", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "solo@example.com",
+		"workspace_id": "personal-workspace",
+		"custom_headers": map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert team: %v", err)
+	}
+	store.AddAccount(&auth.Account{DBID: teamID, AccessToken: "at-shared", Status: auth.StatusReady})
+
+	if merged := handler.mergeRefreshedDuplicateIntoExisting(teamID, "test"); merged {
+		t.Fatal("different effective workspace routes must not merge")
+	}
+
+	teamDuplicateID, err := db.InsertAccountWithCredentials(context.Background(), "team-duplicate", map[string]interface{}{
+		"refresh_token": "rt-upgrade",
+		"access_token":  "at-rotated",
+		"email":         "solo@example.com",
+		"workspace_id":  "personal-workspace",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert team duplicate: %v", err)
+	}
+	store.AddAccount(&auth.Account{DBID: teamDuplicateID, RefreshToken: "rt-upgrade", AccessToken: "at-rotated", Status: auth.StatusReady})
+
+	if merged := handler.mergeRefreshedDuplicateIntoExisting(teamDuplicateID, "test"); !merged {
+		t.Fatal("same effective workspace route should merge")
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("active rows = %d, want personal + team", len(rows))
+	}
+	active := map[int64]bool{}
+	for _, row := range rows {
+		active[row.ID] = true
+	}
+	if !active[personalID] || !active[teamID] || active[teamDuplicateID] {
+		t.Fatalf("active ids = %#v, want personal=%d team=%d", active, personalID, teamID)
+	}
+	teamRow, err := db.GetAccountByID(context.Background(), teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID team: %v", err)
+	}
+	if got := teamRow.GetCredential("refresh_token"); got != "rt-upgrade" {
+		t.Fatalf("team refresh_token = %q, want rt-upgrade", got)
+	}
+}
+
+func TestMergeRefreshedDuplicatePreservesOverrideBackedRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{db: db, store: store}
+	ctx := context.Background()
+
+	oldID, err := db.InsertAccountWithCredentials(ctx, "team-native", map[string]interface{}{
+		"access_token": "team-old-at",
+		"email":        "solo@example.com",
+		"workspace_id": "team-workspace",
+		"account_id":   "team-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert old route: %v", err)
+	}
+	newID, err := db.InsertAccountWithCredentials(ctx, "team-override", map[string]interface{}{
+		"refresh_token": "shared-rt",
+		"access_token":  "personal-new-at",
+		"email":         "solo@example.com",
+		"workspace_id":  "personal-workspace",
+		"account_id":    "personal-workspace",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("insert new route: %v", err)
+	}
+	store.AddAccount(&auth.Account{DBID: newID, RefreshToken: "shared-rt", AccessToken: "personal-new-at", Status: auth.StatusReady})
+
+	if merged := handler.mergeRefreshedDuplicateIntoExisting(newID, "test"); !merged {
+		t.Fatal("same effective route should merge")
+	}
+	oldRow, err := db.GetAccountByID(ctx, oldID)
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	if got := openaiidentity.EffectiveWorkspaceID(
+		oldRow.GetCredential("workspace_id"),
+		oldRow.GetCredentialStringMap("custom_headers"),
+	); got != "team-workspace" {
+		t.Fatalf("survivor effective workspace = %q, want team-workspace", got)
+	}
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(oldRow.GetCredentialStringMap("custom_headers")); got != "team-workspace" {
+		t.Fatalf("survivor override = %q, want team-workspace", got)
 	}
 }
 
@@ -1778,5 +2349,258 @@ func TestParseImportJSONTokensAgentIdentityFlatCredentials(t *testing.T) {
 	}
 	if tok.agentPrivateKey != pk {
 		t.Fatal("private key not carried through")
+	}
+}
+
+// 流式解析器必须与全量解析器对所有形态产出完全一致的 tokens——覆盖顶层数组、
+// 单个平铺对象(带 BOM)、sub2api {accounts:[...]}、多余顶层字段、空 accounts。
+func TestParseImportJSONTokensStreamMatchesFullParse(t *testing.T) {
+	cases := map[string]string{
+		"flat-array":      `[{"refresh_token":"rt-1","email":"a@x.com"},{"access_token":"at-2","email":"b@x.com"},{"refresh_token":"","access_token":""}]`,
+		"flat-single":     `{"refresh_token":"rt-flat","email":"flat@x.com"}`,
+		"sub2api":         `{"exported_at":"2026-01-01T00:00:00Z","proxies":[{"proxy_key":"ignored"}],"accounts":[{"name":"P","credentials":{"refresh_token":"rt-p","access_token":"at-p","email":"p@x.com"}},{"credentials":{"access_token":"at-f","email":"f@x.com"}}]}`,
+		"sub2api-empty":   `{"accounts":[{"credentials":{}}],"proxies":[{"proxy_key":"ignored"}]}`,
+		"sub2api-reorder": `{"accounts":[{"credentials":{"refresh_token":"rt-z"}}],"exported_at":"2026-01-01T00:00:00Z"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			full, ferr := parseImportJSONTokens([]byte(body))
+			stream, serr := parseImportJSONTokensStream(bytes.NewReader([]byte(body)))
+			if (ferr == nil) != (serr == nil) {
+				t.Fatalf("error mismatch: full=%v stream=%v", ferr, serr)
+			}
+			if len(full) != len(stream) {
+				t.Fatalf("len mismatch: full=%d stream=%d\nfull=%+v\nstream=%+v", len(full), len(stream), full, stream)
+			}
+			for i := range full {
+				if full[i] != stream[i] {
+					t.Fatalf("token[%d] mismatch:\n full=%+v\n strm=%+v", i, full[i], stream[i])
+				}
+			}
+		})
+	}
+}
+
+// BOM + 流式:json.Decoder 不吃 BOM,parseImportJSONTokensStream 须先剥。
+func TestParseImportJSONTokensStreamHandlesBOM(t *testing.T) {
+	body := append([]byte{0xef, 0xbb, 0xbf}, []byte(`{"refresh_token":"rt-bom"}`)...)
+	stream, err := parseImportJSONTokensStream(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("stream parse BOM: %v", err)
+	}
+	if len(stream) != 1 || stream[0].refreshToken != "rt-bom" {
+		t.Fatalf("stream = %+v", stream)
+	}
+}
+
+func TestParseImportJSONTokensStreamRejectsBrokenJSON(t *testing.T) {
+	if _, err := parseImportJSONTokensStream(bytes.NewReader([]byte(`{"accounts":[}`))); err == nil {
+		t.Fatal("expected error for broken json")
+	}
+}
+
+func TestAdaptiveImportLimitsUseHysteresisAndDatabasePressure(t *testing.T) {
+	snapshot := importRuntimeLoadSnapshot{DBMaxOpen: 100}
+	now := time.Unix(1_800_000_000, 0)
+	h := &Handler{
+		importLoadSnapshot: func() importRuntimeLoadSnapshot { return snapshot },
+		importLoadNow:      func() time.Time { return now },
+	}
+
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("low-load limits = %+v, want db=12 probe=8", got)
+	}
+	snapshot.RPM = 200
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("medium-load limits = %+v, want db=8 probe=6", got)
+	}
+	// 介于升档(180)和降档(120)阈值之间时保持中档，避免抖动。
+	snapshot.RPM = 150
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("hysteresis limits = %+v, want medium tier", got)
+	}
+	snapshot.RPM = 100
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("recovered limits = %+v, want low tier", got)
+	}
+	snapshot.RPM = 700
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("high-load limits = %+v, want db=4 probe=4", got)
+	}
+	// 高档每次最多降一档。
+	snapshot.RPM = 0
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("early recovery limits = %+v, want high tier during hold", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("first recovery limits = %+v, want medium tier", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("second recovery limits = %+v, want low tier", got)
+	}
+	snapshot.DBWaitCount++
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("DB-wait limits = %+v, want immediate high tier", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("DB-wait backoff limits = %+v, want latched high tier", got)
+	}
+}
+
+func TestAdaptiveImportLimitsReserveDatabasePoolCapacity(t *testing.T) {
+	h := &Handler{importLoadSnapshot: func() importRuntimeLoadSnapshot {
+		return importRuntimeLoadSnapshot{DBMaxOpen: 8}
+	}}
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 2, probe: 8}) {
+		t.Fatalf("small-pool limits = %+v, want db=2 probe=8", got)
+	}
+}
+
+func TestAdaptiveImportLimitsReactToLongRunningRequests(t *testing.T) {
+	snapshot := importRuntimeLoadSnapshot{Active: 64, DBMaxOpen: 100}
+	now := time.Unix(1_800_000_000, 0)
+	h := &Handler{
+		importLoadSnapshot: func() importRuntimeLoadSnapshot { return snapshot },
+		importLoadNow:      func() time.Time { return now },
+	}
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 4, probe: 4}) {
+		t.Fatalf("high-active limits = %+v, want db=4 probe=4", got)
+	}
+	snapshot.Active = 0
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 8, probe: 6}) {
+		t.Fatalf("first active recovery limits = %+v, want medium tier", got)
+	}
+	now = now.Add(importTierRecoveryDelay)
+	if got := h.adaptiveImportLimits(); got != (importConcurrencyLimits{db: 12, probe: 8}) {
+		t.Fatalf("second active recovery limits = %+v, want low tier", got)
+	}
+}
+
+func TestAdaptiveImportDBLimiterShrinksWhileImportIsRunning(t *testing.T) {
+	var rpm atomic.Int64
+	h := &Handler{importLoadSnapshot: func() importRuntimeLoadSnapshot {
+		return importRuntimeLoadSnapshot{RPM: rpm.Load(), DBMaxOpen: 100}
+	}}
+	limiter := &adaptiveImportDBLimiter{handler: h}
+	for i := 0; i < 12; i++ {
+		if !limiter.acquire(context.Background()) {
+			t.Fatalf("low-load permit %d was not acquired", i+1)
+		}
+	}
+	if got := limiter.active.Load(); got != 12 {
+		t.Fatalf("low-load active permits = %d, want 12", got)
+	}
+
+	rpm.Store(1000)
+	blockedCtx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	if limiter.acquire(blockedCtx) {
+		cancel()
+		t.Fatal("high-load limiter granted a 13th permit")
+	}
+	cancel()
+	for i := 0; i < 8; i++ {
+		limiter.release()
+	}
+	blockedCtx, cancel = context.WithTimeout(context.Background(), 75*time.Millisecond)
+	if limiter.acquire(blockedCtx) {
+		cancel()
+		t.Fatal("high-load limiter exceeded four active permits")
+	}
+	cancel()
+
+	limiter.release()
+	if !limiter.acquire(context.Background()) {
+		t.Fatal("high-load limiter did not refill the fourth permit")
+	}
+	for limiter.active.Load() > 0 {
+		limiter.release()
+	}
+}
+
+func TestRunImportProbeTaskUsesEightWorkersAtLowLoad(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, UsageProbeConcurrency: 64})
+	store.SetUsageProbeConcurrency(64)
+	t.Cleanup(store.Stop)
+	h := &Handler{
+		store: store,
+		importLoadSnapshot: func() importRuntimeLoadSnapshot {
+			return importRuntimeLoadSnapshot{DBMaxOpen: 100}
+		},
+	}
+
+	const n = 8
+	started := make(chan struct{}, n)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		h.runImportProbeTask(func(context.Context) {
+			defer wg.Done()
+			started <- struct{}{}
+			<-release
+		})
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatalf("only %d/%d low-load probe workers started", i, n)
+		}
+	}
+	close(release)
+	wg.Wait()
+}
+
+// 导入采样 worker pool:同一时刻在途任务数不超过容量，超出的任务只进队列，
+// 不会各自创建一个阻塞 goroutine。
+func TestRunImportProbeTaskConcurrencyGate(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	store.SetUsageProbeConcurrency(2)
+	h := &Handler{store: store}
+
+	const n = 6
+	var inFlight int32
+	var maxSeen int32
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		h.runImportProbeTask(func(_ context.Context) {
+			defer wg.Done()
+			cur := atomic.AddInt32(&inFlight, 1)
+			for {
+				old := atomic.LoadInt32(&maxSeen)
+				if cur <= old || atomic.CompareAndSwapInt32(&maxSeen, old, cur) {
+					break
+				}
+			}
+			<-release
+			atomic.AddInt32(&inFlight, -1)
+		})
+	}
+	// 给两个 worker 时间拿到任务；其余四个应该仍是普通队列元素。
+	time.Sleep(150 * time.Millisecond)
+	if peak := atomic.LoadInt32(&maxSeen); peak > 2 {
+		close(release)
+		t.Fatalf("in-flight peak = %d, want ≤ 2 (gate leaked)", peak)
+	}
+	h.importProbeQueueMu.Lock()
+	workers := h.importProbeWorkers
+	queued := len(h.importProbeQueue)
+	h.importProbeQueueMu.Unlock()
+	if workers != 2 || queued != n-workers {
+		close(release)
+		t.Fatalf("workers/queued = %d/%d, want 2/%d", workers, queued, n-workers)
+	}
+	close(release)
+	wg.Wait()
+	if peak := atomic.LoadInt32(&maxSeen); peak == 0 {
+		t.Fatal("no probe task ran")
 	}
 }

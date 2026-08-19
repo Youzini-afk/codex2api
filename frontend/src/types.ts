@@ -8,6 +8,8 @@ export interface ToastState {
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
+/** Codex 官方出站请求的设备指纹收敛档位，默认 off（不收敛）。 */
+export type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 export type ModelCooldownMode = 'off' | 'fixed' | 'adaptive'
 
 export interface StatsChannelCounts {
@@ -33,6 +35,8 @@ export interface AccountUsageWindow {
   tokens: number
   account_billed?: number
   user_billed?: number
+  model_counts?: Record<string, number>
+  model_success_counts?: Record<string, number>
 }
 
 export interface GrokProductUsage {
@@ -81,11 +85,15 @@ export interface GrokPlanInfo {
 }
 
 export interface AccountRow {
+  detail_loaded?: boolean
   id: number
   name: string
   email: string
   email_domain?: string
   chatgpt_account_id?: string
+  token_workspace_id?: string
+  workspace_id_override?: string
+  effective_workspace_id?: string
   plan_type: string
   subscription_expires_at?: string
   status: AccountStatus
@@ -106,6 +114,7 @@ export interface AccountRow {
   models?: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
+  codex_fingerprint_mode?: CodexFingerprintMode
   custom_headers?: Record<string, string> | null
   health_tier?: string
   scheduler_score?: number
@@ -152,6 +161,8 @@ export interface AccountRow {
   error_requests?: number
   retry_error_requests?: number
   rate_limit_attempts?: number
+  error_status_counts?: Record<string, number>
+  success_model_counts?: Record<string, number>
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   rate_limit_reset_credits?: number | null
@@ -173,6 +184,8 @@ export interface AccountRow {
   dispatch_count_limited?: boolean
   usage_5h_detail?: AccountUsageWindow
   usage_7d_detail?: AccountUsageWindow
+  // 今日(服务器时区当天 0 点起)网关侧聚合,由 page-stats 补齐。
+  usage_today_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
   // 长窗口(7d 槽)真实类型: "monthly"(free/team 月窗)/"weekly"/未知。
@@ -181,6 +194,12 @@ export interface AccountRow {
   usage_window_7d_seconds?: number
   billed_5h?: number
   billed_7d?: number
+  // 官方结算口径的近 7 天成本(美元)。来自 account_daily_usage 快照,与
+  // billed_7d(本地日志算的网关成本)是两套账,列表里并排展示。
+  official_usd_7d?: number
+  // 官方快照已成功同步过但上游窗口内没有数据(官方统计有滞后)。
+  // 有这个标记时不再重拉 page-stats,胶囊显示静态"暂无数据"而非转圈。
+  official_usage_synced?: boolean
   cooldown_until?: ISODateString
   cooldown_reason?: string
   model_cooldowns?: Array<{
@@ -210,6 +229,172 @@ export interface AccountRow {
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
+
+export interface AccountListSummary {
+  total: number
+  normal: number
+  active: number
+  overload_paused: number
+  rate_limited: number
+  rate_limited_5h: number
+  rate_limited_7d: number
+  abnormal: number
+  banned: number
+  error: number
+  unsampled: number
+  disabled: number
+  locked: number
+  healthy: number
+  warm: number
+  risky: number
+  oauth: number
+  api_key: number
+  subscription_unlocked: number
+  unauthorized_24h: number
+  rate_limited_1h: number
+  timeout_15m: number
+}
+
+export interface AccountEmailDomainFacet {
+  domain: string
+  total: number
+  banned: number
+}
+
+export interface AccountsPageResponse extends AccountsResponse {
+  page: number
+  page_size: number
+  total: number
+  summary: AccountListSummary
+  facets: {
+    tags: string[]
+    email_domains: AccountEmailDomainFacet[]
+  }
+  snapshot_at: ISODateString
+  stats_state: 'ready' | 'stale' | 'warming'
+  disabled_sorts?: string[]
+}
+
+export interface AccountPageStatsItem {
+  usage_5h_detail?: AccountUsageWindow
+  usage_7d_detail?: AccountUsageWindow
+  usage_today_detail?: AccountUsageWindow
+  billed_5h?: number
+  billed_7d?: number
+  official_usd_7d?: number
+  official_usage_synced?: boolean
+}
+
+export interface AccountPageStatsResponse {
+  stats: Record<string, AccountPageStatsItem>
+}
+
+export interface AccountLiveStateResponse {
+  accounts: Record<string, { active_requests: number }>
+}
+
+export interface AccountsPageParams {
+  channel?: 'codex' | 'grok'
+  page: number
+  pageSize: number
+  search?: string
+  status?: string
+  plan?: string
+  authKind?: string
+  tag?: string
+  emailDomain?: string
+  groupInclude?: number[]
+  groupExclude?: number[]
+  ungrouped?: boolean
+  healthTier?: 'healthy' | 'warm' | 'risky' | 'banned' | 'attention'
+  proxyUrl?: string
+  proxyFilter?: 'all' | 'unbound' | 'this' | 'other'
+  sort?: 'requests' | 'today' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
+  order?: 'asc' | 'desc'
+}
+
+export interface AccountQuotaAnalysisBucket {
+  min: number
+  max: number
+  count: number
+}
+
+export interface AccountQuotaAnalysis {
+  total: number
+  sampled: number
+  unsampled: number
+  high_usage: number
+  exhausted: number
+  average_used: number | null
+  buckets: AccountQuotaAnalysisBucket[]
+}
+
+export interface AccountAnalysisTimeBucket {
+  start_at: number
+  end_at: number
+  count: number
+  cooldown_count?: number
+}
+
+export interface AccountRecoveryAnalysis {
+  total: number
+  recoverable: number
+  unknown: number
+  next_at: number | null
+  buckets: AccountAnalysisTimeBucket[]
+}
+
+export interface AccountResetAnalysis {
+  total: number
+  known: number
+  unknown: number
+  next_at: number | null
+  buckets: AccountAnalysisTimeBucket[]
+}
+
+export interface AccountPressureForecastAnalysis {
+  sampled: number
+  threshold: number
+  predicted_at: number | null
+  predicted_count: number
+  unknown: number
+  rpm: number
+  effective_rpm_limit: number
+  rpm_pressure: number | null
+  active_pressure: number
+  rate_limit_pressure: number
+  dispatchable_accounts: number
+  avg_concurrency: number
+  high_pressure_at: number | null
+  supply_shortage_at: number | null
+  risk_level: 'low' | 'medium' | 'high'
+  confidence: number
+}
+
+export interface AccountAnalysisResponse {
+  channel: 'codex' | 'grok'
+  quota: Record<'5h' | '7d', AccountQuotaAnalysis>
+  recovery: Record<'5h' | '7d', AccountRecoveryAnalysis>
+  reset: AccountResetAnalysis
+  forecasts: Record<'5h' | '7d', AccountPressureForecastAnalysis>
+  snapshot_at: ISODateString
+  stats_state: 'ready' | 'stale' | 'warming'
+}
+
+export interface AccountOperationSelector {
+  channel: 'codex' | 'grok'
+  search?: string
+  status?: string
+  plan?: string
+  auth_kind?: string
+  tag?: string
+  email_domain?: string
+  group_include?: number[]
+  group_exclude?: number[]
+  ungrouped?: boolean
+  refreshable_only?: boolean
+  subscription_unlocked?: boolean
+}
 
 // 单张「主动重置次数」券的有效期明细（issue #322）。
 export interface ResetCreditItem {
@@ -469,8 +654,134 @@ export interface AddGrokAccountRequest {
 
 export type UpdateGrokAccountRequest = AddGrokAccountRequest
 
+export interface BatchUpdateGrokModelsRequest {
+  ids: number[]
+  models: string[]
+}
+
+export interface BatchUpdateGrokModelsResponse {
+  message: string
+  success: number
+  failed: number
+  models: string[]
+}
+
 export interface FetchGrokModelsResponse {
   models: string[]
+}
+
+export type GrokFactKind = 'user' | 'settings' | 'billing' | 'auto_topup'
+export type GrokProtocol = 'responses' | 'chat_completions' | 'messages'
+
+/** A sanitized control-plane observation. Token material is never included. */
+export interface GrokAccountFact {
+  account_id: number
+  kind: GrokFactKind | string
+  status: string
+  http_status?: number
+  payload?: Record<string, unknown> | null
+  field_presence?: Record<string, string>
+  credential_generation: number
+  source?: string
+  observed_at?: ISODateString
+  expires_at?: ISODateString
+  updated_at?: ISODateString
+}
+
+export interface GrokAccountIdentitySummary {
+  credential_family_id: string
+  archive_plan?: string
+  archive_plan_source?: string
+  jwt_tier?: string
+  jwt_tier_trust?: string
+}
+
+export interface GrokModelCatalogSnapshot {
+  account_id: number
+  origin: string
+  credential_generation: number
+  auth_kind?: string
+  status: string
+  http_etag?: string
+  etag_hint?: string
+  etag_hint_observed_at?: ISODateString
+  observed_at?: ISODateString
+  expires_at?: ISODateString
+  updated_at?: ISODateString
+}
+
+export interface GrokModelCatalogItem {
+  account_id: number
+  origin: string
+  model_id: string
+  display_name?: string
+  description?: string
+  base_url?: string
+  api_base_url?: string
+  api_backend?: GrokProtocol | string
+  context_window?: number
+  max_output_tokens?: number
+  reasoning?: boolean | null
+  backend_search?: boolean | null
+  stream_tool_calls?: boolean | null
+  supported_in_api?: boolean | null
+  hidden?: boolean | null
+  first_seen_at?: ISODateString
+  observed_at?: ISODateString
+}
+
+export interface GrokModelCatalog {
+  snapshot: GrokModelCatalogSnapshot
+  items: GrokModelCatalogItem[]
+}
+
+export interface GrokModelCapability {
+  account_id: number
+  model_id: string
+  origin: string
+  protocol: GrokProtocol | string
+  credential_generation: number
+  status: string
+  http_status?: number
+  provider_code?: string
+  source?: string
+  retry_after_seconds?: number | null
+  observed_at?: ISODateString
+  expires_at?: ISODateString
+  updated_at?: ISODateString
+}
+
+export interface GrokAccountState {
+  account_id: number
+  credential_generation: number
+  identity?: GrokAccountIdentitySummary | null
+  facts: Record<string, GrokAccountFact>
+  catalogs: GrokModelCatalog[]
+  capabilities: GrokModelCapability[]
+}
+
+export interface GrokStateSyncResponse {
+  message: string
+  state: GrokAccountState
+  models: string[]
+  synced_facts?: string[]
+  errors?: Record<string, string>
+}
+
+export interface GrokCapabilityProbeResult {
+  model_id: string
+  protocol: GrokProtocol | string
+  status: string
+  http_status?: number
+  provider_code?: string
+  retry_after_seconds?: number | null
+  observed_at?: ISODateString
+}
+
+export interface GrokCapabilityProbeResponse {
+  message: string
+  state: GrokAccountState
+  results: GrokCapabilityProbeResult[]
 }
 
 // Grok Device Code OAuth（与 CLIProxyAPI / Grok CLI 一致）。
@@ -569,10 +880,12 @@ export interface UpdateAccountSchedulerRequest {
   dispatch_count_limit?: number | null
   scheduler_priority?: number | null
   custom_headers?: Record<string, string> | null
+  codex_fingerprint_mode?: CodexFingerprintMode | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
-  ids: number[]
+  ids?: number[]
+  selector?: AccountOperationSelector
   enabled?: boolean
   locked?: boolean
 }
@@ -588,6 +901,7 @@ export interface AccountGroup {
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
   proxy_urls: string[]
+  channel: 'codex' | 'grok'
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -605,6 +919,7 @@ export interface CreateAccountGroupRequest {
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
   proxy_urls?: string[]
+  channel?: 'codex' | 'grok'
 }
 
 export interface UpdateAccountGroupRequest {
@@ -616,6 +931,7 @@ export interface UpdateAccountGroupRequest {
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
   proxy_urls?: string[]
+  channel?: 'codex' | 'grok'
 }
 
 export interface AccountModelStat {
@@ -628,6 +944,53 @@ export interface AccountModelStat {
   cached_tokens: number
   account_billed: number
   user_billed: number
+}
+
+// 官方结算用量（wham daily-workspace-usage-counts 落库后的快照）。
+// 与本地 usage_logs 聚合是两套口径：这份是 OpenAI 侧的权威账单数据。
+export interface WhamDailyUsageSplit {
+  client_id?: string
+  model?: string
+  users: number
+  threads: number
+  turns: number
+  credits: number
+  uncached_text_input_tokens?: number
+  cached_text_input_tokens?: number
+  text_output_tokens?: number
+  text_total_tokens?: number
+}
+
+export interface WhamDailyUsageItem {
+  day: string
+  credits: number
+  usd: number
+  users: number
+  threads: number
+  turns: number
+  uncached_input_tokens: number
+  cached_input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  // 当天的记录在上游结算前不含 token 明细，settled=false 时 token 数还不可信。
+  settled: boolean
+  clients: WhamDailyUsageSplit[]
+  models: WhamDailyUsageSplit[]
+}
+
+export interface WhamDailyUsageResponse {
+  days: number
+  items: WhamDailyUsageItem[]
+  totals: {
+    credits: number
+    usd: number
+    total_tokens: number
+    turns: number
+  }
+  credits_per_usd: number
+  retention_days: number
+  last_synced_at?: string
+  refresh_error?: string
 }
 
 export interface AccountUsageDayStat {
@@ -1003,17 +1366,32 @@ export interface SystemSettings {
   codex_ws_busy_acquire_max_wait_sec: number
   codex_ws_busy_overflow_enabled: boolean
   codex_ws_busy_patience_sec: number
+  codex_ws_stateless_slots: number
+  // GitHub 访问（issue #522）：token 只写不读，响应仅回 configured
+  github_token?: string
+  github_token_configured?: boolean
+  github_proxy_url: string
+  // Codex 过载熔断：窗口内 server_is_overloaded 占比达阈值自动暂停调度
+  codex_overload_pause_enabled: boolean
+  codex_overload_threshold_percent: number
+  codex_overload_pause_minutes: number
+  codex_overload_window_minutes: number
   codex_continue_thinking_enabled: boolean
   overflow_auto_compact_enabled: boolean
+  compact_via_responses_enabled: boolean
   codex_preflight_sse_passthrough_enabled: boolean
   codex_continue_max_rounds: number
   utls_shutdown_timeout_minutes: number
   scheduler_mode: string
   affinity_mode?: string
+  session_affinity_spread?: boolean
   grok_affinity_mode?: string
   grok_probe_enabled?: boolean
   grok_probe_interval_minutes?: number
   grok_max_rate_limit_retries?: number
+  grok_follow_up_effort_enabled?: boolean
+  grok_follow_up_tool_effort?: string
+  grok_follow_up_small_effort?: string
   grok_oauth_client_id?: string
   /** 环境变量 GROK_OAUTH_CLIENT_ID 是否正压着上面的设置（只读，后端下发）。 */
   grok_oauth_client_id_env_override?: boolean
@@ -1023,6 +1401,8 @@ export interface SystemSettings {
   max_rate_limit_retries: number
   retry_interval_ms: number
   transport_retry_policy: string
+  /** 新导入/新建 Codex 账号默认盖上的设备指纹收敛档位（off/device/session/full）。 */
+  codex_fingerprint_default_mode: string
   allow_remote_migration: boolean
   database_driver: string
   database_label: string
@@ -1279,6 +1659,36 @@ export interface PromptPolicyIncidentsResponse {
 	page_size: number
 }
 
+export interface PromptPolicyAuditHealth {
+	ok: boolean
+	status: 'healthy' | 'degraded' | string
+	storage_ready: boolean
+	prompt_filter_enabled: boolean
+	review_enabled: boolean
+	review_fail_closed: boolean
+	review_pool: {
+		configured: number
+		available: number
+		cooling_down: number
+		probing: number
+		next_retry_at?: ISODateString
+	}
+	conversation_lock_enabled: boolean
+	incident_count: number
+	latest_incident_id?: string
+	latest_incident_at?: ISODateString
+	queue: {
+		enqueued: number
+		completed: number
+		dropped_high: number
+		dropped_low: number
+		failed: number
+		pending_high: number
+		pending_low: number
+		retained_bytes: number
+	}
+}
+
 export interface PromptPolicyIncidentDetailResponse {
 	incident: PromptPolicyIncident
 	matches: PromptFilterMatch[]
@@ -1423,6 +1833,9 @@ export interface PromptConversationLock {
   locked_at: ISODateString
   unlocked_at?: ISODateString
   unlock_reason?: string
+  restriction_scope?: 'conversation' | 'user_cooldown'
+  expires_at?: ISODateString
+  remaining_seconds?: number
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -1515,6 +1928,8 @@ export interface PromptReviewTestRequest {
 
 export interface PromptReviewKeyTestResult {
   key_index: number
+  key_id?: string
+  key_masked?: string
   ok: boolean
   endpoint?: string
   model?: string
@@ -1529,6 +1944,34 @@ export interface PromptReviewKeyTestResult {
   moderation_thresholds?: Record<string, number>
   latency_ms: number
   error?: string
+}
+
+export interface PromptReviewAPIKeyDescriptor {
+  id: string
+  index: number
+  masked: string
+}
+
+export interface PromptReviewAPIKeysResponse {
+  items: PromptReviewAPIKeyDescriptor[]
+  count: number
+}
+
+export interface PromptReviewProfile {
+  id: string
+  name: string
+  base_url: string
+  model: string
+  request_mode: string
+  timeout_seconds: number
+  key_count: number
+  active: boolean
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface PromptReviewProfilesResponse {
+  profiles: PromptReviewProfile[]
 }
 
 export interface PromptReviewTestResponse {
@@ -2064,10 +2507,19 @@ export interface APIKeyAccountUsageSummary {
   user_billed: number
 }
 
+export interface APIKeyAccountUsageReconciliation {
+  grouped_total: APIKeyAccountUsageSummary
+  ungrouped: APIKeyAccountUsageSummary
+  duplicate: APIKeyAccountUsageSummary
+  unique_grouped_accounts: number
+  multi_group_accounts: number
+}
+
 export interface APIKeyAccountStatsResponse {
   items: APIKeyAccountStat[]
   groups: APIKeyAccountGroupUsage[]
   summary: APIKeyAccountUsageSummary
+  reconciliation?: APIKeyAccountUsageReconciliation
   /** Active accounts use current memberships; deleted accounts use their last retained membership. */
   membership_basis: 'current_and_deleted_last_membership'
 }
@@ -2191,6 +2643,31 @@ export interface ModelPricingOverride {
   input_long?: number
   cached_input_long?: number
   output_long?: number
+	input_long_priority?: number
+	cached_input_long_priority?: number
+	output_long_priority?: number
+	long_context_threshold_tokens?: number
+}
+
+export interface OfficialPricingSyncConfig {
+	enabled: boolean
+	interval_minutes: number
+	include_openai: boolean
+	include_grok: boolean
+	last_attempt_at?: string
+	last_success_at?: string
+	last_error?: string
+	last_warning?: string
+}
+
+export interface OfficialPricingSyncResult {
+	fetched: number
+	applied: number
+	skipped: number
+	missing?: string[]
+	sources: string[]
+	warnings?: string[]
+	synced_at: string
 }
 
 /**
@@ -2296,6 +2773,8 @@ export interface APIKeyLimits {
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
   upstream_channel?: "codex" | "grok"
+  /** 允许该 Key 使用 ChatGPT Live（/v1/live）。默认关闭。 */
+  allow_live?: boolean
   /** 分组 / 账号维度的用量预算（issue #439）。 */
   scope_limits?: APIKeyScopeLimit[]
 }
@@ -2606,6 +3085,8 @@ export interface CreateImageJobPayload {
   background?: string
   style?: string
   upscale?: string
+  strict_size?: boolean
+  upscale_fit?: 'pad' | 'cover'
   api_key_id?: number
   template_id?: number
   input_images?: string[]

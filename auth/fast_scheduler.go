@@ -34,6 +34,10 @@ type fastSchedulerPosition struct {
 // 调度策略：调度优先级全局优先；同优先级内按健康层级分桶，
 // 桶内按调度分排序后 round-robin。
 // 验证过的账号只作为同分 tie-breaker，避免历史请求量盖过额度快重置优先级。
+//
+// fill_first 模式（issue #501）：同优先级内按 7d 用量降序排列并始终从队首
+// 取号，流量集中在剩余额度最少的账号上；该账号限流/耗尽后自然滑落到下一个，
+// 恢复后按最新用量重新排队。无用量数据的账号退化为固定顺序（dbID 升序）。
 type FastScheduler struct {
 	mu            sync.RWMutex
 	baseLimit     int64
@@ -41,11 +45,26 @@ type FastScheduler struct {
 	schedulerMode string
 	buckets       map[AccountHealthTier][]fastSchedulerEntry
 	positions     map[int64]fastSchedulerPosition
-	cursors       [3]atomic.Uint64
-	provenBounds  [3]int           // 每个 tier 桶中验证过的账号数量（排在前面）
-	provenCurs    [3]atomic.Uint64 // 验证账号专用 round-robin 游标
-	groupCheck    func(apiKeyID int64, account *Account) bool
-	acquire       func(account *Account, concurrencyLimit int64) bool
+	// unsorted 记录哪些桶的顺序已被写入侧打乱。写入侧（新增/删除/状态变更）只做
+	// O(1) 改动并在这里打标，真正的重排推迟到下一次取号时按桶合并成一次。
+	// 号池上万时，"每次账号状态变更都整桶重排 + 全量重建位置索引"会把调度器
+	// 独占锁占满（批量导入是最容易触发的场景）。
+	unsorted     map[AccountHealthTier]bool
+	cursors      [3]atomic.Uint64
+	provenBounds [3]int           // 每个 tier 桶中验证过的账号数量（排在前面）
+	provenCurs   [3]atomic.Uint64 // 验证账号专用 round-robin 游标
+	groupCheck   func(apiKeyID int64, account *Account) bool
+	acquire      func(account *Account, concurrencyLimit int64) bool
+	// resorts 统计整桶重排次数，用于回归测试锁定"批量写入不再逐条重排"这个性质。
+	resorts atomic.Uint64
+}
+
+// ResortCount 返回累计的整桶重排次数。
+func (s *FastScheduler) ResortCount() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.resorts.Load()
 }
 
 func NewFastScheduler(baseLimit int64, modeOrUsageMaxAge interface{}, usageMaxAge ...time.Duration) *FastScheduler {
@@ -76,6 +95,7 @@ func NewFastScheduler(baseLimit int64, modeOrUsageMaxAge interface{}, usageMaxAg
 			HealthTierRisky:   nil,
 		},
 		positions: map[int64]fastSchedulerPosition{},
+		unsorted:  map[AccountHealthTier]bool{},
 	}
 }
 
@@ -110,41 +130,81 @@ func (s *FastScheduler) SetSchedulerMode(mode string) {
 
 	// Re-sort all tier buckets according to the new mode.
 	for _, tier := range fastSchedulerTierOrder {
-		entries := s.buckets[tier]
-		if len(entries) == 0 {
-			continue
+		s.sortBucketLocked(tier)
+	}
+}
+
+// entryLessLocked 是所有调度模式共用的桶内排序谓词。调用方必须持有 s.mu。
+//
+// 各模式的排序键：
+//   - fill_first：7d 用量降序，流量集中在剩余额度最少的账号（issue #501）
+//   - remaining_quota：7d 用量升序，优先用剩余额度多的账号
+//   - round_robin 的 healthy 桶：7d 用量升序，把负载摊平到所有可用账号（issue #150）
+//   - 其余：调度分降序
+//
+// 调度优先级（issue #358）始终全局优先，验证过的账号只作同分 tie-breaker，
+// 最后用 dbID 兜底保证全序（因此排序结果与是否稳定排序无关）。
+func (s *FastScheduler) entryLessLocked(tier AccountHealthTier, a, b *fastSchedulerEntry) bool {
+	if a.priority != b.priority {
+		return a.priority > b.priority
+	}
+	switch {
+	case s.schedulerMode == "fill_first":
+		usageA, usageB := a.acc.usagePercentForScheduling(), b.acc.usagePercentForScheduling()
+		if usageA != usageB {
+			return usageA > usageB
 		}
-		if mode == "remaining_quota" {
-			sort.SliceStable(entries, func(i, j int) bool {
-				if entries[i].priority != entries[j].priority {
-					return entries[i].priority > entries[j].priority
-				}
-				usageI := entries[i].acc.usagePercentForScheduling()
-				usageJ := entries[j].acc.usagePercentForScheduling()
-				if usageI == usageJ {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return usageI < usageJ
-			})
-		} else {
-			sort.SliceStable(entries, func(i, j int) bool {
-				if entries[i].priority != entries[j].priority {
-					return entries[i].priority > entries[j].priority
-				}
-				if entries[i].dispatchScore == entries[j].dispatchScore {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return entries[i].dispatchScore > entries[j].dispatchScore
-			})
+	case s.schedulerMode == "remaining_quota":
+		usageA, usageB := a.acc.usagePercentForScheduling(), b.acc.usagePercentForScheduling()
+		if usageA != usageB {
+			return usageA < usageB
 		}
+	case s.schedulerMode == "round_robin" && tier == HealthTierHealthy:
+		usageA, usageB := a.acc.usagePercentForScheduling(), b.acc.usagePercentForScheduling()
+		if usageA != usageB {
+			return usageA < usageB
+		}
+		if a.dispatchScore != b.dispatchScore {
+			return a.dispatchScore > b.dispatchScore
+		}
+	default:
+		if a.dispatchScore != b.dispatchScore {
+			return a.dispatchScore > b.dispatchScore
+		}
+	}
+	if a.proven != b.proven {
+		return a.proven
+	}
+	return a.dbID < b.dbID
+}
+
+// sortBucketLocked 重排单个桶并重建其位置索引，清掉待重排标记。
+func (s *FastScheduler) sortBucketLocked(tier AccountHealthTier) {
+	entries := s.buckets[tier]
+	delete(s.unsorted, tier)
+	if len(entries) == 0 {
+		return
+	}
+	if len(entries) > 1 {
+		s.resorts.Add(1)
+		sort.SliceStable(entries, func(i, j int) bool {
+			return s.entryLessLocked(tier, &entries[i], &entries[j])
+		})
 		s.buckets[tier] = entries
-		s.rebuildPositionsLocked(tier)
+	}
+	s.rebuildPositionsLocked(tier)
+}
+
+// ensureSortedLocked 在取号前把被打乱的桶补排一次。写入侧只打标不排序，
+// 一批连续变更（例如批量导入、并发 Release）在这里合并成一次排序。
+func (s *FastScheduler) ensureSortedLocked() {
+	if len(s.unsorted) == 0 {
+		return
+	}
+	for _, tier := range fastSchedulerTierOrder {
+		if s.unsorted[tier] {
+			s.sortBucketLocked(tier)
+		}
 	}
 }
 
@@ -189,6 +249,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		HealthTierRisky:   nil,
 	}
 	s.positions = make(map[int64]fastSchedulerPosition, len(accounts))
+	s.unsorted = map[AccountHealthTier]bool{}
 
 	// 批量插入：先全部放入桶中，不逐条排序
 	now := time.Now()
@@ -214,41 +275,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 
 	// 每个桶只排序一次 + 重建位置索引 + 计算验证账号边界
 	for _, tier := range fastSchedulerTierOrder {
-		entries := s.buckets[tier]
-		if len(entries) == 0 {
-			continue
-		}
-		if s.schedulerMode == "remaining_quota" {
-			sort.SliceStable(entries, func(i, j int) bool {
-				if entries[i].priority != entries[j].priority {
-					return entries[i].priority > entries[j].priority
-				}
-				usageI := entries[i].acc.usagePercentForScheduling()
-				usageJ := entries[j].acc.usagePercentForScheduling()
-				if usageI == usageJ {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return usageI < usageJ
-			})
-		} else {
-			sort.SliceStable(entries, func(i, j int) bool {
-				if entries[i].priority != entries[j].priority {
-					return entries[i].priority > entries[j].priority
-				}
-				if entries[i].dispatchScore == entries[j].dispatchScore {
-					if entries[i].proven != entries[j].proven {
-						return entries[i].proven
-					}
-					return entries[i].dbID < entries[j].dbID
-				}
-				return entries[i].dispatchScore > entries[j].dispatchScore
-			})
-		}
-		s.buckets[tier] = entries
-		s.rebuildPositionsLocked(tier)
+		s.sortBucketLocked(tier)
 	}
 }
 
@@ -260,8 +287,96 @@ func (s *FastScheduler) Update(acc *Account) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.removeLocked(acc.DBID)
-	s.insertLocked(acc, time.Now())
+	s.updateLocked(acc, time.Now())
+}
+
+// UpdateMany applies one import batch while holding the scheduler lock once.
+// A hot Acquire path must not observe the bucket as unsorted between individual
+// additions, otherwise it can sort the whole pool once per imported account.
+func (s *FastScheduler) UpdateMany(accounts []*Account) {
+	if s == nil || len(accounts) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	for _, acc := range accounts {
+		s.updateLocked(acc, now)
+	}
+}
+
+// updateLocked 优先就地更新已在桶内的条目：只有当新的排序键真的破坏了它与相邻
+// 条目的顺序时，才给该桶打上待重排标记。这样一次 Release / 用量刷新 / 冷却标记
+// 的代价是 O(1)，而不是"整桶重排 + 全量重建位置索引"。
+func (s *FastScheduler) updateLocked(acc *Account, now time.Time) {
+	if acc == nil || acc.DBID == 0 {
+		return
+	}
+
+	tier, dispatchScore, limit, proven, available := acc.fastSchedulerSnapshot(s.baseLimit, s.usageMaxAge, now)
+	schedulable := available && limit > 0 &&
+		(tier == HealthTierHealthy || tier == HealthTierWarm || tier == HealthTierRisky)
+
+	pos, exists := s.positions[acc.DBID]
+	if !schedulable {
+		if exists {
+			s.removeLocked(acc.DBID)
+		}
+		return
+	}
+
+	entries := s.buckets[pos.tier]
+	inPlace := exists && pos.tier == tier &&
+		pos.index >= 0 && pos.index < len(entries) && entries[pos.index].dbID == acc.DBID
+	if !inPlace {
+		// 新账号、换了健康层级，或位置索引与桶不一致：走"摘掉再挂上"的慢路径。
+		if exists {
+			s.removeLocked(acc.DBID)
+		}
+		s.appendLocked(acc, tier, dispatchScore, proven)
+		return
+	}
+
+	entries[pos.index] = fastSchedulerEntry{
+		acc:           acc,
+		dbID:          acc.DBID,
+		dispatchScore: dispatchScore,
+		proven:        proven,
+		priority:      acc.schedulerPriority(),
+	}
+	if s.entryOutOfOrderLocked(tier, entries, pos.index) {
+		s.unsorted[tier] = true
+	}
+}
+
+// entryOutOfOrderLocked 只比较左右邻居：桶已排好序时这足以判断该条目是否仍在
+// 正确位置；桶已被标记待重排时结论无所谓，反正马上会整桶重排。
+func (s *FastScheduler) entryOutOfOrderLocked(tier AccountHealthTier, entries []fastSchedulerEntry, idx int) bool {
+	if idx > 0 && s.entryLessLocked(tier, &entries[idx], &entries[idx-1]) {
+		return true
+	}
+	if idx+1 < len(entries) && s.entryLessLocked(tier, &entries[idx+1], &entries[idx]) {
+		return true
+	}
+	return false
+}
+
+// appendLocked 把条目挂到桶尾并打上待重排标记，O(1)。
+func (s *FastScheduler) appendLocked(acc *Account, tier AccountHealthTier, dispatchScore float64, proven bool) {
+	entries := append(s.buckets[tier], fastSchedulerEntry{
+		acc:           acc,
+		dbID:          acc.DBID,
+		dispatchScore: dispatchScore,
+		proven:        proven,
+		priority:      acc.schedulerPriority(),
+	})
+	s.buckets[tier] = entries
+	s.positions[acc.DBID] = fastSchedulerPosition{tier: tier, index: len(entries) - 1}
+	if len(entries) > 1 && s.entryLessLocked(tier, &entries[len(entries)-1], &entries[len(entries)-2]) {
+		s.unsorted[tier] = true
+	}
 }
 
 func (s *FastScheduler) Remove(dbID int64) {
@@ -309,6 +424,8 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 	baseLimit := s.baseLimit
 	usageMaxAge := s.usageMaxAge
 	for {
+		// 写入侧只打标不排序，取号前在这里把被打乱的桶补排一次。
+		s.ensureSortedLocked()
 		changed := false
 		// 每个健康桶都已按 priority DESC 排序。用三路归并的方式逐级取全局
 		// 最高优先级，并在该优先级内按 healthy -> warm -> risky 扫描。
@@ -345,8 +462,9 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 					segEnd++
 				}
 
-				// 阶段 1：优先在 segment 内验证过的账号中 round-robin（非 remaining_quota 模式）
-				if s.schedulerMode != "remaining_quota" {
+				// 阶段 1：轮询模式优先在 segment 内验证过的账号中 round-robin。
+				// remaining_quota / fill_first 必须严格从排序后的队首开始。
+				if s.schedulerMode != "remaining_quota" && s.schedulerMode != "fill_first" {
 					provenBound := s.provenBounds[tierIdx]
 					if provenBound > segStart {
 						provenEnd := provenBound
@@ -367,7 +485,9 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 				// 阶段 2：回退到 segment 内全量 round-robin
 				cursor := &s.cursors[tierIdx]
 				var zeroCursor atomic.Uint64
-				if s.schedulerMode == "remaining_quota" {
+				// remaining_quota / fill_first 不走轮询游标：每次都从排序后的
+				// 队首开始扫，保证严格按排序语义取号。
+				if s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first" {
 					cursor = &zeroCursor
 				}
 				acc, stale := s.scanRangeLocked(tier, segStart, segEnd, cursor, baseLimit, usageMaxAge, now, apiKeyID, exclude, filter)
@@ -414,12 +534,18 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 			continue
 		}
 		tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshot(baseLimit, usageMaxAge, now)
-		if tier != expectedTier || proven != entry.proven || math.Abs(dispatchScore-entry.dispatchScore) >= 1 {
+		if tier != expectedTier {
+			// 健康层级变了，条目要换桶，桶边界随之变化，必须重新开始扫描。
 			s.removeLocked(entry.dbID)
 			if available && limit > 0 {
 				s.insertLocked(entry.acc, now)
 			}
 			return nil, true
+		}
+		if proven != entry.proven || math.Abs(dispatchScore-entry.dispatchScore) >= 1 {
+			// 同层级内的排序键漂移：就地刷新缓存并标记待重排，继续扫完本轮。
+			// 每次漂移都重启整轮扫描会让大号池下的一次取号反复全量重排。
+			s.refreshEntryLocked(expectedTier, rangeStart+(start+offset)%rangeLen, dispatchScore, proven)
 		}
 		if !available || limit <= 0 {
 			continue
@@ -430,6 +556,20 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 		return entry.acc, false
 	}
 	return nil, false
+}
+
+// refreshEntryLocked 就地刷新桶内某个下标的排序键缓存，顺序被破坏时打上待重排标记。
+func (s *FastScheduler) refreshEntryLocked(tier AccountHealthTier, idx int, dispatchScore float64, proven bool) {
+	entries := s.buckets[tier]
+	if idx < 0 || idx >= len(entries) || entries[idx].acc == nil {
+		return
+	}
+	entries[idx].dispatchScore = dispatchScore
+	entries[idx].proven = proven
+	entries[idx].priority = entries[idx].acc.schedulerPriority()
+	if s.entryOutOfOrderLocked(tier, entries, idx) {
+		s.unsorted[tier] = true
+	}
 }
 
 func (s *FastScheduler) Release(acc *Account) {
@@ -473,67 +613,11 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		return
 	}
 
-	entries := append(s.buckets[tier], fastSchedulerEntry{
-		acc:           acc,
-		dbID:          acc.DBID,
-		dispatchScore: dispatchScore,
-		proven:        proven,
-		priority:      acc.schedulerPriority(),
-	})
-	if s.schedulerMode == "remaining_quota" {
-		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].priority != entries[j].priority {
-				return entries[i].priority > entries[j].priority
-			}
-			usageI := entries[i].acc.usagePercentForScheduling()
-			usageJ := entries[j].acc.usagePercentForScheduling()
-			if usageI == usageJ {
-				if entries[i].proven != entries[j].proven {
-					return entries[i].proven
-				}
-				return entries[i].dbID < entries[j].dbID
-			}
-			return usageI < usageJ
-		})
-	} else if s.schedulerMode == "round_robin" && tier == HealthTierHealthy {
-		// round_robin 模式下,healthy 桶按 7d 用量 ASC 排序后再走轮询。
-		// 这样同一个 round 里,用得少的账号被先轮到,自然把负载摊平到所有可用账号上,
-		// 避免出现"轮询模式仍然一直薅同一个号"的现象 (issue #150)。
-		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].priority != entries[j].priority {
-				return entries[i].priority > entries[j].priority
-			}
-			usageI := entries[i].acc.usagePercentForScheduling()
-			usageJ := entries[j].acc.usagePercentForScheduling()
-			if usageI == usageJ {
-				if entries[i].dispatchScore != entries[j].dispatchScore {
-					return entries[i].dispatchScore > entries[j].dispatchScore
-				}
-				if entries[i].proven != entries[j].proven {
-					return entries[i].proven
-				}
-				return entries[i].dbID < entries[j].dbID
-			}
-			return usageI < usageJ
-		})
-	} else {
-		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].priority != entries[j].priority {
-				return entries[i].priority > entries[j].priority
-			}
-			if entries[i].dispatchScore == entries[j].dispatchScore {
-				if entries[i].proven != entries[j].proven {
-					return entries[i].proven
-				}
-				return entries[i].dbID < entries[j].dbID
-			}
-			return entries[i].dispatchScore > entries[j].dispatchScore
-		})
-	}
-	s.buckets[tier] = entries
-	s.rebuildPositionsLocked(tier)
+	s.appendLocked(acc, tier, dispatchScore, proven)
 }
 
+// removeLocked 用"末尾条目补洞"的方式摘除，O(1)。补洞会打乱桶内顺序，
+// 因此打上待重排标记，由下一次取号前的 ensureSortedLocked 统一修复。
 func (s *FastScheduler) removeLocked(dbID int64) {
 	pos, ok := s.positions[dbID]
 	if !ok {
@@ -541,16 +625,31 @@ func (s *FastScheduler) removeLocked(dbID int64) {
 	}
 
 	entries := s.buckets[pos.tier]
-	if pos.index < 0 || pos.index >= len(entries) {
-		delete(s.positions, dbID)
-		return
+	if pos.index < 0 || pos.index >= len(entries) || entries[pos.index].dbID != dbID {
+		// 位置索引与桶不一致（不应发生）：线性找一遍，宁可慢也不能漏摘。
+		pos.index = -1
+		for idx := range entries {
+			if entries[idx].dbID == dbID {
+				pos.index = idx
+				break
+			}
+		}
+		if pos.index < 0 {
+			delete(s.positions, dbID)
+			s.unsorted[pos.tier] = true
+			return
+		}
 	}
 
-	copy(entries[pos.index:], entries[pos.index+1:])
-	entries = entries[:len(entries)-1]
-	s.buckets[pos.tier] = entries
+	last := len(entries) - 1
+	if pos.index != last {
+		entries[pos.index] = entries[last]
+		s.positions[entries[pos.index].dbID] = fastSchedulerPosition{tier: pos.tier, index: pos.index}
+		s.unsorted[pos.tier] = true
+	}
+	entries[last] = fastSchedulerEntry{}
+	s.buckets[pos.tier] = entries[:last]
 	delete(s.positions, dbID)
-	s.rebuildPositionsLocked(pos.tier)
 }
 
 func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
@@ -573,6 +672,17 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 }
 
 func (a *Account) fastSchedulerSnapshot(baseLimit int64, args ...interface{}) (AccountHealthTier, float64, int64, bool, bool) {
+	return a.fastSchedulerSnapshotWithUsageOverride(baseLimit, false, args...)
+}
+
+func (a *Account) fastSchedulerSnapshotForContinuation(baseLimit int64, args ...interface{}) (AccountHealthTier, float64, int64, bool, bool) {
+	return a.fastSchedulerSnapshotWithUsageOverride(baseLimit, true, args...)
+}
+
+// fastSchedulerSnapshotWithUsageOverride accepts both the historical
+// (baseLimit, now) form and the usage-reserve-aware
+// (baseLimit, usageMaxAge, now) form.
+func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, continuation bool, args ...interface{}) (AccountHealthTier, float64, int64, bool, bool) {
 	usageMaxAge := defaultUsageProbeMaxAge
 	now := time.Now()
 	for _, arg := range args {
@@ -615,24 +725,28 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, args ...interface{}) (A
 		limit = a.smartPacingConcurrencyLimitLocked(limit, now)
 	}
 
-	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
+	continuationUsageOverride := continuation && a.usageLimitContinuationEligibleLocked(now)
+	available := atomic.LoadInt32(&a.Disabled) == 0 &&
+		a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
 	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
 		available = false
 	}
-	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
-		available = false
-	}
-	if a.premium5hRateLimitedLocked(now) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) && !continuationUsageOverride {
 		available = false
 	}
 	if a.quotaAutoPausedLocked(now) {
 		available = false
 	}
-	// Free 账号 7d 用量耗尽，不参与调度
-	if a.usageExhaustedLockedAt(now) {
+	// Fresh dispatch remains fenced by WHAM-reported usage windows even when
+	// IgnoreUsageLimitStatus is enabled. Continuations use a separate, narrow
+	// account-selection path in Store.
+	if a.usageWindowBlocksFreshDispatchLocked(now) &&
+		!continuationUsageOverride {
 		available = false
 	}
-	if a.usageReserveActiveLocked(now, usageMaxAge) {
+	// Usage reserve protects new work while allowing an already bound upstream
+	// turn to finish on the account that owns its continuation state.
+	if a.usageReserveActiveLocked(now, usageMaxAge) && !continuation {
 		available = false
 	}
 

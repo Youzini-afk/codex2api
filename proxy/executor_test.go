@@ -525,6 +525,22 @@ func TestPrepareCodexResponsesLiteTransportBridgesRequestScopedSignal(t *testing
 	if marker := gjson.GetBytes(nonLiteBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
 		t.Fatalf("HTTP body retained false WS-only Lite metadata: %s", nonLiteBody)
 	}
+
+	// 模型门禁剥离信号后（enabled=false），WS 路径必须清掉下游带来的体内标记，
+	// 否则非 lite 模型仍会把标记带上 WS 上游触发 400。
+	gatedWSBody := []byte(`{"model":"gpt-5.5","client_metadata":{"other":"kept","ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`)
+	gatedWSHeaders := make(http.Header)
+	gatedWSHeaders.Set(codexResponsesLiteHeader, "true")
+	gatedWSBody, gatedWSHeaders = prepareCodexResponsesLiteTransport(gatedWSBody, gatedWSHeaders, true, false)
+	if marker := gjson.GetBytes(gatedWSBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("WS body retained Lite metadata after gate disabled it: %s", gatedWSBody)
+	}
+	if got := gjson.GetBytes(gatedWSBody, "client_metadata.other").String(); got != "kept" {
+		t.Fatalf("unrelated client metadata = %q, want kept; body=%s", got, gatedWSBody)
+	}
+	if got := gatedWSHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("WS handshake Lite header = %q, want empty after gate disabled it", got)
+	}
 }
 
 func TestNormalizeCodexResponsesLiteBodyEnforcesUpstreamConstraints(t *testing.T) {
@@ -579,6 +595,68 @@ func TestNormalizeCodexResponsesLiteBodyStripsImageOnlyToolSet(t *testing.T) {
 	}
 	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "" {
 		t.Fatalf("HTTP instructions = %q, want empty after bridge removal", instructions)
+	}
+}
+
+func TestExecuteRequestWebsocketSendsCompactionTriggerLast(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+
+	var seenBody []byte
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		seenBody = append([]byte(nil), requestBody...)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_test"}`)),
+		}, nil
+	}
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, body, "session-1", "", "sk-local", nil, http.Header{}, true)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final websocket body must end with compaction_trigger: %s", seenBody)
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestSendsCompactionTriggerLast(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", nil)
+	if err != nil {
+		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final relay body must end with compaction_trigger: %s", seenBody)
 	}
 }
 
@@ -945,13 +1023,13 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 	downstreamHeaders.Set("User-Agent", "curl/8.0")
 	downstreamHeaders.Set(codexResponsesLiteHeader, "true")
 
-	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.6-sol"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
 	}
 	resp.Body.Close()
 
-	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
+	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.6-sol"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesCompactRequest() error = %v", err)
 	}

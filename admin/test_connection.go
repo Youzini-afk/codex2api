@@ -33,6 +33,45 @@ type testEvent struct {
 	Error   string `json:"error,omitempty"`   // 错误信息
 }
 
+type responsesTerminalOutcome uint8
+
+const (
+	responsesTerminalUnknown responsesTerminalOutcome = iota
+	responsesTerminalSuccess
+	responsesTerminalFailed
+	responsesTerminalUsageLimited
+)
+
+func classifyResponsesTerminalEvent(data []byte) responsesTerminalOutcome {
+	eventType := gjson.GetBytes(data, "type").String()
+	switch eventType {
+	case "response.completed":
+		status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "response.status").String()))
+		if status == "failed" || status == "incomplete" {
+			if proxy.IsUsageLimitReachedError(data) {
+				return responsesTerminalUsageLimited
+			}
+			return responsesTerminalFailed
+		}
+		return responsesTerminalSuccess
+	case "response.failed", "error":
+		if proxy.IsUsageLimitReachedError(data) {
+			return responsesTerminalUsageLimited
+		}
+		return responsesTerminalFailed
+	default:
+		return responsesTerminalUnknown
+	}
+}
+
+func (h *Handler) applyResponsesUsageLimitFailure(account *auth.Account, resp *http.Response, model string, payload []byte) bool {
+	if h == nil || h.store == nil || account == nil || !proxy.IsUsageLimitReachedError(payload) {
+		return false
+	}
+	proxy.Apply429Cooldown(h.store, account, payload, resp, model)
+	return true
+}
+
 // TestConnection 测试账号连接（SSE 流式返回）
 // GET /api/admin/accounts/:id/test
 func (h *Handler) TestConnection(c *gin.Context) {
@@ -55,6 +94,12 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		}
 		account = transient
 		isTransient = true
+	}
+
+	// 连接测试虽是 SSE GET，却会写入未授权、错误、限流或恢复状态。等流结束后
+	// 再失效列表/分析快照，避免账号页继续把已判定的 401 账号显示为“未采样”。
+	if !isTransient {
+		defer h.invalidateAccountSnapshotCaches()
 	}
 
 	isOpenAIResponsesAccount := account.IsRelayStyle()
@@ -117,9 +162,18 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
 				h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
+			case http.StatusPaymentRequired:
+				// 测连 402 是账号侧计费/工作区拒绝，标成错误，避免继续显示成「未采样」。
+				if proxy.IsDeactivatedWorkspaceError(errBody) {
+					h.store.MarkDeactivatedWorkspace(account, errMsg)
+				} else {
+					h.store.MarkError(account, errMsg)
+				}
 			case http.StatusForbidden:
 				if proxy.IsAgentRuntimeDeletedError(errBody) {
 					h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errMsg)
+				} else if proxy.IsDeactivatedWorkspaceError(errBody) {
+					h.store.MarkDeactivatedWorkspace(account, errMsg)
 				}
 			case http.StatusTooManyRequests:
 				// Grok 虽是 relay 风格，但有自己的免费额度语义（free-usage-exhausted → 24h），
@@ -203,6 +257,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			gotTerminal = true
 			if status := gjson.GetBytes(data, "response.status").String(); status == "failed" || status == "incomplete" {
 				sentTerminal = true
+				if !isTransient {
+					h.applyResponsesUsageLimitFailure(account, resp, testModel, data)
+				}
 				if isTransient && proxy.IsUsageLimitReachedError(data) {
 					transientOutcome = "rate_limited"
 				}
@@ -248,6 +305,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		case "response.failed":
 			gotTerminal = true
 			sentTerminal = true
+			if !isTransient {
+				h.applyResponsesUsageLimitFailure(account, resp, testModel, data)
+			}
 			if isTransient && proxy.IsUsageLimitReachedError(data) {
 				transientOutcome = "rate_limited"
 			}
@@ -256,6 +316,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		case "error":
 			gotTerminal = true
 			sentTerminal = true
+			if !isTransient {
+				h.applyResponsesUsageLimitFailure(account, resp, testModel, data)
+			}
 			if isTransient && proxy.IsUsageLimitReachedError(data) {
 				transientOutcome = "rate_limited"
 			}
@@ -570,7 +633,8 @@ func isTextConnectionModel(model string) bool {
 }
 
 type batchTestRequest struct {
-	IDs *[]int64 `json:"ids"`
+	IDs      *[]int64                  `json:"ids"`
+	Selector *accountOperationSelector `json:"selector,omitempty"`
 	// RestoreOnSuccess 仅回收站批量测试使用：测试通过的账号自动恢复到账号池。
 	RestoreOnSuccess bool `json:"restore_on_success"`
 }
@@ -588,20 +652,32 @@ func (h *Handler) persistRecycleBinTestResult(id int64, status string) {
 }
 
 type batchOperationEvent struct {
-	Type        string `json:"type"` // start | progress | complete
-	Action      string `json:"action"`
-	Status      string `json:"status,omitempty"`
-	HTTPStatus  int    `json:"http_status,omitempty"`
-	Current     int    `json:"current"`
-	Total       int    `json:"total"`
-	Success     int64  `json:"success"`
-	Failed      int64  `json:"failed"`
-	Banned      int64  `json:"banned,omitempty"`
-	RateLimited int64  `json:"rate_limited,omitempty"`
-	Deleted     int64  `json:"deleted,omitempty"`
-	AccountID   int64  `json:"account_id,omitempty"`
-	Message     string `json:"message,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Type         string `json:"type"` // start | progress | complete
+	Action       string `json:"action"`
+	Status       string `json:"status,omitempty"`
+	HTTPStatus   int    `json:"http_status,omitempty"`
+	Current      int    `json:"current"`
+	Total        int    `json:"total"`
+	Success      int64  `json:"success"`
+	Failed       int64  `json:"failed"`
+	Banned       int64  `json:"banned,omitempty"`
+	RateLimited  int64  `json:"rate_limited,omitempty"`
+	Deleted      int64  `json:"deleted,omitempty"`
+	AccountID    int64  `json:"account_id,omitempty"`
+	AccountName  string `json:"account_name,omitempty"`
+	AccountEmail string `json:"account_email,omitempty"`
+	Message      string `json:"message,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+func runtimeAccountOperationIdentity(account *auth.Account) (string, string) {
+	if account == nil {
+		return "", ""
+	}
+	account.Mu().RLock()
+	email := strings.TrimSpace(account.Email)
+	account.Mu().RUnlock()
+	return "", email
 }
 
 func batchOperationHTTPStatus(status, message string) int {
@@ -679,6 +755,20 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			return
 		}
 	}
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	if req.Selector != nil {
+		selectorCtx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		ids, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		cancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.IDs = &ids
+	}
 	if req.IDs != nil && len(*req.IDs) == 0 {
 		writeError(c, http.StatusBadRequest, "请提供要测试的账号 ID 列表")
 		return
@@ -701,6 +791,10 @@ func (h *Handler) RecycleBinBatchTest(c *gin.Context) {
 	}
 	if req.IDs != nil && len(*req.IDs) == 0 {
 		writeError(c, http.StatusBadRequest, "请提供要测试的账号 ID 列表")
+		return
+	}
+	if req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "回收站批量测试不支持 selector")
 		return
 	}
 
@@ -910,20 +1004,23 @@ func (h *Handler) emitBatchTestProgress(
 	if onProgress == nil {
 		return
 	}
+	accountName, accountEmail := h.accountOperationIdentity(accountID)
 	current := int(atomic.AddInt64(completedCount, 1))
 	event := batchOperationEvent{
-		Type:        "progress",
-		Action:      "batch_test",
-		Status:      status,
-		HTTPStatus:  batchOperationHTTPStatus(status, message),
-		Current:     current,
-		Total:       total,
-		Success:     atomic.LoadInt64(successCount),
-		Failed:      atomic.LoadInt64(failedCount),
-		Banned:      atomic.LoadInt64(bannedCount),
-		RateLimited: atomic.LoadInt64(rateLimitCount),
-		AccountID:   accountID,
-		Message:     message,
+		Type:         "progress",
+		Action:       "batch_test",
+		Status:       status,
+		HTTPStatus:   batchOperationHTTPStatus(status, message),
+		Current:      current,
+		Total:        total,
+		Success:      atomic.LoadInt64(successCount),
+		Failed:       atomic.LoadInt64(failedCount),
+		Banned:       atomic.LoadInt64(bannedCount),
+		RateLimited:  atomic.LoadInt64(rateLimitCount),
+		AccountID:    accountID,
+		AccountName:  accountName,
+		AccountEmail: accountEmail,
+		Message:      message,
 	}
 	if status == "failed" {
 		event.Error = message
@@ -943,6 +1040,10 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			h.store.MarkError(acc, "批量测试失败: 账号缺少 access_token 和 refresh_token")
 		}
 		return "failed", "账号缺少 access_token 和 refresh_token"
+	}
+
+	if status, msg, done := h.batchTestSkipDeactivatedWorkspace(acc); done {
+		return status, msg
 	}
 
 	if status, msg, done := h.batchTestWhamPreflight(testCtx, acc); done {
@@ -1032,7 +1133,11 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			return "banned", msg
 		}
 		if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
-			h.store.MarkError(acc, "批量测试"+msg)
+			if proxy.IsDeactivatedWorkspaceError(body) {
+				h.store.MarkDeactivatedWorkspace(acc, "批量测试"+msg)
+			} else {
+				h.store.MarkError(acc, "批量测试"+msg)
+			}
 		}
 		return "failed", msg
 	}
@@ -1182,6 +1287,20 @@ func readRecycleBinTestStream(ctx context.Context, resp *http.Response) (string,
 	return "failed", "上游测试未返回明确结果"
 }
 
+func (h *Handler) batchTestSkipDeactivatedWorkspace(acc *auth.Account) (string, string, bool) {
+	if h == nil || h.store == nil || acc == nil {
+		return "", "", false
+	}
+	msg, ok := h.store.LinkedDeactivatedWorkspaceResult(acc)
+	if !ok {
+		return "", "", false
+	}
+	if acc.RuntimeStatus() != "error" {
+		h.store.MarkError(acc, msg)
+	}
+	return "failed", msg, true
+}
+
 func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account) (string, string, bool) {
 	if h == nil || h.store == nil || acc == nil || acc.IsRelayStyle() || acc.GetAccessToken() == "" {
 		return "", "", false
@@ -1202,7 +1321,11 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 		default:
 			if shouldMarkUsageProbeAccountError(resp.StatusCode, body) {
 				msg := fmt.Sprintf("WHAM 用量探针返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
-				h.store.MarkError(acc, msg)
+				if proxy.IsDeactivatedWorkspaceError(body) {
+					h.store.MarkDeactivatedWorkspace(acc, msg)
+				} else {
+					h.store.MarkError(acc, msg)
+				}
 				return "failed", msg, true
 			}
 		}
@@ -1297,8 +1420,7 @@ func (h *Handler) readBatchTestStreamResult(ctx context.Context, acc *auth.Accou
 
 func (h *Handler) batchTestTerminalFailure(acc *auth.Account, resp *http.Response, model string, payload []byte, fallback string) (string, string) {
 	message := formatUpstreamTestError(payload, fallback)
-	if proxy.IsUsageLimitReachedError(payload) {
-		proxy.Apply429Cooldown(h.store, acc, payload, resp, model)
+	if h.applyResponsesUsageLimitFailure(acc, resp, model, payload) {
 		return "rate_limited", message
 	}
 	h.markBatchTestStreamFailure(acc, message)
@@ -1345,7 +1467,7 @@ func batchTestContextFailure(ctx context.Context, err error) (string, bool) {
 
 func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {
 	msg := strings.ToLower(string(body))
-	if statusCode == http.StatusPaymentRequired && proxy.IsDeactivatedWorkspaceError(body) {
+	if statusCode == http.StatusPaymentRequired {
 		return true
 	}
 	if statusCode == http.StatusForbidden {

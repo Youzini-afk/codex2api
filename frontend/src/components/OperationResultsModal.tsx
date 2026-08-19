@@ -30,6 +30,25 @@ function formatResultAccountName(account: AccountRow): string {
   return account.email || account.name || `ID ${account.id}`;
 }
 
+function resultAccountLines(result: {
+  accountId: number;
+  accountName?: string;
+  accountEmail?: string;
+}, account?: AccountRow): { primary: string; secondary?: string } {
+  const email = (account?.email || result.accountEmail || "").trim();
+  const name = (account?.name || result.accountName || "").trim();
+  if (email) {
+    return {
+      primary: email,
+      secondary: name && name !== email ? name : undefined,
+    };
+  }
+  if (account) {
+    return { primary: formatResultAccountName(account) };
+  }
+  return { primary: name || `#${result.accountId}` };
+}
+
 export default function OperationResultsModal({
   state,
   accounts,
@@ -244,14 +263,18 @@ export default function OperationResultsModal({
                 ) : (
                   paginatedResults.results.map((result) => {
                     const account = accountsByID.get(result.accountId);
+                    const identity = resultAccountLines(result, account);
                     return (
                       <TableRow key={result.accountId}>
                         <TableCell className="min-w-48">
-                          <div className="font-medium">
-                            {account
-                              ? formatResultAccountName(account)
-                              : `#${result.accountId}`}
+                          <div className="font-medium break-all">
+                            {identity.primary}
                           </div>
+                          {identity.secondary ? (
+                            <div className="text-xs text-muted-foreground">
+                              {identity.secondary}
+                            </div>
+                          ) : null}
                           <div className="text-xs text-muted-foreground">
                             ID {result.accountId}
                           </div>

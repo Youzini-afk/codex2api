@@ -13,6 +13,7 @@ import ChipInput from "../components/ChipInput";
 import Modal from "../components/Modal";
 import ChannelLogo from "../components/ChannelLogo";
 import PageHeader from "../components/PageHeader";
+import { SegmentedTabs } from "../components/SegmentedTabs";
 import StateShell from "../components/StateShell";
 import StatCard from "../components/StatCard";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
@@ -38,6 +39,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, type SelectOption } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -123,6 +125,7 @@ interface LimitsFormState {
   tokenLimitDaily: string;
   tokenLimitDailyUnit: TokenLimitUnit;
   imageGenerationPolicy: ImageGenerationPolicy;
+  allowLive: boolean;
   upstreamChannel: UpstreamChannel;
   scopeLimits: ScopeLimitFormState[];
 }
@@ -172,6 +175,7 @@ const emptyScopeLimitRow: ScopeLimitFormState = {
 
 // Grok 账号都未声明模型时的下拉兜底(与 Grok 账号页测试模型列表一致)。
 const DEFAULT_GROK_MODEL_OPTIONS = [
+  "grok-4.6",
   "grok-4.5",
   "grok-4",
   "grok-3-fast",
@@ -209,6 +213,7 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
   imageGenerationPolicy: "allow",
+  allowLive: false,
   upstreamChannel: "auto",
   scopeLimits: [],
 };
@@ -1150,33 +1155,21 @@ export default function APIKeys() {
         </div>
 
         <div className="space-y-4">
-          <div className="inline-flex items-center gap-0.5 rounded-xl border border-border bg-muted/30 p-0.5">
-            {(
-              [
-                ["keys", t("apiKeys.tabKeys")],
-                ["token-usage", t("apiKeys.tabTokenUsage")],
-              ] as const
-            ).map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setActiveTab(key)}
-                className={cn(
-                  "rounded-lg px-3.5 py-1.5 text-[13px] font-semibold transition-colors",
-                  activeTab === key
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
+          <SegmentedTabs
+            size="sm"
+            className="w-full max-w-[320px]"
+            tabs={[
+              { value: "keys", label: t("apiKeys.tabKeys") },
+              { value: "token-usage", label: t("apiKeys.tabTokenUsage") },
+            ]}
+            value={activeTab}
+            onValueChange={(value) => setActiveTab(value as "keys" | "token-usage")}
+          />
 
           {activeTab === "keys" && (
             <>
               <div className="toolbar-surface flex flex-col gap-2.5">
-                <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                <div className="flex items-center gap-1.5 overflow-x-auto [-mx-3] [px-3] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                   <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
                     {t("apiKeys.filter")}
                   </span>
@@ -1210,18 +1203,26 @@ export default function APIKeys() {
                       type="button"
                       onClick={() => setStatusFilter(key)}
                       className={cn(
-                        "shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors",
+                        "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-all duration-150",
                         statusFilter === key
-                          ? "bg-primary text-primary-foreground"
-                          : "bg-muted/50 text-muted-foreground hover:bg-muted",
+                          ? "bg-primary text-primary-foreground shadow-2xs ring-1 ring-primary/20 scale-[1.02]"
+                          : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
                       )}
                     >
-                      {label} {count}
+                      <span>{label}</span>
+                      <span className={cn(
+                        "rounded-full px-1.5 py-0.2 text-[10px] font-mono tabular-nums font-bold",
+                        statusFilter === key
+                          ? "bg-primary-foreground/20 text-primary-foreground"
+                          : "bg-muted/80 text-muted-foreground",
+                      )}>
+                        {count}
+                      </span>
                     </button>
                   ))}
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="relative min-w-0 flex-1 sm:max-w-sm">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
+                  <div className="relative w-full min-w-0 flex-1 sm:max-w-sm">
                     <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                     <Input
                       value={searchQuery}
@@ -1232,9 +1233,10 @@ export default function APIKeys() {
                       className="h-8 pl-8 text-[13px]"
                     />
                   </div>
-                  <div className="flex min-w-[10.5rem] items-center gap-1.5">
+                  <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:min-w-[10.5rem]">
                     <ArrowUpDown className="size-3.5 shrink-0 text-muted-foreground" />
                     <Select
+                      className="w-full min-w-0"
                       value={sortMode}
                       onValueChange={(value) =>
                         setSortMode(value as SortMode)
@@ -1575,7 +1577,7 @@ export default function APIKeys() {
                                 </TableCell>
                                 <TableCell className="min-w-[160px] text-sm text-muted-foreground">
                                   <div className="space-y-1">
-                                    <div className="font-medium text-foreground">
+                                    <div className="font-medium tabular-nums text-foreground">
                                       {formatQuotaLimit(keyRow, t)}
                                     </div>
                                     {keyRow.quota_limit > 0 ? (
@@ -1993,11 +1995,24 @@ export default function APIKeys() {
                 value={createForm.limits.upstreamChannel}
                 onChange={(upstreamChannel) =>
                   updateCreateForm({
-                    limits: { ...createForm.limits, upstreamChannel },
+                    limits: applyUpstreamChannel(
+                      createForm.limits,
+                      upstreamChannel,
+                    ),
                   })
                 }
               />
             </FormField>
+            {createForm.limits.upstreamChannel === "codex" ? (
+              <AllowLiveField
+                checked={createForm.limits.allowLive}
+                onCheckedChange={(allowLive) =>
+                  updateCreateForm({
+                    limits: { ...createForm.limits, allowLive },
+                  })
+                }
+              />
+            ) : null}
 
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
@@ -2123,30 +2138,14 @@ export default function APIKeys() {
                 </div>
               </div>
 
-              <div className="flex gap-1 rounded-xl border border-border bg-muted/50 p-1">
-                <button
-                  type="button"
-                  onClick={() => setEditTab("basic")}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
-                    editTab === "basic"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {t("apiKeys.editTabBasic")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setEditTab("limits")}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
-                    editTab === "limits"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {t("apiKeys.editTabLimits")}
-                </button>
-              </div>
+              <SegmentedTabs
+                tabs={[
+                  { value: "basic", label: t("apiKeys.editTabBasic") },
+                  { value: "limits", label: t("apiKeys.editTabLimits") },
+                ]}
+                value={editTab}
+                onValueChange={(value) => setEditTab(value as "basic" | "limits")}
+              />
 
               {editTab === "basic" ? (
                 <>
@@ -2188,11 +2187,24 @@ export default function APIKeys() {
                       value={editForm.limits.upstreamChannel}
                       onChange={(upstreamChannel) =>
                         updateEditForm({
-                          limits: { ...editForm.limits, upstreamChannel },
+                          limits: applyUpstreamChannel(
+                            editForm.limits,
+                            upstreamChannel,
+                          ),
                         })
                       }
                     />
                   </FormField>
+                  {editForm.limits.upstreamChannel === "codex" ? (
+                    <AllowLiveField
+                      checked={editForm.limits.allowLive}
+                      onCheckedChange={(allowLive) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, allowLive },
+                        })
+                      }
+                    />
+                  ) : null}
 
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField
@@ -2456,6 +2468,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimitDaily: tokenDaily.value,
     tokenLimitDailyUnit: tokenDaily.unit,
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
+    allowLive: Boolean(limits.allow_live),
     upstreamChannel:
       limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
         ? limits.upstream_channel
@@ -2571,6 +2584,41 @@ function UpstreamChannelPicker({
   );
 }
 
+function applyUpstreamChannel(
+  limits: LimitsFormState,
+  upstreamChannel: UpstreamChannel,
+): LimitsFormState {
+  return {
+    ...limits,
+    upstreamChannel,
+    allowLive: upstreamChannel === "codex" ? limits.allowLive : false,
+    planAllow: prunePlanAllow(limits.planAllow, upstreamChannel),
+  };
+}
+
+function AllowLiveField({
+  checked,
+  onCheckedChange,
+}: {
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
+      <div className="flex items-center justify-between gap-3">
+        <label className="text-xs font-medium text-foreground">
+          {t("apiKeys.limits.allowLive")}
+        </label>
+        <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      </div>
+      <p className="text-[10px] text-muted-foreground">
+        {t("apiKeys.limits.allowLiveHint")}
+      </p>
+    </div>
+  );
+}
+
 // resolveImageGenerationPolicy 统一新旧两种后端配置：显式 image_generation_policy 优先，
 // 未设时旧的 disable_image_generation=true 视为 block，其余为 allow。
 function resolveImageGenerationPolicy(
@@ -2629,7 +2677,10 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
   return {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
-    plan_allow: form.planAllow.map((p) => p.trim()).filter(Boolean),
+    plan_allow: prunePlanAllow(
+      form.planAllow.map((p) => p.trim()).filter(Boolean),
+      form.upstreamChannel,
+    ),
     no_affinity_group_ids: form.noAffinityGroupIds,
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
@@ -2649,6 +2700,7 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     // 兼容旧字段：block 时同步置位，其余留空由后端按 policy 归一。
     disable_image_generation:
       form.imageGenerationPolicy === "block" || undefined,
+    allow_live: form.upstreamChannel === "codex" && form.allowLive,
     upstream_channel:
       form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
     scope_limits: form.scopeLimits
@@ -2714,9 +2766,9 @@ function resetAPIKeyQuotaUsage(keyRow: APIKeyRow): APIKeyRow {
 }
 
 function usageToneClass(pct: number) {
-  if (pct >= 90) return "bg-destructive";
-  if (pct >= 70) return "bg-[hsl(var(--warning))]";
-  return "bg-[hsl(var(--success))]";
+  if (pct >= 90) return "bg-rose-500 shadow-2xs";
+  if (pct >= 70) return "bg-amber-500 shadow-2xs";
+  return "bg-emerald-500 shadow-2xs";
 }
 
 function UsageBar({
@@ -2733,16 +2785,19 @@ function UsageBar({
   if (!limit || limit <= 0) return null;
   const pct = Math.min(100, Math.max(0, (used / limit) * 100));
   return (
-    <div className={cn("space-y-1", className)}>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+    <div className={cn("space-y-1.5", className)}>
+      <div className="h-2 w-full overflow-hidden rounded-full bg-muted/80 shadow-inner">
         <div
-          className={cn("h-full rounded-full transition-all", usageToneClass(pct))}
+          className={cn("h-full rounded-full transition-all duration-300", usageToneClass(pct))}
           style={{ width: `${pct}%` }}
         />
       </div>
       {showPercent ? (
-        <div className="text-[10px] font-medium tabular-nums text-muted-foreground">
-          {pct.toFixed(0)}%
+        <div className="flex items-center justify-between text-[10px] font-semibold tabular-nums text-muted-foreground">
+          <span>用量比例</span>
+          <span className={cn(pct >= 90 ? "text-rose-500 font-bold" : pct >= 70 ? "text-amber-500 font-bold" : "text-emerald-600 dark:text-emerald-400 font-bold")}>
+            {pct.toFixed(0)}%
+          </span>
         </div>
       ) : null}
     </div>
@@ -2758,24 +2813,24 @@ function KeyStatusBadge({
 }) {
   const config = {
     active: {
-      dot: "bg-[hsl(var(--success))]",
+      dot: "bg-emerald-500 animate-pulse",
       className:
-        "border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]",
+        "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
     },
     expired: {
       dot: "bg-muted-foreground",
       className: "border-transparent bg-muted text-muted-foreground",
     },
     quota_exhausted: {
-      dot: "bg-destructive",
-      className: "border-transparent bg-destructive/10 text-destructive",
+      dot: "bg-rose-500 animate-pulse",
+      className: "border-rose-500/20 bg-rose-500/10 text-rose-600 dark:text-rose-400",
     },
   }[status];
 
   return (
     <Badge
       variant="outline"
-      className={cn("gap-1.5 px-1.5 py-0 text-[11px] font-semibold", config.className)}
+      className={cn("gap-1.5 px-2 py-0.5 text-[11px] font-semibold rounded-full shadow-2xs", config.className)}
     >
       <span className={cn("size-1.5 rounded-full", config.dot)} />
       {t(`apiKeys.status.${status}`)}
@@ -2933,24 +2988,24 @@ function WindowCostBars({
   }
   if (bars.length === 0) return null;
   return (
-    <div className="mt-1.5 space-y-1">
+    <div className="mt-2 rounded-lg border border-border/60 bg-muted/20 p-2 space-y-1.5">
       {bars.map((bar) => {
         const pct = Math.min(100, Math.max(0, (bar.used / bar.limit) * 100));
         return (
-          <div key={bar.label} className="flex items-center gap-1.5">
-            <span className="w-6 text-[10px] font-medium text-muted-foreground">
+          <div key={bar.label} className="flex items-center justify-between gap-2 text-[10px]">
+            <span className="w-6 font-semibold font-mono text-muted-foreground">
               {bar.label}
             </span>
-            <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted shadow-inner">
               <div
                 className={cn(
-                  "h-full rounded-full transition-all",
+                  "h-full rounded-full transition-all duration-300",
                   usageToneClass(pct),
                 )}
                 style={{ width: `${pct}%` }}
               />
             </div>
-            <span className="text-[10px] tabular-nums text-muted-foreground">
+            <span className="font-mono tabular-nums font-semibold text-muted-foreground shrink-0">
               {formatUSD(bar.used)}/{formatUSD(bar.limit)}
             </span>
           </div>
@@ -3184,6 +3239,7 @@ function LimitsEditor({
             <PlanMultiSelect
               value={value.planAllow}
               onChange={(planAllow) => patch({ planAllow })}
+              options={planOptionsForChannel(value.upstreamChannel)}
               allLabel={t("apiKeys.limits.planAllowAll")}
             />
             <p className="text-[10px] text-muted-foreground">
@@ -3388,16 +3444,16 @@ function LimitSection({
   children: ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-border/80 bg-muted/15 p-3">
-      <div className="mb-3 flex items-start gap-2.5">
-        <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-background text-primary shadow-sm ring-1 ring-border/70">
+    <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3">
+      <div className="flex items-start gap-3 border-b border-border/50 pb-2.5">
+        <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary ring-1 ring-primary/20">
           {icon}
         </div>
         <div className="min-w-0">
-          <div className="text-xs font-semibold uppercase tracking-wide text-foreground">
+          <div className="text-xs font-bold uppercase tracking-wider text-foreground">
             {title}
           </div>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground/90">
             {description}
           </p>
         </div>
@@ -3475,8 +3531,9 @@ function APIKeysSkeleton() {
   );
 }
 
-// PLAN_FILTER_OPTIONS 与后端 cleanPlanAllow 的白名单保持一致(pro 与 prolite 相互独立)。
-const PLAN_FILTER_OPTIONS = [
+// 套餐选项与后端 cleanPlanAllow 白名单保持一致(pro 与 prolite 相互独立)。
+// Codex / Grok 分列，自动渠道再合并；切渠道时只保留当前渠道能调度的套餐。
+const CODEX_PLAN_FILTER_OPTIONS = [
   "free",
   "plus",
   "pro",
@@ -3486,14 +3543,52 @@ const PLAN_FILTER_OPTIONS = [
   "go",
 ] as const;
 
+const GROK_PLAN_FILTER_OPTIONS = [
+  "free",
+  "api",
+  "supergrok",
+  "x_basic",
+  "x_premium",
+  "x_premium_plus",
+  "supergrok_heavy",
+  "supergrok_lite",
+  "supergrok_plus",
+] as const;
+
+const PLAN_FILTER_OPTIONS = [
+  ...CODEX_PLAN_FILTER_OPTIONS,
+  ...GROK_PLAN_FILTER_OPTIONS.filter(
+    (plan) => !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
+  ),
+];
+
+function planOptionsForChannel(channel: UpstreamChannel): readonly string[] {
+  if (channel === "codex") return CODEX_PLAN_FILTER_OPTIONS;
+  if (channel === "grok") return GROK_PLAN_FILTER_OPTIONS;
+  return PLAN_FILTER_OPTIONS;
+}
+
+function prunePlanAllow(
+  plans: string[],
+  channel: UpstreamChannel,
+): string[] {
+  if (channel === "auto") return plans;
+  const allowed = new Set(
+    planOptionsForChannel(channel).map((plan) => plan.toLowerCase()),
+  );
+  return plans.filter((plan) => allowed.has(plan.toLowerCase()));
+}
+
 // PlanMultiSelect 让 API Key 选择只调度哪些账号套餐。空表示不限套餐。
 function PlanMultiSelect({
   value,
   onChange,
+  options,
   allLabel,
 }: {
   value: string[];
   onChange: (value: string[]) => void;
+  options: readonly string[];
   allLabel: string;
 }) {
   return (
@@ -3510,7 +3605,7 @@ function PlanMultiSelect({
         >
           {allLabel}
         </button>
-        {PLAN_FILTER_OPTIONS.map((plan) => {
+        {options.map((plan) => {
           const active = value.includes(plan);
           return (
             <button

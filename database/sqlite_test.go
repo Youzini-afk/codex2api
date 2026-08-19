@@ -312,6 +312,57 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 	}
 }
 
+func TestFindActiveAccountByOAuthRouteIdentitySeparatesWorkspaceOverrides(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	personalID, err := db.InsertAccountWithCredentials(ctx, "personal", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "user@example.com",
+		"workspace_id": "personal-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials personal 返回错误: %v", err)
+	}
+	teamID, err := db.InsertAccountWithCredentials(ctx, "team", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "user@example.com",
+		"workspace_id": "personal-workspace",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials team 返回错误: %v", err)
+	}
+
+	got, err := db.FindActiveAccountByOAuthRouteIdentity(ctx, "USER@example.com", "personal-workspace")
+	if err != nil {
+		t.Fatalf("FindActiveAccountByOAuthRouteIdentity personal 返回错误: %v", err)
+	}
+	if got != personalID {
+		t.Fatalf("personal matched id = %d, want %d", got, personalID)
+	}
+
+	got, err = db.FindActiveAccountByOAuthRouteIdentity(ctx, "user@example.com", "team-workspace")
+	if err != nil {
+		t.Fatalf("FindActiveAccountByOAuthRouteIdentity team 返回错误: %v", err)
+	}
+	if got != teamID {
+		t.Fatalf("team matched id = %d, want %d", got, teamID)
+	}
+
+	if _, err := db.FindActiveAccountByOAuthRouteIdentity(ctx, "user@example.com", "other-workspace"); err != sql.ErrNoRows {
+		t.Fatalf("other workspace err = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestFindActiveAccountByOAuthIdentityIgnoresLegacyIDs(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1829,6 +1880,54 @@ func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	}
 }
 
+func TestSQLiteAccountGroupMutationsWaitForUnifiedWriteLock(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	groupA, err := db.CreateAccountGroup(ctx, "lock-a", "", "", 0, 0, sql.NullInt64{})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup A: %v", err)
+	}
+	groupB, err := db.CreateAccountGroup(ctx, "lock-b", "", "", 0, 0, sql.NullInt64{})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup B: %v", err)
+	}
+	accountID, err := db.InsertAccount(ctx, "lock-account", "refresh-token", "")
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+
+	assertBlocked := func(name string, operation func() error) {
+		t.Helper()
+		db.sqliteWriteSem <- struct{}{}
+		done := make(chan error, 1)
+		go func() { done <- operation() }()
+		select {
+		case err := <-done:
+			t.Fatalf("%s bypassed SQLite write lock: %v", name, err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		<-db.sqliteWriteSem
+		if err := <-done; err != nil {
+			t.Fatalf("%s after lock release: %v", name, err)
+		}
+	}
+
+	assertBlocked("SetAccountGroups", func() error {
+		return db.SetAccountGroups(ctx, accountID, []int64{groupA})
+	})
+	assertBlocked("BatchSetAccountGroups", func() error {
+		return db.BatchSetAccountGroups(ctx, []int64{accountID}, []int64{groupB})
+	})
+	assertBlocked("DeleteAccountGroup", func() error {
+		return db.DeleteAccountGroup(ctx, groupA, true)
+	})
+}
+
 func TestUsageLogsPersistEffectiveModel(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -2726,6 +2825,59 @@ func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
 	}
 }
 
+func TestSQLiteSoftDeleteWaitsForUnifiedWriteLock(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	singleID, err := db.InsertAccount(ctx, "queued-single-delete", "rt-single-delete", "")
+	if err != nil {
+		t.Fatalf("InsertAccount(single) 返回错误: %v", err)
+	}
+	batchID, err := db.InsertAccount(ctx, "queued-batch-delete", "rt-batch-delete", "")
+	if err != nil {
+		t.Fatalf("InsertAccount(batch) 返回错误: %v", err)
+	}
+
+	db.sqliteWriteSem <- struct{}{}
+	singleDone := make(chan error, 1)
+	go func() { singleDone <- db.SoftDeleteAccount(ctx, singleID) }()
+	select {
+	case err := <-singleDone:
+		t.Fatalf("SoftDeleteAccount bypassed SQLite write lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-db.sqliteWriteSem
+	if err := <-singleDone; err != nil {
+		t.Fatalf("SoftDeleteAccount after lock release: %v", err)
+	}
+
+	db.sqliteWriteSem <- struct{}{}
+	batchDone := make(chan error, 1)
+	go func() { batchDone <- db.BatchSoftDeleteAccounts(ctx, []int64{batchID}) }()
+	select {
+	case err := <-batchDone:
+		t.Fatalf("BatchSoftDeleteAccounts bypassed SQLite write lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-db.sqliteWriteSem
+	if err := <-batchDone; err != nil {
+		t.Fatalf("BatchSoftDeleteAccounts after lock release: %v", err)
+	}
+
+	var deletedCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts
+		WHERE id IN ($1,$2) AND status = 'deleted'`, singleID, batchID).Scan(&deletedCount); err != nil {
+		t.Fatalf("query deleted accounts: %v", err)
+	}
+	if deletedCount != 2 {
+		t.Fatalf("deleted count = %d, want 2", deletedCount)
+	}
+}
+
 func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()
@@ -3312,6 +3464,272 @@ func TestGetAccountUsageWindowsAggregatesBothRangesInOnePass(t *testing.T) {
 	}
 	if shortWindow[2].Requests != 1 || longWindow[2].Requests != 1 || longWindow[2].Tokens != 300 {
 		t.Fatalf("account 2 windows short=%+v long=%+v", shortWindow[2], longWindow[2])
+	}
+}
+
+func TestAccountUsageAggregatesExcludeTransportRetries(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	insertUsage := func(accountID int64, createdAt time.Time, tokens int, billed float64, retry any, statusCode int, extras ...string) {
+		t.Helper()
+		reason := ""
+		model := ""
+		if len(extras) > 0 {
+			reason = extras[0]
+		}
+		if len(extras) > 1 {
+			model = extras[1]
+		}
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+			(account_id, status_code, total_tokens, account_billed, user_billed, is_retry_attempt, internal_reason, model, created_at)
+			VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8)`, accountID, statusCode, tokens, billed, retry, reason, model, sqliteTimeParam(createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	// NULL is a legacy/non-retry row and must remain part of all aggregates.
+	insertUsage(1, now.Add(-time.Hour), 100, 1, nil, 200, "", "gpt-5.4")
+	insertUsage(1, now.Add(-2*time.Hour), 200, 2, 0, 200, "", "gpt-5.2")
+	// A transport retry carries usage-like fields but must not double count them.
+	insertUsage(1, now.Add(-30*time.Minute), 900, 9, 1, 502)
+	// Client-cancelled rows remain excluded independently of retry classification.
+	insertUsage(1, now.Add(-20*time.Minute), 700, 7, 0, 499)
+	insertUsage(2, now.Add(-time.Hour), 400, 4, 1, 429)
+	// Capability probes remain in raw logs but must not inflate user-facing
+	// request, token, or billing totals.
+	insertUsage(1, now.Add(-10*time.Minute), 500, 5, 0, 200, "grok_capability_probe")
+	var rawProbeCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_logs WHERE internal_reason = 'grok_capability_probe'`).Scan(&rawProbeCount); err != nil {
+		t.Fatalf("query raw capability probe: %v", err)
+	}
+	if rawProbeCount != 1 {
+		t.Fatalf("raw capability probe count = %d, want 1", rawProbeCount)
+	}
+
+	assertUsage := func(label string, got *AccountTimeRangeUsage, requests, tokens int64, billed float64) {
+		t.Helper()
+		if got == nil {
+			t.Fatalf("%s missing account usage", label)
+		}
+		if got.Requests != requests || got.Tokens != tokens || got.AccountBilled != billed || got.UserBilled != billed {
+			t.Fatalf("%s = %+v, want requests=%d tokens=%d billed=%.2f", label, got, requests, tokens, billed)
+		}
+	}
+
+	rangeUsage, err := db.GetAccountTimeRangeUsage(ctx, now.Add(-3*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountTimeRangeUsage: %v", err)
+	}
+	assertUsage("range account 1", rangeUsage[1], 2, 300, 3)
+	if _, ok := rangeUsage[2]; ok {
+		t.Fatalf("range account 2 should be absent when it has only retry rows: %+v", rangeUsage[2])
+	}
+
+	shortWindow, longWindow, err := db.GetAccountUsageWindows(ctx, now.Add(-90*time.Minute), now.Add(-3*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountUsageWindows: %v", err)
+	}
+	assertUsage("global short account 1", shortWindow[1], 1, 100, 1)
+	assertUsage("global long account 1", longWindow[1], 2, 300, 3)
+	if _, ok := longWindow[2]; ok {
+		t.Fatalf("global account 2 should be absent when it has only retry rows: %+v", longWindow[2])
+	}
+
+	shortByID, longByID, err := db.GetAccountUsageWindowsByIDs(ctx, []int64{1, 2}, now.Add(-90*time.Minute), now.Add(-3*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountUsageWindowsByIDs: %v", err)
+	}
+	assertUsage("scoped short account 1", shortByID[1], 1, 100, 1)
+	assertUsage("scoped long account 1", longByID[1], 2, 300, 3)
+	if _, ok := longByID[2]; ok {
+		t.Fatalf("scoped account 2 should be absent when it has only retry rows: %+v", longByID[2])
+	}
+	requestCounts, err := db.GetAccountRequestCounts(ctx)
+	if err != nil {
+		t.Fatalf("GetAccountRequestCounts: %v", err)
+	}
+	if got := requestCounts[1]; got == nil || got.SuccessCount != 2 || got.ErrorCount != 1 || got.RetryErrorCount != 1 {
+		t.Fatalf("global request counts account 1 = %+v, want success=2 error=1 retry_error=1", got)
+	}
+	if got := requestCounts[1]; got.ErrorStatusCounts[499] != 1 || got.ErrorStatusCounts[502] != 0 {
+		t.Fatalf("global error status counts = %#v, want 499=1 and no retry 502", got.ErrorStatusCounts)
+	}
+	if got := requestCounts[1]; got.SuccessModelCounts["gpt-5.4"] != 1 || got.SuccessModelCounts["gpt-5.2"] != 1 {
+		t.Fatalf("global success model counts = %#v, want gpt-5.4=1 gpt-5.2=1", got.SuccessModelCounts)
+	}
+	requestCountsByID, err := db.GetAccountRequestCountsByIDs(ctx, []int64{1, 2})
+	if err != nil {
+		t.Fatalf("GetAccountRequestCountsByIDs: %v", err)
+	}
+	if got := requestCountsByID[1]; got == nil || got.SuccessCount != 2 || got.ErrorCount != 1 || got.RetryErrorCount != 1 {
+		t.Fatalf("scoped request counts account 1 = %+v, want success=2 error=1 retry_error=1", got)
+	}
+	if got := requestCountsByID[1]; got.ErrorStatusCounts[499] != 1 || got.ErrorStatusCounts[502] != 0 {
+		t.Fatalf("scoped error status counts = %#v, want 499=1 and no retry 502", got.ErrorStatusCounts)
+	}
+	if got := requestCountsByID[1]; got.SuccessModelCounts["gpt-5.4"] != 1 || got.SuccessModelCounts["gpt-5.2"] != 1 {
+		t.Fatalf("scoped success model counts = %#v, want gpt-5.4=1 gpt-5.2=1", got.SuccessModelCounts)
+	}
+	billed, err := db.GetAccountBilledSince(ctx, 1, now.Add(-3*time.Hour))
+	if err != nil || billed != 12 {
+		t.Fatalf("GetAccountBilledSince = %.2f, err=%v, want 12", billed, err)
+	}
+	billedByID, err := db.GetAccountsBilledSince(ctx, map[int64]time.Time{1: now.Add(-3 * time.Hour)})
+	if err != nil || billedByID[1] != 12 {
+		t.Fatalf("GetAccountsBilledSince = %#v, err=%v, want account 1 billed 12", billedByID, err)
+	}
+}
+
+func TestUsageStatsExcludeInternalCapabilityProbe(t *testing.T) {
+	db := newGrokStateTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, fixture := range []struct {
+		reason string
+		tokens int
+	}{
+		{tokens: 100},
+		{reason: "grok_capability_probe", tokens: 900},
+	} {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+			(account_id, channel, model, status_code, total_tokens, input_tokens, internal_reason, created_at)
+			VALUES (1, 'grok', 'grok-test', 200, $1, $1, $2, $3)`, fixture.tokens, fixture.reason, sqliteTimeParam(now)); err != nil {
+			t.Fatalf("insert usage fixture: %v", err)
+		}
+	}
+	if err := db.rebuildUsageStatsRollup(ctx); err != nil {
+		t.Fatalf("rebuildUsageStatsRollup: %v", err)
+	}
+	stats, err := db.GetUsageStats(ctx, now.Add(-time.Hour), now.Add(time.Hour), "grok")
+	if err != nil {
+		t.Fatalf("GetUsageStats: %v", err)
+	}
+	if stats.TodayRequests != 1 || stats.TodayTokens != 100 || stats.TotalRequests != 1 || stats.TotalTokens != 100 {
+		t.Fatalf("usage stats = today %d/%d total %d/%d, want 1/100", stats.TodayRequests, stats.TodayTokens, stats.TotalRequests, stats.TotalTokens)
+	}
+	chart, err := db.GetChartAggregation(ctx, now.Add(-time.Hour), now.Add(time.Hour), 5, "grok")
+	if err != nil {
+		t.Fatalf("GetChartAggregation: %v", err)
+	}
+	if len(chart.Timeline) != 1 || chart.Timeline[0].Requests != 1 || chart.Timeline[0].InputTokens != 100 {
+		t.Fatalf("chart timeline = %+v, want one end-user request", chart.Timeline)
+	}
+}
+
+func TestNonRetryUsageLogPredicateUsesDatabaseBooleanType(t *testing.T) {
+	if got := (&DB{driver: "sqlite"}).nonRetryUsageLogPredicate(); got != "COALESCE(is_retry_attempt, 0) = 0" {
+		t.Fatalf("SQLite retry predicate = %q", got)
+	}
+	if got := (&DB{driver: "postgres"}).nonRetryUsageLogPredicate(); got != "COALESCE(is_retry_attempt, false) = false" {
+		t.Fatalf("PostgreSQL retry predicate = %q", got)
+	}
+}
+
+func TestAccountUsageAggregatesExcludeStaleCredentialGeneration(t *testing.T) {
+	db := newGrokStateTestDB(t)
+	ctx := context.Background()
+	accountID, err := db.InsertAccountWithUpstream(ctx, "generation-usage", "xai", "grok", map[string]interface{}{
+		"upstream_type": "grok", "api_key": "first-key",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	row, err := db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, fixture := range []struct {
+		generation int64
+		tokens     int
+	}{
+		{0, 100}, // legacy/unscoped traffic remains visible
+		{row.CredentialGeneration, 200},
+	} {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+			(account_id,credential_generation,status_code,total_tokens,created_at)
+			VALUES($1,$2,200,$3,$4)`, accountID, fixture.generation, fixture.tokens, sqliteTimeParam(now)); err != nil {
+			t.Fatalf("insert usage fixture: %v", err)
+		}
+	}
+	if err := db.UpdateCredentials(ctx, accountID, map[string]interface{}{"api_key": "rotated-key"}); err != nil {
+		t.Fatalf("rotate identity: %v", err)
+	}
+	rotated, err := db.GetAccountByID(ctx, accountID)
+	if err != nil || rotated.CredentialGeneration == row.CredentialGeneration {
+		t.Fatalf("generation did not rotate: before=%d after=%v err=%v", row.CredentialGeneration, rotated, err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+		(account_id,credential_generation,status_code,total_tokens,created_at)
+		VALUES($1,$2,200,300,$3)`, accountID, rotated.CredentialGeneration, sqliteTimeParam(now)); err != nil {
+		t.Fatalf("insert current-generation usage: %v", err)
+	}
+
+	usage, err := db.GetAccountTimeRangeUsage(ctx, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("GetAccountTimeRangeUsage: %v", err)
+	}
+	if got := usage[accountID]; got == nil || got.Requests != 2 || got.Tokens != 400 {
+		t.Fatalf("generation-filtered usage = %+v, want legacy + current only", got)
+	}
+	_, longWindow, err := db.GetAccountUsageWindowsByIDs(ctx, []int64{accountID}, now.Add(-time.Minute), now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountUsageWindowsByIDs: %v", err)
+	}
+	if got := longWindow[accountID]; got == nil || got.Requests != 2 || got.Tokens != 400 {
+		t.Fatalf("generation-filtered scoped usage = %+v, want legacy + current only", got)
+	}
+}
+
+func TestGetAccountModelCountsSinceByIDsMatchesTodayUsage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	insert := func(accountID int64, createdAt time.Time, model, effective string, retry any, statusCode int) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
+			(account_id, status_code, total_tokens, is_retry_attempt, model, effective_model, created_at)
+			VALUES ($1, $2, 10, $3, $4, $5, $6)`, accountID, statusCode, retry, model, effective, sqliteTimeParam(createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+	insert(1, now.Add(-time.Hour), "gpt-5.4", "", 0, 200)
+	insert(1, now.Add(-50*time.Minute), "gpt-5.4", "", 0, 429)
+	insert(1, now.Add(-2*time.Hour), "gpt-5.2", "gpt-5.2-codex", 0, 200)
+	insert(1, now.Add(-30*time.Minute), "gpt-5.4", "", 1, 200)
+	insert(1, now.Add(-20*time.Minute), "gpt-5.4", "", 0, 499)
+	insert(1, now.Add(-26*time.Hour), "gpt-5.3", "", 0, 200)
+	insert(2, now.Add(-time.Hour), "grok-4", "", 0, 200)
+
+	usage, err := db.GetAccountUsageSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountUsageSinceByIDs: %v", err)
+	}
+	models, err := db.GetAccountModelCountsSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountModelCountsSinceByIDs: %v", err)
+	}
+	if usage[1] == nil || usage[1].Requests != 3 {
+		t.Fatalf("today usage account 1 = %+v, want 3 requests", usage[1])
+	}
+	if models[1]["gpt-5.4"].Requests != 2 || models[1]["gpt-5.4"].Success != 1 || models[1]["gpt-5.2-codex"].Requests != 1 || models[1]["gpt-5.2-codex"].Success != 1 || models[1]["gpt-5.3"].Requests != 0 {
+		t.Fatalf("today models account 1 = %#v, want gpt-5.4=2/1 gpt-5.2-codex=1/1", models[1])
+	}
+	if models[2]["grok-4"].Requests != 1 || models[2]["grok-4"].Success != 1 {
+		t.Fatalf("today models account 2 = %#v, want grok-4=1/1", models[2])
 	}
 }
 

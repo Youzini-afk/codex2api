@@ -246,6 +246,16 @@ test('Prompt Filter consolidates advanced controls and tests all configured revi
 	  assert.ok(reviewTemplates > reviewPanel && reviewTemplates < expertPanel, 'review request templates must stay inside the model review section')
 })
 
+test('conversation CY locks expose a bounded automatic expiry control', () => {
+  const source = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
+  assert.match(source, /conversation_lock_ttl_hours: 168/)
+  assert.match(source, /user_cyber_cooldown_minutes: 30/)
+  assert.match(source, /conversationLockTTL/)
+  assert.match(source, /userCyberCooldownMinutes/)
+  assert.match(source, /min=\{1\} max=\{720\}/)
+  assert.match(source, /min=\{1\} max=\{1440\}/)
+})
+
 test('review prompt defaults are owned by the backend rather than duplicated in the UI', () => {
   const frontendSource = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
   const backendSource = readFileSync(new URL('../../../security/promptfilter/review.go', import.meta.url), 'utf8')
@@ -300,6 +310,23 @@ test('terminal enforcement exposes clean-review model exemptions', () => {
   assert.match(source, /<SwitchField[^>]+conversationLockEnabled/)
   assert.doesNotMatch(source, /<SwitchRow/)
   assert.match(zh.promptFilter.help.conversationLockEnabled, /上游明确返回 cyber_policy/)
+})
+
+test('local block message editor round-trips through enforcement config', () => {
+  const source = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
+  const locales = ['en', 'zh', 'zh-TW'].map((name) => JSON.parse(readFileSync(new URL(`../locales/${name}.json`, import.meta.url), 'utf8')))
+
+  assert.match(source, /local_block_message: string/)
+  assert.match(source, /local_block_message: ''/)
+  assert.match(source, /typeof enforcement\.local_block_message === 'string'/)
+  assert.doesNotMatch(source, /maxLength=\{2000\}/)
+  assert.match(source, /Array\.from\(event\.target\.value\)\.slice\(0, 2000\)\.join\(''\)/)
+  assert.match(source, /promptFilter\.localBlockMessagePlaceholder/)
+  for (const locale of locales) {
+    assert.equal(typeof locale.promptFilter.localBlockMessage, 'string')
+    assert.equal(typeof locale.promptFilter.localBlockMessagePlaceholder, 'string')
+    assert.equal(typeof locale.promptFilter.help.localBlockMessage, 'string')
+  }
 })
 
 test('Moderations review exposes sub2api-compatible category thresholds', () => {
