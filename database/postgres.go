@@ -1125,6 +1125,27 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 		updated_at    TIMESTAMPTZ DEFAULT NOW()
 	);
 
+	CREATE TABLE IF NOT EXISTS scheduler_outbox (
+		id          BIGSERIAL PRIMARY KEY,
+		entity_type VARCHAR(32) NOT NULL,
+		entity_id   BIGINT NOT NULL DEFAULT 0,
+		event_type  VARCHAR(32) NOT NULL,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_scheduler_outbox_created ON scheduler_outbox(created_at, id);
+	CREATE TABLE IF NOT EXISTS maintenance_jobs (
+		entity_id BIGINT NOT NULL,
+		job_kind VARCHAR(64) NOT NULL,
+		due_at TIMESTAMPTZ NOT NULL,
+		lease_owner TEXT NOT NULL DEFAULT '',
+		lease_until TIMESTAMPTZ NULL,
+		attempts INT NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY(entity_id, job_kind)
+	);
+	CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_due ON maintenance_jobs(job_kind, due_at, entity_id);
+
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT TRUE;
@@ -1386,6 +1407,7 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_full_usage BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_pool_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_engine VARCHAR(20) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_rate_limit_retries INT DEFAULT 1;
@@ -1404,6 +1426,8 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_affinity_spread BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_seconds INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
@@ -1450,6 +1474,7 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_image_studio_page_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_account_portal_page_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_force_websocket BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_request_compression BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_weak_network_mode BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_interval_sec INT DEFAULT 60;
@@ -1688,6 +1713,9 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := db.installSchedulerOutboxTriggers(ctx); err != nil {
+		return fmt.Errorf("install scheduler outbox triggers: %w", err)
+	}
 
 	// 独立长超时：将已有 TIMESTAMP 列迁移为 TIMESTAMPTZ（大表 ALTER COLUMN TYPE 可能较慢）
 	migrateQuery := `
@@ -1787,8 +1815,9 @@ type APIKeyLimits struct {
 	AllowLive bool `json:"allow_live,omitempty"`
 	// UpstreamChannel 限定该 Key 的请求只调度到指定上游渠道的账号：
 	//   - ""/auto: 不限（默认，按模型路由）
-	//   - codex:   仅非 Grok 账号（Codex OAuth / OpenAI Responses 中转）
+	//   - codex:   仅 Codex OAuth / OpenAI Responses 中转账号
 	//   - grok:    仅 Grok 账号（此时不再要求账号声明模型，直接透传请求模型）
+	//   - antigravity: 预留的 Antigravity 管理渠道；推理适配完成前 fail closed
 	UpstreamChannel string `json:"upstream_channel,omitempty"`
 	// ScopeLimits 是「该 Key × 某账号分组 / 某账号」维度的用量上限（issue #439）。
 	// 与上面的 Cost/Token 限额不同，它只统计该 Key 打到对应 scope 的用量，超额后默认
@@ -1805,9 +1834,10 @@ const (
 
 // 上游渠道限定取值。
 const (
-	UpstreamChannelAuto  = ""
-	UpstreamChannelCodex = "codex"
-	UpstreamChannelGrok  = "grok"
+	UpstreamChannelAuto        = ""
+	UpstreamChannelCodex       = "codex"
+	UpstreamChannelGrok        = "grok"
+	UpstreamChannelAntigravity = "antigravity"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -1817,8 +1847,26 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelCodex
 	case UpstreamChannelGrok:
 		return UpstreamChannelGrok
+	case UpstreamChannelAntigravity:
+		return UpstreamChannelAntigravity
 	}
 	return UpstreamChannelAuto
+}
+
+// accountChannelFilterSQL returns the shared account-provider predicate used by
+// both full account reads and the sanitized admin-list projection.
+func accountChannelFilterSQL(channel, upstreamTypeExpr string) string {
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case UpstreamChannelGrok:
+		return ` AND ` + upstreamTypeExpr + ` = 'grok'`
+	case UpstreamChannelAntigravity:
+		return ` AND ` + upstreamTypeExpr + ` = 'antigravity'`
+	case UpstreamChannelCodex:
+		// Blank legacy rows and OpenAI Responses relays remain in the Codex view.
+		return ` AND ` + upstreamTypeExpr + ` NOT IN ('grok', 'antigravity')`
+	default:
+		return ""
+	}
 }
 
 // ResolveImageGenerationPolicy 归一 Key 的图片工具策略，统一新旧两种配置来源：
@@ -2236,6 +2284,7 @@ type SystemSettings struct {
 	LazyMode                           bool
 	ProxyPoolEnabled                   bool
 	FastSchedulerEnabled               bool
+	SchedulerEngine                    string
 	MaxRetries                         int
 	MaxRateLimitRetries                int
 	AllowRemoteMigration               bool
@@ -2251,6 +2300,8 @@ type SystemSettings struct {
 	SchedulerMode                      string
 	AffinityMode                       string // session 粘性模式: bounded / off / strict
 	SessionAffinitySpread              bool   // 新亲和键按 HRW 哈希散列选号(issue #484)
+	SessionSlotBufferEnabled           bool   // 成功请求结束后为原会话短暂保留并发槽
+	SessionSlotBufferSeconds           int    // 会话并发槽缓冲时间，默认 10 秒，范围 1..60
 	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
 	ResinPlatformName                  string // Resin 平台标识，例如 codex2api
 	PromptFilterEnabled                bool
@@ -2289,6 +2340,7 @@ type SystemSettings struct {
 	PublicImageStudioPageEnabled       bool
 	PublicAccountPortalPageEnabled     bool // 账号自助添加公开门户开关，默认 false
 	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
+	CodexRequestCompression            bool // HTTP /responses 请求体 zstd 压缩（对齐真实客户端），默认 true
 	CodexWSWeakNetworkMode             bool // WS 弱网保守复用模式，默认 false
 	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
 	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
@@ -2432,6 +2484,32 @@ func normalizeSmartPacingWindowsDB(raw string) string {
 	}
 }
 
+// NormalizeSessionSlotBufferSeconds normalizes the configurable reservation
+// duration. Enablement is stored separately, so zero values fall back to 10s.
+func NormalizeSessionSlotBufferSeconds(seconds int) int {
+	if seconds <= 0 {
+		return 10
+	}
+	if seconds > 60 {
+		return 60
+	}
+	return seconds
+}
+
+// NormalizeSchedulerEngine preserves the old fast_scheduler_enabled setting
+// for upgraded databases whose new scheduler_engine column is still blank.
+func NormalizeSchedulerEngine(value string, legacyFastEnabled bool) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "legacy", "shadow", "indexed":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		if legacyFastEnabled {
+			return "indexed"
+		}
+		return "legacy"
+	}
+}
+
 // GetSystemSettings 加载全局设置
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
@@ -2441,6 +2519,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),
 		       COALESCE(fast_scheduler_enabled, false),
+		       COALESCE(scheduler_engine, ''),
 		       COALESCE(max_retries, 2),
 		       COALESCE(max_rate_limit_retries, 1),
 		       COALESCE(allow_remote_migration, false),
@@ -2496,6 +2575,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(public_account_portal_page_enabled, false),
 			       COALESCE(reasoning_effort_models, '[]'),
 			       COALESCE(codex_force_websocket, false),
+			       COALESCE(codex_request_compression, true),
 			       COALESCE(codex_ws_keepalive_enabled, false),
 			       COALESCE(codex_ws_keepalive_interval_sec, 60),
 			       COALESCE(codex_ws_hide_upstream_errors, true),
@@ -2540,13 +2620,15 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(codex_overload_pause_enabled, false),
 		       COALESCE(codex_overload_threshold_percent, 20),
 		       COALESCE(codex_overload_pause_minutes, 30),
-		       COALESCE(codex_overload_window_minutes, 5)
+		       COALESCE(codex_overload_window_minutes, 5),
+		       COALESCE(session_slot_buffer_enabled, false),
+		       COALESCE(session_slot_buffer_seconds, 10)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestContent, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
-		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
+		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.SchedulerEngine, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.UsageProbeResponsesFallbackEnabled, &s.RecoveryProbeIntervalMinutes,
 		&s.SchedulerMode,
@@ -2572,6 +2654,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PublicAccountPortalPageEnabled,
 		&s.ReasoningEffortModels,
 		&s.CodexForceWebsocket,
+		&s.CodexRequestCompression,
 		&s.CodexWSKeepaliveEnabled,
 		&s.CodexWSKeepaliveIntervalSec,
 		&s.CodexWSHideUpstreamErrors,
@@ -2617,6 +2700,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexOverloadThresholdPercent,
 		&s.CodexOverloadPauseMinutes,
 		&s.CodexOverloadWindowMinutes,
+		&s.SessionSlotBufferEnabled,
+		&s.SessionSlotBufferSeconds,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2643,6 +2728,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
 	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
+	s.SessionSlotBufferSeconds = NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds)
+	s.SchedulerEngine = NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled)
+	s.FastSchedulerEnabled = s.SchedulerEngine != "legacy"
 	return s, err
 }
 
@@ -2684,8 +2772,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	if testContent == "" {
 		testContent = "hi"
 	}
-	// 两侧设置字段取并集后，这条 upsert 有 116 个业务参数；最后两个参数
-	// ($117/$118) 只用于并发保护，不对应 INSERT 列。
+	// 两侧设置字段取并集后，这条 upsert 有 120 个业务参数；最后两个参数
+	// ($121/$122) 只用于并发保护，不对应 INSERT 列。
 	_, err := db.conn.ExecContext(ctx, `
 			INSERT INTO system_settings (
 				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_content, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
@@ -2761,9 +2849,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_pause_enabled,
 					codex_overload_threshold_percent,
 					codex_overload_pause_minutes,
-					codex_overload_window_minutes
+					codex_overload_window_minutes,
+					session_slot_buffer_enabled,
+					session_slot_buffer_seconds,
+					scheduler_engine,
+					codex_request_compression
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2803,10 +2895,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $117 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $121 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $118 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $122 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2833,6 +2925,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				public_image_studio_page_enabled = EXCLUDED.public_image_studio_page_enabled,
 					reasoning_effort_models = EXCLUDED.reasoning_effort_models,
 					codex_force_websocket = EXCLUDED.codex_force_websocket,
+					codex_request_compression = EXCLUDED.codex_request_compression,
 					codex_ws_keepalive_enabled = EXCLUDED.codex_ws_keepalive_enabled,
 					codex_ws_keepalive_interval_sec = EXCLUDED.codex_ws_keepalive_interval_sec,
 					codex_ws_hide_upstream_errors = EXCLUDED.codex_ws_hide_upstream_errors,
@@ -2877,7 +2970,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_pause_enabled = EXCLUDED.codex_overload_pause_enabled,
 					codex_overload_threshold_percent = EXCLUDED.codex_overload_threshold_percent,
 					codex_overload_pause_minutes = EXCLUDED.codex_overload_pause_minutes,
-					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes
+					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes,
+					session_slot_buffer_enabled = EXCLUDED.session_slot_buffer_enabled,
+					session_slot_buffer_seconds = EXCLUDED.session_slot_buffer_seconds,
+					scheduler_engine = EXCLUDED.scheduler_engine
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2923,6 +3019,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeCodexOverloadThresholdPercent(s.CodexOverloadThresholdPercent),
 		NormalizeCodexOverloadPauseMinutes(s.CodexOverloadPauseMinutes),
 		NormalizeCodexOverloadWindowMinutes(s.CodexOverloadWindowMinutes),
+		s.SessionSlotBufferEnabled,
+		NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds),
+		NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled),
+		s.CodexRequestCompression,
 		s.PreservePromptFilterCustomPatterns,
 		s.PreservePromptFilterReviewAPIKey)
 	return err
@@ -6208,27 +6308,15 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	return db.ListActiveByChannel(ctx, "")
 }
 
-// ListActiveByChannel 返回未删除账号；channel 为空返回全部，
-// "grok" 仅 Grok 上游，"codex" 为非 Grok（含默认 Codex / OpenAI Responses 等）。
-// 过滤依据 credentials.upstream_type，与管理后台列表的 grok_api 判定一致。
+// ListActiveByChannel 返回未删除账号；channel 为空返回全部，其他已知渠道
+// 按 credentials.upstream_type 显式隔离。缺省 upstream_type 的历史账号归 Codex。
 func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*AccountRow, error) {
-	channel = strings.ToLower(strings.TrimSpace(channel))
 	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
-	switch channel {
-	case UpstreamChannelGrok:
-		if db.isSQLite() {
-			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'grok'`
-		} else {
-			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) = 'grok'`
-		}
-	case UpstreamChannelCodex:
-		// 非 grok 一律归入 codex 视图（缺省 upstream_type 的历史号也算 codex 侧）。
-		if db.isSQLite() {
-			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) <> 'grok'`
-		} else {
-			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) <> 'grok'`
-		}
+	upstreamTypeExpr := `LOWER(COALESCE(credentials->>'upstream_type', ''))`
+	if db.isSQLite() {
+		upstreamTypeExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
 	}
+	where += accountChannelFilterSQL(channel, upstreamTypeExpr)
 
 	query := `
 		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message,
@@ -6331,6 +6419,69 @@ func (db *DB) ListActiveModelCooldowns(ctx context.Context) ([]*AccountModelCool
 		row.UpdatedAt, parseErr = parseDBTimeValue(updatedRaw)
 		if parseErr != nil {
 			return nil, fmt.Errorf("解析模型冷却 updated_at 失败: %w", parseErr)
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// ListActiveModelCooldownsForAccount is the indexed, single-account variant
+// used outside batched scheduler projection refreshes.
+func (db *DB) ListActiveModelCooldownsForAccount(ctx context.Context, accountID int64) ([]*AccountModelCooldownRow, error) {
+	if accountID <= 0 {
+		return nil, nil
+	}
+	return db.ListActiveModelCooldownsForAccounts(ctx, []int64{accountID})
+}
+
+// ListActiveModelCooldownsForAccounts loads only the cooldown rows touched by
+// one scheduler-outbox batch. The consumer caps that batch at 500 account IDs,
+// so both PostgreSQL and SQLite stay comfortably within bind limits.
+func (db *DB) ListActiveModelCooldownsForAccounts(ctx context.Context, accountIDs []int64) ([]*AccountModelCooldownRow, error) {
+	accountIDs = positiveUniqueIDs(accountIDs)
+	if len(accountIDs) == 0 {
+		return nil, nil
+	}
+	args := make([]interface{}, 0, len(accountIDs)+1)
+	placeholders := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		args = append(args, accountID)
+		if db.isSQLite() {
+			placeholders = append(placeholders, "?")
+		} else {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+	}
+	args = append(args, db.timeArg(time.Now()))
+	resetPlaceholder := "?"
+	if !db.isSQLite() {
+		resetPlaceholder = fmt.Sprintf("$%d", len(args))
+	}
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT account_id, model, COALESCE(reason, ''), reset_at, updated_at
+		FROM account_model_cooldowns
+		WHERE account_id IN (`+strings.Join(placeholders, ",")+`) AND reset_at > `+resetPlaceholder+`
+		ORDER BY account_id, model
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("批量查询账号模型冷却失败: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*AccountModelCooldownRow
+	for rows.Next() {
+		row := &AccountModelCooldownRow{}
+		var resetRaw, updatedRaw interface{}
+		if err := rows.Scan(&row.AccountID, &row.Model, &row.Reason, &resetRaw, &updatedRaw); err != nil {
+			return nil, err
+		}
+		row.ResetAt, err = parseDBTimeValue(resetRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析模型冷却 reset_at 失败: %w", err)
+		}
+		row.UpdatedAt, err = parseDBTimeValue(updatedRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析模型冷却 updated_at 失败: %w", err)
 		}
 		result = append(result, row)
 	}

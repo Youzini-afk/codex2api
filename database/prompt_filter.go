@@ -898,8 +898,10 @@ func promptFilterLogWhere(query PromptFilterLogQuery) (string, []any) {
 			LOWER(COALESCE(api_key_masked, '')) LIKE $%d OR
 			LOWER(COALESCE(newapi_user_id, '')) LIKE $%d OR
 			LOWER(COALESCE(newapi_request_id, '')) LIKE $%d OR
-			LOWER(COALESCE(newapi_decision_id, '')) LIKE $%d
-		)`, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx))
+			LOWER(COALESCE(newapi_decision_id, '')) LIKE $%d OR
+			LOWER(COALESCE(request_correlation_id, '')) LIKE $%d OR
+			LOWER(COALESCE(session_hash, '')) LIKE $%d
+		)`, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx))
 	}
 	if len(clauses) == 0 {
 		return "", args
@@ -1009,5 +1011,14 @@ func (db *DB) ClearPromptFilterLogsByReviewStatus(ctx context.Context, reviewed 
 		return nil
 	}
 	_, err := db.conn.ExecContext(ctx, `DELETE FROM prompt_filter_logs WHERE reviewed = $1`, reviewed)
+	return err
+}
+
+func (db *DB) ClearPromptFilterLogsBySource(ctx context.Context, source string) error {
+	normalizedSource := strings.TrimSpace(source)
+	if db == nil || normalizedSource == "" {
+		return nil
+	}
+	_, err := db.conn.ExecContext(ctx, `DELETE FROM prompt_filter_logs WHERE source = $1`, normalizedSource)
 	return err
 }

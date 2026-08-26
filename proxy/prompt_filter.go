@@ -285,8 +285,12 @@ func (h *Handler) capturePromptFilterAuditContext(c *gin.Context) promptFilterAu
 		newAPIUserName = policyContext.Meta.UserName
 		newAPIUserEmail = policyContext.Meta.UserEmail
 		newAPIUserGroup = policyContext.Meta.UserGroup
-	} else if newAPIStatus == "unbound" {
-		sessionHash = hashRiskIdentity(promptSessionID(c))
+	} else {
+		// Conversation locking falls back to the Codex-local identity whenever a
+		// verified platform/session identity is unavailable. Audit correlation must
+		// make the same choice for optional unsigned bindings, disabled bindings,
+		// and failed optional verification—not only for completely unbound keys.
+		sessionHash = promptConversationLockFallbackSessionHash(c)
 	}
 	clientIP := input.ClientIP
 	if (newAPIStatus == "verified" || newAPIStatus == "signed_response") && strings.TrimSpace(policyContext.Identity.ClientIP) != "" {

@@ -102,6 +102,12 @@ func TestPromptPolicyIncidentPersistsNullableScoresAndExactEvidenceLink(t *testi
 	if err != nil || len(items) != 1 || items[0].ID != got.CandidateEvidenceID || items[0].PromptPolicyIncidentID != incident.IncidentID {
 		t.Fatalf("candidate evidence link items=%#v err=%v", items, err)
 	}
+	for _, auditReference := range []string{incident.IncidentID, incident.RequestCorrelationID} {
+		incidents, total, err := db.ListPromptPolicyIncidentsPage(ctx, PromptPolicyIncidentQuery{Page: 1, PageSize: 10, Query: auditReference})
+		if err != nil || total != 1 || len(incidents) != 1 || incidents[0].IncidentID != incident.IncidentID {
+			t.Fatalf("audit reference %q did not locate incident: total=%d incidents=%#v err=%v", auditReference, total, incidents, err)
+		}
+	}
 
 	notRun, notRunCandidate, notRunEvidence := promptPolicyTestInputs("incident-not-run")
 	notRun.LocalEvaluationState = PromptPolicyEvaluationNotRun
@@ -334,6 +340,33 @@ func TestClearPromptFilterLogsByReviewStatusKeepsOtherLogSection(t *testing.T) {
 	}
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM prompt_filter_logs`).Scan(&localCount); err != nil || localCount != 0 {
 		t.Fatalf("local logs not cleared count=%d err=%v", localCount, err)
+	}
+}
+
+func TestClearPromptFilterLogsBySourceKeepsOtherSources(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	ctx := context.Background()
+	for _, input := range []*PromptFilterLogInput{
+		{Source: "local_filter", Action: "block"},
+		{Source: "local_filter", Action: "allow", Reviewed: true, ReviewModel: "review-model"},
+		{Source: "upstream_cyber_policy", Action: "block"},
+	} {
+		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
+			t.Fatalf("InsertPromptFilterLog: %v", err)
+		}
+	}
+	if err := db.ClearPromptFilterLogsBySource(ctx, "local_filter"); err != nil {
+		t.Fatalf("clear local source logs: %v", err)
+	}
+	var localCount, upstreamCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM prompt_filter_logs WHERE source = 'local_filter'`).Scan(&localCount); err != nil {
+		t.Fatalf("count local source logs: %v", err)
+	}
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM prompt_filter_logs WHERE source = 'upstream_cyber_policy'`).Scan(&upstreamCount); err != nil {
+		t.Fatalf("count upstream source logs: %v", err)
+	}
+	if localCount != 0 || upstreamCount != 1 {
+		t.Fatalf("source clear crossed boundaries: local=%d upstream=%d", localCount, upstreamCount)
 	}
 }
 

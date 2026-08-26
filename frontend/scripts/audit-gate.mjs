@@ -20,7 +20,25 @@ const ALLOWLIST = new Map([
 
 const BLOCKING_SEVERITIES = new Set(["high", "critical"]);
 
-const result = spawnSync("npm", ["audit", "--omit=dev", "--json"], {
+// npm run 会提供当前实际使用的 npm CLI 路径。用同一个 Node 进程执行它，
+// 避免 Windows 上裸 `npm` 需要经 npm.cmd/cmd.exe 解析而触发 spawnSync ENOENT。
+const npmExecPath = process.env.npm_execpath;
+let npmCommand;
+let npmArgs;
+if (npmExecPath) {
+  npmCommand = process.execPath;
+  npmArgs = [npmExecPath, "audit", "--omit=dev", "--json"];
+} else if (process.platform === "win32") {
+  // .cmd wrappers are shell scripts on Windows and cannot be executed by
+  // spawnSync directly. The command is constant; no user-controlled value is
+  // interpolated into the shell string.
+  npmCommand = process.env.ComSpec || "cmd.exe";
+  npmArgs = ["/d", "/s", "/c", "npm audit --omit=dev --json"];
+} else {
+  npmCommand = "npm";
+  npmArgs = ["audit", "--omit=dev", "--json"];
+}
+const result = spawnSync(npmCommand, npmArgs, {
   encoding: "utf8",
   maxBuffer: 32 * 1024 * 1024,
 });

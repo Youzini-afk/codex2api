@@ -11,6 +11,7 @@ import ModelLogo from "../components/ModelLogo";
 import OperationResultsModal from "../components/OperationResultsModal";
 import { cn } from "@/lib/utils";
 import GrokAccounts from "./GrokAccounts";
+import AntigravityAccounts from "./AntigravityAccounts";
 import { mergeAccountLiveState, useAccountLiveState } from "../hooks/useAccountLiveState";
 import PageHeader from "../components/PageHeader";
 import { CompactStat } from "../components/CompactStat";
@@ -47,6 +48,7 @@ import type {
   AccountOperationSelector,
   AccountPageStatsItem,
   AccountLiveStateResponse,
+  UpstreamChannel,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -73,6 +75,7 @@ import {
   isOfficialCostTooNew,
   needsOfficialCostReload,
   needsUsageReload,
+  supportsOfficialUsage,
 } from "../lib/usageFormat";
 import {
   applyOptionalWorkspaceRouteHeader,
@@ -206,6 +209,32 @@ const IMPORT_BATCH_MAX_BYTES = 150 * 1024 * 1024;
 const formatMB = (bytes: number): string =>
   `${Math.round(bytes / (1024 * 1024))}MB`;
 
+function AccountConcurrencyBadge({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  const active = Math.max(0, account.active_requests ?? 0);
+  const occupied = Math.max(active, account.occupied_requests ?? active);
+  if (occupied === 0) return null;
+
+  const buffered = occupied - active;
+  const showOccupied = account.session_slot_buffer_enabled === true;
+  const title = showOccupied
+    ? t("accounts.occupiedRequestsTooltip", { active, occupied, buffered })
+    : t("accounts.activeRequestsTooltip", { count: active });
+
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+      title={title}
+    >
+      <span
+        className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+        aria-hidden
+      />
+      {showOccupied ? `${active}/${occupied}` : active}
+    </span>
+  );
+}
+
 // splitFilesIntoBatches 按累计字节大小把文件分批。单个文件即便超过 batchMax
 // 也自成一批(交由后端上限兜底),保证每个文件都被投递。
 function splitFilesIntoBatches(files: File[], batchMax: number): File[][] {
@@ -286,7 +315,7 @@ type AccountGroupDraft = {
   auto_pause_5h_threshold: number;
   auto_pause_7d_threshold: number;
   proxyURLsInput: string;
-  channel: "codex" | "grok";
+  channel: UpstreamChannel;
 };
 
 function getDefaultAccountVisibleColumns(): Record<
@@ -1287,20 +1316,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                       {account.status !== "overload_paused" && (
                                         <AccountStatusCountdown account={account} />
                                       )}
-                                      {(account.active_requests ?? 0) > 0 && (
-                                        <span
-                                          className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                                          title={t("accounts.activeRequestsTooltip", {
-                                            count: account.active_requests ?? 0,
-                                          })}
-                                        >
-                                          <span
-                                            className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                                            aria-hidden
-                                          />
-                                          {account.active_requests}
-                                        </span>
-                                      )}
+                                      <AccountConcurrencyBadge account={account} />
                                     </div>
                                     <AccountHealthBar
                                       buckets={healthBuckets}
@@ -1518,8 +1534,7 @@ export default function Accounts() {
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   type ReserveMode = "off" | "custom";
   const [showAdd, setShowAdd] = useState(false);
-  // providerView 决定账号管理页顶部展示哪一套上游：codex(现有页) 或 grok(独立黑白视图)。
-  // 由路由驱动（/accounts vs /accounts/grok），刷新浏览器后停留在当前视图。
+  // providerView 由路由驱动，刷新浏览器后停留在当前上游视图。
   const location = useLocation();
   const navigate = useNavigate();
   // ?groupManager=1 深链直接打开分组管理器(Grok 页的「管理分组」跳转入口,issue #487)。
@@ -1536,13 +1551,35 @@ export default function Accounts() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.search]);
+  // ?pending=1 落到 Codex 账号页审核区（API Keys 门户卡片 / Grok 横幅共用）。
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get("pending") !== "1") return;
+    const path = location.pathname.replace(/\/+$/, "");
+    if (path.endsWith("/accounts/grok") || path.endsWith("/accounts/invite")) {
+      navigate({ pathname: "/accounts", search: "?pending=1" }, { replace: true });
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      document.getElementById("pending-review")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [location.pathname, location.search, navigate]);
   const normalizedPath = location.pathname.replace(/\/+$/, "");
-  const providerView: "codex" | "grok" = normalizedPath.endsWith("/accounts/grok")
+  const providerView: UpstreamChannel = normalizedPath.endsWith("/accounts/grok")
     ? "grok"
-    : "codex";
+    : normalizedPath.endsWith("/accounts/antigravity")
+      ? "antigravity"
+      : "codex";
   const setProviderView = useCallback(
-    (view: "codex" | "grok") => {
-      navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    (view: UpstreamChannel) => {
+      navigate(
+        view === "grok"
+          ? "/accounts/grok"
+          : view === "antigravity"
+            ? "/accounts/antigravity"
+            : "/accounts",
+      );
     },
     [navigate],
   );
@@ -1859,11 +1896,14 @@ export default function Accounts() {
   // 分组按渠道隔离(issue #487):Codex 页的所有分组选择器只出 codex 渠道分组;
   // 管理器仍显示全部渠道(带徽标),徽标解析也用全量以兼容迁移前的跨渠道成员。
   const codexGroups = useMemo(
-    () => allGroups.filter((group) => group.channel !== "grok"),
+    () => allGroups.filter((group) => group.channel === "codex"),
     [allGroups],
   );
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([]);
   const [lazyMode, setLazyMode] = useState(false);
+  const [accountPortalEnabled, setAccountPortalEnabled] = useState(false);
+  const [panelPendingCount, setPanelPendingCount] = useState(0);
+  const [grokSelfServicePending, setGrokSelfServicePending] = useState(0);
   // 导入/添加账号时直接绑定的分组（记住上次选择，添加弹窗与导入弹窗共用，与 allowDuplicate 同风格）。
   const {
     groupIds: importGroupIds,
@@ -2512,7 +2552,28 @@ export default function Accounts() {
       .then((response) => { if (!cancelled) setAllGroups(response.groups ?? []); })
       .catch(() => undefined);
     void api.getSettings()
-      .then((settings) => { if (!cancelled) setLazyMode(settings.lazy_mode); })
+      .then((settings) => {
+        if (cancelled) return;
+        setLazyMode(settings.lazy_mode);
+        setAccountPortalEnabled(Boolean(settings.public_account_portal_page_enabled));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [providerView]);
+
+  useEffect(() => {
+    if (providerView !== "grok") return;
+    let cancelled = false;
+    void api.getAccountsPage({
+      channel: "codex",
+      page: 1,
+      pageSize: 1,
+      status: "disabled",
+      tag: "self-service",
+    })
+      .then((response) => {
+        if (!cancelled) setGrokSelfServicePending(response.total ?? 0);
+      })
       .catch(() => undefined);
     return () => { cancelled = true; };
   }, [providerView]);
@@ -2897,6 +2958,7 @@ export default function Accounts() {
     riskyAccounts: data.summary?.risky ?? 0,
     oauthAccounts: data.summary?.oauth ?? 0,
     apiKeyAccounts: data.summary?.api_key ?? 0,
+    selfServicePendingAccounts: data.summary?.self_service_pending ?? 0,
   };
   const {
     totalAccounts,
@@ -2917,7 +2979,17 @@ export default function Accounts() {
     riskyAccounts,
     oauthAccounts,
     apiKeyAccounts,
+    selfServicePendingAccounts,
   } = accountSummary;
+  const selfServicePendingCount = Math.max(selfServicePendingAccounts, panelPendingCount);
+  const pendingReviewRequested = new URLSearchParams(location.search).get("pending") === "1";
+  const showPendingReviewPanel = accountPortalEnabled || selfServicePendingCount > 0 || pendingReviewRequested;
+  const scrollToPendingReview = useCallback(() => {
+    document.getElementById("pending-review")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+  const handlePendingCountChange = useCallback((count: number) => {
+    setPanelPendingCount(count);
+  }, []);
 
   const allTags = data.facets.tags;
   const emailDomainStats = data.facets.email_domains;
@@ -5561,7 +5633,7 @@ export default function Accounts() {
       auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
       auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
       proxyURLsInput: (group.proxy_urls ?? []).join("\n"),
-      channel: group.channel === "grok" ? "grok" : "codex",
+      channel: group.channel,
     });
   };
 
@@ -5693,21 +5765,23 @@ export default function Accounts() {
     [],
   );
 
-  // Codex/Grok 顶部段控切换：两套账号视图共用同一切换器（Grok 通过 headerSlot 注入）。
+  // 三个账号视图共用同一切换器（独立页面通过 headerSlot 注入）。
   // 滑块动画 + 品牌 logo，与仪表盘渠道过滤器视觉一致。
-  // 不复用 Codex 侧的导入/导出/邀请/回收站等入口，Grok 页只保留账号本身的增删启停。
-  // useMemo 保持引用稳定,否则每轮渲染的新元素会击穿 GrokAccounts 的 memo 边界。
+  // useMemo 保持引用稳定,否则每轮渲染的新元素会击穿独立账号页的 memo 边界。
   const providerSwitcher = useMemo(() => (
-    <div className="relative grid grid-cols-2 items-center rounded-lg border border-border bg-muted/40 p-0.5">
+    <div className="relative grid w-full max-w-[480px] grid-cols-3 items-center rounded-lg border border-border bg-muted/40 p-0.5">
       <span
         aria-hidden
-        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/2)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
-        style={{ transform: `translateX(${providerView === "grok" ? 100 : 0}%)` }}
+        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/3)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
+        style={{
+          transform: `translateX(${providerView === "grok" ? 100 : providerView === "antigravity" ? 200 : 0}%)`,
+        }}
       />
       {(
         [
           ["codex", t("accounts.providerViewCodex")],
           ["grok", t("accounts.providerViewGrok")],
+          ["antigravity", t("accounts.providerViewAntigravity")],
         ] as const
       ).map(([key, label]) => (
         <button
@@ -5716,14 +5790,14 @@ export default function Accounts() {
           onClick={() => setProviderView(key)}
           aria-pressed={providerView === key}
           className={cn(
-            "relative z-10 inline-flex items-center justify-center gap-2 rounded-md px-5 py-2 text-base font-semibold transition-all duration-200 active:scale-[0.97]",
+            "relative z-10 inline-flex min-w-0 items-center justify-center gap-1 rounded-md px-1.5 py-2 text-xs font-semibold transition-all duration-200 active:scale-[0.97] sm:gap-2 sm:px-3 sm:text-sm",
             providerView === key
               ? "text-foreground"
               : "text-muted-foreground opacity-75 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
           )}
         >
-          <ChannelLogo channel={key} size={20} />
-          {label}
+          <ChannelLogo channel={key} size={18} />
+          <span className="min-w-0 truncate">{label}</span>
         </button>
       ))}
     </div>
@@ -5733,6 +5807,25 @@ export default function Accounts() {
     // key 触发渠道切换时整块内容淡入过渡，切换器由 headerSlot 常驻不闪。
     return (
       <div key="provider-grok" className="animate-channel-switch-in">
+        {grokSelfServicePending > 0 ? (
+          <button
+            type="button"
+            onClick={() => navigate("/accounts?pending=1")}
+            className="mb-3 flex w-full items-center gap-2.5 rounded-xl border border-amber-500/40 bg-amber-500/[0.06] px-3 py-2.5 text-left shadow-sm transition-colors hover:bg-amber-500/[0.1]"
+          >
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-300">
+              <Hourglass className="size-4" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold tracking-tight text-foreground">
+                {t("accounts.pendingReview.grokBanner", { count: grokSelfServicePending })}
+              </span>
+              <span className="block text-[11px] text-muted-foreground">
+                {t("accounts.pendingReview.jumpHint")}
+              </span>
+            </span>
+          </button>
+        ) : null}
         <GrokAccounts
           headerSlot={providerSwitcher}
           showOperationResults={showOperationResults}
@@ -5740,6 +5833,14 @@ export default function Accounts() {
             handleOperationResultsVisibilityChange
           }
         />
+      </div>
+    );
+  }
+
+  if (providerView === "antigravity") {
+    return (
+      <div key="provider-antigravity" className="animate-channel-switch-in">
+        <AntigravityAccounts headerSlot={providerSwitcher} />
       </div>
     );
   }
@@ -6215,6 +6316,15 @@ export default function Accounts() {
               <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
                 {t("accounts.filter")}
               </span>
+              {showPendingReviewPanel ? (
+                <button
+                  type="button"
+                  onClick={scrollToPendingReview}
+                  className="shrink-0 whitespace-nowrap rounded-lg bg-amber-500/15 px-2.5 py-1.5 text-[12px] font-semibold text-amber-800 transition-colors hover:bg-amber-500/20 dark:text-amber-200"
+                >
+                  {t("accounts.pendingReview.chip", { count: selfServicePendingCount })}
+                </button>
+              ) : null}
               {(
                 [
                   ["all", t("accounts.filterAll"), totalAccounts],
@@ -6847,11 +6957,14 @@ export default function Accounts() {
             </div>
           )}
 
-          <PendingSelfServiceReviewPanel
-            onApprove={handleApprovePending}
-            onReject={handleRejectPending}
-            onSaveNote={handleSaveNote}
-          />
+          {showPendingReviewPanel ? (
+            <PendingSelfServiceReviewPanel
+              onApprove={handleApprovePending}
+              onReject={handleRejectPending}
+              onSaveNote={handleSaveNote}
+              onCountChange={handlePendingCountChange}
+            />
+          ) : null}
 
           <Card>
             <CardContent className="p-3 sm:p-4">
@@ -10204,13 +10317,20 @@ export default function Accounts() {
                                 {group.name}
                               </span>
                               <span
-                                className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ${
+                                className={`inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ${
                                   group.channel === "grok"
                                     ? "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300"
-                                    : "bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300"
+                                    : group.channel === "antigravity"
+                                      ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
+                                      : "bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300"
                                 }`}
                               >
-                                {group.channel === "grok" ? "Grok" : "Codex"}
+                                <ChannelLogo channel={group.channel} size={11} />
+                                {group.channel === "grok"
+                                  ? t("accounts.providerViewGrok")
+                                  : group.channel === "antigravity"
+                                    ? t("accounts.providerViewAntigravity")
+                                    : t("accounts.providerViewCodex")}
                               </span>
                               <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground">
                                 {t("accounts.groupMembers")}{" "}
@@ -10304,12 +10424,12 @@ export default function Accounts() {
                       return (
                         <>
                           <div className="flex gap-2">
-                            {(["codex", "grok"] as const).map((channel) => (
+                            {(["codex", "grok", "antigravity"] as const).map((channel) => (
                               <button
                                 key={channel}
                                 type="button"
                                 disabled={channelLocked}
-                                className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                                   groupDraft.channel === channel
                                     ? "border-primary bg-primary/10 text-primary"
                                     : "border-border text-muted-foreground hover:bg-muted/50"
@@ -10321,7 +10441,12 @@ export default function Accounts() {
                                   }))
                                 }
                               >
-                                {channel === "grok" ? "Grok" : "Codex"}
+                                <ChannelLogo channel={channel} size={14} />
+                                {channel === "grok"
+                                  ? t("accounts.providerViewGrok")
+                                  : channel === "antigravity"
+                                    ? t("accounts.providerViewAntigravity")
+                                    : t("accounts.providerViewCodex")}
                               </button>
                             ))}
                           </div>
@@ -12047,6 +12172,10 @@ function isActiveAutoPauseWindowReached(
 
 // Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
 // k12/edu are paid education workspaces with 5h limits (issue #307/#309).
+function isSparkUsagePlan(planType?: string): boolean {
+  return normalizePlanType(planType) === "pro";
+}
+
 function isPremiumUsagePlan(planType?: string): boolean {
   return [
     "plus",
@@ -13411,20 +13540,7 @@ function AccountMobileCard({
                     }
                     errorMessage={account.error_message}
                   />
-                  {(account.active_requests ?? 0) > 0 && (
-                    <span
-                      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                      title={t("accounts.activeRequestsTooltip", {
-                        count: account.active_requests ?? 0,
-                      })}
-                    >
-                      <span
-                        className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                        aria-hidden
-                      />
-                      {account.active_requests}
-                    </span>
-                  )}
+                  <AccountConcurrencyBadge account={account} />
                 </div>
               </div>
             </div>
@@ -13766,20 +13882,9 @@ function AccountMobileCard({
               <AccountHealthBar buckets={healthBuckets} />
             </div>
           )}
-          {(account.active_requests ?? 0) > 0 && (
+          {Math.max(account.active_requests ?? 0, account.occupied_requests ?? 0) > 0 && (
             <div className="mt-1">
-              <span
-                className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                title={t("accounts.activeRequestsTooltip", {
-                  count: account.active_requests ?? 0,
-                })}
-              >
-                <span
-                  className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                  aria-hidden
-                />
-                {account.active_requests}
-              </span>
+              <AccountConcurrencyBadge account={account} />
             </div>
           )}
         </div>
@@ -14578,6 +14683,14 @@ function usageBarColor(pct: number): string {
   return "bg-emerald-500";
 }
 
+// 标签 / 条 / 百分比 三列固定，避免 7d 与 spark 把进度条拉成不同长度。
+const USAGE_BAR_LABEL_CLASS =
+  "w-10 shrink-0 text-[11px] font-medium text-muted-foreground";
+const USAGE_BAR_TRACK_CLASS =
+  "h-1.5 w-[88px] shrink-0 rounded-full bg-muted overflow-hidden";
+const USAGE_BAR_META_CLASS =
+  "text-[11px] font-medium text-muted-foreground mt-0.5 pl-[46px]";
+
 // 单行用量进度条
 function UsageBar({
   label,
@@ -14598,29 +14711,20 @@ function UsageBar({
   return (
     <div>
       <div className="flex items-center gap-1.5">
-        <span className="text-[11px] font-medium text-muted-foreground w-7 shrink-0">
-          {label}
-        </span>
-        <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden min-w-[72px]">
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
+        <div className={USAGE_BAR_TRACK_CLASS}>
           <div
             className={`h-full rounded-full transition-all ${usageBarColor(pct)}`}
             style={{ width: `${Math.min(100, pct)}%` }}
           />
         </div>
-        <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">
+        <span className="w-[42px] shrink-0 text-right text-[12px] font-semibold tabular-nums">
           {pct.toFixed(1)}%
         </span>
       </div>
-      {detailText && (
-        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]">
-          {detailText}
-        </div>
-      )}
+      {detailText && <div className={USAGE_BAR_META_CLASS}>{detailText}</div>}
       {resetTime && (
-        <div
-          className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]"
-          title={resetTime.title}
-        >
+        <div className={USAGE_BAR_META_CLASS} title={resetTime.title}>
           ⏱ {resetTime.label}
         </div>
       )}
@@ -14648,7 +14752,7 @@ function UsageWindowStat({
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <span className="w-7 shrink-0">{label}</span>
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
         <span>
           {formatCompactUsageNumber(detail?.requests)}{" "}
           {t("accounts.usageReqUnit")} /{" "}
@@ -14657,7 +14761,7 @@ function UsageWindowStat({
         </span>
       </div>
       {(accountBilledText || userBilledText) && (
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[34px]">
+        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[46px]">
           {accountBilledText && (
             <span>
               {t("accounts.accountBilledLabel")}: ${accountBilledText}
@@ -14869,6 +14973,10 @@ function UsageCell({
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined;
   const has5h =
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
+  const hasSparkPct =
+    account.usage_percent_spark !== null &&
+    account.usage_percent_spark !== undefined;
+  const showSpark = isSparkUsagePlan(account.plan_type);
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
   const has5hReset = !!account.reset_5h_at;
   const has7dReset = !!account.reset_7d_at;
@@ -14886,12 +14994,28 @@ function UsageCell({
     </div>
   ) : null;
 
+  const sparkBar = showSpark ? (
+    hasSparkPct ? (
+      <UsageBar
+        label="spark"
+        pct={account.usage_percent_spark!}
+        resetAt={account.reset_spark_at}
+      />
+    ) : (
+      <UsageBar
+        label="spark"
+        pct={0}
+        resetAt={account.reset_spark_at}
+      />
+    )
+  ) : null;
+
   if (showFiveHour) {
-    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset)
+    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset && !showSpark)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
-      <div className={`${wide ? "w-full" : "w-52"} flex items-start gap-1`}>
-        <div className="flex-1 space-y-1.5">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
           {has5h ? (
             <UsageBar
               label="5h"
@@ -14902,6 +15026,29 @@ function UsageCell({
           ) : (
             <UsageWindowStat label="5h" detail={account.usage_5h_detail} />
           )}
+          {sparkBar}
+          {has7d ? (
+            <UsageBar
+              label={longWindowLabel}
+              pct={account.usage_percent_7d!}
+              resetAt={account.reset_7d_at}
+              detail={account.usage_7d_detail}
+            />
+          ) : (
+            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
+          )}
+          {reserveHint}
+        </div>
+        {refreshButton}
+      </div>
+    );
+  }
+
+  if (showSpark) {
+    return (
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
+          {sparkBar}
           {has7d ? (
             <UsageBar
               label={longWindowLabel}
@@ -14921,8 +15068,8 @@ function UsageCell({
 
   if (sevenDayPresent) {
     return (
-      <div className={`${wide ? "w-full" : "w-48"} flex items-start gap-1`}>
-        <div className="flex-1 space-y-1">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1">
           {has7d ? (
             <UsageBar
               label={longWindowLabel}
@@ -14964,7 +15111,7 @@ function BilledCell({
   const official =
     typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
   const showOfficial =
-    isCodexOfficialAccount(account) && !isOfficialCostHiddenAccount(account);
+    supportsOfficialUsage(account) && !isOfficialCostHiddenAccount(account);
   // synced 表示后端已成功同步过但上游没有数据(官方统计有滞后):
   // 这是确定的"暂无数据",不是"还在加载",不该转圈。
   // 导入未满一天、封禁/错误号也不转圈：官方结算要到次日才出数。
@@ -15140,15 +15287,19 @@ function PendingSelfServiceReviewPanel({
   onApprove,
   onReject,
   onSaveNote,
+  onCountChange,
 }: {
   onApprove: (account: AccountRow) => Promise<void>;
   onReject: (account: AccountRow) => Promise<void>;
   onSaveNote: (account: AccountRow, note: string) => Promise<void>;
+  onCountChange?: (count: number) => void;
 }) {
   const { t } = useTranslation();
   const [pending, setPending] = useState<AccountRow[]>([]);
   const [pendingPage, setPendingPage] = useState(1);
   const [pendingTotal, setPendingTotal] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadingPending, setLoadingPending] = useState(true);
   const pendingPageSize = 20;
   const loadPending = useCallback(async () => {
     try {
@@ -15161,19 +15312,33 @@ function PendingSelfServiceReviewPanel({
         sort: "created_at",
         order: "asc",
       });
+      const total = response.total ?? 0;
       setPending(response.accounts ?? []);
-      setPendingTotal(response.total ?? 0);
+      setPendingTotal(total);
+      setLoadError(null);
+      onCountChange?.(total);
       if (response.page !== pendingPage) setPendingPage(response.page);
-    } catch {
-      // This auxiliary panel must never block the account list.
+    } catch (error) {
+      setLoadError(getErrorMessage(error));
+    } finally {
+      setLoadingPending(false);
     }
-  }, [pendingPage]);
+  }, [onCountChange, pendingPage]);
   useEffect(() => { void loadPending(); }, [loadPending]);
+  useEffect(() => {
+    const refresh = () => {
+      if (!document.hidden) void loadPending();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [loadPending]);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draftNote, setDraftNote] = useState("");
   const [savingId, setSavingId] = useState<number | null>(null);
-
-  if (pending.length === 0) return null;
 
   const startEdit = (account: AccountRow) => {
     setEditingId(account.id);
@@ -15198,7 +15363,7 @@ function PendingSelfServiceReviewPanel({
   };
 
   return (
-    <Card className="border-amber-500/40 bg-amber-500/[0.04] shadow-sm">
+    <Card id="pending-review" className="border-amber-500/40 bg-amber-500/[0.04] shadow-sm scroll-mt-4">
       <CardContent className="p-3 sm:p-4">
         <div className="mb-3 flex items-center gap-2.5">
           <div className="flex size-9 items-center justify-center rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-300">
@@ -15215,6 +15380,19 @@ function PendingSelfServiceReviewPanel({
           </div>
         </div>
 
+        {loadingPending && pending.length === 0 ? (
+          <p className="text-sm text-muted-foreground">{t("common.loading")}</p>
+        ) : loadError ? (
+          <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-destructive">
+            <span>{t("accounts.pendingReview.loadFailed", { error: loadError })}</span>
+            <Button size="sm" variant="outline" onClick={() => void loadPending()}>
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : pending.length === 0 ? (
+          <p className="text-sm text-muted-foreground">{t("accounts.pendingReview.empty")}</p>
+        ) : (
+        <>
         <div className="space-y-2">
           {pending.map((account) => {
             const editing = editingId === account.id;
@@ -15322,6 +15500,8 @@ function PendingSelfServiceReviewPanel({
             />
           </div>
         ) : null}
+        </>
+        )}
       </CardContent>
     </Card>
   );

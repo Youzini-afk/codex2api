@@ -489,6 +489,8 @@ func NewEnhancedRateLimiter(db *database.DB, globalRPM, accountRPM, modelRPM int
 
 // Allow 检查请求是否允许通过（全局限流）
 func (erl *EnhancedRateLimiter) Allow() bool {
+	erl.mu.RLock()
+	defer erl.mu.RUnlock()
 	if !erl.enabled {
 		return true
 	}
@@ -497,12 +499,11 @@ func (erl *EnhancedRateLimiter) Allow() bool {
 
 // AllowWithContext 检查请求是否允许通过（带上下文的多级限流）
 func (erl *EnhancedRateLimiter) AllowWithContext(accountID, model string) bool {
+	erl.mu.RLock()
+	defer erl.mu.RUnlock()
 	if !erl.enabled {
 		return true
 	}
-
-	erl.mu.RLock()
-	defer erl.mu.RUnlock()
 
 	// 1. 检查全局限流
 	if !erl.globalLimiter.allow() {
@@ -555,11 +556,25 @@ func (erl *EnhancedRateLimiter) AllowWithContext(accountID, model string) bool {
 	return true
 }
 
+// GetGlobalRPM returns the configured global rate while synchronizing with
+// dynamic updates.
+func (erl *EnhancedRateLimiter) GetGlobalRPM() int {
+	if erl == nil {
+		return 0
+	}
+	erl.mu.RLock()
+	defer erl.mu.RUnlock()
+	return erl.globalRPM
+}
+
 // UpdateGlobalRPM 动态更新全局限流
 func (erl *EnhancedRateLimiter) UpdateGlobalRPM(rpm int) {
 	erl.mu.Lock()
 	defer erl.mu.Unlock()
 
+	if erl.globalRPM == rpm {
+		return
+	}
 	erl.globalRPM = rpm
 	erl.globalLimiter.updateRPM(rpm)
 	erl.enabled = erl.globalRPM > 0 || erl.accountRPM > 0 || erl.modelRPM > 0
@@ -861,7 +876,7 @@ func (rl *RateLimiter) UpdateRPM(rpm int) {
 // GetRPM 获取当前 RPM（向后兼容）
 func (rl *RateLimiter) GetRPM() int {
 	if rl.enhanced != nil {
-		return rl.enhanced.globalRPM
+		return rl.enhanced.GetGlobalRPM()
 	}
 	return 0
 }

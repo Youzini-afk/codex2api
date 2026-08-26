@@ -1,5 +1,6 @@
 export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
+export type UpstreamChannel = 'codex' | 'grok' | 'antigravity'
 
 export interface ToastState {
   msg: string
@@ -103,6 +104,8 @@ export interface AccountRow {
   account_type?: string
   openai_responses_api?: boolean
   grok_api?: boolean
+  antigravity_api?: boolean
+  antigravity_auth_kind?: 'oauth' | 'api_key' | string
   agent_identity?: boolean
   grok_auth_kind?: string
   grok_plan?: GrokPlanInfo
@@ -110,6 +113,15 @@ export interface AccountRow {
   // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
   grok_rate_limit?: GrokRateLimitSnapshot
   grok_free_quota?: GrokFreeQuotaSnapshot
+  antigravity_project_id?: string
+  antigravity_avatar_url?: string
+  antigravity_verified_email?: boolean
+  project_id?: string
+  avatar_url?: string
+  verified_email?: boolean
+  antigravity_quota?: AntigravityQuotaSnapshot
+  antigravity_permissions?: AntigravityPermissionsSnapshot
+  antigravity_sync_warning?: string
   base_url?: string
   models?: string[]
   model_mapping?: string
@@ -155,6 +167,8 @@ export interface AccountRow {
   updated_at: ISODateString
   codex_usage_updated_at?: ISODateString
   active_requests?: number
+  occupied_requests?: number
+  session_slot_buffer_enabled?: boolean
   total_requests?: number
   last_used_at?: ISODateString
   success_requests?: number
@@ -165,6 +179,7 @@ export interface AccountRow {
   success_model_counts?: Record<string, number>
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  usage_percent_spark?: number | null
   rate_limit_reset_credits?: number | null
   applicable_reset_credits?: number | null
   credits_balance?: string | null
@@ -188,6 +203,7 @@ export interface AccountRow {
   usage_today_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
+  reset_spark_at?: ISODateString
   // 长窗口(7d 槽)真实类型: "monthly"(free/team 月窗)/"weekly"/未知。
   // free/team plan 的长窗口实为约 30 天,标签应显示 30d 而非 7d (issue #324)。
   usage_window_7d_kind?: 'monthly' | 'weekly' | ''
@@ -253,6 +269,7 @@ export interface AccountListSummary {
   unauthorized_24h: number
   rate_limited_1h: number
   timeout_15m: number
+  self_service_pending?: number
 }
 
 export interface AccountEmailDomainFacet {
@@ -290,11 +307,12 @@ export interface AccountPageStatsResponse {
 }
 
 export interface AccountLiveStateResponse {
-  accounts: Record<string, { active_requests: number }>
+  accounts: Record<string, { active_requests: number; occupied_requests: number }>
+  session_slot_buffer_enabled: boolean
 }
 
 export interface AccountsPageParams {
-  channel?: 'codex' | 'grok'
+  channel?: UpstreamChannel
   page: number
   pageSize: number
   search?: string
@@ -372,7 +390,7 @@ export interface AccountPressureForecastAnalysis {
 }
 
 export interface AccountAnalysisResponse {
-  channel: 'codex' | 'grok'
+  channel: UpstreamChannel
   quota: Record<'5h' | '7d', AccountQuotaAnalysis>
   recovery: Record<'5h' | '7d', AccountRecoveryAnalysis>
   reset: AccountResetAnalysis
@@ -382,7 +400,7 @@ export interface AccountAnalysisResponse {
 }
 
 export interface AccountOperationSelector {
-  channel: 'codex' | 'grok'
+  channel: UpstreamChannel
   search?: string
   status?: string
   plan?: string
@@ -654,6 +672,220 @@ export interface AddGrokAccountRequest {
 
 export type UpdateGrokAccountRequest = AddGrokAccountRequest
 
+export interface AntigravityModelQuota {
+  model?: string
+  model_id?: string
+  name?: string
+  remaining_fraction: number
+  remaining_percent?: number
+  reset_time?: string
+  display_name?: string
+  supports_images?: boolean
+  supports_thinking?: boolean
+  thinking_budget?: number
+  recommended?: boolean
+  max_tokens?: number
+  max_output_tokens?: number
+  supported_mime_types?: Record<string, boolean>
+}
+
+export interface AntigravityQuotaBucket {
+  bucket_id: string
+  window: string
+  remaining_fraction: number
+  reset_time?: string
+  display_name?: string
+  description?: string
+}
+
+export interface AntigravityQuotaGroup {
+  display_name: string
+  description?: string
+  buckets: AntigravityQuotaBucket[]
+}
+
+export interface AntigravityQuotaSnapshot {
+  models: Record<string, AntigravityModelQuota> | AntigravityModelQuota[]
+  quota_groups?: AntigravityQuotaGroup[]
+  groups?: AntigravityQuotaGroup[]
+  subscription_tier?: string
+  model_forwarding_rules?: Record<string, string>
+  ai_credits?: {
+    credits: number
+    expiry_date?: string
+  }
+  forbidden?: boolean
+  updated_at: ISODateString
+}
+
+export interface AntigravityPermissionsSnapshot {
+  allowed: boolean
+  reason?: string
+  project_id?: string
+  effective_tier?: string
+  restricted?: boolean
+  allowed_tiers?: unknown[]
+  ineligible_tiers?: unknown[]
+  current_tier?: unknown
+  paid_tier?: unknown
+  updated_at: ISODateString
+}
+
+export type AntigravityAuthKind = 'oauth' | 'api_key'
+
+export interface AntigravityCapabilityObservation {
+  credential_generation: number
+  protocol: 'interactions' | 'cloud_code_v1internal' | string
+  model_id: string
+  status: string
+  verified: boolean
+  http_status?: number
+  source: string
+  observed_at: ISODateString
+  content_type?: string
+}
+
+export interface AntigravityAccountState {
+  account_id: number
+  credential_generation: number
+  credential_kind: AntigravityAuthKind
+  catalog: {
+    models: string[]
+    source: 'declared' | 'default' | 'google_control_plane' | string
+    verified: boolean
+    synchronized: boolean
+    observed_at?: ISODateString
+  }
+  identity: {
+    status: string
+    email_verified: boolean
+    subject_known: boolean
+    project_status: string
+    project_id?: string
+  }
+  permissions?: AntigravityPermissionsSnapshot
+  quota?: AntigravityQuotaSnapshot
+  capabilities: AntigravityCapabilityObservation[]
+  last_synced_at?: ISODateString
+  last_sync_attempt_at?: ISODateString
+  last_capability_probe_at?: ISODateString
+  warnings: string[]
+}
+
+export interface AntigravityStateSyncResponse {
+  message: string
+  state: AntigravityAccountState
+  remote: boolean
+  catalog_source: string
+  verified: boolean
+}
+
+export interface AntigravityCapabilityProbeResponse {
+  message: string
+  state: AntigravityAccountState
+  result: AntigravityCapabilityObservation
+  warning?: string
+}
+
+export interface AddAntigravityAccountRequest {
+  name?: string
+  auth_kind?: AntigravityAuthKind
+  auth_json?: string
+  api_key?: string
+  models?: string[]
+  model_mapping?: string
+  proxy_url?: string
+  group_ids?: number[]
+}
+
+export interface UpdateAntigravityAccountRequest {
+  name?: string
+  auth_json?: string
+  api_key?: string
+  models?: string[]
+  model_mapping?: string
+  proxy_url?: string
+  group_ids?: number[]
+}
+
+export interface AntigravityImportRequest {
+  files: string[]
+  proxy_url?: string
+  group_ids?: number[]
+}
+
+export interface AntigravityImportItem {
+  index: number
+  sub_index?: number
+  id?: number
+  email?: string
+  ok: boolean
+  synced?: boolean
+  warning?: string
+  error?: string
+}
+
+export interface AntigravityImportResponse {
+  total: number
+  imported: number
+  synced?: number
+  degraded?: number
+  failed: number
+  group_ids?: number[]
+  warning?: string
+  items: AntigravityImportItem[]
+}
+
+export interface AntigravityCreateResponse extends MessageResponse {
+  id: number
+  email?: string
+  synced: boolean
+  warning?: string
+  group_ids?: number[]
+}
+
+export interface AntigravityOAuthStartRequest {
+  name?: string
+  proxy_url?: string
+  oauth_client_key?: string
+  group_ids?: number[]
+}
+
+export interface AntigravityOAuthStartResponse {
+  session_id: string
+  auth_url: string
+  redirect_uri: string
+  expires_at: ISODateString
+}
+
+export type AntigravityOAuthStatus =
+  | 'waiting'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | string
+
+export interface AntigravityOAuthStatusResponse {
+  session_id: string
+  status: AntigravityOAuthStatus
+  account_id?: number
+  email?: string
+  warning?: string
+  error?: string
+  expires_at: ISODateString
+}
+
+export interface AntigravityOAuthCompleteRequest {
+  session_id: string
+  callback_url: string
+}
+
+export interface AntigravityOAuthCompleteResponse {
+  message: string
+  session_id: string
+}
+
 export interface BatchUpdateGrokModelsRequest {
   ids: number[]
   models: string[]
@@ -901,7 +1133,7 @@ export interface AccountGroup {
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
   proxy_urls: string[]
-  channel: 'codex' | 'grok'
+  channel: UpstreamChannel
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -919,7 +1151,7 @@ export interface CreateAccountGroupRequest {
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
   proxy_urls?: string[]
-  channel?: 'codex' | 'grok'
+  channel?: UpstreamChannel
 }
 
 export interface UpdateAccountGroupRequest {
@@ -931,7 +1163,7 @@ export interface UpdateAccountGroupRequest {
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
   proxy_urls?: string[]
-  channel?: 'codex' | 'grok'
+  channel?: UpstreamChannel
 }
 
 export interface AccountModelStat {
@@ -1049,6 +1281,7 @@ export interface AccountUsageDetail {
 
 export interface MessageResponse {
   message: string
+  warning?: string
 }
 
 export interface SystemUpdateInfo {
@@ -1136,6 +1369,10 @@ export interface OpsOverviewResponse {
     used_bytes: number
     total_bytes: number
     process_bytes: number
+    container_used_bytes?: number
+    container_limit_bytes?: number
+    container_percent?: number
+    container_source?: 'cgroup' | 'process'
     heap_alloc_bytes?: number
     heap_inuse_bytes?: number
     heap_released_bytes?: number
@@ -1181,6 +1418,43 @@ export interface OpsOverviewResponse {
   requests: {
     active: number
     total: number
+  }
+  scheduler?: {
+    engine: 'legacy' | 'shadow' | 'indexed' | string
+    selection_total: number
+    selection_fast_hit: number
+    selection_slow_hit: number
+    selection_miss: number
+    selection_duration_ns: number
+    slow_scanned_accounts: number
+    wait_started: number
+    wait_wakeups: number
+    wait_timeouts: number
+    wait_canceled: number
+    waiters: number
+    availability_signals: number
+    snapshot_generation: number
+    snapshot_account_count: number
+    last_snapshot_at: ISODateString | ''
+    outbox_watermark: number
+    outbox_high_watermark: number
+    outbox_backlog: number
+    outbox_events: number
+    outbox_batches: number
+    outbox_errors: number
+    outbox_lag_ms: number
+    outbox_last_applied_at: ISODateString | ''
+    routing_cache_hits: number
+    routing_cache_misses: number
+    routing_cache_builds: number
+    routing_cache_fallbacks: number
+    routing_cache_invalidations: number
+    routing_cache_evictions: number
+    routing_cache_entries: number
+    routing_cache_accounts: number
+    shadow_checks: number
+    shadow_agreements: number
+    shadow_mismatches: number
   }
   postgres: {
     healthy: boolean
@@ -1353,7 +1627,9 @@ export interface SystemSettings {
   auto_reset_credits_before_expiry_min: number
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
+  scheduler_engine: 'legacy' | 'shadow' | 'indexed'
   codex_force_websocket: boolean
+  codex_request_compression: boolean
   codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
   codex_ws_keepalive_interval_sec: number
@@ -1385,6 +1661,8 @@ export interface SystemSettings {
   scheduler_mode: string
   affinity_mode?: string
   session_affinity_spread?: boolean
+  session_slot_buffer_enabled: boolean
+  session_slot_buffer_seconds: number
   grok_affinity_mode?: string
   grok_probe_enabled?: boolean
   grok_probe_interval_minutes?: number
@@ -2345,6 +2623,8 @@ export interface ModelInfo {
 
 export interface ModelsResponse {
   models: string[]
+  // Antigravity 渠道账号模型并集/默认集
+  antigravity_models?: string[]
   // Grok 渠道账号声明模型的并集;渠道选 grok 时模型下拉用这份
   grok_models?: string[]
   items?: ModelInfo[]
@@ -2772,7 +3052,7 @@ export interface APIKeyLimits {
   disable_image_generation?: boolean
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
-  upstream_channel?: "codex" | "grok"
+  upstream_channel?: UpstreamChannel
   /** 允许该 Key 使用 ChatGPT Live（/v1/live）。默认关闭。 */
   allow_live?: boolean
   /** 分组 / 账号维度的用量预算（issue #439）。 */

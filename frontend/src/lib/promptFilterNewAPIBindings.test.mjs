@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { extractBalancedBody } from './sourceBoundary.mjs'
 
 const readSource = (url) => readFileSync(url, 'utf8').replace(/\r\n?/g, '\n')
 
@@ -56,11 +57,11 @@ test('key bindings are embedded in an optional NewAPI adapter panel', () => {
   assert.equal(componentSource.includes('<Card'), false, 'embedded binding editor must not create a second top-level card')
   assert.equal(pageSource.includes('getPromptFilterNewAPISecret'), false)
   assert.equal(pageSource.includes("setBool('newapi', 'enabled'"), false)
-  const recommendedPresetStart = pageSource.indexOf('const applyRecommendedProtection')
-  const recommendedPresetEnd = pageSource.indexOf('\n\n  return (', recommendedPresetStart)
-  assert.ok(recommendedPresetStart >= 0, 'missing applyRecommendedProtection')
-  assert.ok(recommendedPresetEnd > recommendedPresetStart, 'missing PromptFilter render boundary')
-  const recommendedPreset = pageSource.slice(recommendedPresetStart, recommendedPresetEnd)
+  const recommendedPreset = extractBalancedBody(
+    pageSource,
+    'const applyRecommendedProtection',
+    'applyRecommendedProtection body',
+  )
   for (const fragment of [
     "recommendedStrength === 'penalty'",
     "t('promptFilter.penaltyRequiresNewAPI')",

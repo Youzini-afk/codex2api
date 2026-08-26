@@ -474,6 +474,23 @@ func TestEnhancedRateLimiter_UpdateRPM(t *testing.T) {
 	}
 }
 
+func TestEnhancedRateLimiter_UpdateGlobalRPMIdempotent(t *testing.T) {
+	erl := NewEnhancedRateLimiter(nil, 60, 0, 0)
+	defer erl.Stop()
+	erl.globalLimiter.bucket.mu.RLock()
+	before := erl.globalLimiter.bucket.lastRefill
+	erl.globalLimiter.bucket.mu.RUnlock()
+
+	time.Sleep(time.Millisecond)
+	erl.UpdateGlobalRPM(60)
+	erl.globalLimiter.bucket.mu.RLock()
+	after := erl.globalLimiter.bucket.lastRefill
+	erl.globalLimiter.bucket.mu.RUnlock()
+	if !after.Equal(before) {
+		t.Fatalf("same-RPM replay reset refill clock: before=%s after=%s", before, after)
+	}
+}
+
 func TestEnhancedRateLimiter_UpdateAllRPM(t *testing.T) {
 	erl := NewEnhancedRateLimiter(nil, 60, 30, 15)
 	defer erl.Stop()
@@ -604,6 +621,7 @@ func TestEnhancedRateLimiter_Concurrent(t *testing.T) {
 
 func TestRateLimiter_BackwardCompatible(t *testing.T) {
 	rl := NewRateLimiter(60)
+	defer rl.GetEnhancedLimiter().Stop()
 
 	// 基本功能测试
 	if rl.GetRPM() != 60 {
@@ -620,6 +638,35 @@ func TestRateLimiter_BackwardCompatible(t *testing.T) {
 	enhanced := rl.GetEnhancedLimiter()
 	if enhanced == nil {
 		t.Error("Expected non-nil enhanced limiter")
+	}
+}
+
+func TestRateLimiterConcurrentUpdateAndRequestPath(t *testing.T) {
+	rl := NewRateLimiter(60)
+	defer rl.GetEnhancedLimiter().Stop()
+
+	const workers = 16
+	const iterations = 1000
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				if worker%4 == 0 {
+					rl.UpdateRPM((i % 120) + 1)
+					continue
+				}
+				_ = rl.GetRPM()
+				_ = rl.GetEnhancedLimiter().Allow()
+				_ = rl.GetEnhancedLimiter().AllowWithContext("account", "model")
+			}
+		}(worker)
+	}
+	wg.Wait()
+
+	if got := rl.GetRPM(); got < 1 || got > 120 {
+		t.Fatalf("final RPM = %d, want a published update in [1,120]", got)
 	}
 }
 

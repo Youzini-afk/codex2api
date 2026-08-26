@@ -47,7 +47,8 @@ Codex2API 采用三层配置架构：
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | 否 | 48 | HTTP 请求体上限。后台 MP4 动态壁纸上传最大 40MB，默认值为 multipart 上传预留余量 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
 | `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
-| `FAST_SCHEDULER_ENABLED` | 否 | `false` | 通过环境变量启用快速调度器（也可在管理后台运行时开启） |
+| `CODEX_SCHEDULER_ENGINE` | 否 | 空 | 调度引擎强制值：`legacy` / `shadow` / `indexed`。设置后优先于数据库配置，适合容器级灰度或紧急回退 |
+| `FAST_SCHEDULER_ENABLED` | 否 | `false` | 旧版兼容开关；未设置 `CODEX_SCHEDULER_ENGINE` 且数据库没有 `SchedulerEngine` 时，`true` 映射为 `indexed` |
 | `TZ` | 否 | UTC | 时区，如 `Asia/Shanghai` |
 
 ### Codex 上游稳定性配置
@@ -62,6 +63,9 @@ Codex2API 采用三层配置架构：
 | `CODEX_SESSION_AFFINITY_TTL` | 否 | `1h` | Codex 会话到账号/代理的黏性 TTL，支持 `1h`、`90m` 或秒数 |
 | `CODEX_COMPACTION_AFFINITY_TTL` | 否 | `168h` | 加密压缩状态的来源亲和 TTL。缓存仅保存密文的 SHA-256 摘要、来源账号和兼容域；已知状态不会跨 Codex 官方、不同 Responses 中转或 Grok 上游流转 |
 | `CODEX_FINGERPRINT_DEBUG` | 否 | `false` | 输出脱敏指纹策略诊断日志，不记录 token |
+| `CODEX_REQUEST_COMPRESSION` | 否 | 跟随系统设置 | 覆盖系统设置「Codex HTTP 请求体压缩」。`zstd`/`on`/`true`/`1` 强制开启，`off`/`false`/`0` 强制关闭，未设置或取值无法识别时以系统设置为准。作为部署级逃生阀存在：DB 不可达或后台打不开时仍可整机切换 |
+| `CODEX_SESSION_HEADER_MODE` | 否 | `native` | 出站会话头形态。`native` 发真实客户端的 `session-id` / `thread-id` / `x-client-request-id`；`legacy` 回退到旧的 `Session_id`（WS 另带 `Conversation_id`） |
+| `CODEX_SESSION_HEADER_ALIGN_CONVERGED` | 否 | `false` | 开启后 `session-id` 头改用指纹收敛后的会话身份，与 turn metadata 的 `session_id` 对齐。默认关：请求体 `prompt_cache_key` 始终独立隔离，但上游是否也拿该头参与缓存分组无法从客户端源码确认 |
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
 
@@ -196,7 +200,8 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `MaxRateLimitRetries` | int | 2 | 0-10 | 遇到 429 限流时的最大额外重试次数 |
 | `RetryIntervalMS` | int | 0 | 0-30000 | 普通重试前等待的毫秒数；`0` 保持立即重试 |
 | `TransportRetryPolicy` | string | `rotate` | `rotate` / `sticky` | 传输错误重试时换号，或保留同一账号重试 |
-| `FastSchedulerEnabled` | bool | false | - | 启用快速调度器 |
+| `SchedulerEngine` | string | `legacy` | `legacy` / `shadow` / `indexed` | 调度执行引擎；设置页可热切换，跨实例通过数据库 outbox 增量同步 |
+| `FastSchedulerEnabled` | bool | false | - | 旧版兼容字段；新部署应使用 `SchedulerEngine` |
 | `CodexForceWebsocket` | bool | false | - | 强制 Codex 上游走 WebSocket 长连接（复用连接池），更接近官方 CLI 体验；关闭时走原有 HTTP 请求 |
 | `CodexWSKeepaliveEnabled` | bool | false | - | 启用上游 WS 空闲连接保活（后台仅发 Ping，不发起新请求、不消耗账号额度） |
 | `CodexWSKeepaliveIntervalSec` | int | 60 | 10-600 | WS 保活 Ping 间隔（秒），仅在 `CodexWSKeepaliveEnabled` 开启时生效 |
@@ -207,6 +212,16 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `AffinityMode` | string | `bounded` | - | 会话亲和：`bounded`（50 次、5 分钟或账号不健康时重新挑号）、`off`（每次重选）、`strict`（长期粘连） |
 
 调度优先级先决定账号层级，同一优先级内再比较健康档位、调度分和当前负载；会话亲和只负责复用已绑定账号。多个最终用户共享同一个 API Key 时，下游可传 `X-Codex2API-Affinity-Key`，值会先哈希且仅用于本地账号绑定，不会转发给上游。
+
+调度引擎的推荐上线顺序是 `legacy → shadow → indexed`：
+
+- `legacy` 保留原有全池扫描，作为无停机回退路径。
+- `shadow` 仍由 legacy 选号，每 64 次请求抽样一次索引可用性并在运维页展示一致/差异计数；它用于短时灰度，不建议长期承载全量流量。
+- `indexed` 使用分层内存索引、稀疏 API Key 路由子池和事件驱动等待。账号数增长时，稳态选号不再复制或扫描完整账号切片。
+
+启动会自动创建 `scheduler_outbox` 和 `maintenance_jobs` 及相应索引/触发器，PostgreSQL 与 SQLite 均无需手工迁移。多实例对账号、API Key、分组、代理和请求热路径系统设置的变化按 outbox 水位增量重放；高频用量计数不会产生调度事件。系统设置同步使用同一份已提交快照，覆盖 Store 持有的调度/重试/会话设置、proxy `RuntimeSettings`、`GlobalRPM`、PostgreSQL 连接池、用量日志和模型定价覆盖。环境变量 `CODEX_SCHEDULER_ENGINE`、`CODEX_BILLING_TIER_POLICY` 和 `CODEX_REQUEST_COMPRESSION` 仍高于数据库值。
+
+并非所有基础设施或专用配置都适合通过这条 outbox 路径重建：`RedisPoolSize`、图片存储后端和 Resin 配置在其他实例上需要重启；Responses 上下文缓存继续使用独立的 generation 轮询器，不由 settings 事件代替。
 
 ### 测试配置
 
@@ -397,8 +412,9 @@ TZ=Asia/Shanghai
 
 **调度参数:**
 
-- `MaxConcurrency`、`GlobalRPM` 等修改后立即生效
+- `MaxConcurrency`、`GlobalRPM`、调度/重试/会话参数、proxy 请求热路径参数、用量日志和模型定价覆盖修改后会在所有实例热生效
 - 通过管理后台修改时会自动持久化到数据库
+- `RedisPoolSize`、图片存储后端和 Resin 配置需要重启其他实例；Responses 上下文缓存使用独立的 generation 轮询同步
 
 ---
 

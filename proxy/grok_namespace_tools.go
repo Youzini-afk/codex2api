@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -105,6 +106,315 @@ func grokFunctionToolForCustom(tool map[string]any, name string) map[string]any 
 	return converted
 }
 
+// grokPermissiveObjectSchema 是无法保真转换时的降级形态:宽松 object,仅保留
+// 原 schema 的 description。宁可让模型自由发挥、由客户端做最终参数校验,也不能
+// 让整段对话因 schema 形态被上游 400 掐死。
+func grokPermissiveObjectSchema(root map[string]any) map[string]any {
+	out := map[string]any{"type": "object", "additionalProperties": true}
+	if description, ok := root["description"].(string); ok && strings.TrimSpace(description) != "" {
+		out["description"] = description
+	}
+	return out
+}
+
+// grokObjectishSchemaBranch 判断联合分支是否可并入 object 根:显式 object、
+// type 数组含 "object",或未声明 type 但带 properties。
+func grokObjectishSchemaBranch(branch map[string]any) bool {
+	if kind, ok := branch["type"].(string); ok {
+		return kind == "object"
+	}
+	if typeList, ok := branch["type"].([]any); ok {
+		for _, item := range typeList {
+			if kind, ok := item.(string); ok && kind == "object" {
+				return true
+			}
+		}
+		return false
+	}
+	if _, ok := branch["type"]; ok {
+		return false
+	}
+	_, hasProperties := branch["properties"]
+	return hasProperties
+}
+
+// grokSchemaTypeListHasNonObject 报告 schema 的 type 数组里是否还有 object 之外
+// 的选项。折叠成单一 object 后这些选项不可表达,与丢弃非 object 联合分支适用
+// 同一条 required 放宽规则。
+func grokSchemaTypeListHasNonObject(schema map[string]any) bool {
+	typeList, ok := schema["type"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range typeList {
+		if kind, ok := item.(string); ok && kind != "object" {
+			return true
+		}
+	}
+	return false
+}
+
+// grokLookupLocalJSONPointer 在 schema 文档内解析 "#/..." 形式的本地 JSON
+// Pointer(含 ~0/~1 反转义),仅支持 map 路径——$defs/definitions 场景足够。
+func grokLookupLocalJSONPointer(document map[string]any, pointer string) (map[string]any, bool) {
+	if !strings.HasPrefix(pointer, "#/") {
+		return nil, false
+	}
+	current := any(document)
+	for _, rawToken := range strings.Split(strings.TrimPrefix(pointer, "#/"), "/") {
+		token := strings.ReplaceAll(strings.ReplaceAll(rawToken, "~1", "/"), "~0", "~")
+		node, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if current, ok = node[token]; !ok {
+			return nil, false
+		}
+	}
+	target, ok := current.(map[string]any)
+	return target, ok
+}
+
+// grokDerefSchemaBranch 展开联合分支上的本地 $ref 链(深度上限防循环引用):
+// Pydantic/Zod 常生成 anyOf:[{"$ref":"#/$defs/X"},{"type":"null"}] 形态,直接按
+// "非 object"丢弃会丢掉整个对象定义。$ref 之外的 sibling 键覆盖在解析结果上
+// (2020-12 允许 $ref 携带 sibling)。无 $ref 原样返回;解析失败返回 nil,由调用
+// 方按不可合并分支处理(行为与修复前一致,不会更糟)。
+func grokDerefSchemaBranch(document, branch map[string]any) map[string]any {
+	current := branch
+	for depth := 0; depth < 8; depth++ {
+		rawRef, exists := current["$ref"]
+		if !exists {
+			return current
+		}
+		refText, ok := rawRef.(string)
+		if !ok {
+			return nil
+		}
+		target, ok := grokLookupLocalJSONPointer(document, refText)
+		if !ok {
+			return nil
+		}
+		next := make(map[string]any, len(target)+len(current))
+		for key, value := range target {
+			next[key] = value
+		}
+		for key, value := range current {
+			if key != "$ref" {
+				next[key] = value
+			}
+		}
+		current = next
+	}
+	return nil
+}
+
+// mergeGrokUnionRootSchema 把 anyOf/oneOf/allOf 根合并成单一 object:
+// properties 取各 object 分支的并集,同名属性 schema 不一致时按联合语义包成
+// 嵌套 anyOf(联合)或 allOf(交),不丢弃任何分支定义;required 按语义收敛——
+// 联合(任一分支成立)取交集,allOf(全部成立)取并集;非 object 分支丢弃。
+// 根上的非联合 sibling 键($defs/definitions/additionalProperties 等)原样保留:
+// 分支属性里的 "$ref":"#/$defs/X" 依赖根级定义容器,丢掉会产生悬空引用,上游拿到
+// 不可解析的 schema 照样 400(PR #580 评审)。没有任何 object 分支时整体降级为
+// 宽松 object。
+func mergeGrokUnionRootSchema(root map[string]any, branches []any, requireAll bool) map[string]any {
+	merged := make(map[string]any, len(root)+1)
+	for key, value := range root {
+		switch key {
+		case "anyOf", "oneOf", "allOf", "type", "properties", "required":
+			// 联合关键字被消解;type/properties/required 由下方合并逻辑重建。
+			continue
+		}
+		merged[key] = value
+	}
+	merged["type"] = "object"
+	// 同名属性收集所有互异的分支定义(根定义在前),合并时再决定单值还是嵌套联合。
+	propertyVariants := map[string][]any{}
+	appendPropertyVariant := func(key string, value any) {
+		for _, existing := range propertyVariants[key] {
+			if reflect.DeepEqual(existing, value) {
+				return
+			}
+		}
+		propertyVariants[key] = append(propertyVariants[key], value)
+	}
+	// 根自身可能就是 object schema(type:"object" 且额外挂了 anyOf/oneOf):它的
+	// properties/required 在任何分支下都成立,作为合并基底且 required 恒保留。
+	rootRequired := map[string]bool{}
+	if rootProps, ok := root["properties"].(map[string]any); ok {
+		for key, value := range rootProps {
+			appendPropertyVariant(key, value)
+		}
+	}
+	if list, ok := root["required"].([]any); ok {
+		for _, item := range list {
+			if key, ok := item.(string); ok {
+				rootRequired[key] = true
+			}
+		}
+	}
+	var required map[string]bool
+	objectBranches := 0
+	droppedNonObject := false
+	for _, rawBranch := range branches {
+		branch, _ := rawBranch.(map[string]any)
+		if branch != nil {
+			branch = grokDerefSchemaBranch(root, branch)
+		}
+		if branch == nil || !grokObjectishSchemaBranch(branch) {
+			droppedNonObject = true
+			continue
+		}
+		// 分支 type 数组还带 null 等非 object 选项时,这些选项在合并结果里不可
+		// 表达,视同丢弃过非 object 分支,触发同一条 required 放宽规则。
+		if grokSchemaTypeListHasNonObject(branch) {
+			droppedNonObject = true
+		}
+		objectBranches++
+		if _, has := merged["description"]; !has {
+			if description, ok := branch["description"].(string); ok && strings.TrimSpace(description) != "" {
+				merged["description"] = description
+			}
+		}
+		if props, ok := branch["properties"].(map[string]any); ok {
+			for key, value := range props {
+				appendPropertyVariant(key, value)
+			}
+		}
+		branchRequired := map[string]bool{}
+		if list, ok := branch["required"].([]any); ok {
+			for _, item := range list {
+				if key, ok := item.(string); ok {
+					branchRequired[key] = true
+				}
+			}
+		}
+		if required == nil {
+			required = branchRequired
+		} else if requireAll {
+			for key := range branchRequired {
+				required[key] = true
+			}
+		} else {
+			for key := range required {
+				if !branchRequired[key] {
+					delete(required, key)
+				}
+			}
+		}
+	}
+	if objectBranches == 0 && len(propertyVariants) == 0 {
+		return grokPermissiveObjectSchema(root)
+	}
+	if len(propertyVariants) > 0 {
+		// 冲突属性按联合类型包成嵌套联合(嵌套联合 Grok 接受,只有根联合被拒):
+		// anyOf/oneOf 用 anyOf 保住每个判别分支(如 const:"create"/const:"update"),
+		// 不能先到先得地排除后续分支;allOf 用 allOf 保留全部约束。根定义在
+		// anyOf 场景下随之从"恒成立"放宽为"任一成立",符合本文件宁可放宽、
+		// 不禁止原本合法调用的降级方针。
+		unionKeyword := "anyOf"
+		if requireAll {
+			unionKeyword = "allOf"
+		}
+		properties := make(map[string]any, len(propertyVariants))
+		for key, variants := range propertyVariants {
+			if len(variants) == 1 {
+				properties[key] = variants[0]
+				continue
+			}
+			properties[key] = map[string]any{unionKeyword: variants}
+		}
+		merged["properties"] = properties
+	}
+	finalRequired := map[string]bool{}
+	for key := range rootRequired {
+		finalRequired[key] = true
+	}
+	// 联合里丢弃过非 object 分支(常见是 null,表示"可空调用")时,分支侧的
+	// required 不再并入:null 分支已不可表达,再强加必填会让模型无法发出
+	// 原本合法的空参调用。allOf(全部成立)不受此影响。
+	if requireAll || !droppedNonObject {
+		for key := range required {
+			finalRequired[key] = true
+		}
+	}
+	if len(finalRequired) > 0 {
+		keys := make([]string, 0, len(finalRequired))
+		for key := range finalRequired {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		values := make([]any, len(keys))
+		for index, key := range keys {
+			values[index] = key
+		}
+		merged["required"] = values
+	}
+	return merged
+}
+
+// normalizeGrokToolParameterSchema 把函数工具参数 schema 归一成 Grok 上游接受
+// 的形态:根节点必须是单一 object(上游对联合/非 object 根返回 400
+// "tool parameter root must be an object type")。返回 (归一后 schema, 是否改写)。
+// 合规的 object 根保持原样,嵌套结构一律不动,避免扰动上游缓存前缀。
+func normalizeGrokToolParameterSchema(schema map[string]any) (map[string]any, bool) {
+	if schema == nil {
+		return schema, false
+	}
+	// 联合关键字优先于 type 判断:Grok 只要在根上看到 anyOf/oneOf 就按联合根
+	// 拒绝,即使同时声明了 type:"object"(2026-08-26 线上实测)。
+	for _, key := range []string{"anyOf", "oneOf"} {
+		if branches, ok := schema[key].([]any); ok && len(branches) > 0 {
+			return mergeGrokUnionRootSchema(schema, branches, false), true
+		}
+	}
+	if branches, ok := schema["allOf"].([]any); ok && len(branches) > 0 {
+		return mergeGrokUnionRootSchema(schema, branches, true), true
+	}
+	if typeList, ok := schema["type"].([]any); ok {
+		hasObject := false
+		for _, item := range typeList {
+			if kind, ok := item.(string); ok && kind == "object" {
+				hasObject = true
+				break
+			}
+		}
+		if !hasObject {
+			return grokPermissiveObjectSchema(schema), true
+		}
+		out := make(map[string]any, len(schema))
+		for key, value := range schema {
+			out[key] = value
+		}
+		out["type"] = "object"
+		// type:["object","null"] 与 anyOf:[object,{type:"null"}] 语义等价,折叠后
+		// 适用同一条规则:非 object 选项(常见是 null,表示可空参调用)不可表达时
+		// 放弃 required 强制,否则模型无法发出原本合法的空参调用。
+		if grokSchemaTypeListHasNonObject(schema) {
+			delete(out, "required")
+		}
+		return out, true
+	}
+	if kind, ok := schema["type"].(string); ok {
+		if kind == "object" {
+			return schema, false
+		}
+		return grokPermissiveObjectSchema(schema), true
+	}
+	if _, ok := schema["properties"]; ok {
+		out := make(map[string]any, len(schema)+1)
+		for key, value := range schema {
+			out[key] = value
+		}
+		out["type"] = "object"
+		return out, true
+	}
+	if len(schema) == 0 {
+		return map[string]any{"type": "object"}, true
+	}
+	return grokPermissiveObjectSchema(schema), true
+}
+
 func normalizeGrokFunctionTool(tool map[string]any, name string) map[string]any {
 	converted := make(map[string]any, len(tool))
 	for key, value := range tool {
@@ -125,6 +435,21 @@ func normalizeGrokFunctionTool(tool map[string]any, name string) map[string]any 
 		"metadata", "x_provider", "cache_control", "cacheControl",
 	} {
 		delete(converted, key)
+	}
+	if params, ok := converted["parameters"].(map[string]any); ok {
+		if normalized, changed := normalizeGrokToolParameterSchema(params); changed {
+			converted["parameters"] = normalized
+		}
+	} else if flag, ok := converted["parameters"].(bool); ok {
+		// JSON Schema 布尔形态:true=任意输入合法,false=任意输入非法。原样透传
+		// 都会命中上游 "root must be an object type"。true 降级为宽松 object;
+		// false 本就没有合法调用,给出空封闭 object(最接近的可表达形态),
+		// 参数校验仍由客户端兜底。
+		if flag {
+			converted["parameters"] = grokPermissiveObjectSchema(nil)
+		} else {
+			converted["parameters"] = map[string]any{"type": "object", "additionalProperties": false}
+		}
 	}
 	return converted
 }

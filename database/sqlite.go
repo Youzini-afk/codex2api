@@ -132,6 +132,26 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS scheduler_outbox (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			entity_type TEXT NOT NULL,
+			entity_id INTEGER NOT NULL DEFAULT 0,
+			event_type TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_scheduler_outbox_created ON scheduler_outbox(created_at, id);`,
+		`CREATE TABLE IF NOT EXISTS maintenance_jobs (
+			entity_id INTEGER NOT NULL,
+			job_kind TEXT NOT NULL,
+			due_at TIMESTAMP NOT NULL,
+			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_until TIMESTAMP NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY(entity_id, job_kind)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_due ON maintenance_jobs(job_kind, due_at, entity_id);`,
 		`CREATE TABLE IF NOT EXISTS usage_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			account_id INTEGER DEFAULT 0,
@@ -257,6 +277,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				lazy_mode INTEGER DEFAULT 0,
 				proxy_pool_enabled INTEGER DEFAULT 0,
 				fast_scheduler_enabled INTEGER DEFAULT 0,
+				scheduler_engine TEXT DEFAULT '',
 				max_retries INTEGER DEFAULT 2,
 				max_rate_limit_retries INTEGER DEFAULT 1,
 				reasoning_effort_models TEXT DEFAULT '[]',
@@ -277,9 +298,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				public_image_studio_page_enabled INTEGER DEFAULT 1,
 				public_account_portal_page_enabled INTEGER DEFAULT 0,
 				scheduler_mode TEXT DEFAULT 'round_robin',
-					affinity_mode TEXT DEFAULT 'bounded',
-					session_affinity_spread INTEGER DEFAULT 0,
+				affinity_mode TEXT DEFAULT 'bounded',
+				session_affinity_spread INTEGER DEFAULT 0,
+				session_slot_buffer_enabled INTEGER DEFAULT 0,
+				session_slot_buffer_seconds INTEGER DEFAULT 10,
 					codex_force_websocket INTEGER DEFAULT 0,
+					codex_request_compression INTEGER DEFAULT 1,
 					codex_ws_weak_network_mode INTEGER DEFAULT 0,
 					codex_ws_keepalive_enabled INTEGER DEFAULT 0,
 					codex_ws_keepalive_interval_sec INTEGER DEFAULT 60,
@@ -482,6 +506,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "tags", "TEXT DEFAULT '[]'"},
 		{"accounts", "note", "TEXT DEFAULT ''"},
 		{"accounts", "deleted_at", "TIMESTAMP NULL"},
+		{"accounts", "credential_generation", "INTEGER NOT NULL DEFAULT 1"},
 		{"usage_logs", "channel", "TEXT DEFAULT ''"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
@@ -560,7 +585,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "lazy_mode", "INTEGER DEFAULT 0"},
 		{"system_settings", "proxy_pool_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "scheduler_engine", "TEXT DEFAULT ''"},
 		{"system_settings", "codex_force_websocket", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_request_compression", "INTEGER DEFAULT 1"},
 		{"system_settings", "codex_ws_weak_network_mode", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_keepalive_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_keepalive_interval_sec", "INTEGER DEFAULT 60"},
@@ -672,6 +699,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "scheduler_mode", "TEXT DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "TEXT DEFAULT 'bounded'"},
 		{"system_settings", "session_affinity_spread", "INTEGER DEFAULT 0"},
+		{"system_settings", "session_slot_buffer_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "session_slot_buffer_seconds", "INTEGER DEFAULT 10"},
 		{"system_settings", "auto_pause_5h_threshold", "REAL DEFAULT 0"},
 		{"system_settings", "auto_pause_7d_threshold", "REAL DEFAULT 0"},
 		{"system_settings", "auto_pause_5h_guard_band_percent", "REAL DEFAULT 5"},
@@ -772,6 +801,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') = 'deleted'
 	`); err != nil {
 		return err
+	}
+	if err := db.installSchedulerOutboxTriggers(ctx); err != nil {
+		return fmt.Errorf("install scheduler outbox triggers: %w", err)
 	}
 
 	return db.runDataMigrationsWithTimeout()

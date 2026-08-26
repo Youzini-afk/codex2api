@@ -231,6 +231,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = excludeAntigravityAccountsFilter(accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -533,7 +534,11 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ClearModelCooldown(account, attemptEffectiveModel)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
-			h.store.Release(account)
+			if outcome.logStatusCode == http.StatusOK {
+				h.store.ReleaseForSession(account, affinityKey)
+			} else {
+				h.store.Release(account)
+			}
 			return
 		}
 
@@ -893,7 +898,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
-		h.store.Release(account)
+		if outcome.logStatusCode == http.StatusOK {
+			h.store.ReleaseForSession(account, affinityKey)
+		} else {
+			h.store.Release(account)
+		}
 		return
 	}
 }

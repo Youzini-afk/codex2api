@@ -1405,6 +1405,11 @@ func dropBareReasoningInputItems(body map[string]any) bool {
 	return true
 }
 
+// codexEncryptedContentPrefix 是 Codex 上游 reasoning.encrypted_content 的
+// Fernet 令牌前缀：版本字节 0x80 使 base64 编码恒以 "gAAAA" 开头。其他渠道
+// （如 Grok）的密文是裸 base64，不含此前缀，可据此区分血统。
+const codexEncryptedContentPrefix = "gAAAA"
+
 func dropBareReasoningInputValue(value any) (any, bool, bool) {
 	switch v := value.(type) {
 	case []any:
@@ -1423,9 +1428,22 @@ func dropBareReasoningInputValue(value any) (any, bool, bool) {
 		}
 		return out, changed, true
 	case map[string]any:
-		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" &&
-			firstNonEmptyAnyString(v["encrypted_content"]) == "" {
-			return nil, true, false
+		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" {
+			// 无密文、或外渠道血统密文（非 Fernet 前缀）的 reasoning 项整项
+			// 丢弃：Codex 上游要求 reasoning 必带自家可解的 encrypted_content，
+			// 缺失报 missing_required_parameter，外来密文报
+			// invalid_encrypted_content（issue #565）。
+			ec := firstNonEmptyAnyString(v["encrypted_content"])
+			if ec == "" || !strings.HasPrefix(ec, codexEncryptedContentPrefix) {
+				return nil, true, false
+			}
+			// Codex reasoning schema 不认 status 字段（400 unknown_parameter），
+			// 自家输出也从不携带；跨渠道会话中客户端可能裸回灌带 status 的
+			// 外渠道 reasoning 输出（issue #565）。
+			if _, has := v["status"]; has {
+				delete(v, "status")
+				return v, true, true
+			}
 		}
 		return v, false, true
 	default:
@@ -2191,6 +2209,10 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	// 7. 删除 Codex 不支持的字段
 	// 注意：prompt_cache_retention 上游(HTTP 与 WS 路径)均不接受，会返回
 	// 400 Unsupported parameter，因此在此一并剥离，executor / wsrelay 层也各自兜底删除。
+	// 顶层 type 是 Responses WS 事件信封字段(response.create)，native WS ingress 会
+	// 注入/保留它，HTTP /responses 上游不接受(400 Unsupported parameter: type)；
+	// WS 出站由 wsrelay 统一重设该字段，此处删除对 WS 路径无影响(issue #548)。
+	// map 上的 delete 只作用于顶层，input[]/tools 等嵌套对象里的合法 type 不受影响。
 	for _, field := range []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
@@ -2198,7 +2220,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		"logit_bias", "response_format", "serviceTier", "metadata",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
 		"disable_response_storage", "verbosity",
-		"prompt_cache_retention", "safety_identifier",
+		"prompt_cache_retention", "safety_identifier", "type",
 	} {
 		delete(body, field)
 	}

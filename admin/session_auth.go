@@ -1,7 +1,9 @@
 package admin
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -21,48 +23,62 @@ const (
 
 type adminSessionStore struct {
 	mu       sync.Mutex
-	sessions map[string]time.Time
+	sessions map[string]adminSession
+}
+
+type adminSession struct {
+	expiresAt         time.Time
+	secretFingerprint [sha256.Size]byte
 }
 
 func newAdminSessionStore() *adminSessionStore {
 	store := &adminSessionStore{
-		sessions: make(map[string]time.Time),
+		sessions: make(map[string]adminSession),
 	}
 	go store.cleanupLoop()
 	return store
 }
 
-func (s *adminSessionStore) Create() (string, time.Time, error) {
+func (s *adminSessionStore) Create(adminSecret string) (string, time.Time, error) {
 	token, err := adminRandomHex(32)
 	if err != nil {
 		return "", time.Time{}, err
 	}
 	expiresAt := time.Now().Add(adminSessionTTL)
+	session := adminSession{
+		expiresAt:         expiresAt,
+		secretFingerprint: adminSessionSecretFingerprint(token, adminSecret),
+	}
 
 	s.mu.Lock()
-	s.sessions[token] = expiresAt
+	s.sessions[token] = session
 	s.mu.Unlock()
 
 	return token, expiresAt, nil
 }
 
-func (s *adminSessionStore) Validate(token string) (time.Time, bool) {
-	if s == nil || strings.TrimSpace(token) == "" {
+func (s *adminSessionStore) Validate(token, adminSecret string) (time.Time, bool) {
+	if s == nil || strings.TrimSpace(token) == "" || adminSecret == "" {
 		return time.Time{}, false
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	expiresAt, ok := s.sessions[token]
+	session, ok := s.sessions[token]
 	if !ok {
 		return time.Time{}, false
 	}
-	if time.Now().After(expiresAt) {
+	if time.Now().After(session.expiresAt) {
 		delete(s.sessions, token)
 		return time.Time{}, false
 	}
-	return expiresAt, true
+	currentFingerprint := adminSessionSecretFingerprint(token, adminSecret)
+	if !hmac.Equal(session.secretFingerprint[:], currentFingerprint[:]) {
+		delete(s.sessions, token)
+		return time.Time{}, false
+	}
+	return session.expiresAt, true
 }
 
 func (s *adminSessionStore) Delete(token string) {
@@ -79,7 +95,7 @@ func (s *adminSessionStore) Clear() {
 		return
 	}
 	s.mu.Lock()
-	s.sessions = make(map[string]time.Time)
+	s.sessions = make(map[string]adminSession)
 	s.mu.Unlock()
 }
 
@@ -90,13 +106,21 @@ func (s *adminSessionStore) cleanupLoop() {
 	for range ticker.C {
 		now := time.Now()
 		s.mu.Lock()
-		for token, expiresAt := range s.sessions {
-			if now.After(expiresAt) {
+		for token, session := range s.sessions {
+			if now.After(session.expiresAt) {
 				delete(s.sessions, token)
 			}
 		}
 		s.mu.Unlock()
 	}
+}
+
+func adminSessionSecretFingerprint(token, adminSecret string) [sha256.Size]byte {
+	mac := hmac.New(sha256.New, []byte(adminSecret))
+	_, _ = mac.Write([]byte(token))
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], mac.Sum(nil))
+	return fingerprint
 }
 
 func adminRandomHex(n int) (string, error) {
@@ -121,7 +145,7 @@ func (h *Handler) authorizeAdminRequest(c *gin.Context) (bool, string, string) {
 		return false, source, ""
 	}
 
-	if expiresAt, ok := h.validateAdminSession(c.Request); ok {
+	if expiresAt, ok := h.validateAdminSession(c.Request, adminSecret); ok {
 		c.Set("admin_session_expires_at", expiresAt.Format(time.RFC3339))
 		return true, source, "session"
 	}
@@ -141,7 +165,7 @@ func (h *Handler) authorizeAdminRequest(c *gin.Context) (bool, string, string) {
 	return false, source, ""
 }
 
-func (h *Handler) validateAdminSession(r *http.Request) (time.Time, bool) {
+func (h *Handler) validateAdminSession(r *http.Request, adminSecret string) (time.Time, bool) {
 	if h == nil || h.sessionStore == nil || r == nil {
 		return time.Time{}, false
 	}
@@ -149,7 +173,7 @@ func (h *Handler) validateAdminSession(r *http.Request) (time.Time, bool) {
 	if err != nil || cookie == nil {
 		return time.Time{}, false
 	}
-	return h.sessionStore.Validate(security.SanitizeInput(cookie.Value))
+	return h.sessionStore.Validate(security.SanitizeInput(cookie.Value), adminSecret)
 }
 
 func (h *Handler) GetAdminSessionStatus(c *gin.Context) {
@@ -164,7 +188,7 @@ func (h *Handler) GetAdminSessionStatus(c *gin.Context) {
 		return
 	}
 
-	if expiresAt, ok := h.validateAdminSession(c.Request); ok {
+	if expiresAt, ok := h.validateAdminSession(c.Request, adminSecret); ok {
 		c.JSON(http.StatusOK, adminSessionStatusResponse{
 			AuthRequired:    true,
 			Authenticated:   true,
@@ -229,7 +253,7 @@ func (h *Handler) LoginAdminSession(c *gin.Context) {
 		h.sessionStore = newAdminSessionStore()
 	}
 
-	token, expiresAt, err := h.sessionStore.Create()
+	token, expiresAt, err := h.sessionStore.Create(adminSecret)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "创建登录会话失败")
 		return

@@ -275,15 +275,14 @@ func main() {
 	proxy.SetResponseContextCache(tc)
 
 	// 4b. 应用数据库连接池设置
+	rateLimiter := proxy.NewRateLimiter(settings.GlobalRPM)
+	runtimeSettings, runtimeSettingsErr := applyRuntimeSystemSettings(context.Background(), settings, db, rateLimiter)
+	if runtimeSettingsErr != nil {
+		log.Fatalf("应用系统运行时设置失败: %v", runtimeSettingsErr)
+	}
 	if settings.PgMaxConns > 0 {
-		db.SetMaxOpenConns(settings.PgMaxConns)
 		log.Printf("%s 连接池: max_conns=%d", cfg.Database.Label(), settings.PgMaxConns)
 	}
-	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
-	if overrides, perr := database.ParseModelPricingOverridesJSON(settings.ModelPricingOverrides); perr == nil {
-		database.SetModelPricingOverrides(overrides)
-	}
-	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
 	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_mode=%s first_token_timeout=%ds billing_tier_policy=%s",
 		runtimeSettings.ClientCompatMode,
 		runtimeSettings.CodexMinCLIVersion,
@@ -322,6 +321,7 @@ func main() {
 
 	// 5. 初始化账号管理器
 	store := auth.NewStore(db, tc, settings)
+	store.SetSystemSettingsApplyHook(systemSettingsApplyHook(db, rateLimiter))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	if err := store.Init(ctx); err != nil {
@@ -330,8 +330,6 @@ func main() {
 	}
 	cancel()
 
-	// 全局 RPM 限流器
-	rateLimiter := proxy.NewRateLimiter(settings.GlobalRPM)
 	adminHandler := admin.NewHandler(store, db, tc, rateLimiter, cfg.AdminSecret)
 	// 初始化 admin handler 的连接池设置跟踪
 	adminHandler.SetPoolSizes(settings.PgMaxConns, settings.RedisPoolSize)
@@ -637,7 +635,13 @@ func loggerMiddleware() gin.HandlerFunc {
 		start := time.Now()
 		c.Next()
 		latency := time.Since(start)
-		if shouldSkipAccessLog(c.Request.Method, c.Request.URL.Path, c.Writer.Status()) {
+		statusCode := c.Writer.Status()
+		if override, ok := c.Get(proxy.AccessLogStatusContextKey); ok {
+			if status, valid := override.(int); valid && status >= 100 && status <= 599 {
+				statusCode = status
+			}
+		}
+		if shouldSkipAccessLog(c.Request.Method, c.Request.URL.Path, statusCode) {
 			return
 		}
 
@@ -674,9 +678,9 @@ func loggerMiddleware() gin.HandlerFunc {
 		}
 
 		if emailStr != "" {
-			log.Printf("%s %s %d %v%s [%s] [%s]", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), latency, tagStr, emailStr, proxyStr)
+			log.Printf("%s %s %d %v%s [%s] [%s]", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr, emailStr, proxyStr)
 		} else {
-			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), latency, tagStr)
+			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr)
 		}
 	}
 }

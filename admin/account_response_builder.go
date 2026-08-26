@@ -11,6 +11,41 @@ import (
 	"github.com/codex2api/internal/openaiidentity"
 )
 
+func antigravityPersistedStatus(row *database.AccountRow) (string, string) {
+	if row == nil {
+		return "error", "账号不存在"
+	}
+	if syncErr := strings.TrimSpace(row.GetCredential("antigravity_sync_error")); syncErr != "" {
+		return "error", syncErr
+	}
+	if raw := strings.TrimSpace(row.GetCredential("antigravity_quota")); raw != "" {
+		var quota auth.AntigravityQuotaSnapshot
+		if json.Unmarshal([]byte(raw), &quota) == nil && quota.Forbidden {
+			return "error", "Google quota API denied access"
+		}
+	}
+	rawPermissions := strings.TrimSpace(row.GetCredential("antigravity_permissions"))
+	if rawPermissions == "" {
+		rawPermissions = strings.TrimSpace(row.GetCredential("antigravity_entitlements"))
+	}
+	if raw := rawPermissions; raw != "" {
+		var permissions auth.AntigravityEntitlements
+		if json.Unmarshal([]byte(raw), &permissions) == nil && !permissions.Allowed &&
+			(permissions.Reason != "" || !permissions.UpdatedAt.IsZero()) {
+			reason := strings.TrimSpace(permissions.Reason)
+			if reason == "" {
+				reason = "Google account is not allowed to use Antigravity"
+			}
+			return "error", reason
+		}
+	}
+	status := strings.TrimSpace(row.Status)
+	if status == "" {
+		status = "active"
+	}
+	return status, row.ErrorMessage
+}
+
 // buildAccountResponse enriches one database row with its in-memory scheduler
 // state and the already-scoped request/usage aggregates. Keeping this logic in
 // one place ensures the paged list and the on-demand detail endpoint expose the
@@ -26,8 +61,19 @@ func (h *Handler) buildAccountResponse(
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 	isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 	isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+	isAntigravityAccount := strings.EqualFold(upstreamType, auth.UpstreamAntigravity)
+	antigravityAuthKind := ""
+	if isAntigravityAccount {
+		if strings.TrimSpace(row.GetCredential("api_key")) != "" {
+			antigravityAuthKind = auth.AntigravityAuthKindAPIKey
+		} else {
+			antigravityAuthKind = auth.AntigravityAuthKindOAuth
+		}
+	}
 	grokAuthKind := ""
 	var grokBilling json.RawMessage
+	var antigravityQuota json.RawMessage
+	var antigravityPermissions json.RawMessage
 	if isGrokAccount {
 		if strings.TrimSpace(row.GetCredential("api_key")) != "" {
 			grokAuthKind = auth.GrokAuthKindAPIKey
@@ -39,6 +85,14 @@ func (h *Handler) buildAccountResponse(
 		// control-plane / cooldown / mapping payload gated by includeDetails.
 		if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
 			grokBilling = json.RawMessage(detail)
+		}
+	}
+	if isAntigravityAccount {
+		antigravityQuota = antigravityPublishedQuotaJSON(row.GetCredential("antigravity_quota"))
+		if raw := strings.TrimSpace(row.GetCredential("antigravity_permissions")); raw != "" && json.Valid([]byte(raw)) {
+			antigravityPermissions = json.RawMessage(raw)
+		} else if raw := strings.TrimSpace(row.GetCredential("antigravity_entitlements")); raw != "" && json.Valid([]byte(raw)) {
+			antigravityPermissions = json.RawMessage(raw)
 		}
 	}
 	email := row.GetCredential("email")
@@ -70,7 +124,7 @@ func (h *Handler) buildAccountResponse(
 	}
 	// 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不暴露该字段。
 	codexFingerprintMode := ""
-	if !isOpenAIResponsesAccount && !isGrokAccount {
+	if !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount {
 		codexFingerprintMode = auth.NormalizeCodexFingerprintMode(row.GetCredential(auth.CodexFingerprintModeCredentialKey))
 	}
 	ignoreUsageLimitStatusOverride := row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
@@ -107,7 +161,7 @@ func (h *Handler) buildAccountResponse(
 		SubscriptionExpiresAt:     row.GetCredential("subscription_expires_at"),
 		Status:                    row.Status,
 		ErrorMessage:              row.ErrorMessage,
-		ATOnly:                    !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+		ATOnly:                    !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 		CreditEnabled:             row.CreditEnabled,
 		CreditSkipUsageWindow:     row.CreditSkipUsageWindow,
 		SkipWarmTier:              row.SkipWarmTier,
@@ -115,10 +169,18 @@ func (h *Handler) buildAccountResponse(
 		AccessTokenType:           accountAccessTokenType(row),
 		OpenAIResponsesAPI:        isOpenAIResponsesAccount,
 		GrokAPI:                   isGrokAccount,
+		AntigravityAPI:            isAntigravityAccount,
+		AntigravityAuthKind:       antigravityAuthKind,
 		AgentIdentity:             isAgentIdentityCredentialRow(row),
 		GrokAuthKind:              grokAuthKind,
 		GrokPlan:                  grokPlan,
 		GrokBilling:               grokBilling,
+		AvatarURL:                 row.GetCredential("avatar_url"),
+		VerifiedEmail:             row.GetCredentialBool("verified_email"),
+		ProjectID:                 row.GetCredential("project_id"),
+		AntigravityQuota:          antigravityQuota,
+		AntigravityPermissions:    antigravityPermissions,
+		AntigravitySyncWarning:    row.GetCredential("antigravity_sync_warning"),
 		BaseURL:                   baseURL,
 		Models:                    row.GetCredentialStringSlice("models"),
 		ModelMapping:              modelMapping,
@@ -144,6 +206,9 @@ func (h *Handler) buildAccountResponse(
 		Codex5HUsageUpdatedAt:     row.GetCredential("codex_5h_usage_updated_at"),
 		UsageLimitOverride:        ignoreUsageLimitStatusOverride,
 		UsageLimitEffective:       ignoreUsageLimitStatusEffective,
+	}
+	if isAntigravityAccount {
+		resp.Models = antigravityPublishedModelsOrDefault(row.GetCredentialStringSlice("models"))
 	}
 	resp.AutoPause5hThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_5h_threshold")
 	resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
@@ -183,6 +248,8 @@ func (h *Handler) buildAccountResponse(
 		resp.GroupIDs = append([]int64(nil), runtimeAccount.GroupIDs...)
 		runtimeAccount.Mu().RUnlock()
 		resp.ActiveRequests = runtimeAccount.GetActiveRequests()
+		resp.OccupiedRequests = runtimeAccount.GetOccupiedRequests()
+		resp.SessionSlotBufferEnabled = h.store.SessionSlotBufferEnabled()
 		resp.TotalRequests = runtimeAccount.GetTotalRequests()
 		debug := runtimeAccount.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
 		resp.HealthTier = debug.HealthTier
@@ -219,6 +286,9 @@ func (h *Handler) buildAccountResponse(
 		if usagePct5h, ok := runtimeAccount.GetUsagePercent5h(); ok {
 			resp.UsagePercent5h = &usagePct5h
 		}
+		if usagePctSpark, ok := runtimeAccount.GetUsagePercentSpark(); ok {
+			resp.UsagePercentSpark = &usagePctSpark
+		}
 		if credits, ok := runtimeAccount.GetRateLimitResetCredits(); ok {
 			resp.RateLimitResetCredits = &credits
 		}
@@ -247,6 +317,9 @@ func (h *Handler) buildAccountResponse(
 		}
 		if t := runtimeAccount.GetReset7dAt(); !t.IsZero() {
 			resp.Reset7dAt = t.Format(time.RFC3339)
+		}
+		if t := runtimeAccount.GetResetSparkAt(); !t.IsZero() {
+			resp.ResetSparkAt = t.Format(time.RFC3339)
 		}
 		if sec := runtimeAccount.GetWindow7dSeconds(); sec > 0 {
 			resp.Window7dSeconds = &sec
@@ -282,14 +355,19 @@ func (h *Handler) buildAccountResponse(
 				})
 			}
 		}
-		resp.Status = runtimeAccount.RuntimeStatusWithUsageProbeMaxAge(h.store.GetUsageProbeMaxAge())
-		resp.UsingCredits = runtimeAccount.UsingCredits()
-		runtimeAccount.Mu().RLock()
-		resp.ErrorMessage = runtimeAccount.ErrorMsg
-		runtimeAccount.Mu().RUnlock()
+		if !isAntigravityAccount {
+			resp.Status = runtimeAccount.RuntimeStatusWithUsageProbeMaxAge(h.store.GetUsageProbeMaxAge())
+			resp.UsingCredits = runtimeAccount.UsingCredits()
+			runtimeAccount.Mu().RLock()
+			resp.ErrorMessage = runtimeAccount.ErrorMsg
+			runtimeAccount.Mu().RUnlock()
+		}
 	} else if row.CooldownUntil.Valid && row.CooldownUntil.Time.After(now) {
 		resp.CooldownReason = row.CooldownReason
 		resp.CooldownUntil = row.CooldownUntil.Time.Format(time.RFC3339)
+	}
+	if isAntigravityAccount {
+		resp.Status, resp.ErrorMessage = antigravityPersistedStatus(row)
 	}
 	if resp.DispatchScore == 0 {
 		resp.DispatchScore = dispatchScoreFallback(resp.SchedulerScore, resp.ScoreBiasEffective, resp.HealthTier, resp.Status)

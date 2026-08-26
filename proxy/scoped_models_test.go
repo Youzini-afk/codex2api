@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -209,6 +210,48 @@ func TestScopedModelRecordsDoesNotNeedDatabase(t *testing.T) {
 	handler := NewHandler(store, nil, nil, nil)
 	if got := handler.scopedModelRecords(context.Background(), &database.APIKeyRow{ID: 1}); len(got) == 0 {
 		t.Fatal("conservative Grok defaults missing")
+	}
+}
+
+func TestScopedModelsIncludeAntigravityAccounts(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	store.AddAccount(&auth.Account{
+		DBID: 99, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "project-id",
+		Models: []string{"gemini-3.7-flash-tiered"},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 7})
+	found := map[string]bool{}
+	for _, model := range models {
+		found[model.ID] = true
+	}
+	if !found["gemini-3.7-flash-low"] || !found["gemini-3.7-flash-medium"] || !found["gemini-3.7-flash-high"] {
+		t.Fatal("projected Antigravity public model missing from /v1/models")
+	}
+}
+
+func TestScopedModelsIncludeExperimentalAPIKeyAntigravityWithoutGrokGates(t *testing.T) {
+	t.Setenv(auth.AntigravityExperimentalInteractionsEnv, "true")
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	account := &auth.Account{
+		DBID: 100, UpstreamType: auth.UpstreamAntigravity, APIKey: "google-api-key",
+		Models: []string{"gemini-3.6-flash-low"},
+	}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, nil, nil)
+	row := &database.APIKeyRow{ID: 8, Limits: database.APIKeyLimits{UpstreamChannel: database.UpstreamChannelAntigravity}}
+
+	models := listScopedModelsForTest(t, handler, row)
+	if account.IsGrokAPI() {
+		t.Fatal("Antigravity API-key account was misclassified as Grok")
+	}
+	if owner, _, ok := scopedModelByID(models, "gemini-3.6-flash-low"); !ok || owner != "google" {
+		t.Fatalf("API-key Antigravity model owner=%q ok=%v; models=%+v", owner, ok, models)
+	}
+	for _, model := range models {
+		if strings.HasPrefix(model.ID, "grok-") || model.Owner == "xai" {
+			t.Fatalf("Grok catalog polluted Antigravity-only model list: %+v", models)
+		}
 	}
 }
 

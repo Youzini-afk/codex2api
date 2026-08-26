@@ -85,10 +85,21 @@ func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclud
 }
 
 func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter) (*auth.Account, string) {
+	return h.nextAccountForSessionWithDispatch(sessionID, apiKeyID, exclude, filter, auth.DispatchPolicyStandard)
+}
+
+func (h *Handler) nextAccountForSessionWithDispatch(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
-	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
+	return h.store.NextForSessionWithDispatch(sessionID, apiKeyID, exclude, filter, policy)
+}
+
+func dispatchPolicyForModel(model string) auth.DispatchPolicy {
+	if isProOnlyModel(model) {
+		return auth.DispatchPolicySpark
+	}
+	return auth.DispatchPolicyStandard
 }
 
 func (h *Handler) withModelCooldownFilter(model string, filter auth.AccountFilter) auth.AccountFilter {
@@ -308,6 +319,9 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account == nil {
 			return false
 		}
+		if account.IsAntigravityAPI() {
+			return false
+		}
 		if account.IsRelayStyle() {
 			return false
 		}
@@ -333,19 +347,26 @@ func requestUpstreamChannel(c *gin.Context) string {
 	return row.Limits.ResolveUpstreamChannel()
 }
 
-// applyUpstreamChannelFilter 按下游 Key 的上游渠道限定改写账号过滤器。
-// grok 渠道换成 Grok 专属过滤（账号未声明模型时按可见目录或保守默认集准入）；
-// codex 渠道在原过滤器上排除 Grok 账号；未限定则原样返回。
+// applyUpstreamChannelFilter 按下游 Key 的上游渠道限定收窄既有过滤器。
+// 保留既有端点能力约束很重要：compact / Messages / Chat 等路径可能显式排除
+// 某类账号，渠道选择不能把这些硬门覆盖掉。
 func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
+	combine := func(channelFilter auth.AccountFilter) auth.AccountFilter {
+		return func(account *auth.Account) bool {
+			return channelFilter(account) && (filter == nil || filter(account))
+		}
+	}
 	switch requestUpstreamChannel(c) {
 	case database.UpstreamChannelGrok:
-		return grokChannelAccountFilter(effectiveModel)
+		return combine(grokChannelAccountFilter(effectiveModel))
+	case database.UpstreamChannelAntigravity:
+		return combine(antigravityChannelAccountFilter(effectiveModel))
 	case database.UpstreamChannelCodex:
 		return func(account *auth.Account) bool {
-			if account == nil || account.IsGrokAPI() {
+			if account == nil || account.IsGrokAPI() || account.IsAntigravityAPI() {
 				return false
 			}
-			return filter(account)
+			return filter == nil || filter(account)
 		}
 	}
 	return filter
@@ -370,6 +391,23 @@ func grokChannelAccountFilter(model string) auth.AccountFilter {
 	}
 }
 
+func antigravityChannelAccountFilter(model string) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsAntigravityAPI() || !account.AntigravityDispatchEnabled() {
+			return false
+		}
+		wireModel, supported := antigravityResolvePublicModelForAccount(account, model)
+		if !supported {
+			return false
+		}
+		if account.IsModelRateLimited(model) || account.IsModelRateLimited(wireModel) {
+			return false
+		}
+		return true
+	}
+}
+
 func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.AccountFilter {
 	return accountFilterForResponsesModelWithOriginal(model, model, allowCodexAccounts)
 }
@@ -384,8 +422,9 @@ func accountFilterForCompactResponsesModelWithOriginal(originalModel string, eff
 		return resolveAccountCompactModelMappingForCandidates(account, candidates)
 	})
 	return func(account *auth.Account) bool {
-		// Grok 上游没有 /responses/compact 端点，compact 请求不路由到 Grok 账号
-		if account.IsGrokAPI() {
+		// Grok/Antigravity 上游都没有 Responses compact 适配器。尤其不能让
+		// Antigravity Google bearer 落入官方 Codex executor。
+		if account.IsGrokAPI() || account.IsAntigravityAPI() {
 			return false
 		}
 		return inner(account)
@@ -405,12 +444,21 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 		if account == nil {
 			return false
 		}
+		if account.IsAntigravityAPI() {
+			if !account.AntigravityDispatchEnabled() {
+				return false
+			}
+			wireModel, supported := antigravityResolvePublicModelForAccount(account, effectiveModel)
+			return supported && !account.IsModelRateLimited(effectiveModel) && !account.IsModelRateLimited(wireModel)
+		}
 		if account.IsRelayStyle() {
 			routedModel := effectiveModel
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
 			}
-			return relayAccountSupportsModel(account, routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
+			supported := relayAccountSupportsModel(account, routedModel)
+			rateLimited := routedModel != "" && account.IsModelRateLimited(routedModel)
+			return supported && !rateLimited
 		}
 		if !allowCodexAccounts {
 			return false
@@ -427,6 +475,13 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 func relayAccountSupportsModel(account *auth.Account, model string) bool {
 	if account == nil {
 		return false
+	}
+	if account.IsAntigravityAPI() {
+		if !account.AntigravityDispatchEnabled() {
+			return false
+		}
+		_, ok := antigravityResolvePublicModelForAccount(account, model)
+		return ok
 	}
 	if account.IsGrokAPI() {
 		return grokAccountSupportsVisibleModel(account, model)
@@ -474,6 +529,12 @@ func (h *Handler) modelSupportedByAccountMapping(model string) bool {
 	}
 	for _, account := range h.store.Accounts() {
 		if account == nil || !account.IsRelayStyle() {
+			continue
+		}
+		if account.IsAntigravityAPI() {
+			if _, ok := antigravityResolvePublicModelForAccount(account, model); ok {
+				return true
+			}
 			continue
 		}
 		mappedModel, ok := resolveAccountModelMapping(account, model)
@@ -558,6 +619,14 @@ func usageLogErrorMessageImpl(statusCode int, body []byte, trustedText bool) str
 		if candidate = strings.TrimSpace(candidate); candidate != "" {
 			message = candidate
 			break
+		}
+	}
+	if message == "" {
+		// Grok/xAI 风格错误体把说明放在顶层字符串 error 字段:
+		// {"code":"invalid-argument","error":"..."}。仅在 error 是字符串时采用,
+		// 避免把对象形态的整段 JSON 打进 message。
+		if errField := gjson.GetBytes(body, "error"); errField.Type == gjson.String {
+			message = strings.TrimSpace(errField.String())
 		}
 	}
 
@@ -1176,8 +1245,13 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if input.Channel == "" && h.store != nil {
 		input.Channel = database.UpstreamChannelCodex
 		if input.AccountID > 0 {
-			if acc := h.store.FindByID(input.AccountID); acc != nil && acc.IsGrokAPI() {
-				input.Channel = database.UpstreamChannelGrok
+			if acc := h.store.FindByID(input.AccountID); acc != nil {
+				switch {
+				case acc.IsGrokAPI():
+					input.Channel = database.UpstreamChannelGrok
+				case acc.IsAntigravityAPI():
+					input.Channel = database.UpstreamChannelAntigravity
+				}
 			}
 		}
 	}
@@ -1587,6 +1661,15 @@ func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
 	}
 }
 
+func excludeAntigravityAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if account == nil || account.IsAntigravityAPI() {
+			return false
+		}
+		return inner == nil || inner(account)
+	}
+}
+
 func responseCachePreparationFailure(prepared responsesBodyPreparation) (status int, reason string, unavailable bool) {
 	if prepared.PreviousResponseID == "" || prepared.Bypassed || prepared.CacheLookup.Kind == responseCacheLookupHit {
 		return 0, "", false
@@ -1744,6 +1827,30 @@ func shouldFallbackWebsocketMessageTooBigToHTTP(outcome streamOutcome, useWebsoc
 
 func classifyTransportFailure(err error) string {
 	if err == nil {
+		return ""
+	}
+
+	// Structured proxy errors already carry their retry semantics. Treating
+	// every non-nil error as a transport failure turns deterministic adapter
+	// errors (for example an invalid Responses feature) into account failures,
+	// retries them against the whole pool, and can leave the caller with a
+	// misleading "no available account" 503. Only unwrap errors that actually
+	// describe an upstream transport failure; ordinary structured 4xx errors
+	// are not transport incidents.
+	var apiErr *Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case ErrorCodeUpstreamTimeout:
+			return "timeout"
+		case ErrorCodeUpstreamStreamBreak:
+			return "transport"
+		}
+		if !apiErr.Retryable || (apiErr.HTTPStatus >= 400 && apiErr.HTTPStatus < 500) {
+			return ""
+		}
+		if apiErr.Cause != nil {
+			return classifyTransportFailure(apiErr.Cause)
+		}
 		return ""
 	}
 
@@ -2530,6 +2637,9 @@ func (h *Handler) effectiveMaxRateLimitRetries(account *auth.Account, fallback i
 const (
 	logStatusClientClosed        = 499
 	logStatusUpstreamStreamBreak = 598
+	// AccessLogStatusContextKey 允许流处理器在 HTTP 200 header 已提交后，
+	// 把最终的内部结果（如客户端断开的 499）提供给访问日志中间件。
+	AccessLogStatusContextKey = "x-access-log-status"
 )
 
 // upstreamStreamBreakMessage 是断流反馈给下游的稳定可读消息；机器识别用
@@ -2829,9 +2939,17 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
+	upstreamChannel := requestUpstreamChannel(c)
 	var requestModel, mappedModel string
 	var mappingApplied bool
-	if nativeRemoteCompactionV2 {
+	if upstreamChannel == database.UpstreamChannelAntigravity {
+		// Antigravity is a native, fixed public surface. Do not let global Codex
+		// aliases or synthesized reasoning aliases rewrite an Antigravity-only
+		// request before validation; the adapter performs the sole public->wire
+		// translation after an account proves it owns the required backing model.
+		requestModel = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+		mappedModel = requestModel
+	} else if nativeRemoteCompactionV2 {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
 	} else {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -2842,8 +2960,14 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
-		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+	switch upstreamChannel {
+	case database.UpstreamChannelGrok:
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单。
+	case database.UpstreamChannelAntigravity:
+		// Antigravity 专用 Key 公开稳定的逻辑模型，同时继续接受旧的固定
+		// effort 别名；raw backing 与 account model_mapping 不是下游模型名。
+		rules["model"] = append(rules["model"], api.ModelValidator(antigravityAcceptedModelIDs()))
+	default:
 		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	}
 	result := validator.ValidateRequest(rules)
@@ -2973,9 +3097,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	var lastRetryAfter string
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
 	invalidEncryptedContentRetried := false
+	antigravityRefreshRetried := map[int64]bool{}
 	relayContinuationAttempted := false
 	overflowCompactRetried := false
 	overflowCompactEnabled := autoCompactOverflowEnabled(c)
@@ -2990,24 +3116,28 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	capacityShedRetries := map[int64]int{}
+	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
-				account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+				account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			}
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationUnavailable && !relayContinuationAttempted {
-				account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+				account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			} else if turnContinuationPinned {
-				account, stickyProxyURL = h.nextRetryAccountForContinuation(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			} else {
-				account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+				account, stickyProxyURL = h.nextRetryAccountForSessionWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
-			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+			if lastStatusCode > 0 && len(lastBody) > 0 {
+				if lastRetryAfter != "" {
+					c.Header("Retry-After", lastRetryAfter)
+				}
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
@@ -3020,7 +3150,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 				return
 			}
-			if h.store.HasUsageLimitedCandidateWithFilter(apiKeyID, retryExclusions.ForSelection(), accountFilter) {
+			if h.store.HasUsageLimitedCandidateWithDispatch(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, "Codex 账号用量窗口已达上限")
 				return
 			}
@@ -3098,10 +3228,21 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			upstreamEndpoint := relayUpstreamEndpointForProtocol(account, GrokProtocolResponses, attemptEffectiveModel)
 			upstreamBody := getOpenAIResponsesBody()
+			if account.IsAntigravityAPI() {
+				// Antigravity has no upstream previous_response_id store. Use the
+				// owner-scoped, locally expanded body so a later function_call_output
+				// still carries the matching function_call/name history.
+				upstreamBody = codexBody
+			}
 			var mappedBody []byte
 			var mappedModel string
 			var accountMappingApplied bool
-			if nativeRemoteCompactionV2 {
+			if account.IsAntigravityAPI() {
+				// Antigravity exposes only native public model IDs. Account-level
+				// OpenAI aliases are deliberately ignored so the adapter receives
+				// the public ID once and performs the single public->wire mapping.
+				mappedBody = upstreamBody
+			} else if nativeRemoteCompactionV2 {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountCompactModelMappingToBody(upstreamBody, account, logModel, effectiveModel)
 			} else {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
@@ -3111,7 +3252,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr := ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolResponses, rawBody, upstreamBody, proxyURL, downstreamHeaders)
+			var resp *http.Response
+			var reqErr error
+			if account.IsAntigravityAPI() {
+				resp, reqErr = ExecuteAntigravityResponsesRequest(upstreamCtx, account, attemptEffectiveModel, upstreamBody, isStream, proxyURL)
+				if reqErr != nil {
+					log.Printf("[antigravity] forwarding failed account=%d: %v", account.ID(), reqErr)
+				}
+				upstreamEndpoint = "/v1internal:" + map[bool]string{true: "streamGenerateContent", false: "generateContent"}[isStream]
+			} else {
+				resp, reqErr = ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolResponses, rawBody, upstreamBody, proxyURL, downstreamHeaders)
+			}
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -3144,7 +3295,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 					continue
 				}
-				if !timedOut && !stickyRetry {
+				if retryable && !timedOut && !stickyRetry {
 					retryExclusions.MarkHard(account.ID())
 				}
 
@@ -3175,8 +3326,22 @@ func (h *Handler) Responses(c *gin.Context) {
 				if wsHTTPFallback.ForceHTTP() {
 					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 				}
+				retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				antigravityRefreshFailed := false
+				if resp.StatusCode == http.StatusUnauthorized && account.IsAntigravityAPI() && account.AntigravityAuthKind() == auth.AntigravityAuthKindOAuth && !antigravityRefreshRetried[account.ID()] {
+					antigravityRefreshRetried[account.ID()] = true
+					if refreshErr := h.store.RefreshAntigravityAccount(c.Request.Context(), account); refreshErr == nil {
+						h.store.Release(account)
+						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						log.Printf("Antigravity OAuth token refreshed after upstream 401 (account=%d)", account.ID())
+						continue
+					} else {
+						antigravityRefreshFailed = true
+						log.Printf("Antigravity OAuth refresh failed after upstream 401 (account=%d): %v", account.ID(), refreshErr)
+					}
+				}
 
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
@@ -3198,7 +3363,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityRefreshFailed {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -3240,12 +3405,16 @@ func (h *Handler) Responses(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					lastRetryAfter = retryAfter
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
 					}
 					continue
 				}
 
+				if retryAfter != "" {
+					c.Header("Retry-After", retryAfter)
+				}
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 				return
 			}
@@ -3289,7 +3458,11 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.ClearModelCooldown(account, attemptEffectiveModel)
 					h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 				}
-				h.store.Release(account)
+				if outcome.logStatusCode == http.StatusOK {
+					h.store.ReleaseForSession(account, affinityKey)
+				} else {
+					h.store.Release(account)
+				}
 				return
 			}
 
@@ -3576,7 +3749,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ConfirmResponsesAvailableSince(account, start)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
-			h.store.Release(account)
+			if outcome.logStatusCode == http.StatusOK {
+				h.store.ReleaseForSession(account, affinityKey)
+			} else {
+				h.store.Release(account)
+			}
 			return
 		}
 
@@ -3674,6 +3851,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
+			retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			accountReleasedForOverflow := false
@@ -3760,12 +3938,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				lastRetryAfter = retryAfter
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
 				continue
 			}
 
+			if retryAfter != "" {
+				c.Header("Retry-After", retryAfter)
+			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
@@ -3833,6 +4015,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 并发方,锁零竞争。
 			var downstreamMu sync.Mutex
 			var pendingFirstTokenEvents bytes.Buffer
+			contEnabled, contMaxRounds := codexContinueThinkingSettings()
 			// 前置元数据事件立即透传（旧版兼容，issue #425）：每个 attempt 取一次快照，
 			// 热更新对新请求生效，流转发中途不切换缓冲策略。
 			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
@@ -3841,6 +4024,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				downstreamMu.Lock()
 				defer downstreamMu.Unlock()
+				// 上游 context 为了提取 usage 会在客户端断开后再排空最多 5 秒；
+				// 但下游 context 一旦取消，绝不能再尝试写 SSE，否则下一帧必然
+				// 变成 broken pipe。继续解析帧只用于拿 response.completed/usage。
+				if c.Request.Context().Err() != nil {
+					clientGone = true
+				}
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
@@ -3939,7 +4128,35 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 思考截断自动续想（默认关闭）：开启时用折叠状态机包裹 forward，
 			// 命中 518n-2 截断指纹则用同一账号续发上游并折叠成单响应；
 			// 关闭时保持原有逐事件透传路径，字节级零变化。
-			contEnabled, contMaxRounds := codexContinueThinkingSettings()
+			// 默认（未启用自动续想）路径也可能在 xhigh/max 的长推理阶段数十秒
+			// 没有可转发帧。定期写标准 SSE 注释，避免本机反代/Tailscale
+			// 把健康长流误判为空闲连接。自动续想路径已有自己的隐藏轮保活，
+			// 不重复启动第二个 ticker。
+			stopDownstreamKeepalive := func() {}
+			if !contEnabled {
+				stopDownstreamKeepalive = startDownstreamSSEKeepalive(c.Request.Context(), downstreamSSEKeepaliveInterval, func() bool {
+					downstreamMu.Lock()
+					defer downstreamMu.Unlock()
+					if c.Request.Context().Err() != nil {
+						clientGone = true
+						return false
+					}
+					if clientGone {
+						return false
+					}
+					// 首个真实字节前不能写注释，否则会提前提交 HTTP 200，
+					// 破坏首包前 response.failed 的真实状态码与换号重试语义。
+					if !wroteAnyBody {
+						return true
+					}
+					if err := streamWriter.WriteSSEComment(downstreamSSEKeepaliveComment); err != nil {
+						writeErr = err
+						clientGone = true
+						return false
+					}
+					return true
+				})
+			}
 			if contEnabled {
 				fold := &continueFold{
 					baseBody:  upstreamBody,
@@ -4020,6 +4237,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			} else {
 				readErr = ReadSSEStream(resp.Body, forward)
 			}
+			stopDownstreamKeepalive()
 			// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 			// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
 			if writeErr == nil && wroteAnyBody {
@@ -4161,6 +4379,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
+		if logStatusCode != http.StatusOK {
+			c.Set(AccessLogStatusContextKey, logStatusCode)
+		}
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
@@ -4277,7 +4498,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		if !accountReleasedForOverflow {
-			h.store.Release(account)
+			if outcome.logStatusCode == http.StatusOK {
+				h.store.ReleaseForSession(account, affinityKey)
+			} else {
+				h.store.Release(account)
+			}
 		}
 		return
 	}
@@ -4426,17 +4651,18 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	invalidEncryptedContentRetried := false
 	relayContinuationAttempted := false
 
+	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	for attempt := 0; ; attempt++ {
 		var account *auth.Account
 		var stickyProxyURL string
 		if attempt == 0 && compactionAffinity.Known {
-			account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, excludeAccounts, accountFilter)
+			account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, excludeAccounts, accountFilter, dispatchPolicy)
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			}
 		}
 		if account == nil {
-			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, excludeAccounts, accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if compactionAffinity.Known {
@@ -4451,7 +4677,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithDispatch(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter, dispatchPolicy)
 			if account == nil {
 				if (lastStatusCode == http.StatusTooManyRequests || lastStatusCode == http.StatusBadGateway) && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -4676,7 +4902,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 			})
 
-			h.store.Release(account)
+			h.store.ReleaseForSession(account, affinityKey)
 			contentType := resp.Header.Get("Content-Type")
 			if contentType == "" {
 				contentType = "application/json"
@@ -4965,7 +5191,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		})
 
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
-		h.store.Release(account)
+		h.store.ReleaseForSession(account, affinityKey)
 		c.Data(http.StatusOK, "application/json", respBody)
 		return
 	}
@@ -5065,6 +5291,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = excludeAntigravityAccountsFilter(accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -5094,10 +5321,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	capacityShedRetries := map[int64]int{}
+	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			account, stickyProxyURL = h.nextRetryAccountForSessionWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 		}
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -5360,7 +5588,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ClearModelCooldown(account, attemptEffectiveModel)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
-			h.store.Release(account)
+			if outcome.logStatusCode == http.StatusOK {
+				h.store.ReleaseForSession(account, affinityKey)
+			} else {
+				h.store.Release(account)
+			}
 			return
 		}
 
@@ -5738,7 +5970,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
-		h.store.Release(account)
+		if outcome.logStatusCode == http.StatusOK {
+			h.store.ReleaseForSession(account, affinityKey)
+		} else {
+			h.store.Release(account)
+		}
 		return
 	}
 }
@@ -6194,6 +6430,10 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		decision.Cooldown = time.Until(cooldown.ResetAt)
 		return decision
 	}
+	if isProOnlyModel(model) && IsUsageLimitReachedError(body) && decision.Scope == rateLimitScopeAccount {
+		store.MarkSparkUsageExhausted(account, decision.ResetAt)
+		return decision
+	}
 	if account.IsPremium5hPlan() && decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited_5h" {
 		store.MarkResponsesPremium5hRateLimited(account, decision.ResetAt)
 		return decision
@@ -6211,6 +6451,15 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 	// Grok 上游的错误语义与 Codex 不同（免费额度耗尽/超支限制/Retry-After），单独映射。
 	if account.IsGrokAPI() {
 		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)
+	}
+	// Antigravity 401 is recovered by RefreshAntigravityAccount. Do not apply
+	// Codex subscription/payment semantics, but retain relay-style model
+	// cooldowns for real 429s so repeated requests cannot hammer Google.
+	if account.IsAntigravityAPI() {
+		if statusCode == http.StatusTooManyRequests {
+			return Apply429Cooldown(h.store, account, body, resp, model)
+		}
+		return codex429Decision{}
 	}
 	if IsUsageLimitReachedError(body) {
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
@@ -6555,6 +6804,27 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 	})
 }
 
+func normalizedRetryAfter(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 || strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	digits := true
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			digits = false
+			break
+		}
+	}
+	if digits {
+		return value
+	}
+	if _, err := http.ParseTime(value); err == nil {
+		return value
+	}
+	return ""
+}
+
 // sendFinalUpstreamError 重试用尽后的最终错误响应：识别 usage_limit_reached 改写为 503，其余透传
 func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []byte) {
 	if details, ok := parseUsageLimitDetails(body); ok {
@@ -6648,7 +6918,8 @@ func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, sta
 
 // ListModels 列出可用模型
 // listModelsOrManifest 按客户端形态分发模型列表：带 client_version 查询参数的是
-// Codex 客户端在刷新模型选单（期望 manifest 格式，解析失败会静默冻结在本地缓存），
+// Codex 客户端在刷新模型选单（期望 manifest 格式，解析失败会静默冻结在本地缓存）。
+// Antigravity 渠道或没有 ChatGPT 账号时，把 Cockpit 同一份目录改写成 manifest。
 // 其余客户端返回 OpenAI 兼容列表。
 func (h *Handler) listModelsOrManifest(c *gin.Context) {
 	if strings.TrimSpace(c.Query("client_version")) != "" {
@@ -6693,6 +6964,12 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 	if h != nil && h.store != nil {
 		for _, account := range h.store.Accounts() {
 			declared := account.OpenAIResponsesModels()
+			if account.IsAntigravityAPI() {
+				if !account.AntigravityDispatchEnabled() {
+					continue
+				}
+				declared = antigravityPublicModelsForAccount(account)
+			}
 			// 未声明 models 白名单的 Grok 账号：补默认 Grok 模型集，让 grok-4.5 等
 			// 出现在 /v1/models（否则下游客户端拉不到可用的 Grok 模型名）。
 			if len(declared) == 0 && account.IsGrokAPI() {
@@ -6713,7 +6990,11 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 				seen[key] = struct{}{}
 				models = append(models, model)
 			}
-			for _, alias := range accountModelMappingAliases(account) {
+			aliases := accountModelMappingAliases(account)
+			if account.IsAntigravityAPI() {
+				aliases = nil
+			}
+			for _, alias := range aliases {
 				key := strings.ToLower(strings.TrimSpace(alias))
 				if key == "" {
 					continue

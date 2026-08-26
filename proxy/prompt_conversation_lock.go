@@ -37,6 +37,10 @@ type promptCyberRestriction struct {
 	ExpiresAt         time.Time
 	RetryAfterSeconds int64
 	IncidentID        string
+	DecisionID        string
+	RequestID         string
+	AuditReference    string
+	TriggerReasonCode string
 }
 
 type promptConversationLockIdentity struct {
@@ -102,6 +106,13 @@ func promptConversationSessionSignal(c *gin.Context) string {
 	return ""
 }
 
+// promptConversationLockFallbackSessionHash 统一 codex-local 降级身份的 session
+// hash 派生。锁表和审计日志必须使用同一条信号提取与指纹链路，后台才能用审计
+// 记录里的 session_hash 定位并解锁对应会话。
+func promptConversationLockFallbackSessionHash(c *gin.Context) string {
+	return hashRiskIdentity(promptSessionFingerprint32(promptConversationSessionSignal(c)))
+}
+
 func verifiedPromptConversationLockIdentity(c *gin.Context, policyContext verifiedNewAPIPolicyContext) (promptConversationLockIdentity, bool) {
 	if c == nil || !policyContext.MetaVerified {
 		return promptConversationLockIdentity{}, false
@@ -144,6 +155,19 @@ func promptCyberRestrictionDecision(item *database.PromptConversationLock, cfg p
 	if item != nil {
 		result.LockedAt = item.LockedAt.UTC()
 		result.IncidentID = strings.TrimSpace(item.IncidentID)
+		result.DecisionID = strings.TrimSpace(item.DecisionID)
+		result.RequestID = strings.TrimSpace(item.RequestID)
+		result.TriggerReasonCode = strings.TrimSpace(item.ReasonCode)
+		result.AuditReference = result.IncidentID
+		if result.AuditReference == "" {
+			result.AuditReference = result.RequestID
+		}
+		// 旧版本的本地锁没有单独保存 request_id，但 decision_id 一直使用
+		// local-block:<request_correlation_id>。兼容推导后，历史锁也能直接
+		// 粘贴定位到原始审核日志，而不需要等待新数据产生。
+		if result.AuditReference == "" && strings.HasPrefix(result.DecisionID, "local-block:") {
+			result.AuditReference = strings.TrimSpace(strings.TrimPrefix(result.DecisionID, "local-block:"))
+		}
 		if item.ReasonCode == promptUserCyberCooldownReasonCode {
 			result.ReasonCode = promptUserCyberCooldownReasonCode
 			result.Scope = database.PromptConversationRestrictionScopeUserCooldown
@@ -158,10 +182,16 @@ func promptCyberRestrictionDecision(item *database.PromptConversationLock, cfg p
 		}
 	}
 	remainingText := promptCyberRestrictionRemainingText(result.RetryAfterSeconds)
+	auditText := ""
+	if result.AuditReference != "" {
+		auditText = fmt.Sprintf("审计编号：%s；", result.AuditReference)
+	}
 	if result.Scope == database.PromptConversationRestrictionScopeUserCooldown {
-		result.Message = fmt.Sprintf("该用户因上游 CYB 进入安全冷却，剩余约 %s；冷却期间所有新请求均不会转发，也不会重复累计处罚。管理员可在「Prompt 检查 → 风险画像 → 用户详情」解除冷却。错误码：%s。", remainingText, result.ReasonCode)
+		result.Message = fmt.Sprintf("该用户因上游 CYB 进入安全冷却，剩余约 %s；冷却期间所有新请求均不会转发，也不会重复累计处罚。%s管理员可在「Prompt 检查 → 风险画像 → 用户详情」解除冷却。错误码：%s。", remainingText, auditText, result.ReasonCode)
+	} else if result.TriggerReasonCode != "" && result.TriggerReasonCode != newAPIUpstreamCyberPolicyReasonCode {
+		result.Message = fmt.Sprintf("当前对话因本地高风险规则已锁定，剩余约 %s；后续请求不会转发或重复累计处罚。触发原因：%s；%s管理员可在「Prompt 检查 → 风险画像 → 会话详情」审核并手动解锁。错误码：%s。", remainingText, result.TriggerReasonCode, auditText, result.ReasonCode)
 	} else {
-		result.Message = fmt.Sprintf("当前对话因上游 CYB 已锁定，剩余约 %s；后续请求不会转发或重复累计处罚。管理员可在「Prompt 检查 → 风险画像 → 会话详情」手动解锁。错误码：%s。", remainingText, result.ReasonCode)
+		result.Message = fmt.Sprintf("当前对话因上游 CYB 已锁定，剩余约 %s；后续请求不会转发或重复累计处罚。%s管理员可在「Prompt 检查 → 风险画像 → 会话详情」手动解锁。错误码：%s。", remainingText, auditText, result.ReasonCode)
 	}
 	return result
 }
@@ -199,6 +229,18 @@ func promptCyberRestrictionDetails(restriction promptCyberRestriction, signedDet
 	}
 	if restriction.IncidentID != "" {
 		details["incident_id"] = restriction.IncidentID
+	}
+	if restriction.DecisionID != "" {
+		details["decision_id"] = restriction.DecisionID
+	}
+	if restriction.RequestID != "" {
+		details["request_id"] = restriction.RequestID
+	}
+	if restriction.AuditReference != "" {
+		details["audit_reference"] = restriction.AuditReference
+	}
+	if restriction.TriggerReasonCode != "" {
+		details["trigger_reason_code"] = restriction.TriggerReasonCode
 	}
 	return details
 }
@@ -276,7 +318,7 @@ func promptConversationLockFallbackIdentity(c *gin.Context) (promptConversationL
 		Platform:           promptConversationLockFallbackPlatform,
 		NewAPIUserID:       subject,
 		SessionFingerprint: fingerprint,
-		SessionHash:        hashRiskIdentity(fingerprint),
+		SessionHash:        promptConversationLockFallbackSessionHash(c),
 	}, true
 }
 

@@ -1722,6 +1722,7 @@ export default function Usage() {
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
+  const [antigravityModelOptions, setAntigravityModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
@@ -1858,10 +1859,12 @@ export default function Usage() {
           : response.models ?? []
         setModelOptions(models)
         setGrokModelOptions(response.grok_models ?? [])
+        setAntigravityModelOptions(response.antigravity_models ?? [])
       } catch {
         if (active) {
           setModelOptions([])
           setGrokModelOptions([])
+          setAntigravityModelOptions([])
         }
       }
     }
@@ -1908,16 +1911,18 @@ export default function Usage() {
   const rangeAccountBilled = stats?.today_account_billed ?? 0
   const rangeUserBilled = stats?.today_user_billed ?? 0
   const modelStats = stats?.model_stats ?? []
-  // 下拉选项跟随渠道过滤：codex 只列 Codex manifest 目录，grok 只列 Grok 账号声明模型，
-  // 全部渠道两者都列；再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
+  // 下拉选项跟随渠道过滤：各渠道只列自己的目录，全部渠道合并所有目录；
+  // 再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
   const modelFilterOptions = useMemo(() => {
     const seen = new Set<string>()
     const merged: string[] = []
     const catalog = channel === 'grok'
       ? grokModelOptions
+      : channel === 'antigravity'
+        ? antigravityModelOptions
       : channel === 'codex'
         ? modelOptions
-        : [...modelOptions, ...grokModelOptions]
+        : [...modelOptions, ...grokModelOptions, ...antigravityModelOptions]
     for (const m of catalog) {
       const key = m.trim()
       if (key && !seen.has(key)) { seen.add(key); merged.push(key) }
@@ -1927,7 +1932,7 @@ export default function Usage() {
       if (key && key !== 'unknown' && !seen.has(key)) { seen.add(key); merged.push(key) }
     }
     return merged
-  }, [modelOptions, grokModelOptions, modelStats, channel])
+  }, [modelOptions, grokModelOptions, antigravityModelOptions, modelStats, channel])
   const featureStats = stats?.feature_stats
   const endpointStats = stats?.endpoint_stats ?? []
   const apiKeyStats = stats?.api_key_stats ?? []
@@ -2742,12 +2747,12 @@ export default function Usage() {
                               </Badge>
                             )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
-                              {(log.channel === 'codex' || log.channel === 'grok') && (
+                              {(log.channel === 'codex' || log.channel === 'grok' || log.channel === 'antigravity') && (
                                 <ChannelLogo
                                   channel={log.channel}
                                   size={13}
                                   className="mr-1"
-                                  title={log.channel === 'grok' ? 'Grok' : 'Codex'}
+                                  title={log.channel === 'grok' ? 'Grok' : log.channel === 'antigravity' ? 'Antigravity' : 'Codex'}
                                 />
                               )}
                               {log.model || '-'}

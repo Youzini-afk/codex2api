@@ -63,28 +63,30 @@ type Handler struct {
 	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
 	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
 	// （官方统计有滞后），让 page-stats 下发显式空态而不是无限触发回补。
-	whamDailyBackfillMu       sync.Mutex
-	whamDailyBackfillLast     map[int64]time.Time
-	whamDailyBackfillInFlight map[int64]struct{}
-	whamDailyBackfillFailedAt map[int64]time.Time
-	whamDailySyncedOnce       map[int64]struct{}
-	recordAccountEvent        func(int64, string, string)
-	proxyProbe                func(context.Context, string, string) proxyProbeResult
-	reloadProxyPoolFn         func() error
-	proxyBatchEventSender     func(*gin.Context, proxyBatchTestEvent) bool
-	proxyBatchTestMu          sync.Mutex
-	cpuSampler                *cpuSampler
-	memReader                 memStatsReader
-	startedAt                 time.Time
-	pgMaxConns                int
-	redisPoolSize             int
-	databaseDriver            string
-	databaseLabel             string
-	cacheDriver               string
-	cacheLabel                string
-	adminSecretEnv            string
-	sessionStore              *adminSessionStore
-	imageProxy                *proxy.Handler
+	whamDailyBackfillMu        sync.Mutex
+	whamDailyBackfillLast      map[int64]time.Time
+	whamDailyBackfillInFlight  map[int64]struct{}
+	whamDailyBackfillFailedAt  map[int64]time.Time
+	whamDailySyncedOnce        map[int64]struct{}
+	recordAccountEvent         func(int64, string, string)
+	proxyProbe                 func(context.Context, string, string) proxyProbeResult
+	reloadProxyPoolFn          func() error
+	proxyBatchEventSender      func(*gin.Context, proxyBatchTestEvent) bool
+	proxyBatchTestMu           sync.Mutex
+	cpuSampler                 *cpuSampler
+	memReader                  memStatsReader
+	startedAt                  time.Time
+	pgMaxConns                 int
+	redisPoolSize              int
+	databaseDriver             string
+	databaseLabel              string
+	cacheDriver                string
+	cacheLabel                 string
+	adminSecretEnv             string
+	sessionStore               *adminSessionStore
+	imageProxy                 *proxy.Handler
+	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
+	antigravityCapabilityProbe antigravityCapabilityExecutor
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
 	// 在大文件导入时堆出成千上万个阻塞协程。
@@ -907,13 +909,15 @@ func (h *Handler) getUsageStatsSummaryCached(ctx context.Context, rangeStart, ra
 	return stats, nil
 }
 
-// parseUsageChannel 解析 query 里的渠道过滤参数（codex/grok，其余视为不限）。
+// parseUsageChannel 解析 query 里的账号/用量渠道过滤参数。
 func parseUsageChannel(c *gin.Context) string {
 	switch strings.ToLower(strings.TrimSpace(c.Query("channel"))) {
 	case database.UpstreamChannelCodex:
 		return database.UpstreamChannelCodex
 	case database.UpstreamChannelGrok:
 		return database.UpstreamChannelGrok
+	case database.UpstreamChannelAntigravity:
+		return database.UpstreamChannelAntigravity
 	}
 	return ""
 }
@@ -1039,6 +1043,22 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/grok/import", h.BatchImportGrokAccounts)
 	api.POST("/accounts/grok/oauth/auth-url", h.GenerateGrokAuthURL)        // 兼容旧客户端
 	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
+	api.POST("/accounts/antigravity", h.AddAntigravityAccount)
+	api.POST("/accounts/antigravity/models", h.FetchAntigravityModels)
+	api.POST("/accounts/antigravity/batch-models", h.BatchUpdateAntigravityModels)
+	api.GET("/accounts/antigravity/export", h.ExportAntigravityAccounts)
+	api.POST("/accounts/antigravity/import", h.BatchImportAntigravityAccounts)
+	api.POST("/accounts/antigravity/refresh", h.BatchRefreshAntigravityAccounts)
+	api.POST("/accounts/antigravity/oauth/start", h.StartAntigravityOAuth)
+	api.GET("/accounts/antigravity/oauth/status", h.GetAntigravityOAuthStatus)
+	api.POST("/accounts/antigravity/oauth/complete", h.CompleteAntigravityOAuth)
+	api.DELETE("/accounts/antigravity/oauth/:session_id", h.CancelAntigravityOAuth)
+	api.PATCH("/accounts/:id/antigravity", h.UpdateAntigravityAccount)
+	api.POST("/accounts/:id/antigravity/refresh", h.RefreshAntigravityAccount)
+	api.POST("/accounts/:id/antigravity/quota", h.RefreshAntigravityQuota)
+	api.GET("/accounts/:id/antigravity/state", h.GetAntigravityAccountState)
+	api.POST("/accounts/:id/antigravity/sync", h.SyncAntigravityAccountState)
+	api.POST("/accounts/:id/antigravity/capabilities/probe", h.ProbeAntigravityAccountCapabilities)
 	api.PATCH("/accounts/:id/grok", h.UpdateGrokAccount)
 	api.GET("/accounts/:id/grok/state", h.GetGrokAccountState)
 	api.POST("/accounts/:id/grok/sync", h.SyncGrokAccountState)
@@ -1088,6 +1108,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/clean-error", h.CleanError)
 	api.POST("/accounts/grok/clean-banned", h.CleanGrokBanned)
 	api.POST("/accounts/grok/clean-error", h.CleanGrokError)
+	api.POST("/accounts/antigravity/clean-banned", h.CleanAntigravityBanned)
+	api.POST("/accounts/antigravity/clean-error", h.CleanAntigravityError)
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
@@ -1316,8 +1338,8 @@ type dashboardAccountCounts struct {
 	disabled    int
 }
 
-// summarizeDashboardAccounts 汇总账号健康计数，并按上游渠道（codex/grok）拆分。
-// 渠道判定优先用运行时账号（IsGrokAPI），不在池中的行回退 upstream_type 凭据。
+// summarizeDashboardAccounts 汇总账号健康计数，并按独立账号渠道拆分。
+// 渠道判定优先用运行时账号，不在池中的行回退 upstream_type 凭据。
 func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*auth.Account) (dashboardAccountCounts, map[string]dashboardAccountCounts) {
 	runtimeByID := make(map[int64]*auth.Account, len(runtimeAccounts))
 	for _, acc := range runtimeAccounts {
@@ -1328,8 +1350,9 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 
 	var counts dashboardAccountCounts
 	channelCounts := map[string]dashboardAccountCounts{
-		database.UpstreamChannelCodex: {},
-		database.UpstreamChannelGrok:  {},
+		database.UpstreamChannelCodex:       {},
+		database.UpstreamChannelGrok:        {},
+		database.UpstreamChannelAntigravity: {},
 	}
 	counts.total = len(rows)
 	for _, row := range rows {
@@ -1339,12 +1362,18 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		status := strings.ToLower(strings.TrimSpace(row.Status))
 		cooldownReason := strings.ToLower(strings.TrimSpace(row.CooldownReason))
 		channel := database.UpstreamChannelCodex
-		if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamGrok) {
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		if strings.EqualFold(upstreamType, auth.UpstreamGrok) {
 			channel = database.UpstreamChannelGrok
+		} else if strings.EqualFold(upstreamType, auth.UpstreamAntigravity) {
+			channel = database.UpstreamChannelAntigravity
 		}
 		usingCredits := false
 		acc := runtimeByID[row.ID]
-		if acc != nil {
+		isAntigravity := channel == database.UpstreamChannelAntigravity
+		if isAntigravity {
+			status, _ = antigravityPersistedStatus(row)
+		} else if acc != nil {
 			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
 			cooldownReason = ""
 			// 积分顶替限流：状态仍报限流（窗口客观打满），但账号照常参与调度，按可用计。
@@ -1384,7 +1413,7 @@ func isDashboardAbnormalAccount(status string) bool {
 
 func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bool {
 	if acc != nil {
-		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() {
+		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() || acc.IsAntigravityAPI() {
 			return false
 		}
 		snapshot := acc.GetAccountListRuntimeSnapshot()
@@ -1398,7 +1427,9 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 		return false
 	}
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
-	if strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) {
+	if strings.EqualFold(upstreamType, auth.UpstreamGrok) ||
+		strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) ||
+		strings.EqualFold(upstreamType, auth.UpstreamAntigravity) {
 		return false
 	}
 	status := strings.ToLower(strings.TrimSpace(row.Status))
@@ -1447,12 +1478,20 @@ type accountResponse struct {
 	AccessTokenType               string                      `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI            bool                        `json:"openai_responses_api,omitempty"`
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
+	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
+	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
 	AgentIdentity                 bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind                  string                      `json:"grok_auth_kind,omitempty"`
 	GrokPlan                      *auth.GrokPlan              `json:"grok_plan,omitempty"`
 	GrokBilling                   json.RawMessage             `json:"grok_billing,omitempty"`
 	GrokRateLimit                 *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
 	GrokFreeQuota                 *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
+	AvatarURL                     string                      `json:"avatar_url,omitempty"`
+	VerifiedEmail                 bool                        `json:"verified_email,omitempty"`
+	ProjectID                     string                      `json:"project_id,omitempty"`
+	AntigravityQuota              json.RawMessage             `json:"antigravity_quota,omitempty"`
+	AntigravityPermissions        json.RawMessage             `json:"antigravity_permissions,omitempty"`
+	AntigravitySyncWarning        string                      `json:"antigravity_sync_warning,omitempty"`
 	BaseURL                       string                      `json:"base_url,omitempty"`
 	Models                        []string                    `json:"models,omitempty"`
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
@@ -1476,6 +1515,8 @@ type accountResponse struct {
 	CodexUsageUpdatedAt           string                      `json:"codex_usage_updated_at,omitempty"`
 	Codex5HUsageUpdatedAt         string                      `json:"codex_5h_usage_updated_at,omitempty"`
 	ActiveRequests                int64                       `json:"active_requests"`
+	OccupiedRequests              int64                       `json:"occupied_requests"`
+	SessionSlotBufferEnabled      bool                        `json:"session_slot_buffer_enabled"`
 	TotalRequests                 int64                       `json:"total_requests"`
 	LastUsedAt                    string                      `json:"last_used_at"`
 	SuccessRequests               int64                       `json:"success_requests"`
@@ -1486,6 +1527,7 @@ type accountResponse struct {
 	SuccessModelCounts            map[string]int64            `json:"success_model_counts,omitempty"`
 	UsagePercent7d                *float64                    `json:"usage_percent_7d"`
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
+	UsagePercentSpark             *float64                    `json:"usage_percent_spark"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
 	ApplicableResetCredits        *int                        `json:"applicable_reset_credits"`
 	CreditsBalance                *string                     `json:"credits_balance"`
@@ -1507,6 +1549,7 @@ type accountResponse struct {
 	Usage7dDetail                 *accountUsageWindow         `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                     string                      `json:"reset_5h_at,omitempty"`
 	Reset7dAt                     string                      `json:"reset_7d_at,omitempty"`
+	ResetSparkAt                  string                      `json:"reset_spark_at,omitempty"`
 	Window7dKind                  string                      `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
 	Window7dSeconds               *int64                      `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
 	Billed5h                      *float64                    `json:"billed_5h"`
@@ -4230,6 +4273,10 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
 		return
 	}
+	if account.IsAntigravityAPI() {
+		writeError(c, http.StatusBadRequest, "Antigravity 账号请使用专用配额刷新")
+		return
+	}
 	if account.IsGrokAPI() {
 		// Grok 账号同步完整富目录到 catalog 表；响应 models 是可见目录，不覆盖账号白名单。
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 110*time.Second)
@@ -5836,11 +5883,17 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 	if pct, ok := account.GetUsagePercent7d(); ok {
 		resp["usage_percent_7d"] = pct
 	}
+	if pct, ok := account.GetUsagePercentSpark(); ok {
+		resp["usage_percent_spark"] = pct
+	}
 	if t := account.GetReset5hAt(); !t.IsZero() {
 		resp["reset_5h_at"] = t.Format(time.RFC3339)
 	}
 	if t := account.GetReset7dAt(); !t.IsZero() {
 		resp["reset_7d_at"] = t.Format(time.RFC3339)
+	}
+	if t := account.GetResetSparkAt(); !t.IsZero() {
+		resp["reset_spark_at"] = t.Format(time.RFC3339)
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -8675,7 +8728,9 @@ type settingsResponse struct {
 	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     string `json:"scheduler_engine"`
 	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
+	CodexRequestCompression             bool   `json:"codex_request_compression"`
 	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         int    `json:"codex_ws_keepalive_interval_sec"`
@@ -8708,6 +8763,8 @@ type settingsResponse struct {
 	SchedulerMode                       string `json:"scheduler_mode"`
 	AffinityMode                        string `json:"affinity_mode"`
 	SessionAffinitySpread               bool   `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            bool   `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            int    `json:"session_slot_buffer_seconds"`
 	GrokAffinityMode                    string `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
@@ -8833,7 +8890,9 @@ type updateSettingsReq struct {
 	AutoResetCreditsBeforeExpiryMin     *int     `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                    *bool    `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                *bool    `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     *string  `json:"scheduler_engine"`
 	CodexForceWebsocket                 *bool    `json:"codex_force_websocket"`
+	CodexRequestCompression             *bool    `json:"codex_request_compression"`
 	CodexWSWeakNetworkMode              *bool    `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             *bool    `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         *int     `json:"codex_ws_keepalive_interval_sec"`
@@ -8865,6 +8924,8 @@ type updateSettingsReq struct {
 	SchedulerMode                       *string  `json:"scheduler_mode"`
 	AffinityMode                        *string  `json:"affinity_mode"`
 	SessionAffinitySpread               *bool    `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            *bool    `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            *int     `json:"session_slot_buffer_seconds"`
 	GrokAffinityMode                    *string  `json:"grok_affinity_mode"`
 	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
@@ -9572,7 +9633,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -9605,6 +9668,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
@@ -9954,6 +10019,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	persistedAutoResetCreditsEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
+	sessionSlotBufferEnabled := h.store.SessionSlotBufferEnabled()
+	sessionSlotBufferSeconds := database.NormalizeSessionSlotBufferSeconds(int(h.store.GetSessionSlotBuffer() / time.Second))
 	existingSettings, settingsErr := h.db.GetSystemSettings(c.Request.Context())
 	if settingsErr != nil {
 		writeError(c, http.StatusInternalServerError, "读取现有设置失败："+settingsErr.Error())
@@ -9974,6 +10041,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
+		sessionSlotBufferEnabled = existingSettings.SessionSlotBufferEnabled
+		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(existingSettings.SessionSlotBufferSeconds)
+	}
+	if req.SessionSlotBufferEnabled != nil {
+		sessionSlotBufferEnabled = *req.SessionSlotBufferEnabled
+	}
+	if req.SessionSlotBufferSeconds != nil {
+		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(*req.SessionSlotBufferSeconds)
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -10214,7 +10289,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
 	}
 
-	if req.FastSchedulerEnabled != nil {
+	if req.SchedulerEngine != nil {
+		engine := strings.ToLower(strings.TrimSpace(*req.SchedulerEngine))
+		if engine != "legacy" && engine != "shadow" && engine != "indexed" {
+			writeError(c, http.StatusBadRequest, "scheduler_engine 必须是 legacy、shadow 或 indexed")
+			return
+		}
+		h.store.SetSchedulerEngine(engine)
+		log.Printf("设置已更新: scheduler_engine = %s", engine)
+	} else if req.FastSchedulerEnabled != nil {
 		h.store.SetFastSchedulerEnabled(*req.FastSchedulerEnabled)
 		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
 	}
@@ -10223,6 +10306,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexForceWebsocket(*req.CodexForceWebsocket)
 		runtimeCfg.CodexForceWebsocket = *req.CodexForceWebsocket
 		log.Printf("设置已更新: codex_force_websocket = %t", *req.CodexForceWebsocket)
+	}
+	if req.CodexRequestCompression != nil {
+		h.store.SetCodexRequestCompression(*req.CodexRequestCompression)
+		runtimeCfg.CodexRequestCompression = *req.CodexRequestCompression
+		log.Printf("设置已更新: codex_request_compression = %t", *req.CodexRequestCompression)
 	}
 
 	if req.CodexWSWeakNetworkMode != nil {
@@ -10415,7 +10503,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetSessionAffinitySpread(*req.SessionAffinitySpread)
 		log.Printf("设置已更新: session_affinity_spread = %t", *req.SessionAffinitySpread)
 	}
-
 	if req.GrokAffinityMode != nil {
 		h.store.SetGrokAffinityMode(*req.GrokAffinityMode)
 		log.Printf("设置已更新: grok_affinity_mode = %s", *req.GrokAffinityMode)
@@ -10920,7 +11007,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -10953,6 +11042,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            sessionSlotBufferEnabled,
+		SessionSlotBufferSeconds:            sessionSlotBufferSeconds,
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
@@ -11015,6 +11106,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if req.SessionSlotBufferEnabled != nil || req.SessionSlotBufferSeconds != nil {
+			writeError(c, http.StatusInternalServerError, "保存会话并发槽缓冲设置失败，设置未生效")
+			return
+		}
 		if modelCooldownUpdateRequested {
 			writeError(c, http.StatusInternalServerError, "保存模型冷却设置前无法持久化系统设置")
 			return
@@ -11033,6 +11128,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	} else {
+		if req.SessionSlotBufferSeconds != nil {
+			h.store.SetSessionSlotBuffer(time.Duration(sessionSlotBufferSeconds) * time.Second)
+			log.Printf("设置已更新: session_slot_buffer_seconds = %d", sessionSlotBufferSeconds)
+		}
+		if req.SessionSlotBufferEnabled != nil {
+			h.store.SetSessionSlotBufferEnabled(sessionSlotBufferEnabled)
+			log.Printf("设置已更新: session_slot_buffer_enabled = %t", sessionSlotBufferEnabled)
+		}
 		if promptFilterChanged {
 			if req.PromptFilterCustomPatterns == nil {
 				// The database preserved this field atomically because the request did
@@ -11170,7 +11273,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -11203,6 +11308,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
 		GrokAffinityMode:                    h.store.GetGrokAffinityMode(),
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
@@ -11667,6 +11774,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
 	catalog.GrokModels = h.grokChannelModels()
+	catalog.AntigravityModels = h.antigravityChannelModels()
 	c.JSON(http.StatusOK, catalog)
 }
 
@@ -11691,6 +11799,35 @@ func (h *Handler) grokChannelModels() []string {
 			seen[key] = struct{}{}
 			models = append(models, model)
 		}
+	}
+	sort.Strings(models)
+	return models
+}
+
+func (h *Handler) antigravityChannelModels() []string {
+	if h == nil || h.store == nil {
+		return proxy.AntigravityPublishedModelIDs(auth.AntigravityDefaultModelIDs())
+	}
+	seen := make(map[string]struct{})
+	models := make([]string, 0)
+	for _, account := range h.store.Accounts() {
+		if account == nil || !account.IsAntigravityAPI() {
+			continue
+		}
+		for _, model := range proxy.AntigravityPublishedModelIDs(account.AntigravityModels()) {
+			key := strings.ToLower(strings.TrimSpace(model))
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			models = append(models, model)
+		}
+	}
+	if len(models) == 0 {
+		models = proxy.AntigravityPublishedModelIDs(auth.AntigravityDefaultModelIDs())
 	}
 	sort.Strings(models)
 	return models
@@ -11802,6 +11939,20 @@ func (h *Handler) CleanGrokError(c *gin.Context) {
 // cleanGrokByStatus 按运行时状态清理 Grok 账号，不影响其它平台
 func (h *Handler) cleanGrokByStatus(c *gin.Context, targetStatus string) {
 	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, (*auth.Account).IsGrokAPI), "auto_clean")
+}
+
+// CleanAntigravityBanned 清理封禁的 Antigravity 账号。
+func (h *Handler) CleanAntigravityBanned(c *gin.Context) {
+	h.cleanAntigravityByStatus(c, "unauthorized")
+}
+
+// CleanAntigravityError 清理错误状态的 Antigravity 账号。
+func (h *Handler) CleanAntigravityError(c *gin.Context) {
+	h.cleanAntigravityByStatus(c, "error")
+}
+
+func (h *Handler) cleanAntigravityByStatus(c *gin.Context, targetStatus string) {
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, (*auth.Account).IsAntigravityAPI), "auto_clean")
 }
 
 // cleanByStatus 按运行时状态清理账号
