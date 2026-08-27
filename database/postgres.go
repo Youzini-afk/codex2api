@@ -1358,7 +1358,8 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 			response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 			response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 			response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
-			response_cache_config_generation BIGINT NOT NULL DEFAULT 1
+			response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
+			models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608
 		);
 	CREATE TABLE IF NOT EXISTS api_key_scope_counters (
 		api_key_id BIGINT NOT NULL,
@@ -1428,6 +1429,7 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_affinity_spread BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_seconds INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
@@ -1514,9 +1516,11 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_activate_5h_window_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864;
@@ -2261,6 +2265,34 @@ func NormalizeSiteName(value string) string {
 	return value
 }
 
+const (
+	DefaultModelsListReadMaxBytes int64 = 8 << 20
+	MinModelsListReadMaxBytes     int64 = 1 << 20
+	MaxModelsListReadMaxBytes     int64 = 256 << 20
+)
+
+// ValidateModelsListReadMaxBytes 校验模型列表响应的最大读取字节数。
+func ValidateModelsListReadMaxBytes(value int64) error {
+	if value < MinModelsListReadMaxBytes || value > MaxModelsListReadMaxBytes {
+		return fmt.Errorf("models_list_read_max_bytes 必须在 %d 到 %d 字节之间", MinModelsListReadMaxBytes, MaxModelsListReadMaxBytes)
+	}
+	return nil
+}
+
+// NormalizeModelsListReadMaxBytes 把缺失或越界旧值收敛到安全范围。
+func NormalizeModelsListReadMaxBytes(value int64) int64 {
+	if value <= 0 {
+		return DefaultModelsListReadMaxBytes
+	}
+	if value < MinModelsListReadMaxBytes {
+		return MinModelsListReadMaxBytes
+	}
+	if value > MaxModelsListReadMaxBytes {
+		return MaxModelsListReadMaxBytes
+	}
+	return value
+}
+
 // SystemSettings 运行时设置项
 type SystemSettings struct {
 	SiteName                           string
@@ -2287,6 +2319,7 @@ type SystemSettings struct {
 	SchedulerEngine                    string
 	MaxRetries                         int
 	MaxRateLimitRetries                int
+	ContinuousRetryPolicy              string // JSON: database.ContinuousRetryPolicy
 	AllowRemoteMigration               bool
 	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
 	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
@@ -2302,6 +2335,7 @@ type SystemSettings struct {
 	SessionAffinitySpread              bool   // 新亲和键按 HRW 哈希散列选号(issue #484)
 	SessionSlotBufferEnabled           bool   // 成功请求结束后为原会话短暂保留并发槽
 	SessionSlotBufferSeconds           int    // 会话并发槽缓冲时间，默认 10 秒，范围 1..60
+	ModelsListReadMaxBytes             int64  // 上游 /models 与 Codex 模型清单的最大读取字节数，默认 8 MiB
 	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
 	ResinPlatformName                  string // Resin 平台标识，例如 codex2api
 	PromptFilterEnabled                bool
@@ -2395,6 +2429,8 @@ type SystemSettings struct {
 	AutoResetCreditsEnabled bool
 	// AutoResetCreditsBeforeExpiryMin 是进入临期窗口的提前分钟数（默认 60，范围 10-10080）。
 	AutoResetCreditsBeforeExpiryMin int
+	// AutoActivate5hWindowEnabled 控制 5h 窗口重置后是否发送一次最小真实 /responses 以启动下一轮窗口（默认关闭，issue #581）。
+	AutoActivate5hWindowEnabled bool
 	// ModelPricingOverrides 是模型定价覆盖 JSON（model → ModelPricingOverride），
 	// custom/synced 覆盖代码默认；空为 "{}"。
 	ModelPricingOverrides string
@@ -2622,7 +2658,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(codex_overload_pause_minutes, 30),
 		       COALESCE(codex_overload_window_minutes, 5),
 		       COALESCE(session_slot_buffer_enabled, false),
-		       COALESCE(session_slot_buffer_seconds, 10)
+		       COALESCE(session_slot_buffer_seconds, 10),
+		       COALESCE(models_list_read_max_bytes, 8388608),
+		       COALESCE(auto_activate_5h_window_enabled, false)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2702,6 +2740,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexOverloadWindowMinutes,
 		&s.SessionSlotBufferEnabled,
 		&s.SessionSlotBufferSeconds,
+		&s.ModelsListReadMaxBytes,
+		&s.AutoActivate5hWindowEnabled,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2724,14 +2764,111 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	if strings.TrimSpace(s.PayloadRules) == "" {
 		s.PayloadRules = "{}"
 	}
+	var continuousRetryRaw sql.NullString
+	if policyErr := db.conn.QueryRowContext(ctx, `SELECT COALESCE(continuous_retry_policy, '') FROM system_settings WHERE id = 1`).Scan(&continuousRetryRaw); policyErr == nil {
+		s.ContinuousRetryPolicy = continuousRetryRaw.String
+	} else if !errors.Is(policyErr, sql.ErrNoRows) {
+		return nil, policyErr
+	}
+	if strings.TrimSpace(s.ContinuousRetryPolicy) == "" {
+		s.ContinuousRetryPolicy = EncodeContinuousRetryPolicy(DefaultContinuousRetryPolicy())
+	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
 	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
 	s.SessionSlotBufferSeconds = NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds)
+	s.ModelsListReadMaxBytes = NormalizeModelsListReadMaxBytes(s.ModelsListReadMaxBytes)
 	s.SchedulerEngine = NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled)
 	s.FastSchedulerEnabled = s.SchedulerEngine != "legacy"
 	return s, err
+}
+
+// UpdateContinuousRetryPolicy atomically merges one admin partial update into
+// the latest persisted policy. The row lock prevents concurrent tabs or
+// replicas from replacing fields they did not edit with a stale JSON snapshot.
+func (db *DB) UpdateContinuousRetryPolicy(ctx context.Context, update ContinuousRetryPolicyUpdate) (ContinuousRetryPolicy, error) {
+	if db == nil || db.conn == nil {
+		return DefaultContinuousRetryPolicy(), nil
+	}
+
+	var committed ContinuousRetryPolicy
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		defaultRaw := EncodeContinuousRetryPolicy(DefaultContinuousRetryPolicy())
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO system_settings (id, continuous_retry_policy)
+			VALUES (1, $1)
+			ON CONFLICT (id) DO NOTHING
+		`, defaultRaw); err != nil {
+			return err
+		}
+
+		var currentRaw string
+		if err := tx.QueryRowContext(ctx, continuousRetryPolicySelectQuery(!db.isSQLite())).Scan(&currentRaw); err != nil {
+			return err
+		}
+		current := DefaultContinuousRetryPolicy()
+		if strings.TrimSpace(currentRaw) != "" {
+			current = ParseContinuousRetryPolicy(currentRaw)
+		}
+		next := current
+		if update.Enabled != nil {
+			next.Enabled = *update.Enabled
+		}
+		if update.CatchAll != nil {
+			next.CatchAll = *update.CatchAll
+		}
+		if update.Categories != nil {
+			next.Categories = append([]string(nil), (*update.Categories)...)
+		}
+		if update.StatusCodes != nil {
+			next.StatusCodes = append([]int(nil), (*update.StatusCodes)...)
+		}
+		if update.ErrorCodes != nil {
+			next.ErrorCodes = append([]string(nil), (*update.ErrorCodes)...)
+		}
+		if update.MaxDurationSeconds != nil {
+			next.MaxDurationSeconds = *update.MaxDurationSeconds
+		}
+		next = NormalizeContinuousRetryPolicy(next)
+		nextRaw := EncodeContinuousRetryPolicy(next)
+		if nextRaw != strings.TrimSpace(currentRaw) {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE system_settings
+				SET continuous_retry_policy = $1
+				WHERE id = 1
+			`, nextRaw); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		committed = next
+		return nil
+	})
+	if err != nil {
+		return ContinuousRetryPolicy{}, err
+	}
+	return committed, nil
+}
+
+func continuousRetryPolicySelectQuery(forUpdate bool) string {
+	query := `
+		SELECT COALESCE(continuous_retry_policy, '')
+		FROM system_settings
+		WHERE id = 1
+	`
+	if forUpdate {
+		query += " FOR UPDATE"
+	}
+	return query
 }
 
 // NormalizeCodexFingerprintDefaultMode 把新账号默认指纹收敛档位归一到四个已知
@@ -2853,9 +2990,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					session_slot_buffer_enabled,
 					session_slot_buffer_seconds,
 					scheduler_engine,
-					codex_request_compression
+					codex_request_compression,
+					auto_activate_5h_window_enabled
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2895,10 +3033,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $121 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+					prompt_filter_custom_patterns = CASE WHEN $122 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $122 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+					prompt_filter_review_api_key = CASE WHEN $123 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2973,7 +3111,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes,
 					session_slot_buffer_enabled = EXCLUDED.session_slot_buffer_enabled,
 					session_slot_buffer_seconds = EXCLUDED.session_slot_buffer_seconds,
-					scheduler_engine = EXCLUDED.scheduler_engine
+					scheduler_engine = EXCLUDED.scheduler_engine,
+					auto_activate_5h_window_enabled = EXCLUDED.auto_activate_5h_window_enabled
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -3023,6 +3162,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds),
 		NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled),
 		s.CodexRequestCompression,
+		s.AutoActivate5hWindowEnabled,
 		s.PreservePromptFilterCustomPatterns,
 		s.PreservePromptFilterReviewAPIKey)
 	return err
@@ -3037,6 +3177,20 @@ func (db *DB) UpdateCodexSyncedCLIVersion(ctx context.Context, version string) e
 		ON CONFLICT (id) DO UPDATE SET
 			codex_synced_cli_version = EXCLUDED.codex_synced_cli_version
 	`, strings.TrimSpace(version))
+	return err
+}
+
+// UpdateModelsListReadMaxBytes 原子更新模型列表读取上限，不回写整行设置。
+func (db *DB) UpdateModelsListReadMaxBytes(ctx context.Context, value int64) error {
+	if err := ValidateModelsListReadMaxBytes(value); err != nil {
+		return err
+	}
+	_, err := db.conn.ExecContext(ctx, `
+		INSERT INTO system_settings (id, models_list_read_max_bytes)
+		VALUES (1, $1)
+		ON CONFLICT (id) DO UPDATE SET
+			models_list_read_max_bytes = EXCLUDED.models_list_read_max_bytes
+	`, value)
 	return err
 }
 
@@ -6063,10 +6217,11 @@ type AccountTimeRangeUsage struct {
 	UserBilled    float64
 }
 
-// AccountModelCount 某个模型在指定窗口内的请求数与成功数。
+// AccountModelCount 某个模型在指定窗口内的请求数、成功数与平均首字时长。
 type AccountModelCount struct {
-	Requests int64
-	Success  int64
+	Requests        int64
+	Success         int64
+	AvgFirstTokenMs float64
 }
 
 // nonRetryUsageLogPredicate keeps transport retry attempts out of end-user

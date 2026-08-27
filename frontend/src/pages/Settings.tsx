@@ -13,6 +13,14 @@ import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
 import { buildWritableSettingsPayload } from '../lib/settingsPayload'
 import {
+  buildContinuousRetryCatchAllPatch,
+  buildContinuousRetryEnabledPatch,
+  createContinuousRetrySaveQueue,
+  parseContinuousRetryErrorCodes,
+  parseContinuousRetryMaxDurationSeconds,
+  parseContinuousRetryStatusCodes,
+} from '../lib/continuousRetrySettings'
+import {
   MIB,
   buildResponseCacheBudgetPatch,
   bytesToMiB,
@@ -115,6 +123,7 @@ const AUTO_SAVE_TOAST_MS = 2000
 const DEFAULT_RESPONSE_CACHE_TOTAL_BYTES = 64 * MIB
 const DEFAULT_RESPONSE_CACHE_ENTRY_BYTES = 8 * MIB
 const DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES = 64 * MIB
+const DEFAULT_MODELS_LIST_READ_MAX_BYTES = 8 * MIB
 const RESPONSE_CACHE_BUDGET_KEYS = [
   'response_cache_local_max_bytes',
   'response_cache_local_max_entry_bytes',
@@ -1259,6 +1268,15 @@ export default function Settings() {
     { label: t('settings.transportRetryPolicyRotate'), value: 'rotate' },
     { label: t('settings.transportRetryPolicySticky'), value: 'sticky' },
   ]
+  const continuousRetryCategoryOptions = [
+    { label: t('settings.continuousRetryCategoryTransport'), value: 'transport' },
+    { label: t('settings.continuousRetryCategory429'), value: 'http_429' },
+    { label: t('settings.continuousRetryCategory4xx'), value: 'http_4xx' },
+    { label: t('settings.continuousRetryCategory5xx'), value: 'http_5xx' },
+    { label: t('settings.continuousRetryCategoryStream'), value: 'stream_error' },
+    { label: t('settings.continuousRetryCategoryResponseFailed'), value: 'response_failed' },
+    { label: t('settings.continuousRetryCategoryContext'), value: 'context_error' },
+  ]
   const codexFingerprintDefaultModeOptions = [
     { label: t('accounts.codexFingerprintModeOff'), value: 'off' },
     { label: t('accounts.codexFingerprintModeDevice'), value: 'device' },
@@ -1322,6 +1340,10 @@ export default function Settings() {
       ...cacheNormalized,
       billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
       first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
+      models_list_read_max_bytes:
+        Number.isFinite(cacheNormalized.models_list_read_max_bytes) && cacheNormalized.models_list_read_max_bytes >= MIB
+          ? cacheNormalized.models_list_read_max_bytes
+          : DEFAULT_MODELS_LIST_READ_MAX_BYTES,
     }
     if (!normalized.lazy_mode) {
       return normalized
@@ -1364,6 +1386,7 @@ export default function Settings() {
     scheduler_engine: 'legacy',
     auto_reset_credits_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
+    auto_activate_5h_window_enabled: false,
     codex_force_websocket: false,
     codex_request_compression: true,
     codex_ws_weak_network_mode: false,
@@ -1408,6 +1431,12 @@ export default function Settings() {
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
     transport_retry_policy: 'rotate',
+    continuous_retry_enabled: false,
+    continuous_retry_catch_all: false,
+    continuous_retry_categories: ['transport', 'http_429', 'http_5xx', 'stream_error'],
+    continuous_retry_status_codes: [],
+    continuous_retry_error_codes: [],
+    continuous_retry_max_duration_seconds: 600,
     codex_fingerprint_default_mode: 'off',
     allow_remote_migration: false,
     database_driver: 'postgres',
@@ -1462,6 +1491,7 @@ export default function Settings() {
     first_token_timeout_seconds: 0,
     first_token_excludes_ws_acquire: false,
     billing_tier_policy: 'actual',
+    models_list_read_max_bytes: DEFAULT_MODELS_LIST_READ_MAX_BYTES,
     show_full_usage_numbers: false,
     public_key_usage_page_enabled: true,
     public_image_studio_page_enabled: true,
@@ -1483,6 +1513,11 @@ export default function Settings() {
     smart_pacing_windows: '5h,7d',
     ignore_usage_limit_status: false,
   })
+  const continuousRetryStatusCodesText = (settingsForm.continuous_retry_status_codes ?? []).join(',')
+  const continuousRetryErrorCodesText = (settingsForm.continuous_retry_error_codes ?? []).join(',')
+  const continuousRetryFineControlsDisabled = !settingsForm.continuous_retry_enabled || settingsForm.continuous_retry_catch_all
+  const [continuousRetryStatusCodesDraft, setContinuousRetryStatusCodesDraft] = useState(continuousRetryStatusCodesText)
+  const [continuousRetryErrorCodesDraft, setContinuousRetryErrorCodesDraft] = useState(continuousRetryErrorCodesText)
   const lazyModeActive = settingsForm.lazy_mode
   const responseCacheBudget = responseCacheBudgetFromSettings(settingsForm)
   const [savingSettings, setSavingSettings] = useState(false)
@@ -1509,11 +1544,20 @@ export default function Settings() {
   const autoSavePendingCountRef = useRef(0)
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
   const autoSaveStatusTimerRef = useRef<number | null>(null)
+  const continuousRetrySaveQueueRef = useRef(createContinuousRetrySaveQueue())
   const { toast, showToast } = useToast()
 
   useEffect(() => {
     settingsFormRef.current = settingsForm
   }, [settingsForm])
+
+  useEffect(() => {
+    setContinuousRetryStatusCodesDraft(continuousRetryStatusCodesText)
+  }, [continuousRetryStatusCodesText])
+
+  useEffect(() => {
+    setContinuousRetryErrorCodesDraft(continuousRetryErrorCodesText)
+  }, [continuousRetryErrorCodesText])
 
   useEffect(() => {
     return () => {
@@ -1628,6 +1672,10 @@ export default function Settings() {
       finishAutoSaveRequest('error')
     }
   }, [commitSettingsForm, finishAutoSaveRequest, showToast, t])
+
+  const autoSaveContinuousRetryPatch = useCallback((patch: Partial<SystemSettings>) => {
+    return continuousRetrySaveQueueRef.current(() => autoSaveSettingsPatch(patch))
+  }, [autoSaveSettingsPatch])
 
   const autoSaveBooleanField = useCallback((field: keyof SystemSettings, value: boolean, extraPatch: Partial<SystemSettings> = {}) => {
     void autoSaveSettingsPatch({
@@ -2298,6 +2346,131 @@ export default function Settings() {
                 </div>
               </div>
             </SettingsCard>
+            <div className="lg:col-span-2">
+              <SettingsCard
+                title={t('settings.continuousRetryTitle')}
+                description={t('settings.continuousRetryDesc')}
+                icon={<RefreshCw className="size-4" />}
+              >
+                <div className="space-y-4">
+                  <SettingField
+                    label={t('settings.continuousRetryEnabled')}
+                    description={t('settings.continuousRetryEnabledDesc')}
+                    layout="switch"
+                  >
+                    <Switch
+                      aria-label={t('settings.continuousRetryEnabled')}
+                      checked={settingsForm.continuous_retry_enabled}
+                      onCheckedChange={(checked) => void autoSaveContinuousRetryPatch(buildContinuousRetryEnabledPatch(checked))}
+                    />
+                  </SettingField>
+                  <SettingField
+                    label={t('settings.continuousRetryCatchAll')}
+                    description={t('settings.continuousRetryCatchAllDesc')}
+                    warning={t('settings.continuousRetryCatchAllWarning')}
+                    layout="switch"
+                    className={cn(
+                      'rounded-lg',
+                      settingsForm.continuous_retry_catch_all && 'border-amber-500/50 bg-amber-500/10 hover:border-amber-500/60',
+                    )}
+                  >
+                    <Switch
+                      aria-label={t('settings.continuousRetryCatchAll')}
+                      checked={settingsForm.continuous_retry_catch_all}
+                      onCheckedChange={(checked) => void autoSaveContinuousRetryPatch(buildContinuousRetryCatchAllPatch(checked))}
+                    />
+                  </SettingField>
+                  <SettingField
+                    label={t('settings.continuousRetryMaxDuration')}
+                    description={t('settings.continuousRetryMaxDurationDesc')}
+                  >
+                    <Input
+                      aria-label={t('settings.continuousRetryMaxDuration')}
+                      type="number"
+                      min={1}
+                      max={900}
+                      step={1}
+                      value={settingsForm.continuous_retry_max_duration_seconds}
+                      disabled={!settingsForm.continuous_retry_enabled}
+                      onChange={(event) => {
+                        const value = Number(event.target.value)
+                        setSettingsForm((current) => ({
+                          ...current,
+                          continuous_retry_max_duration_seconds: Number.isFinite(value) ? value : 600,
+                        }))
+                      }}
+                      onBlur={(event) => {
+                        const value = parseContinuousRetryMaxDurationSeconds(event.target.value)
+                        setSettingsForm((current) => ({ ...current, continuous_retry_max_duration_seconds: value }))
+                        void autoSaveContinuousRetryPatch({ continuous_retry_max_duration_seconds: value })
+                      }}
+                    />
+                  </SettingField>
+                  <div className={cn('grid gap-3 sm:grid-cols-2 lg:grid-cols-4', continuousRetryFineControlsDisabled && 'opacity-60')}>
+                    {continuousRetryCategoryOptions.map((option) => (
+                      <SettingField
+                        key={option.value}
+                        label={option.label}
+                        layout="switch"
+                        className="rounded-lg border border-border/60 px-3 py-2"
+                      >
+                        <Switch
+                          aria-label={option.label}
+                          checked={(settingsForm.continuous_retry_categories ?? []).includes(option.value)}
+                          disabled={continuousRetryFineControlsDisabled}
+                          onCheckedChange={(checked) => {
+                            const current = settingsFormRef.current.continuous_retry_categories ?? []
+                            const next = checked
+                              ? Array.from(new Set([...current, option.value]))
+                              : current.filter((value) => value !== option.value)
+                            void autoSaveContinuousRetryPatch({ continuous_retry_categories: next })
+                          }}
+                        />
+                      </SettingField>
+                    ))}
+                  </div>
+                  <div className="grid gap-4 lg:grid-cols-2">
+                    <SettingField
+                      label={t('settings.continuousRetryStatusCodes')}
+                      description={t('settings.continuousRetryStatusCodesDesc')}
+                    >
+                      <Input
+                        aria-label={t('settings.continuousRetryStatusCodes')}
+                        value={continuousRetryStatusCodesDraft}
+                        disabled={continuousRetryFineControlsDisabled}
+                        placeholder="403,404,429,500,501,502,503,504"
+                        onChange={(event) => setContinuousRetryStatusCodesDraft(event.target.value)}
+                        onBlur={(event) => {
+                          const values = parseContinuousRetryStatusCodes(event.target.value)
+                          setContinuousRetryStatusCodesDraft(values.join(','))
+                          void autoSaveContinuousRetryPatch({ continuous_retry_status_codes: values })
+                        }}
+                      />
+                    </SettingField>
+                    <SettingField
+                      label={t('settings.continuousRetryErrorCodes')}
+                      description={t('settings.continuousRetryErrorCodesDesc')}
+                    >
+                      <Input
+                        aria-label={t('settings.continuousRetryErrorCodes')}
+                        value={continuousRetryErrorCodesDraft}
+                        disabled={continuousRetryFineControlsDisabled}
+                        placeholder="rate_limited,context_length_exceeded"
+                        onChange={(event) => setContinuousRetryErrorCodesDraft(event.target.value)}
+                        onBlur={(event) => {
+                          const values = parseContinuousRetryErrorCodes(event.target.value)
+                          setContinuousRetryErrorCodesDraft(values.join(','))
+                          void autoSaveContinuousRetryPatch({ continuous_retry_error_codes: values })
+                        }}
+                      />
+                    </SettingField>
+                  </div>
+                  <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-400">
+                    {t('settings.continuousRetryWarning')}
+                  </p>
+                </div>
+              </SettingsCard>
+            </div>
           </div>
 
           <SettingsCard
@@ -2455,6 +2628,23 @@ export default function Settings() {
                 </div>
               </div>
             </div>
+          </SettingsCard>
+
+          <SettingsCard
+            title={t('settings.autoActivate5hTitle')}
+            description={t('settings.autoActivate5hDesc')}
+            icon={<Timer className="size-4" />}
+          >
+            <SettingField
+              label={t('settings.autoActivate5hEnabled')}
+              description={t('settings.autoActivate5hEnabledDesc')}
+              layout="switch"
+            >
+              <Switch
+                checked={Boolean(settingsForm.auto_activate_5h_window_enabled)}
+                onCheckedChange={(checked) => autoSaveBooleanField('auto_activate_5h_window_enabled', checked)}
+              />
+            </SettingField>
           </SettingsCard>
 
           <SettingsCard title={t('settings.schedulingStrategy')} icon={<Layers className="size-4" />}>
@@ -3497,6 +3687,30 @@ export default function Settings() {
                     onChange={(value) => autoSaveStringField('billing_tier_policy', value)}
                     options={billingTierPolicyOptions}
                   />
+                </SettingField>
+                <SettingField label={t('settings.modelsListReadMaxBytes')} description={t('settings.modelsListReadMaxBytesDesc')}>
+                  <div className="relative">
+                    <DraftNumberInput
+                      min={1}
+                      max={256}
+                      className="pr-12 tabular-nums"
+                      value={bytesToMiB(settingsForm.models_list_read_max_bytes)}
+                      onValueChange={(value) =>
+                        setSettingsForm((form) => ({
+                          ...form,
+                          models_list_read_max_bytes: mibToBytes(value),
+                        }))
+                      }
+                      onValueCommit={(value) =>
+                        void autoSaveSettingsPatch({
+                          models_list_read_max_bytes: mibToBytes(value),
+                        })
+                      }
+                    />
+                    <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-medium text-muted-foreground">
+                      MiB
+                    </span>
+                  </div>
                 </SettingField>
                 <SettingField label={t('settings.streamFlushPolicy')} description={t('settings.streamFlushPolicyDesc')}>
                   <SegmentedPillGroup

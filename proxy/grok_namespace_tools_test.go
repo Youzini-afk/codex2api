@@ -71,6 +71,9 @@ func TestGrokCustomResponseRestoration(t *testing.T) {
 	if got := gjson.GetBytes(nonStream, "output.0.type").String(); got != "custom_tool_call" {
 		t.Fatalf("non-stream type = %q; body=%s", got, nonStream)
 	}
+	if got := gjson.GetBytes(nonStream, "output.0.id").String(); got != "ctc_1" {
+		t.Fatalf("non-stream custom id = %q, want ctc_1; body=%s", got, nonStream)
+	}
 	if got := gjson.GetBytes(nonStream, "output.0.input").String(); got != "patch text" {
 		t.Fatalf("non-stream input = %q; body=%s", got, nonStream)
 	}
@@ -79,6 +82,9 @@ func TestGrokCustomResponseRestoration(t *testing.T) {
 	added := r.rewriteLine([]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":\"\"}}\n"))
 	if got := gjson.GetBytes(bytesAfterSSEData(added), "item.type").String(); got != "custom_tool_call" {
 		t.Fatalf("stream added type = %q; line=%s", got, added)
+	}
+	if got := gjson.GetBytes(bytesAfterSSEData(added), "item.id").String(); got != "ctc_1" {
+		t.Fatalf("stream added custom id = %q, want ctc_1; line=%s", got, added)
 	}
 	delta := r.rewriteLine([]byte("data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\"}\n"))
 	if delta != nil {
@@ -90,6 +96,17 @@ func TestGrokCustomResponseRestoration(t *testing.T) {
 	}
 	if got := gjson.GetBytes(bytesAfterSSEData(done), "input").String(); got != "patch text" {
 		t.Fatalf("stream done input = %q; line=%s", got, done)
+	}
+	if got := gjson.GetBytes(bytesAfterSSEData(done), "item_id").String(); got != "ctc_1" {
+		t.Fatalf("stream done custom item_id = %q, want ctc_1; line=%s", got, done)
+	}
+	itemDone := r.rewriteLine([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"patch text\\\"}\"}}\n"))
+	if got := gjson.GetBytes(bytesAfterSSEData(itemDone), "item.id").String(); got != "ctc_1" {
+		t.Fatalf("stream done item custom id = %q, want ctc_1; line=%s", got, itemDone)
+	}
+	completed := r.rewriteLine([]byte("data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"patch text\\\"}\"}]}}\n"))
+	if got := gjson.GetBytes(bytesAfterSSEData(completed), "response.output.0.id").String(); got != "ctc_1" {
+		t.Fatalf("stream completed custom id = %q, want ctc_1; line=%s", got, completed)
 	}
 }
 
@@ -113,6 +130,9 @@ func TestGrokAdditionalToolsAndToolSearchMatrix(t *testing.T) {
 	}
 	proxyName := ""
 	for alias, metadata := range result.Aliases {
+		if alias == "tool_search" {
+			continue // 习惯名反解映射,不是出站声明名(map 迭代顺序随机,不跳过会间歇取错)
+		}
 		if metadata.ToolSearch {
 			proxyName = alias
 			break
@@ -136,6 +156,9 @@ func TestGrokAdditionalToolsAndToolSearchMatrix(t *testing.T) {
 	if got := gjson.GetBytes(nonStream, "output.0.type").String(); got != "tool_search_call" {
 		t.Fatalf("restored tool_search type = %q; body=%s", got, nonStream)
 	}
+	if got := gjson.GetBytes(nonStream, "output.0.id").String(); got != "tsc_ts" {
+		t.Fatalf("restored tool_search id = %q, want tsc_ts; body=%s", got, nonStream)
+	}
 	if got := gjson.GetBytes(nonStream, "output.0.arguments.query").String(); got != "github" {
 		t.Fatalf("restored tool_search query = %q; body=%s", got, nonStream)
 	}
@@ -145,11 +168,33 @@ func TestGrokAdditionalToolsAndToolSearchMatrix(t *testing.T) {
 	if got := gjson.GetBytes(bytesAfterSSEData(added), "item.type").String(); got != "tool_search_call" {
 		t.Fatalf("stream tool_search added type = %q; line=%s", got, added)
 	}
+	if got := gjson.GetBytes(bytesAfterSSEData(added), "item.id").String(); got != "tsc_ts" {
+		t.Fatalf("stream tool_search id = %q, want tsc_ts; line=%s", got, added)
+	}
 	if leaked := r.rewriteLine([]byte("data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_ts\",\"delta\":\"{}\"}\n")); leaked != nil {
 		t.Fatalf("tool_search argument delta leaked: %s", leaked)
 	}
 	if leaked := r.rewriteLine([]byte("data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_ts\",\"arguments\":\"{}\"}\n")); leaked != nil {
 		t.Fatalf("tool_search argument done leaked: %s", leaked)
+	}
+}
+
+func TestRetypeGrokResponsesToolCallItemIDOnlyChangesKnownPrefixes(t *testing.T) {
+	tests := []struct {
+		id       string
+		itemType string
+		want     string
+	}{
+		{id: "fc_custom", itemType: "custom_tool_call", want: "ctc_custom"},
+		{id: "fc_search", itemType: "tool_search_call", want: "tsc_search"},
+		{id: "ctc_custom", itemType: "custom_tool_call", want: "ctc_custom"},
+		{id: "external-id", itemType: "custom_tool_call", want: "external-id"},
+		{id: "fc_function", itemType: "function_call", want: "fc_function"},
+	}
+	for _, tc := range tests {
+		if got := retypeGrokResponsesToolCallItemID(tc.id, tc.itemType); got != tc.want {
+			t.Errorf("retype(%q, %q) = %q, want %q", tc.id, tc.itemType, got, tc.want)
+		}
 	}
 }
 
@@ -856,5 +901,95 @@ func TestGrokTypeArrayNullableRootDropsRequiredLikeUnion(t *testing.T) {
 	}
 	if schema.Get("required").Exists() {
 		t.Fatalf("required must be dropped to match the equivalent anyOf-null form: %s", schema.Get("required").Raw)
+	}
+}
+
+// Grok 上游把 "tool_search" 保留给内置工具,同名 function 声明会被
+// 400 拒绝。代理别名与用户自带的同名 function 都必须避开保留名,
+// 且模型按声明名或习惯名回调时都能反解。
+func TestGrokToolSearchAvoidsReservedUpstreamFunctionName(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[
+			{"type":"tool_search"},
+			{"type":"function","name":"tool_search","parameters":{"type":"object"}}
+		],
+		"input":[{"type":"message","role":"user","content":"hi"}]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	for _, tool := range gjson.GetBytes(result.Body, "tools").Array() {
+		if tool.Get("type").String() == "function" && tool.Get("name").String() == "tool_search" {
+			t.Fatalf("reserved function name leaked upstream: %s", result.Body)
+		}
+	}
+
+	proxyName := ""
+	userAlias := ""
+	for alias, metadata := range result.Aliases {
+		if alias == "tool_search" {
+			continue
+		}
+		if metadata.ToolSearch {
+			proxyName = alias
+		} else if metadata.Name == "tool_search" {
+			userAlias = alias
+		}
+	}
+	if proxyName == "" || proxyName == "tool_search" {
+		t.Fatalf("tool_search proxy alias not remapped: aliases=%#v", result.Aliases)
+	}
+	if userAlias == "" || userAlias == "tool_search" {
+		t.Fatalf("user function named tool_search not remapped: aliases=%#v", result.Aliases)
+	}
+
+	restored := reverseGrokNamespaceJSON([]byte(`{"output":[{"type":"function_call","call_id":"fc_1","name":"`+userAlias+`","arguments":"{}"}]}`), result.Aliases)
+	if got := gjson.GetBytes(restored, "output.0.name").String(); got != "tool_search" {
+		t.Fatalf("user tool_search function name = %q; body=%s", got, restored)
+	}
+	if got := gjson.GetBytes(restored, "output.0.type").String(); got != "function_call" {
+		t.Fatalf("user tool_search call type = %q; body=%s", got, restored)
+	}
+
+	habitual := reverseGrokNamespaceJSON([]byte(`{"output":[{"type":"function_call","call_id":"fc_2","name":"tool_search","arguments":"{\"query\":\"x\"}"}]}`), result.Aliases)
+	if got := gjson.GetBytes(habitual, "output.0.type").String(); got != "tool_search_call" {
+		t.Fatalf("habitual tool_search call type = %q; body=%s", got, habitual)
+	}
+}
+
+// 历史 function_call 的保留名必须跟声明侧一起改名:声明被挪到 tool_search_fn
+// 而历史仍引用 tool_search 时,上游按保留名/未声明名拒绝,或与内置 tool_search
+// 混淆。多轮工具会话是常态形态,声明与历史必须始终同名。
+func TestGrokReservedFunctionNameRenamedInHistoryCalls(t *testing.T) {
+	body := []byte(`{
+		"model":"grok-4.6",
+		"tools":[{"type":"function","name":"tool_search","parameters":{"type":"object"}}],
+		"input":[
+			{"type":"message","role":"user","content":"hi"},
+			{"type":"function_call","call_id":"c1","name":"tool_search","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":"ok"}
+		]
+	}`)
+	result := prepareGrokUpstreamBody(body)
+	declared := gjson.GetBytes(result.Body, `tools.0.name`).String()
+	historical := gjson.GetBytes(result.Body, `input.1.name`).String()
+	if declared == "tool_search" {
+		t.Fatalf("reserved declaration leaked upstream: %s", result.Body)
+	}
+	if historical != declared {
+		t.Fatalf("history call name %q diverged from declaration %q: %s", historical, declared, result.Body)
+	}
+
+	// 本轮未再声明该工具(如工具被裁剪)时,历史里的保留名同样不能原样出站,
+	// 且纯历史改名必须触发重新序列化。
+	historyOnly := []byte(`{
+		"model":"grok-4.6",
+		"input":[
+			{"type":"function_call","call_id":"c2","name":"tool_search","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c2","output":"ok"}
+		]
+	}`)
+	historyResult := prepareGrokUpstreamBody(historyOnly)
+	if got := gjson.GetBytes(historyResult.Body, `input.0.name`).String(); got == "tool_search" {
+		t.Fatalf("reserved history call name leaked upstream without declaration: %s", historyResult.Body)
 	}
 }

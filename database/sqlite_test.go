@@ -147,6 +147,39 @@ func TestSQLiteSessionSlotBufferSettingsRoundtrip(t *testing.T) {
 	}
 }
 
+func TestSQLiteModelsListReadLimitRoundTripAndFullUpdatePreservesValue(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "models-list-limit.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	const want = int64(16 << 20)
+	if err := db.UpdateModelsListReadMaxBytes(ctx, want); err != nil {
+		t.Fatalf("UpdateModelsListReadMaxBytes: %v", err)
+	}
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if settings.ModelsListReadMaxBytes != want {
+		t.Fatalf("read limit = %d, want %d", settings.ModelsListReadMaxBytes, want)
+	}
+
+	settings.SiteName = "preserve-model-list-limit"
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after full update: %v", err)
+	}
+	if settings.ModelsListReadMaxBytes != want {
+		t.Fatalf("read limit after full update = %d, want %d", settings.ModelsListReadMaxBytes, want)
+	}
+}
+
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1559,6 +1592,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		IgnoreUsageLimitStatus:              true,
 		AutoResetCreditsEnabled:             true,
 		AutoResetCreditsBeforeExpiryMin:     75,
+		AutoActivate5hWindowEnabled:         true,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1590,6 +1624,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.AutoResetCreditsBeforeExpiryMin != 75 {
 		t.Fatalf("AutoResetCreditsBeforeExpiryMin = %d, want 75", settings.AutoResetCreditsBeforeExpiryMin)
+	}
+	if !settings.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = false, want true")
 	}
 	if settings.TestContent != "say pong" {
 		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
@@ -1766,6 +1803,7 @@ func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testi
 	settings := &SystemSettings{
 		AutoResetCreditsEnabled:         true,
 		AutoResetCreditsBeforeExpiryMin: 90,
+		AutoActivate5hWindowEnabled:     true,
 		ModelPricingOverrides:           `{"old":{"input":1}}`,
 		ModelPricingSyncURL:             "https://old.example/pricing.json",
 	}
@@ -1804,6 +1842,9 @@ func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testi
 	}
 	if !got.AutoResetCreditsEnabled || got.AutoResetCreditsBeforeExpiryMin != 90 {
 		t.Fatalf("auto reset settings = (%v,%d), want (true,90)", got.AutoResetCreditsEnabled, got.AutoResetCreditsBeforeExpiryMin)
+	}
+	if !got.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = false, want true")
 	}
 	if got.CodexSyncedCLIVersion != "9.9.9" {
 		t.Fatalf("CodexSyncedCLIVersion = %q, want 9.9.9", got.CodexSyncedCLIVersion)
@@ -3769,21 +3810,21 @@ func TestGetAccountModelCountsSinceByIDsMatchesTodayUsage(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
-	insert := func(accountID int64, createdAt time.Time, model, effective string, retry any, statusCode int) {
+	insert := func(accountID int64, createdAt time.Time, model, effective string, retry any, statusCode, firstTokenMs int) {
 		t.Helper()
 		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
-			(account_id, status_code, total_tokens, is_retry_attempt, model, effective_model, created_at)
-			VALUES ($1, $2, 10, $3, $4, $5, $6)`, accountID, statusCode, retry, model, effective, sqliteTimeParam(createdAt)); err != nil {
+			(account_id, status_code, total_tokens, is_retry_attempt, model, effective_model, first_token_ms, created_at)
+			VALUES ($1, $2, 10, $3, $4, $5, $6, $7)`, accountID, statusCode, retry, model, effective, firstTokenMs, sqliteTimeParam(createdAt)); err != nil {
 			t.Fatalf("insert usage log: %v", err)
 		}
 	}
-	insert(1, now.Add(-time.Hour), "gpt-5.4", "", 0, 200)
-	insert(1, now.Add(-50*time.Minute), "gpt-5.4", "", 0, 429)
-	insert(1, now.Add(-2*time.Hour), "gpt-5.2", "gpt-5.2-codex", 0, 200)
-	insert(1, now.Add(-30*time.Minute), "gpt-5.4", "", 1, 200)
-	insert(1, now.Add(-20*time.Minute), "gpt-5.4", "", 0, 499)
-	insert(1, now.Add(-26*time.Hour), "gpt-5.3", "", 0, 200)
-	insert(2, now.Add(-time.Hour), "grok-4", "", 0, 200)
+	insert(1, now.Add(-time.Hour), "gpt-5.4", "", 0, 200, 1200)
+	insert(1, now.Add(-50*time.Minute), "gpt-5.4", "", 0, 429, 1800)
+	insert(1, now.Add(-2*time.Hour), "gpt-5.2", "gpt-5.2-codex", 0, 200, 500)
+	insert(1, now.Add(-30*time.Minute), "gpt-5.4", "", 1, 200, 2400)
+	insert(1, now.Add(-20*time.Minute), "gpt-5.4", "", 0, 499, 3000)
+	insert(1, now.Add(-26*time.Hour), "gpt-5.3", "", 0, 200, 700)
+	insert(2, now.Add(-time.Hour), "grok-4", "", 0, 200, 900)
 
 	usage, err := db.GetAccountUsageSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
 	if err != nil {
@@ -3798,6 +3839,9 @@ func TestGetAccountModelCountsSinceByIDsMatchesTodayUsage(t *testing.T) {
 	}
 	if models[1]["gpt-5.4"].Requests != 2 || models[1]["gpt-5.4"].Success != 1 || models[1]["gpt-5.2-codex"].Requests != 1 || models[1]["gpt-5.2-codex"].Success != 1 || models[1]["gpt-5.3"].Requests != 0 {
 		t.Fatalf("today models account 1 = %#v, want gpt-5.4=2/1 gpt-5.2-codex=1/1", models[1])
+	}
+	if models[1]["gpt-5.4"].AvgFirstTokenMs != 1500 || models[1]["gpt-5.2-codex"].AvgFirstTokenMs != 500 {
+		t.Fatalf("today model first-token averages = %#v, want gpt-5.4=1500 gpt-5.2-codex=500", models[1])
 	}
 	if models[2]["grok-4"].Requests != 1 || models[2]["grok-4"].Success != 1 {
 		t.Fatalf("today models account 2 = %#v, want grok-4=1/1", models[2])

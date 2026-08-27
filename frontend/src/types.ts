@@ -38,6 +38,7 @@ export interface AccountUsageWindow {
   user_billed?: number
   model_counts?: Record<string, number>
   model_success_counts?: Record<string, number>
+  model_avg_first_token_ms?: Record<string, number>
 }
 
 export interface GrokProductUsage {
@@ -123,6 +124,7 @@ export interface AccountRow {
   antigravity_permissions?: AntigravityPermissionsSnapshot
   antigravity_sync_warning?: string
   base_url?: string
+  balance_query_url?: string
   models?: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
@@ -210,8 +212,10 @@ export interface AccountRow {
   usage_window_7d_seconds?: number
   billed_5h?: number
   billed_7d?: number
-  // 官方结算口径的近 7 天成本(美元)。来自 account_daily_usage 快照,与
-  // billed_7d(本地日志算的网关成本)是两套账,列表里并排展示。
+  // 官方结算口径的累计成本(美元)。来自 account_daily_usage 快照全窗口,
+  // 与 billed_7d(本地日志算的网关成本)是两套账,列表里并排展示。
+  official_usd?: number
+  // 兼容旧 page-stats 字段；值与 official_usd 相同,不再表示「只含 7 天」。
   official_usd_7d?: number
   // 官方快照已成功同步过但上游窗口内没有数据(官方统计有滞后)。
   // 有这个标记时不再重拉 page-stats,胶囊显示静态"暂无数据"而非转圈。
@@ -298,6 +302,7 @@ export interface AccountPageStatsItem {
   usage_today_detail?: AccountUsageWindow
   billed_5h?: number
   billed_7d?: number
+  official_usd?: number
   official_usd_7d?: number
   official_usage_synced?: boolean
 }
@@ -625,6 +630,7 @@ export interface AddOpenAIResponsesAccountRequest {
   name?: string
   base_url: string
   api_key: string
+  balance_query_url?: string
   models: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
@@ -636,6 +642,7 @@ export interface UpdateOpenAIResponsesAccountRequest {
   name?: string
   base_url: string
   api_key?: string
+  balance_query_url?: string
   models: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
@@ -653,6 +660,14 @@ export interface FetchOpenAIResponsesModelsRequest {
 export interface FetchOpenAIResponsesModelsResponse {
   base_url: string
   models: string[]
+}
+
+export interface OpenAIResponsesBalanceResponse {
+  balance: number
+  unit: string
+  source: string
+  unlimited?: boolean
+  queried_at: ISODateString
 }
 
 export type GrokAuthKind = 'oauth' | 'api_key'
@@ -1625,6 +1640,7 @@ export interface SystemSettings {
   auto_clean_expired: boolean
   auto_reset_credits_enabled: boolean
   auto_reset_credits_before_expiry_min: number
+  auto_activate_5h_window_enabled: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   scheduler_engine: 'legacy' | 'shadow' | 'indexed'
@@ -1679,6 +1695,12 @@ export interface SystemSettings {
   max_rate_limit_retries: number
   retry_interval_ms: number
   transport_retry_policy: string
+  continuous_retry_enabled: boolean
+  continuous_retry_catch_all: boolean
+  continuous_retry_categories: string[]
+  continuous_retry_status_codes: number[]
+  continuous_retry_error_codes: string[]
+  continuous_retry_max_duration_seconds: number
   /** 新导入/新建 Codex 账号默认盖上的设备指纹收敛档位（off/device/session/full）。 */
   codex_fingerprint_default_mode: string
   allow_remote_migration: boolean
@@ -1739,6 +1761,7 @@ export interface SystemSettings {
   first_token_timeout_seconds: number
   first_token_excludes_ws_acquire: boolean
   billing_tier_policy: 'actual' | 'requested' | string
+  models_list_read_max_bytes: number
   show_full_usage_numbers: boolean
   public_key_usage_page_enabled: boolean
   public_image_studio_page_enabled: boolean
@@ -2096,6 +2119,7 @@ export interface PromptConversationLock {
   id: number
   lock_key: string
   status: 'active' | 'unlocked'
+  identity_kind: 'newapi' | 'codex_session' | 'fingerprint_replay' | string
   platform: string
   newapi_user_id: string
   session_fingerprint: string
@@ -2111,7 +2135,7 @@ export interface PromptConversationLock {
   locked_at: ISODateString
   unlocked_at?: ISODateString
   unlock_reason?: string
-  restriction_scope?: 'conversation' | 'user_cooldown'
+	restriction_scope?: 'conversation' | 'user_cooldown' | 'fingerprint_replay'
   expires_at?: ISODateString
   remaining_seconds?: number
   created_at: ISODateString
@@ -2923,10 +2947,10 @@ export interface ModelPricingOverride {
   input_long?: number
   cached_input_long?: number
   output_long?: number
-	input_long_priority?: number
-	cached_input_long_priority?: number
-	output_long_priority?: number
-	long_context_threshold_tokens?: number
+  input_long_priority?: number
+  cached_input_long_priority?: number
+  output_long_priority?: number
+  long_context_threshold_tokens?: number
 }
 
 export interface OfficialPricingSyncConfig {

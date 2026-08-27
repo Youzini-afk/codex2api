@@ -191,6 +191,9 @@ type Account struct {
 	Reset5hAt           time.Time // 5h 窗口重置时间
 	UsageUpdatedAt      time.Time // 兼容旧字段：最近一次 7d/通用用量快照刷新时间
 	UsageUpdatedAt5h    time.Time // 5h 用量快照刷新时间
+	// activated5hResetAt 是已经为其发送过「开窗」最小 /responses 的那个 Reset5hAt。
+	// 每个观测到的 5h 窗口最多激活一次（issue #581）。
+	activated5hResetAt time.Time
 	// Spark 是 Pro/Prolite 账号上独立于主 5h/7d 的用量窗口。
 	UsagePercentSpark      float64
 	UsagePercentSparkValid bool
@@ -2317,6 +2320,71 @@ func (a *Account) GetUsagePercent5h() (float64, bool) {
 	return a.UsagePercent5h, a.UsagePercent5hValid
 }
 
+// Mark5hWindowActivated 记录已经为哪个 Reset5hAt 发送过开窗请求。
+func (a *Account) Mark5hWindowActivated(resetAt time.Time) {
+	if a == nil || resetAt.IsZero() {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.activated5hResetAt = resetAt
+}
+
+// GetActivated5hResetAt 返回最近一次 5h 开窗请求对应的 Reset5hAt。
+func (a *Account) GetActivated5hResetAt() time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.activated5hResetAt
+}
+
+// ShouldActivate5hWindow 判断账号是否需要发送一次真实最小 /responses 来启动下一轮 5h 窗口。
+// 只认上游观测到的 5h + reset 时间，不按套餐写死；每个 Reset5hAt 最多一次。
+func (a *Account) ShouldActivate5hWindow(now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.AccessToken == "" && !a.isCodexAgentIdentityLocked() {
+		return false
+	}
+	if a.isRelayStyleLocked() {
+		return false
+	}
+	if a.Status == StatusError {
+		return false
+	}
+	if a.healthTierLocked() == HealthTierBanned {
+		return false
+	}
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+		return false
+	}
+	if a.quotaAutoPausedLocked(now) {
+		return false
+	}
+	if a.rawUsageExhaustedLocked() || a.rawUsageWindow7dExhaustedLocked(now) {
+		return false
+	}
+	if !a.UsagePercent5hValid || a.Reset5hAt.IsZero() || a.Reset5hAt.After(now) {
+		return false
+	}
+	if !a.activated5hResetAt.IsZero() && a.activated5hResetAt.Unix() == a.Reset5hAt.Unix() {
+		return false
+	}
+	return true
+}
+
 // SetRateLimitResetCredits 记录账号剩余的「主动重置次数」。
 func (a *Account) SetRateLimitResetCredits(count int) {
 	a.mu.Lock()
@@ -3379,10 +3447,11 @@ type Store struct {
 	ignoreUsageLimitStatus       atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
 
 	// 重试间隔与传输错误重试策略（issue #331）
-	retryIntervalMS      atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
-	transportRetryPolicy atomic.Value // 传输错误重试策略: rotate / sticky
-	githubToken          atomic.Value // GitHub API token，仅发给 api.github.com（issue #522）
-	githubProxyURL       atomic.Value // GitHub 域名专用出站代理，空回落全局/环境代理（issue #522）
+	retryIntervalMS       atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
+	transportRetryPolicy  atomic.Value // 传输错误重试策略: rotate / sticky
+	continuousRetryPolicy atomic.Value // database.ContinuousRetryPolicy（默认关闭）
+	githubToken           atomic.Value // GitHub API token，仅发给 api.github.com（issue #522）
+	githubProxyURL        atomic.Value // GitHub 域名专用出站代理，空回落全局/环境代理（issue #522）
 
 	// 新导入/新建 Codex 账号默认盖上的指纹收敛档位: off / device / session / full
 	codexFingerprintDefaultMode atomic.Value
@@ -3439,6 +3508,23 @@ type sessionAffinity struct {
 	boundAt      time.Time
 	requestCount int64
 	expiresAt    time.Time
+}
+
+// SessionAffinityGuard carries the one-request decision made while selecting
+// an account for an existing sticky session. A non-zero guard means the bound
+// account was otherwise eligible but temporarily had no concurrency capacity,
+// so the selected fallback must not replace the durable binding.
+//
+// The preserved account ID is intentionally private: callers may only pass the
+// opaque decision back to Store when binding the selected account.
+type SessionAffinityGuard struct {
+	preserveAccountID int64
+}
+
+// PreservesExisting reports whether this selection is a temporary capacity
+// spillover whose durable affinity must remain unchanged.
+func (g SessionAffinityGuard) PreservesExisting() bool {
+	return g.preserveAccountID != 0
 }
 
 const defaultSessionAffinityTTL = time.Hour
@@ -3962,6 +4048,11 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.ignoreUsageLimitStatus.Store(settings.IgnoreUsageLimitStatus)
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
+	continuousPolicy := database.ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy)
+	if strings.TrimSpace(settings.ContinuousRetryPolicy) == "" {
+		continuousPolicy = database.DefaultContinuousRetryPolicy()
+	}
+	s.continuousRetryPolicy.Store(continuousPolicy)
 	s.codexFingerprintDefaultMode.Store(NormalizeCodexFingerprintMode(settings.CodexFingerprintDefaultMode))
 	s.githubToken.Store(strings.TrimSpace(settings.GithubToken))
 	s.githubProxyURL.Store(strings.TrimSpace(settings.GithubProxyURL))
@@ -5410,6 +5501,13 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 			account.SetUsageSnapshot5hAt(parsed, resetAt, usageUpdated5hAt)
 		}
 	}
+	if activatedResetAt := row.GetCredential("codex_5h_window_activated_reset_at"); activatedResetAt != "" {
+		if t, err := time.Parse(time.RFC3339, activatedResetAt); err == nil {
+			account.Mark5hWindowActivated(t)
+		} else {
+			log.Printf("[账号 %d] 解析 codex_5h_window_activated_reset_at 失败: %v", row.ID, err)
+		}
+	}
 	if usagePctSpark := row.GetCredential("codex_spark_used_percent"); usagePctSpark != "" {
 		if parsed, err := strconv.ParseFloat(usagePctSpark, 64); err == nil {
 			resetAt := time.Time{}
@@ -5994,26 +6092,39 @@ func (s *Store) NextExcluding(apiKeyID int64, exclude map[int64]bool) *Account {
 	return s.NextExcludingWithFilter(apiKeyID, exclude, nil)
 }
 
-func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLimit bool) bool {
+type accountAcquireFailure uint8
+
+const (
+	accountAcquireFailureNone accountAcquireFailure = iota
+	accountAcquireFailureCapacity
+	accountAcquireFailureDispatchLimit
+)
+
+func (s *Store) tryAcquireAccountWithFailure(acc *Account, limit int64, updateSchedulerOnLimit bool) (bool, accountAcquireFailure) {
 	if acc == nil || limit <= 0 {
-		return false
+		return false, accountAcquireFailureDispatchLimit
 	}
 	if !reserveOccupiedAccountSlot(acc, limit) {
-		return false
+		return false, accountAcquireFailureCapacity
 	}
 	now := time.Now()
 	reservation := acc.reserveDispatchCount(now)
 	if !reservation.Allowed {
 		releaseOccupiedAccountSlot(acc)
 		s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
-		return false
+		return false, accountAcquireFailureDispatchLimit
 	}
 	atomic.AddInt64(&acc.TotalRequests, 1)
 	atomic.StoreInt64(&acc.LastUsedAt, now.UnixNano())
 	if reservation.HitLimit {
 		s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
 	}
-	return true
+	return true, accountAcquireFailureNone
+}
+
+func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLimit bool) bool {
+	acquired, _ := s.tryAcquireAccountWithFailure(acc, limit, updateSchedulerOnLimit)
+	return acquired
 }
 
 // accountOccupiedRequests is a pure snapshot. All production admission paths
@@ -6431,6 +6542,16 @@ func (s *Store) BindSessionAffinity(key string, account *Account, proxyURL strin
 	s.bindSessionAffinity(key, account, proxyURL)
 }
 
+// BindSessionAffinityWithGuard records the selected account unless selection
+// identified it as a one-request capacity spillover. In that case the existing
+// healthy binding remains authoritative and the fallback stays request-local.
+func (s *Store) BindSessionAffinityWithGuard(key string, account *Account, proxyURL string, guard SessionAffinityGuard) {
+	if guard.PreservesExisting() {
+		return
+	}
+	s.bindSessionAffinity(key, account, proxyURL)
+}
+
 func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL string) {
 	if s == nil || account == nil {
 		return
@@ -6554,11 +6675,20 @@ func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]boo
 // 解除发生时绕过 binding 走完整挑号策略(NextExcludingWithFilter),后续 BindSessionAffinity
 // 会重新建立绑定。
 func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	return account, proxyURL
 }
 
 // NextForSessionWithDispatch 优先复用绑定账号，并按用量策略选号。
 func (s *Store) NextForSessionWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, policy)
+	return account, proxyURL
+}
+
+// NextForSessionWithDispatchGuard is the binding-aware variant used by proxy
+// request paths. The returned guard must be passed to BindSessionAffinityWithGuard
+// after the attempt is selected or committed.
+func (s *Store) NextForSessionWithDispatchGuard(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
 	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, policy)
 }
 
@@ -6567,12 +6697,14 @@ func (s *Store) NextForSessionWithDispatch(key string, apiKeyID int64, exclude m
 // to the account that created them, so bounded-affinity escape must not rotate
 // accounts.
 func (s *Store) NextForContinuationWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	return account, proxyURL
 }
 
 // NextForContinuationWithDispatch preserves a bound turn and applies a usage policy.
 func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, policy)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, policy)
+	return account, proxyURL
 }
 
 // nextForSessionWithFilter 是会话选号的统一实现。preserveBinding=true(续链请求)时
@@ -6583,14 +6715,15 @@ func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, excl
 //   - 绑定账号当前取不到（超并发/冷却/被本次请求排除）时返回 nil 而不是回退到
 //     别的账号。调用方据此决定是等它空出来，还是剥离续链 id 降级换号。
 //
-// 绑定本身不存在（新会话/绑定已 TTL 过期）时仍走完整挑号，与普通请求一致。
-func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string) {
+// 绑定本身不存在时仍走完整挑号，与普通请求一致；TTL 过期只影响普通请求，
+// preserveBinding=true 的续链请求仍保留原账号。
+func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
 	if s == nil {
-		return nil, ""
+		return nil, "", SessionAffinityGuard{}
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), ""
+		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
 	}
 
 	now := time.Now()
@@ -6606,13 +6739,13 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 	if mode == AffinityModeOff && !preserveBinding {
-		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), ""
+		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
 	}
 
 	if ok {
 		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
 			if preserveBinding {
-				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key, policy), ""
+				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key, policy), "", SessionAffinityGuard{}
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
 			ok = false
@@ -6634,26 +6767,37 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 
 		if expired || escape {
 			s.UnbindSessionAffinity(key, binding.accountID)
-		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding, key, policy); acc != nil {
-			// 命中粘性,记一次复用
-			s.sessionMu.Lock()
-			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
-				current.requestCount++
-				s.sessionBindings[key] = current
+		} else {
+			acc, capacityFull := s.takeByIDModeWithCapacity(binding.accountID, apiKeyID, exclude, filter, preserveBinding, key, policy)
+			if acc != nil {
+				// 命中粘性,记一次复用
+				s.sessionMu.Lock()
+				if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
+					current.requestCount++
+					s.sessionBindings[key] = current
+				}
+				s.sessionMu.Unlock()
+				return acc, binding.proxyURL, SessionAffinityGuard{}
 			}
-			s.sessionMu.Unlock()
-			return acc, binding.proxyURL
-		} else if preserveBinding {
-			return nil, ""
+			if preserveBinding {
+				return nil, "", SessionAffinityGuard{}
+			}
+			if capacityFull {
+				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy)
+				if fallback == nil {
+					return nil, "", SessionAffinityGuard{}
+				}
+				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
+			}
 		}
 	}
 	if binding, ok := s.getCachedSessionAffinity(key); ok {
 		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
 			if preserveBinding {
-				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key, policy), ""
+				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key, policy), "", SessionAffinityGuard{}
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
-			return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), ""
+			return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
 		}
 		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
 		cacheMode := mode
@@ -6662,20 +6806,31 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 		if cacheMode == AffinityModeBounded && !preserveBinding && !s.affinityAccountStillHealthy(binding.accountID) {
 			// 不复用,落到完整挑号
-		} else if acc := s.takeByIDMode(binding.accountID, apiKeyID, exclude, filter, preserveBinding, key, policy); acc != nil {
-			s.sessionMu.Lock()
-			if s.sessionBindings == nil {
-				s.sessionBindings = make(map[string]sessionAffinity)
+		} else {
+			acc, capacityFull := s.takeByIDModeWithCapacity(binding.accountID, apiKeyID, exclude, filter, preserveBinding, key, policy)
+			if acc != nil {
+				s.sessionMu.Lock()
+				if s.sessionBindings == nil {
+					s.sessionBindings = make(map[string]sessionAffinity)
+				}
+				s.sessionBindings[key] = binding
+				s.sessionMu.Unlock()
+				return acc, binding.proxyURL, SessionAffinityGuard{}
 			}
-			s.sessionBindings[key] = binding
-			s.sessionMu.Unlock()
-			return acc, binding.proxyURL
-		} else if preserveBinding {
-			return nil, ""
+			if preserveBinding {
+				return nil, "", SessionAffinityGuard{}
+			}
+			if capacityFull {
+				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy)
+				if fallback == nil {
+					return nil, "", SessionAffinityGuard{}
+				}
+				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
+			}
 		}
 	}
 
-	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), ""
+	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
 }
 
 // nextAccountForFreshAffinity 为"新亲和键首次绑定"选号(issue #484)。
@@ -6940,18 +7095,26 @@ func (s *Store) takeByIDForContinuation(id int64, apiKeyID int64, exclude map[in
 }
 
 func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, continuation bool, sessionKey string, policy DispatchPolicy) *Account {
+	account, _ := s.takeByIDModeWithCapacity(id, apiKeyID, exclude, filter, continuation, sessionKey, policy)
+	return account
+}
+
+// takeByIDModeWithCapacity distinguishes a pure concurrency miss from every
+// other reason a bound account cannot be selected. Only the former is safe to
+// treat as a one-request spillover without migrating the durable binding.
+func (s *Store) takeByIDModeWithCapacity(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, continuation bool, sessionKey string, policy DispatchPolicy) (*Account, bool) {
 	if s == nil || id == 0 {
-		return nil
+		return nil, false
 	}
 	if exclude != nil && exclude[id] {
-		return nil
+		return nil, false
 	}
 
 	s.mu.RLock()
 	target := s.lookupByIDLocked(id)
 	s.mu.RUnlock()
 	if target == nil {
-		return nil
+		return nil, false
 	}
 	usageMaxAge := s.GetUsageProbeMaxAge()
 	usageLimitContinuationEligible := continuation && policy == DispatchPolicyStandard && target.UsageLimitContinuationEligible()
@@ -6959,39 +7122,47 @@ func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, f
 	sparkEligible := policy == DispatchPolicySpark && target.SparkDispatchEligible()
 	if s.GetLazyMode() {
 		if !s.accountLazySelectable(target) && !continuationEligible && !sparkEligible {
-			return nil
+			return nil, false
 		}
 	} else if policy == DispatchPolicySpark && !sparkEligible {
-		return nil
+		return nil, false
 	} else if policy == DispatchPolicyStandard && !target.IsAvailableWithUsageProbeMaxAge(usageMaxAge) && !continuationEligible {
-		return nil
+		return nil, false
 	}
 	if s.accountHasCachedCooldown(target) {
 		usageLimitContinuationEligible = continuation && policy == DispatchPolicyStandard && target.UsageLimitContinuationEligible()
 		continuationEligible = usageLimitContinuationEligible
 		sparkEligible = policy == DispatchPolicySpark && target.SparkDispatchEligible()
 		if !usageLimitContinuationEligible && !sparkEligible {
-			return nil
+			return nil, false
 		}
 	}
 	if !s.accountAllowedForAPIKey(target, apiKeyID) {
-		return nil
+		return nil, false
 	}
 	filter = s.withUsableEgressFilter(filter)
 	if filter != nil && !filter(target) {
-		return nil
+		return nil, false
 	}
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	now := time.Now()
 	if s.GetLazyMode() && !continuationEligible && !sparkEligible {
 		if s.tryReclaimSessionSlot(target, sessionKey, true) {
-			return target
+			return target, false
 		}
-		if !s.acquireLazyCandidate(target, maxConcurrency) {
-			return nil
+		if !s.ensureLazyDispatchReady(target) {
+			return nil, false
 		}
-		return target
+		_, _, _, limit := target.schedulerSnapshot(maxConcurrency)
+		if limit <= 0 {
+			return nil, false
+		}
+		acquired, failure := s.tryAcquireAccountWithFailure(target, limit, true)
+		if !acquired {
+			return nil, failure == accountAcquireFailureCapacity
+		}
+		return target, false
 	}
 
 	var limit int64
@@ -7004,15 +7175,16 @@ func (s *Store) takeByIDMode(id int64, apiKeyID int64, exclude map[int64]bool, f
 		_, _, limit, _, available = target.fastSchedulerSnapshot(maxConcurrency, usageMaxAge, now)
 	}
 	if !available || limit <= 0 {
-		return nil
+		return nil, false
 	}
 	if s.tryReclaimSessionSlot(target, sessionKey, true) {
-		return target
+		return target, false
 	}
-	if !s.tryAcquireAccount(target, limit, true) {
-		return nil
+	acquired, failure := s.tryAcquireAccountWithFailure(target, limit, true)
+	if !acquired {
+		return nil, failure == accountAcquireFailureCapacity
 	}
-	return target
+	return target, false
 }
 
 // WaitForAvailable 等待可用账号（带超时的请求排队）
@@ -7173,24 +7345,34 @@ func (s *Store) hasContinuationCandidateWithDispatch(key string, apiKeyID int64,
 
 // WaitForSessionAvailableWithFilter waits for an account that satisfies the request-level filter.
 func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	return account, proxyURL
 }
 
 func (s *Store) WaitForSessionAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	return account, proxyURL
+}
+
+// WaitForSessionAvailableWithDispatchGuard is the binding-aware waiting path.
+// It preserves the capacity-spillover decision made by the successful retry.
+func (s *Store) WaitForSessionAvailableWithDispatchGuard(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
 	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
 }
 
 // WaitForContinuationAvailableWithFilter waits for the account already bound
 // to a stateful continuation instead of falling through to another account.
 func (s *Store) WaitForContinuationAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	return account, proxyURL
 }
 
 func (s *Store) WaitForContinuationAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, policy)
+	account, proxyURL, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, policy)
+	return account, proxyURL
 }
 
-func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string) {
+func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -7205,10 +7387,10 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 	// even when the current snapshot is empty; an account created by another
 	// replica can then wake the request without database polling.
 	if s.SchedulerEngine() == "legacy" && !hasCandidate() {
-		return nil, ""
+		return nil, "", SessionAffinityGuard{}
 	}
 	if timeout <= 0 {
-		return nil, ""
+		return nil, "", SessionAffinityGuard{}
 	}
 
 	metrics := s.schedulerMetrics
@@ -7234,16 +7416,17 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 		changed, _ := hub.subscribe()
 		var acc *Account
 		var proxyURL string
+		var guard SessionAffinityGuard
 		if preserveBinding {
 			acc, proxyURL = s.NextForContinuationWithDispatch(key, apiKeyID, exclude, filter, policy)
 		} else {
-			acc, proxyURL = s.NextForSessionWithDispatch(key, apiKeyID, exclude, filter, policy)
+			acc, proxyURL, guard = s.NextForSessionWithDispatchGuard(key, apiKeyID, exclude, filter, policy)
 		}
 		if acc != nil {
-			return acc, proxyURL
+			return acc, proxyURL, guard
 		}
 		if s.SchedulerEngine() == "legacy" && !hasCandidate() {
-			return nil, ""
+			return nil, "", SessionAffinityGuard{}
 		}
 
 		select {
@@ -7258,12 +7441,12 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 			if metrics != nil {
 				metrics.waitCanceled.Add(1)
 			}
-			return nil, ""
+			return nil, "", SessionAffinityGuard{}
 		case <-deadline.C:
 			if metrics != nil {
 				metrics.waitTimeouts.Add(1)
 			}
-			return nil, ""
+			return nil, "", SessionAffinityGuard{}
 		}
 	}
 }
@@ -7365,6 +7548,18 @@ func (s *Store) ReleaseForSession(acc *Account, sessionKey string) {
 	time.AfterFunc(buffer, func() {
 		s.expireSessionSlot(acc, sessionKey, reservationID)
 	})
+}
+
+// ReleaseForSessionWithGuard avoids reserving capacity on a temporary fallback.
+// The durable owner remains a different account, so a fallback reservation
+// cannot be reclaimed through the normal bound-account path and would only
+// suppress usable capacity until the buffer expires.
+func (s *Store) ReleaseForSessionWithGuard(acc *Account, sessionKey string, guard SessionAffinityGuard) {
+	if guard.PreservesExisting() {
+		s.Release(acc)
+		return
+	}
+	s.ReleaseForSession(acc, sessionKey)
 }
 
 func (s *Store) expireSessionSlot(acc *Account, sessionKey string, reservationID uint64) {
@@ -7540,6 +7735,25 @@ func (s *Store) GetTransportRetryPolicy() string {
 		return v
 	}
 	return "rotate"
+}
+
+// SetContinuousRetryPolicy 热更新上游错误持续重试策略。
+func (s *Store) SetContinuousRetryPolicy(policy database.ContinuousRetryPolicy) {
+	if s == nil {
+		return
+	}
+	s.continuousRetryPolicy.Store(database.NormalizeContinuousRetryPolicy(policy))
+}
+
+// GetContinuousRetryPolicy 返回当前上游错误持续重试策略的值快照。
+func (s *Store) GetContinuousRetryPolicy() database.ContinuousRetryPolicy {
+	if s == nil {
+		return database.DefaultContinuousRetryPolicy()
+	}
+	if value, ok := s.continuousRetryPolicy.Load().(database.ContinuousRetryPolicy); ok {
+		return database.NormalizeContinuousRetryPolicy(value)
+	}
+	return database.DefaultContinuousRetryPolicy()
 }
 
 // SetCodexFingerprintDefaultMode 动态更新新导入账号的默认指纹收敛档位。
