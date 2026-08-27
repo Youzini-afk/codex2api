@@ -349,7 +349,6 @@ func (h *Handler) buildAccountResponse(
 			resp.CooldownReason = reason
 			resp.CooldownUntil = until.Format(time.RFC3339)
 		}
-		resp.UsageReserveActiveWindows = runtimeAccount.GetUsageReserveActiveWindows(h.store.GetUsageProbeMaxAge())
 		if includeDetails {
 			for _, cooldown := range runtimeAccount.ActiveModelCooldowns() {
 				resp.ModelCooldowns = append(resp.ModelCooldowns, modelCooldownResponse{

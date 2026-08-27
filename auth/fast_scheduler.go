@@ -813,18 +813,12 @@ func (a *Account) fastSchedulerSnapshotForContinuation(baseLimit int64, args ...
 	return a.fastSchedulerSnapshotWithUsageOverride(baseLimit, true, args...)
 }
 
-// fastSchedulerSnapshotWithUsageOverride accepts both the historical
-// (baseLimit, now) form and the usage-reserve-aware
-// (baseLimit, usageMaxAge, now) form.
+// fastSchedulerSnapshotWithUsageOverride accepts both historical call forms;
+// time.Duration arguments from the retired fork reserve feature are ignored.
 func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, continuation bool, args ...interface{}) (AccountHealthTier, float64, int64, bool, bool) {
-	usageMaxAge := defaultUsageProbeMaxAge
 	now := time.Now()
 	for _, arg := range args {
 		switch v := arg.(type) {
-		case time.Duration:
-			if v > 0 {
-				usageMaxAge = v
-			}
 		case time.Time:
 			now = v
 		}
@@ -878,12 +872,6 @@ func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, contin
 		!continuationUsageOverride {
 		available = false
 	}
-	// Usage reserve protects new work while allowing an already bound upstream
-	// turn to finish on the account that owns its continuation state.
-	if a.usageReserveActiveLocked(now, usageMaxAge) && !continuation {
-		available = false
-	}
-
 	tier, limit, available = a.applyAntigravitySchedulerOverrideLocked(baseLimit, tier, limit, available)
 	return tier, score, limit, proven, available
 }

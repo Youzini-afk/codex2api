@@ -1135,9 +1135,6 @@ func (a *Account) dispatchBonusEligibleLocked(now time.Time, tier AccountHealthT
 	if a.usageExhaustedLocked() {
 		return false
 	}
-	if a.usageReserveActiveLocked(now, defaultUsageProbeMaxAge) {
-		return false
-	}
 	if a.quotaAutoPausedLocked(now) {
 		return false
 	}
@@ -1223,9 +1220,6 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		tier = HealthTierBanned
 	}
 	if a.premium5hRateLimitedLocked(now) && tier != HealthTierBanned {
-		tier = HealthTierRisky
-	}
-	if a.usageReserveActiveLocked(now, defaultUsageProbeMaxAge) && tier != HealthTierBanned {
 		tier = HealthTierRisky
 	}
 	if a.Status == StatusCooldown && a.CooldownReason == premium5hCooldownReason && tier != HealthTierBanned {
@@ -1348,11 +1342,6 @@ func (a *Account) usageReserveActiveLocked(now time.Time, maxAge time.Duration) 
 
 // IsAvailable 检查账号是否可用
 func (a *Account) IsAvailable() bool {
-	return a.IsAvailableWithUsageProbeMaxAge(defaultUsageProbeMaxAge)
-}
-
-// IsAvailableWithUsageProbeMaxAge checks availability using the same usage snapshot freshness policy as usage probes.
-func (a *Account) IsAvailableWithUsageProbeMaxAge(maxAge time.Duration) bool {
 	// 原子标志优先：401 时瞬间置位，无需等锁即可拦截并发请求
 	if atomic.LoadInt32(&a.Disabled) != 0 {
 		return false
@@ -1364,14 +1353,17 @@ func (a *Account) IsAvailableWithUsageProbeMaxAge(maxAge time.Duration) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	return a.isAvailableLockedWithUsageProbeMaxAge(time.Now(), maxAge)
+	return a.isAvailableLocked(time.Now())
+}
+
+// IsAvailableWithUsageProbeMaxAge is retained for source compatibility with
+// older fork callers. Current upstream scheduling owns usage-window freshness,
+// so the legacy per-account reserve max-age no longer changes availability.
+func (a *Account) IsAvailableWithUsageProbeMaxAge(_ time.Duration) bool {
+	return a.IsAvailable()
 }
 
 func (a *Account) isAvailableLocked(now time.Time) bool {
-	return a.isAvailableLockedWithUsageProbeMaxAge(now, defaultUsageProbeMaxAge)
-}
-
-func (a *Account) isAvailableLockedWithUsageProbeMaxAge(now time.Time, maxAge time.Duration) bool {
 	if a.Status == StatusError {
 		return false
 	}
@@ -1394,9 +1386,6 @@ func (a *Account) isAvailableLockedWithUsageProbeMaxAge(now time.Time, maxAge ti
 	// IgnoreUsageLimitStatus only protects an already active continuation;
 	// fresh sessions remain fenced by the latest local usage observation.
 	if a.usageWindowBlocksFreshDispatchLocked(now) {
-		return false
-	}
-	if a.usageReserveActiveLocked(now, maxAge) {
 		return false
 	}
 	if a.quotaAutoPausedLocked(now) {
@@ -1884,17 +1873,8 @@ func (a *Account) UsageLimitContinuationEligible() bool {
 // bypass a local fresh-dispatch usage gate. Usage-window bypass remains tied
 // to IgnoreUsageLimitStatus; reserve bypass preserves an already established
 // upstream turn on the account that owns its continuation state.
-func (a *Account) localUsageContinuationEligible(maxAge time.Duration) bool {
-	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
-		return false
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	now := time.Now()
-	if a.Status == StatusError || a.healthTierLocked() == HealthTierBanned {
-		return false
-	}
-	return a.usageLimitContinuationEligibleLocked(now) || a.usageReserveActiveLocked(now, maxAge)
+func (a *Account) localUsageContinuationEligible(_ time.Duration) bool {
+	return a.UsageLimitContinuationEligible()
 }
 
 // FreshDispatchUsageLimited reports whether this otherwise dispatchable
@@ -2085,22 +2065,20 @@ func (a *Account) ModelCatalogEligible() bool {
 
 // RuntimeStatus 返回运行时状态字符串（供 admin API 使用）
 func (a *Account) RuntimeStatus() string {
-	return a.RuntimeStatusWithUsageProbeMaxAge(defaultUsageProbeMaxAge)
-}
-
-func (a *Account) RuntimeStatusWithUsageProbeMaxAge(maxAge time.Duration) string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.runtimeStatusLockedWithUsageProbeMaxAge(time.Now(), maxAge)
+	return a.runtimeStatusLocked(time.Now())
+}
+
+func (a *Account) RuntimeStatusWithUsageProbeMaxAge(_ time.Duration) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.runtimeStatusLocked(time.Now())
 }
 
 // runtimeStatusLocked returns the public runtime status while the caller
 // holds a.mu for reading or writing.
 func (a *Account) runtimeStatusLocked(now time.Time) string {
-	return a.runtimeStatusLockedWithUsageProbeMaxAge(now, defaultUsageProbeMaxAge)
-}
-
-func (a *Account) runtimeStatusLockedWithUsageProbeMaxAge(now time.Time, maxAge time.Duration) string {
 	if a.healthTierLocked() == HealthTierBanned {
 		return "unauthorized"
 	}
@@ -2127,9 +2105,6 @@ func (a *Account) runtimeStatusLockedWithUsageProbeMaxAge(now time.Time, maxAge 
 	}
 	if a.usageWindowBlocksFreshDispatchLocked(now) {
 		return "rate_limited"
-	}
-	if a.usageReserveActiveLocked(now, maxAge) {
-		return "usage_reserved"
 	}
 	switch a.Status {
 	case StatusError:
@@ -3122,23 +3097,6 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 		return resetCreditsStale
 	}
 	if resetCreditsStale {
-		return true
-	}
-	if usageReserveWindowNeedsProbe(
-		a.UsagePercent5hValid,
-		a.Reset5hAt,
-		usageWindowUpdatedAt(a.UsageUpdatedAt5h, a.UsageUpdatedAt),
-		a.UsageReservePercent5h,
-		now,
-		maxAge,
-	) || usageReserveWindowNeedsProbe(
-		a.UsagePercent7dValid,
-		a.Reset7dAt,
-		usageWindowUpdatedAt(a.UsageUpdated7dAt, a.UsageUpdatedAt),
-		a.UsageReservePercent7d,
-		now,
-		maxAge,
-	) {
 		return true
 	}
 	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() || now.Sub(a.UsageUpdatedAt) > maxAge {
@@ -11100,7 +11058,6 @@ func (s *Store) HealthCountsNonBlocking() (available int, total int, complete bo
 	total = len(accounts)
 	now := time.Now()
 	lazy := s.GetLazyMode()
-	usageProbeMaxAge := s.GetUsageProbeMaxAge()
 	for _, acc := range accounts {
 		if acc == nil {
 			continue
@@ -11115,7 +11072,7 @@ func (s *Store) HealthCountsNonBlocking() (available int, total int, complete bo
 		// Mirror AvailableCount: lazy mode accepts refresh/session-token-only
 		// accounts that hydrate on demand, otherwise a healthy lazy pool would
 		// report zero available.
-		if (lazy && acc.lazySelectableLocked(now)) || (!lazy && acc.isAvailableLockedWithUsageProbeMaxAge(now, usageProbeMaxAge)) {
+		if (lazy && acc.lazySelectableLocked(now)) || (!lazy && acc.isAvailableLocked(now)) {
 			available++
 		}
 		acc.mu.RUnlock()

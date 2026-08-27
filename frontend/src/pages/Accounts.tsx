@@ -9282,105 +9282,6 @@ export default function Accounts() {
                             </div>
                           </div>
                         </div>
-                        <div className="rounded-xl border border-border p-4 md:col-span-2">
-                          <div className="text-sm font-semibold text-foreground">
-                            {t("accounts.usageReserveLabel")}
-                          </div>
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            {t("accounts.usageReserveHint")}
-                          </div>
-                          <div className="mt-4 grid gap-4 md:grid-cols-2">
-                            <div className="rounded-lg border border-border bg-muted/20 p-3">
-                              <div className="flex items-center justify-between gap-3">
-                                <div>
-                                  <div className="text-sm font-semibold text-foreground">
-                                    {t("accounts.usageReserve5hLabel")}
-                                  </div>
-                                  <div className="mt-1 text-xs text-muted-foreground">
-                                    {formatRemainingPreview(editPreview.reserve5hRemaining, t)}
-                                  </div>
-                                </div>
-                                {editPreview.reserve5hActive && (
-                                  <span className="rounded-full bg-cyan-500/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-600 dark:text-cyan-300">
-                                    {t("accounts.usageReserveActive")}
-                                  </span>
-                                )}
-                              </div>
-                              <div className="mt-3 flex gap-2">
-                                <TogglePill
-                                  active={reserve5hMode === "off"}
-                                  onClick={() => setReserve5hMode("off")}
-                                  label={t("accounts.usageReserveOff")}
-                                />
-                                <TogglePill
-                                  active={reserve5hMode === "custom"}
-                                  onClick={() => setReserve5hMode("custom")}
-                                  label={t("accounts.schedulerCustom")}
-                                />
-                              </div>
-                              {reserve5hMode === "custom" && (
-                                <div className="mt-3 space-y-2">
-                                  <Input
-                                    inputMode="numeric"
-                                    value={reserve5hInput}
-                                    onChange={(event: ChangeEvent<HTMLInputElement>) => setReserve5hInput(event.target.value)}
-                                    placeholder={t("accounts.usageReservePlaceholder")}
-                                  />
-                                  <div className={`text-xs ${reserve5hInputInvalid ? "text-red-500" : "text-muted-foreground"}`}>
-                                    {reserve5hInputInvalid
-                                      ? t("accounts.usageReserveRange")
-                                      : t("accounts.usageReserveCustomValuePreview", { value: parsedReserve5h ?? 0 })}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-
-                            <div className="rounded-lg border border-border bg-muted/20 p-3">
-                              <div className="flex items-center justify-between gap-3">
-                                <div>
-                                  <div className="text-sm font-semibold text-foreground">
-                                    {t("accounts.usageReserve7dLabel")}
-                                  </div>
-                                  <div className="mt-1 text-xs text-muted-foreground">
-                                    {formatRemainingPreview(editPreview.reserve7dRemaining, t)}
-                                  </div>
-                                </div>
-                                {editPreview.reserve7dActive && (
-                                  <span className="rounded-full bg-cyan-500/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-600 dark:text-cyan-300">
-                                    {t("accounts.usageReserveActive")}
-                                  </span>
-                                )}
-                              </div>
-                              <div className="mt-3 flex gap-2">
-                                <TogglePill
-                                  active={reserve7dMode === "off"}
-                                  onClick={() => setReserve7dMode("off")}
-                                  label={t("accounts.usageReserveOff")}
-                                />
-                                <TogglePill
-                                  active={reserve7dMode === "custom"}
-                                  onClick={() => setReserve7dMode("custom")}
-                                  label={t("accounts.schedulerCustom")}
-                                />
-                              </div>
-                              {reserve7dMode === "custom" && (
-                                <div className="mt-3 space-y-2">
-                                  <Input
-                                    inputMode="numeric"
-                                    value={reserve7dInput}
-                                    onChange={(event: ChangeEvent<HTMLInputElement>) => setReserve7dInput(event.target.value)}
-                                    placeholder={t("accounts.usageReservePlaceholder")}
-                                  />
-                                  <div className={`text-xs ${reserve7dInputInvalid ? "text-red-500" : "text-muted-foreground"}`}>
-                                    {reserve7dInputInvalid
-                                      ? t("accounts.usageReserveRange")
-                                      : t("accounts.usageReserveCustomValuePreview", { value: parsedReserve7d ?? 0 })}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
                       </div>
                     </div>
 
@@ -15137,12 +15038,6 @@ function UsageCell({
   const longWindowLabel = formatLongUsageWindowLabel(account);
   // 5h 是上游可选窗口：仅数据存在时展示，不再因 premium plan 强制占位（issue #382）
   const showFiveHour = fiveHourPresent;
-  const reserveWindows = account.usage_reserve_active_windows ?? [];
-  const reserveHint = reserveWindows.length > 0 ? (
-    <div className="text-[11px] font-semibold text-cyan-600 dark:text-cyan-300">
-      {t("accounts.usageReserveWindowActive", { windows: reserveWindows.join(" / ") })}
-    </div>
-  ) : null;
 
   const sparkBar = showSpark ? (
     hasSparkPct ? (
@@ -15191,7 +15086,6 @@ function UsageCell({
           ) : (
             <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
           )}
-          {reserveHint}
         </div>
         {refreshButton}
       </div>
@@ -15217,7 +15111,6 @@ function UsageCell({
               apiAccount={account.openai_responses_api}
             />
           )}
-          {reserveHint}
         </div>
         {refreshButton}
       </div>
@@ -15242,7 +15135,6 @@ function UsageCell({
               apiAccount={account.openai_responses_api}
             />
           )}
-          {reserveHint}
         </div>
         {refreshButton}
       </div>

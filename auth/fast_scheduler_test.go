@@ -57,27 +57,17 @@ func TestFastSchedulerSkipsDispatchPausedAccount(t *testing.T) {
 	}
 }
 
-func TestFastSchedulerSkipsUsageReservedAccount(t *testing.T) {
+func TestFastSchedulerIgnoresLegacyUsageReserve(t *testing.T) {
 	now := time.Now()
-	reserved := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
-	reserved.UsageReservePercent7d = int64Ptr(15)
-	reserved.UsagePercent7d = 90
-	reserved.UsagePercent7dValid = true
-	reserved.Reset7dAt = now.Add(24 * time.Hour)
-	reserved.UsageUpdatedAt = now
-	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
-
-	scheduler := NewFastScheduler(2, 10*time.Minute)
-	scheduler.Rebuild([]*Account{reserved, fallback})
-
-	got := scheduler.Acquire()
-	if got == nil {
-		t.Fatal("Acquire() returned nil")
-	}
-	defer scheduler.Release(got)
-
-	if got.DBID != fallback.DBID {
-		t.Fatalf("Acquire() picked dbID=%d, want %d", got.DBID, fallback.DBID)
+	preferred := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	preferred.UsageReservePercent7d = int64Ptr(15)
+	preferred.UsagePercent7d = 90
+	preferred.UsagePercent7dValid = true
+	preferred.Reset7dAt = now.Add(24 * time.Hour)
+	preferred.UsageUpdatedAt = now
+	_, _, limit, _, available := preferred.fastSchedulerSnapshot(2, now)
+	if !available || limit <= 0 {
+		t.Fatalf("legacy usage reserve unexpectedly blocked fast scheduler: available=%t limit=%d", available, limit)
 	}
 }
 
