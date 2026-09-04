@@ -385,9 +385,14 @@ func NewWithOptions(driver string, dsn string, options Options) (*DB, error) {
 		}
 		options.SQLiteMigrationSourcePath = validatedPath
 	}
+	// 测试注册了 schema 模板且目标文件尚不存在时，直接复制模板并跳过迁移。
+	fromSchemaTemplate := false
 	if driver == "sqlite" {
 		if err := ensureSQLiteParentDir(dsn); err != nil {
 			return nil, fmt.Errorf("创建 SQLite 数据目录失败: %w", err)
+		}
+		if target, ok := sqliteSchemaTemplateTarget(dsn); ok {
+			fromSchemaTemplate = applySQLiteSchemaTemplate(target)
 		}
 		dsn = sqliteConnectDSN(dsn)
 	} else if pgSchema != "" {
@@ -490,30 +495,34 @@ func NewWithOptions(driver string, dsn string, options Options) (*DB, error) {
 		}
 	}
 	schemaOnlyAutoImport := migrationGuard != nil && !migrationGuard.completed
-	if schemaOnlyAutoImport {
-		err = db.migratePostgresSchema(initCtx)
-	} else {
-		err = db.migrate(initCtx)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("数据库迁移失败: %w", err)
-	}
-	if err := db.ensurePromptFilterNewAPIBindingsTable(initCtx); err != nil {
-		return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
-	}
-	if err := db.ensurePromptRuleCandidatesTable(initCtx); err != nil {
-		return nil, fmt.Errorf("创建提示词规则候选表失败: %w", err)
-	}
-	if err := db.ensurePromptPolicyIncidentsTable(initCtx); err != nil {
-		return nil, fmt.Errorf("创建提示词策略事件表失败: %w", err)
-	}
-	if options.AutoMigrateFromSQLite {
-		if err := db.ensurePromptRiskTrustTables(initCtx); err != nil {
-			return nil, fmt.Errorf("创建提示词风险信任表失败: %w", err)
+	// 模板复制出来的库已经包含下面全部 schema（模板本身就是走完整路径建出来的），
+	// 跳过迁移与各 ensure*：在 -race 下这些幂等 DDL 每次仍要几百毫秒。
+	if !fromSchemaTemplate {
+		if schemaOnlyAutoImport {
+			err = db.migratePostgresSchema(initCtx)
+		} else {
+			err = db.migrate(initCtx)
 		}
-	}
-	if err := db.ensurePromptConversationLocksTable(initCtx); err != nil {
-		return nil, fmt.Errorf("创建提示词会话锁表失败: %w", err)
+		if err != nil {
+			return nil, fmt.Errorf("数据库迁移失败: %w", err)
+		}
+		if err := db.ensurePromptFilterNewAPIBindingsTable(initCtx); err != nil {
+			return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
+		}
+		if err := db.ensurePromptRuleCandidatesTable(initCtx); err != nil {
+			return nil, fmt.Errorf("创建提示词规则候选表失败: %w", err)
+		}
+		if err := db.ensurePromptPolicyIncidentsTable(initCtx); err != nil {
+			return nil, fmt.Errorf("创建提示词策略事件表失败: %w", err)
+		}
+		if options.AutoMigrateFromSQLite {
+			if err := db.ensurePromptRiskTrustTables(initCtx); err != nil {
+				return nil, fmt.Errorf("创建提示词风险信任表失败: %w", err)
+			}
+		}
+		if err := db.ensurePromptConversationLocksTable(initCtx); err != nil {
+			return nil, fmt.Errorf("创建提示词会话锁表失败: %w", err)
+		}
 	}
 
 	baselineInsert := `
@@ -557,11 +566,13 @@ func NewWithOptions(driver string, dsn string, options Options) (*DB, error) {
 	// Grok 的历史回填必须在可选 SQLite 导入之后执行，否则空目标库会先写入
 	// 完成标记，随后导入的账号将永远跳过 family / state 回填。该回填可能耗时
 	// 数分钟，因此沿用独立、有限且不继承启动取消信号的上下文。
-	grokStateCtx, grokStateCancel := grokStateStartupContext(initCtx)
-	grokStateErr := db.ensureGrokStateSchema(grokStateCtx)
-	grokStateCancel()
-	if grokStateErr != nil {
-		return nil, fmt.Errorf("初始化 Grok 状态表失败: %w", grokStateErr)
+	if !fromSchemaTemplate {
+		grokStateCtx, grokStateCancel := grokStateStartupContext(initCtx)
+		grokStateErr := db.ensureGrokStateSchema(grokStateCtx)
+		grokStateCancel()
+		if grokStateErr != nil {
+			return nil, fmt.Errorf("初始化 Grok 状态表失败: %w", grokStateErr)
+		}
 	}
 
 	// 自动迁移需要在目标空库检查之前避免创建这条业务基线；迁移完成或默认启动路径
