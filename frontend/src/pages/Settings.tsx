@@ -7,10 +7,16 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
+import type { AntigravityOAuthClientSetting, HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
 import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
+import {
+  CLAUDE_TIMEZONE_CUSTOM,
+  CLAUDE_TIMEZONE_OPTIONS,
+  claudeTimezoneLabel,
+  findClaudeTimezoneOption,
+} from '../lib/claudeAccountOptions'
 import { buildWritableSettingsPayload } from '../lib/settingsPayload'
 import {
   buildContinuousRetryCatchAllPatch,
@@ -128,6 +134,7 @@ const RESPONSE_CACHE_BUDGET_KEYS = [
   'response_cache_local_max_bytes',
   'response_cache_local_max_entry_bytes',
   'response_cache_reconstruct_max_bytes',
+  'response_cache_write_policy',
 ] as const satisfies ReadonlyArray<keyof SystemSettings>
 const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   raw_user_agent: '',
@@ -202,6 +209,7 @@ const normalizeResponseCacheSettings = (settings: SystemSettings): SystemSetting
   response_cache_reconstruct_max_bytes: Number.isFinite(settings.response_cache_reconstruct_max_bytes)
     ? settings.response_cache_reconstruct_max_bytes
     : DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+  response_cache_write_policy: settings.response_cache_write_policy === 'on_demand' ? 'on_demand' : 'always',
   response_cache_config_generation: Number.isFinite(settings.response_cache_config_generation)
     ? settings.response_cache_config_generation
     : 0,
@@ -689,6 +697,283 @@ function ReasoningEffortModelsEditor({
 const SETTINGS_FIELD_GRID = 'grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2'
 const SETTINGS_FIELD_GRID_3 = 'grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2 xl:grid-cols-3'
 const SETTINGS_SWITCH_GRID = 'grid grid-cols-1 gap-3 sm:grid-cols-2'
+
+// ClaudeCodeSettingsCard 是 ClaudeCode 全局配置卡片(独立读写 /settings/claude-config)。
+// 全体 Claude 账号默认遵守;个体账号可在「账号管理 → 编辑账号」里覆盖。
+function ClaudeCodeSettingsCard() {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [fingerprintMode, setFingerprintMode] = useState<'preserve' | 'force' | ''>('')
+  const [clientPlatform, setClientPlatform] = useState<'any' | 'claude_code_cli_only'>('any')
+  const [versionPolicy, setVersionPolicy] = useState<'passthrough' | 'fixed' | 'minimum'>('passthrough')
+  const [clientVersion, setClientVersion] = useState('')
+  const [timezone, setTimezone] = useState('')
+  const [timezoneCustom, setTimezoneCustom] = useState(false)
+  const [sessionWindow, setSessionWindow] = useState('')
+  const [allowServiceTier, setAllowServiceTier] = useState(false)
+  const [allowInferenceGeo, setAllowInferenceGeo] = useState(false)
+  const [allowSpeed, setAllowSpeed] = useState(false)
+  const [allowSafetyIdentifier, setAllowSafetyIdentifier] = useState(false)
+  const [allowedBetaHeaders, setAllowedBetaHeaders] = useState('')
+  const [maxOutputTokens, setMaxOutputTokens] = useState('0')
+  const [maxToolCount, setMaxToolCount] = useState('0')
+  const [maxToolSchemaBytes, setMaxToolSchemaBytes] = useState('0')
+  const [cliVersionSyncEnabled, setCliVersionSyncEnabled] = useState(true)
+  const [cliVersionSyncIntervalHours, setCliVersionSyncIntervalHours] = useState(12)
+  const [syncedCliVersion, setSyncedCliVersion] = useState('')
+  const [effectiveCliVersion, setEffectiveCliVersion] = useState('')
+  const [syncingCliVersion, setSyncingCliVersion] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    void api
+      .getClaudeConfig()
+      .then((cfg) => {
+        if (cancelled) return
+        setFingerprintMode((cfg.fingerprint_mode as 'preserve' | 'force' | '') ?? '')
+        setClientPlatform(cfg.client_platform ?? 'any')
+        setVersionPolicy(cfg.version_policy ?? 'passthrough')
+        setClientVersion(cfg.client_version ?? '')
+        setTimezone(cfg.default_timezone ?? '')
+        setTimezoneCustom(Boolean(cfg.default_timezone && !findClaudeTimezoneOption(cfg.default_timezone)))
+        setSessionWindow(cfg.session_window_limit ? String(cfg.session_window_limit) : '')
+        setAllowServiceTier(Boolean(cfg.allow_service_tier))
+        setAllowInferenceGeo(Boolean(cfg.allow_inference_geo))
+        setAllowSpeed(Boolean(cfg.allow_speed))
+        setAllowSafetyIdentifier(Boolean(cfg.allow_safety_identifier))
+        setAllowedBetaHeaders((cfg.allowed_beta_headers ?? []).join(', '))
+        setMaxOutputTokens(String(cfg.max_output_tokens ?? 0))
+        setMaxToolCount(String(cfg.max_tool_count ?? 0))
+        setMaxToolSchemaBytes(String(cfg.max_tool_schema_bytes ?? 0))
+        setCliVersionSyncEnabled(cfg.cli_version_sync_enabled ?? true)
+        setCliVersionSyncIntervalHours(cfg.cli_version_sync_interval_hours || 12)
+        setSyncedCliVersion(cfg.synced_cli_version ?? '')
+        setEffectiveCliVersion(cfg.effective_cli_version ?? cfg.builtin_cli_version ?? '')
+      })
+      .catch(() => {
+        /* 读取失败保持默认空 */
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const save = useCallback(async () => {
+    setSaving(true)
+    try {
+      const n = Number(sessionWindow.trim())
+      const maxOutputValue = Number(maxOutputTokens.trim())
+      const maxToolValue = Number(maxToolCount.trim())
+      const maxToolSchemaValue = Number(maxToolSchemaBytes.trim())
+      await api.updateClaudeConfig({
+        fingerprint_mode: fingerprintMode,
+        client_platform: clientPlatform,
+        version_policy: versionPolicy,
+        client_version: versionPolicy === 'passthrough' ? '' : clientVersion.trim(),
+        default_timezone: timezone.trim(),
+        session_window_limit: Number.isFinite(n) && n > 0 ? Math.floor(n) : 0,
+        allow_service_tier: allowServiceTier,
+        allow_inference_geo: allowInferenceGeo,
+        allow_speed: allowSpeed,
+        allow_safety_identifier: allowSafetyIdentifier,
+        allowed_beta_headers: allowedBetaHeaders.split(',').map((item) => item.trim()).filter(Boolean),
+        max_output_tokens: Number.isFinite(maxOutputValue) && maxOutputValue >= 0 ? Math.floor(maxOutputValue) : 0,
+        max_tool_count: Number.isFinite(maxToolValue) && maxToolValue >= 0 ? Math.floor(maxToolValue) : 0,
+        max_tool_schema_bytes: Number.isFinite(maxToolSchemaValue) && maxToolSchemaValue >= 0 ? Math.floor(maxToolSchemaValue) : 0,
+        cli_version_sync_enabled: cliVersionSyncEnabled,
+        cli_version_sync_interval_hours: cliVersionSyncIntervalHours,
+      })
+      showToast(t('settings.claudeSaved'), 'success')
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setSaving(false)
+    }
+  }, [allowInferenceGeo, allowSafetyIdentifier, allowServiceTier, allowSpeed, allowedBetaHeaders, cliVersionSyncEnabled, cliVersionSyncIntervalHours, clientPlatform, clientVersion, fingerprintMode, maxOutputTokens, maxToolCount, maxToolSchemaBytes, sessionWindow, showToast, t, timezone, versionPolicy])
+
+  const handleSyncClaudeCliVersion = useCallback(async () => {
+    setSyncingCliVersion(true)
+    try {
+      const result = await api.syncClaudeCLIVersion()
+      if (result.updated) setSyncedCliVersion(result.fetched_version)
+      setEffectiveCliVersion(result.effective_version)
+      showToast(t('settings.claudeCliVersionSyncSuccess', { version: result.effective_version, accounts: result.accounts_refreshed }), 'success')
+      if (result.warning) {
+        showToast(t('settings.claudeCliVersionSyncWarning', { version: result.effective_version, message: result.warning }), 'warning')
+      }
+    } catch (error) {
+      showToast(`${t('settings.claudeCliVersionSyncFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setSyncingCliVersion(false)
+    }
+  }, [showToast, t])
+
+  return (
+    <SettingsCard
+      title={t('settings.claudeSettingsTitle')}
+      description={t('settings.claudeSettingsDesc')}
+      icon={<ChannelLogo channel="claude" size={16} />}
+      footer={
+        <div className="flex justify-end">
+          <Button onClick={() => void save()} disabled={loading || saving}>
+            {t('common.save')}
+          </Button>
+        </div>
+      }
+    >
+      <div className={SETTINGS_FIELD_GRID_3}>
+        <SettingField label={t('settings.claudeSessionWindow')} description={t('settings.claudeSessionWindowDesc')}>
+          <Input
+            value={sessionWindow}
+            onChange={(e) => setSessionWindow(e.target.value)}
+            placeholder={t('settings.claudeFollowGlobal')}
+            inputMode="numeric"
+          />
+        </SettingField>
+        <SettingField label={t('settings.claudeFingerprintMode')} description={t('settings.claudeFingerprintModeDesc')}>
+          <Select
+            value={fingerprintMode}
+            onValueChange={(value) => setFingerprintMode(value as 'preserve' | 'force' | '')}
+            options={[
+              { value: '', label: t('settings.claudeFpPreserve') },
+              { value: 'preserve', label: t('settings.claudeFpPreserveExplicit') },
+              { value: 'force', label: t('settings.claudeFpForce') },
+            ]}
+          />
+        </SettingField>
+        <SettingField label={t('settings.claudeClientPlatform')} description={t('settings.claudeClientPlatformDesc')}>
+          <Select
+            value={clientPlatform}
+            onValueChange={(value) => setClientPlatform(value as 'any' | 'claude_code_cli_only')}
+            options={[
+              { value: 'any', label: t('settings.claudeClientPlatformAny') },
+              { value: 'claude_code_cli_only', label: t('settings.claudeClientPlatformCLIOnly') },
+            ]}
+          />
+        </SettingField>
+        <SettingField label={t('settings.claudeVersionPolicy')} description={t('settings.claudeVersionPolicyDesc')}>
+          <div className="space-y-1.5">
+            <Select
+              value={versionPolicy}
+              onValueChange={(value) => setVersionPolicy(value as 'passthrough' | 'fixed' | 'minimum')}
+              options={[
+                { value: 'passthrough', label: t('settings.claudeVersionPolicyPassthrough') },
+                { value: 'fixed', label: t('settings.claudeVersionPolicyFixed') },
+                { value: 'minimum', label: t('settings.claudeVersionPolicyMinimum') },
+              ]}
+            />
+            {versionPolicy !== 'passthrough' ? <Input value={clientVersion} onChange={(e) => setClientVersion(e.target.value)} placeholder="2.1.251" /> : null}
+          </div>
+        </SettingField>
+        <SettingField label={t('settings.claudeDefaultTimezone')} description={t('settings.claudeDefaultTimezoneDesc')}>
+          <div className="space-y-1.5">
+            <Select
+              value={timezoneCustom ? CLAUDE_TIMEZONE_CUSTOM : (findClaudeTimezoneOption(timezone)?.value ?? (timezone ? CLAUDE_TIMEZONE_CUSTOM : ''))}
+              onValueChange={(value) => {
+                if (value === CLAUDE_TIMEZONE_CUSTOM) {
+                  setTimezoneCustom(true)
+                  if (findClaudeTimezoneOption(timezone)) setTimezone('')
+                  return
+                }
+                setTimezoneCustom(false)
+                setTimezone(value)
+              }}
+              options={[
+                { value: '', label: t('settings.claudeTimezoneUnset') },
+                ...CLAUDE_TIMEZONE_OPTIONS,
+                { value: CLAUDE_TIMEZONE_CUSTOM, label: t('settings.claudeTimezoneCustom') },
+              ]}
+            />
+            {timezoneCustom ? <Input value={timezone} onChange={(e) => setTimezone(e.target.value)} placeholder="Asia/Shanghai" /> : null}
+            {timezone ? <p className="text-[10px] text-muted-foreground">{claudeTimezoneLabel(timezone)}</p> : null}
+          </div>
+        </SettingField>
+        <SettingField label={t('settings.claudeCliVersionSync')} description={t('settings.claudeCliVersionSyncDesc')}>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" onClick={() => void handleSyncClaudeCliVersion()} disabled={syncingCliVersion}>
+              <RefreshCw className={cn('size-3.5', syncingCliVersion && 'animate-spin')} />
+              {syncingCliVersion ? t('settings.claudeCliVersionSyncing') : t('settings.claudeCliVersionSyncNow')}
+            </Button>
+            {effectiveCliVersion ? (
+              <span className="font-mono text-xs text-muted-foreground">
+                {effectiveCliVersion}
+                {!syncedCliVersion ? ` · ${t('settings.claudeCliVersionBuiltin')}` : ''}
+              </span>
+            ) : null}
+          </div>
+        </SettingField>
+        {/* 自动同步开关 + 间隔成对横排，与 Codex 运行时优化保持同一布局 */}
+        <div className="sm:col-span-2 grid gap-0 overflow-hidden rounded-lg border border-border/60 bg-muted/15 sm:grid-cols-2 sm:divide-x sm:divide-border/60">
+          <div className="flex min-h-[48px] items-center justify-between gap-3 px-3 py-2.5">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className="text-[13px] font-medium leading-snug text-foreground sm:text-sm">{t('settings.claudeCliVersionAutoSync')}</span>
+              <SettingHelp text={t('settings.claudeCliVersionAutoSyncDesc')} />
+            </div>
+            <Switch checked={cliVersionSyncEnabled} onCheckedChange={setCliVersionSyncEnabled} />
+          </div>
+          <div className={cn('flex min-h-[48px] items-center justify-between gap-3 border-t border-border/60 px-3 py-2.5 sm:border-t-0', !cliVersionSyncEnabled && 'opacity-60')}>
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className="text-[13px] font-medium leading-snug text-foreground sm:text-sm">{t('settings.claudeCliVersionSyncInterval')}</span>
+              <SettingHelp text={t('settings.claudeCliVersionSyncIntervalDesc')} />
+            </div>
+            <div className="relative w-[7.25rem] shrink-0">
+              <DraftNumberInput
+                min={1}
+                max={720}
+                className="h-9 pr-10 tabular-nums"
+                disabled={!cliVersionSyncEnabled}
+                value={cliVersionSyncIntervalHours}
+                onValueChange={setCliVersionSyncIntervalHours}
+              />
+              <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">h</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <details className="mt-4 rounded-lg border border-primary/20 bg-primary/5">
+        <summary className="cursor-pointer px-3 py-2.5 text-sm font-semibold text-foreground">
+          {t('settings.claudeSecurityTitle')}
+        </summary>
+        <div className="space-y-4 border-t border-primary/10 px-3 pb-3 pt-3">
+          <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.claudeSecurityDesc')}</p>
+          <div className={SETTINGS_SWITCH_GRID}>
+            <SettingField label={t('settings.claudeAllowServiceTier')} description={t('settings.claudeAllowServiceTierDesc')} layout="switch">
+              <Switch checked={allowServiceTier} onCheckedChange={setAllowServiceTier} />
+            </SettingField>
+            <SettingField label={t('settings.claudeAllowInferenceGeo')} description={t('settings.claudeAllowInferenceGeoDesc')} layout="switch">
+              <Switch checked={allowInferenceGeo} onCheckedChange={setAllowInferenceGeo} />
+            </SettingField>
+            <SettingField label={t('settings.claudeAllowSpeed')} description={t('settings.claudeAllowSpeedDesc')} layout="switch">
+              <Switch checked={allowSpeed} onCheckedChange={setAllowSpeed} />
+            </SettingField>
+            <SettingField label={t('settings.claudeAllowSafetyIdentifier')} description={t('settings.claudeAllowSafetyIdentifierDesc')} layout="switch">
+              <Switch checked={allowSafetyIdentifier} onCheckedChange={setAllowSafetyIdentifier} />
+            </SettingField>
+          </div>
+          <div className={SETTINGS_FIELD_GRID}>
+            <SettingField label={t('settings.claudeAllowedBetaHeaders')} description={t('settings.claudeAllowedBetaHeadersDesc')}>
+              <Input value={allowedBetaHeaders} onChange={(event) => setAllowedBetaHeaders(event.target.value)} placeholder="token-efficient-tools-2025-02-19" />
+            </SettingField>
+            <SettingField label={t('settings.claudeMaxOutputTokens')} description={t('settings.claudeMaxOutputTokensDesc')}>
+              <Input value={maxOutputTokens} onChange={(event) => setMaxOutputTokens(event.target.value)} inputMode="numeric" min={0} type="number" placeholder={t('settings.claudeUnlimitedPlaceholder')} />
+            </SettingField>
+            <SettingField label={t('settings.claudeMaxToolCount')} description={t('settings.claudeMaxToolCountDesc')}>
+              <Input value={maxToolCount} onChange={(event) => setMaxToolCount(event.target.value)} inputMode="numeric" min={0} type="number" />
+            </SettingField>
+            <SettingField label={t('settings.claudeMaxToolSchemaBytes')} description={t('settings.claudeMaxToolSchemaBytesDesc')}>
+              <Input value={maxToolSchemaBytes} onChange={(event) => setMaxToolSchemaBytes(event.target.value)} inputMode="numeric" min={0} type="number" />
+            </SettingField>
+          </div>
+        </div>
+      </details>
+    </SettingsCard>
+  )
+}
 
 function SettingsCard({
   title,
@@ -1288,6 +1573,10 @@ export default function Settings() {
     { label: t('settings.modelCooldownModeFixed'), value: 'fixed' },
     { label: t('settings.modelCooldownModeAdaptive'), value: 'adaptive' },
   ]
+  const responseCacheWritePolicyOptions = [
+    { label: t('settings.responseCache.writePolicyAlways'), value: 'always' },
+    { label: t('settings.responseCache.writePolicyOnDemand'), value: 'on_demand' },
+  ]
   const affinityModeOptions = [
     { label: t('settings.affinityModeBounded'), value: 'bounded' },
     { label: t('settings.affinityModeOff'), value: 'off' },
@@ -1303,6 +1592,10 @@ export default function Settings() {
     { label: t('settings.grokFollowUpEffortLow'), value: 'low' },
     { label: t('settings.grokFollowUpEffortMedium'), value: 'medium' },
     { label: t('settings.grokFollowUpEffortHigh'), value: 'high' },
+  ]
+  const grokQualityGuardOnExhaustedOptions = [
+    { label: t('settings.grokQualityGuardFailClosed'), value: 'fail_closed' },
+    { label: t('settings.grokQualityGuardFailOpen'), value: 'fail_open' },
   ]
   const clientCompatOptions = [
     { label: t('settings.clientCompatPreserve'), value: 'preserve' },
@@ -1426,6 +1719,11 @@ export default function Settings() {
     grok_follow_up_effort_enabled: false,
     grok_follow_up_tool_effort: 'medium',
     grok_follow_up_small_effort: 'low',
+    grok_quality_guard_enabled: false,
+    grok_quality_guard_max_attempts: 6,
+    grok_quality_guard_hold_timeout_sec: 30,
+    grok_quality_guard_on_exhausted: 'fail_closed',
+    grok_quality_guard_account_cooldown_hours: 12,
     grok_oauth_client_id: '',
     max_retries: 2,
     max_rate_limit_retries: 1,
@@ -1446,6 +1744,7 @@ export default function Settings() {
     response_cache_local_max_bytes: DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
     response_cache_local_max_entry_bytes: DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
     response_cache_reconstruct_max_bytes: DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+    response_cache_write_policy: 'always',
     response_cache_config_generation: 0,
     relay_model_cooldown_mode: 'off',
     relay_model_cooldown_seconds: 2,
@@ -1546,6 +1845,32 @@ export default function Settings() {
   const autoSaveStatusTimerRef = useRef<number | null>(null)
   const continuousRetrySaveQueueRef = useRef(createContinuousRetrySaveQueue())
   const { toast, showToast } = useToast()
+  // 邀请引导开关走独立端点(system_settings.invite_guide_config),不进主设置
+  // 表单——那条 UPSERT 的占位符已经排到 $119,每加一列都要整体顺移。
+  // null 表示还没加载出来,此时开关不渲染,避免先闪一个错误的默认态。
+  const [inviteGuideEnabled, setInviteGuideEnabled] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    void api.getInviteGuideSettings()
+      .then((res) => { if (!cancelled) setInviteGuideEnabled(res.enabled) })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [])
+
+  // 乐观更新 + 失败回滚：开关是本地独立状态，写失败必须回到真实值，
+  // 否则界面显示开着、后端其实是关的。
+  const saveInviteGuideEnabled = async (next: boolean) => {
+    const previous = inviteGuideEnabled
+    setInviteGuideEnabled(next)
+    try {
+      await api.updateInviteGuideSettings(next)
+      showToast(t('settings.autoSaved'), 'success', AUTO_SAVE_TOAST_MS)
+    } catch (error) {
+      setInviteGuideEnabled(previous)
+      showToast(getErrorMessage(error), 'error')
+    }
+  }
 
   useEffect(() => {
     settingsFormRef.current = settingsForm
@@ -1690,6 +2015,62 @@ export default function Settings() {
       [field]: value,
     } as Partial<SystemSettings>)
   }, [autoSaveSettingsPatch])
+
+  // ===== Antigravity OAuth client 配置(草稿态 + 显式保存;secret 不回显,留空 = 沿用已保存值) =====
+  const [agOAuthDraft, setAgOAuthDraft] = useState<{ rows: AntigravityOAuthClientSetting[]; activeKey: string } | null>(null)
+  const [agOAuthSaving, setAgOAuthSaving] = useState(false)
+  const agOAuthServer = useMemo(() => ({
+    rows: (settingsForm.antigravity_oauth_clients ?? []).map(client => ({ ...client, client_secret: '' })),
+    activeKey: settingsForm.antigravity_oauth_client_key ?? '',
+  }), [settingsForm.antigravity_oauth_clients, settingsForm.antigravity_oauth_client_key])
+  const agOAuth = agOAuthDraft ?? agOAuthServer
+  const agOAuthDirty = agOAuthDraft !== null
+  const updateAgOAuthRow = (index: number, patch: Partial<AntigravityOAuthClientSetting>) => {
+    setAgOAuthDraft({
+      ...agOAuth,
+      rows: agOAuth.rows.map((row, i) => (i === index ? { ...row, ...patch } : row)),
+    })
+  }
+  const removeAgOAuthRow = (index: number) => {
+    setAgOAuthDraft({ ...agOAuth, rows: agOAuth.rows.filter((_, i) => i !== index) })
+  }
+  const addAgOAuthRow = () => {
+    setAgOAuthDraft({
+      ...agOAuth,
+      rows: [...agOAuth.rows, { key: '', client_id: '', client_secret: '', has_secret: false }],
+    })
+  }
+  const saveAgOAuth = async () => {
+    setAgOAuthSaving(true)
+    try {
+      const activeKey = agOAuth.activeKey.trim().toLowerCase()
+      const updated = await api.updateSettings({
+        antigravity_oauth_clients: agOAuth.rows.map(row => ({
+          key: row.key.trim().toLowerCase(),
+          client_id: row.client_id.trim(),
+          client_secret: (row.client_secret ?? '').trim(),
+        })),
+        // 活跃 key 指向的条目被删掉时自动回落「第一个」,避免整次保存被后端校验拒绝。
+        antigravity_oauth_client_key: agOAuth.rows.some(row => row.key.trim().toLowerCase() === activeKey) ? activeKey : '',
+      })
+      commitSettingsForm({
+        ...settingsFormRef.current,
+        antigravity_oauth_clients: updated.antigravity_oauth_clients,
+        antigravity_oauth_client_key: updated.antigravity_oauth_client_key,
+        antigravity_oauth_env_clients: updated.antigravity_oauth_env_clients,
+        antigravity_oauth_client_key_env_override: updated.antigravity_oauth_client_key_env_override,
+        antigravity_oauth_active_key_effective: updated.antigravity_oauth_active_key_effective,
+        antigravity_oauth_using_builtin: updated.antigravity_oauth_using_builtin,
+        antigravity_oauth_builtin_client: updated.antigravity_oauth_builtin_client,
+      })
+      setAgOAuthDraft(null)
+      showToast(t('settings.antigravityOAuth.saved'), 'success')
+    } catch (error) {
+      showToast(`${t('settings.antigravityOAuth.saveFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setAgOAuthSaving(false)
+    }
+  }
 
   const updateResponseCacheBudget = (
     field: keyof ResponseCacheBudgetMiB,
@@ -2038,6 +2419,8 @@ export default function Settings() {
         { id: 'settings-overview', label: t('settings.nav.overview'), icon: <Activity className="size-4" /> },
         { id: 'settings-traffic', label: t('settings.nav.traffic'), icon: <Gauge className="size-4" /> },
         { id: 'settings-grok', label: t('settings.nav.grok'), icon: <ChannelLogo channel="grok" size={16} /> },
+        { id: 'settings-claude', label: t('settings.nav.claude'), icon: <ChannelLogo channel="claude" size={16} /> },
+        { id: 'settings-antigravity', label: t('settings.nav.antigravity'), icon: <ChannelLogo channel="antigravity" size={16} /> },
         { id: 'settings-runtime', label: t('settings.nav.runtime'), icon: <Wrench className="size-4" /> },
         { id: 'settings-storage', label: t('settings.nav.storage'), icon: <ImageIcon className="size-4" /> },
         { id: 'settings-appearance', label: t('settings.nav.appearance'), icon: <Palette className="size-4" /> },
@@ -2343,6 +2726,19 @@ export default function Settings() {
                       }}
                     />
                   </SettingField>
+                  {inviteGuideEnabled !== null && (
+                    <SettingField
+                      label={t('settings.inviteGuide')}
+                      description={t('settings.inviteGuideDesc')}
+                      layout="switch"
+                    >
+                      <Switch
+                        aria-label={t('settings.inviteGuide')}
+                        checked={inviteGuideEnabled}
+                        onCheckedChange={(checked) => void saveInviteGuideEnabled(checked)}
+                      />
+                    </SettingField>
+                  )}
                 </div>
               </div>
             </SettingsCard>
@@ -3025,6 +3421,90 @@ export default function Settings() {
                   />
                 </SettingField>
               </div>
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.grokQualityGuardEnabled')} description={t('settings.grokQualityGuardEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.grok_quality_guard_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('grok_quality_guard_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField
+                  label={t('settings.grokQualityGuardMaxAttempts')}
+                  description={t('settings.grokQualityGuardMaxAttemptsDesc')}
+                  suffix={t('settings.unit.times')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={20}
+                    step={1}
+                    integer
+                    emptyValue={6}
+                    disabled={!settingsForm.grok_quality_guard_enabled}
+                    value={settingsForm.grok_quality_guard_max_attempts ?? 6}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_quality_guard_max_attempts: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 1 ? 1 : value
+                      void autoSaveSettingsPatch({ grok_quality_guard_max_attempts: v })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokQualityGuardHoldTimeout')}
+                  description={t('settings.grokQualityGuardHoldTimeoutDesc')}
+                  suffix={t('settings.unit.sec')}
+                >
+                  <DraftNumberInput
+                    min={5}
+                    max={300}
+                    step={5}
+                    integer
+                    emptyValue={30}
+                    disabled={!settingsForm.grok_quality_guard_enabled}
+                    value={settingsForm.grok_quality_guard_hold_timeout_sec ?? 30}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_quality_guard_hold_timeout_sec: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 5 ? 5 : value
+                      void autoSaveSettingsPatch({ grok_quality_guard_hold_timeout_sec: v })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokQualityGuardCooldownHours')}
+                  description={t('settings.grokQualityGuardCooldownHoursDesc')}
+                  suffix={t('settings.unit.hour')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={168}
+                    step={1}
+                    integer
+                    emptyValue={12}
+                    disabled={!settingsForm.grok_quality_guard_enabled}
+                    value={settingsForm.grok_quality_guard_account_cooldown_hours ?? 12}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_quality_guard_account_cooldown_hours: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 1 ? 1 : value
+                      void autoSaveSettingsPatch({ grok_quality_guard_account_cooldown_hours: v })
+                    }}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.grokQualityGuardOnExhausted')} description={t('settings.grokQualityGuardOnExhaustedDesc')}>
+                  <Select
+                    value={settingsForm.grok_quality_guard_on_exhausted || 'fail_closed'}
+                    disabled={!settingsForm.grok_quality_guard_enabled}
+                    onValueChange={(value) => autoSaveStringField('grok_quality_guard_on_exhausted', value)}
+                    options={grokQualityGuardOnExhaustedOptions}
+                  />
+                </SettingField>
+              </div>
               <div className={SETTINGS_FIELD_GRID_3}>
                 {/* client_id 同时可由环境变量 GROK_OAUTH_CLIENT_ID 指定，且环境变量优先级更高；
                     被覆盖时这里禁用输入并说明当前生效值，避免用户以为改了却不起作用。 */}
@@ -3049,6 +3529,120 @@ export default function Settings() {
                     onBlur={(e) => autoSaveStringField('grok_oauth_client_id', e.currentTarget.value.trim())}
                   />
                 </SettingField>
+              </div>
+            </div>
+          </SettingsCard>
+          </SettingsSection>
+
+          <SettingsSection id="settings-claude" title={t('settings.nav.claude')} description={t('settings.nav.claudeDesc')} icon={<ChannelLogo channel="claude" size={16} />}>
+            <ClaudeCodeSettingsCard />
+          </SettingsSection>
+
+          <SettingsSection id="settings-antigravity" title={t('settings.nav.antigravity')} description={t('settings.nav.antigravityDesc')} icon={<ChannelLogo channel="antigravity" size={16} />}>
+          <SettingsCard
+            title={t('settings.antigravityOAuth.title')}
+            description={t('settings.antigravityOAuth.description')}
+            icon={<Shield className="size-4" />}
+          >
+            <div className="space-y-4">
+              {(settingsForm.antigravity_oauth_env_clients?.length ?? 0) > 0 && (
+                <div className="space-y-1.5 rounded-md border border-dashed border-border/70 p-3 text-xs text-muted-foreground">
+                  <div>{t('settings.antigravityOAuth.envClientsHint')}</div>
+                  {settingsForm.antigravity_oauth_env_clients?.map(client => (
+                    <div key={client.key} className="flex items-center gap-2 font-mono">
+                      <Badge variant="outline" className="text-[11px]">{client.key}</Badge>
+                      <span className="truncate">{client.client_id}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {settingsForm.antigravity_oauth_using_builtin && settingsForm.antigravity_oauth_builtin_client && (
+                <div className="space-y-1.5 rounded-md border border-dashed border-border/70 p-3 text-xs text-muted-foreground">
+                  <div>{t('settings.antigravityOAuth.builtinHint')}</div>
+                  <div className="flex items-center gap-2 font-mono">
+                    <Badge variant="outline" className="text-[11px]">{settingsForm.antigravity_oauth_builtin_client.key}</Badge>
+                    <span className="truncate">{settingsForm.antigravity_oauth_builtin_client.client_id}</span>
+                  </div>
+                </div>
+              )}
+              {agOAuth.rows.length === 0 ? (
+                <div className="text-sm text-muted-foreground">{t('settings.antigravityOAuth.empty')}</div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="hidden gap-2 text-xs text-muted-foreground sm:grid sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_minmax(0,2fr)_2rem]">
+                    <span>{t('settings.antigravityOAuth.key')}</span>
+                    <span>{t('settings.antigravityOAuth.clientId')}</span>
+                    <span>{t('settings.antigravityOAuth.clientSecret')}</span>
+                    <span />
+                  </div>
+                  {agOAuth.rows.map((row, index) => (
+                    <div key={index} className="grid items-center gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_minmax(0,2fr)_2rem]">
+                      <Input
+                        value={row.key}
+                        placeholder={t('settings.antigravityOAuth.keyPlaceholder')}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateAgOAuthRow(index, { key: e.target.value })}
+                      />
+                      <Input
+                        value={row.client_id}
+                        placeholder={t('settings.antigravityOAuth.clientIdPlaceholder')}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateAgOAuthRow(index, { client_id: e.target.value })}
+                      />
+                      <Input
+                        type="password"
+                        autoComplete="new-password"
+                        value={row.client_secret ?? ''}
+                        placeholder={row.has_secret ? t('settings.antigravityOAuth.secretKeepPlaceholder') : t('settings.antigravityOAuth.secretRequiredPlaceholder')}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => updateAgOAuthRow(index, { client_secret: e.target.value })}
+                      />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={t('common.delete')}
+                        onClick={() => removeAgOAuthRow(index)}
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <Button variant="outline" size="sm" onClick={addAgOAuthRow}>
+                {t('settings.antigravityOAuth.addClient')}
+              </Button>
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField
+                  label={t('settings.antigravityOAuth.activeKey')}
+                  description={
+                    settingsForm.antigravity_oauth_client_key_env_override
+                      ? t('settings.antigravityOAuth.activeKeyEnvOverride', {
+                          value: settingsForm.antigravity_oauth_active_key_effective || '',
+                        })
+                      : t('settings.antigravityOAuth.activeKeyDesc')
+                  }
+                >
+                  <Select
+                    value={agOAuth.activeKey}
+                    disabled={settingsForm.antigravity_oauth_client_key_env_override}
+                    onValueChange={(value: string) => setAgOAuthDraft({ ...agOAuth, activeKey: value })}
+                    options={[
+                      { label: t('settings.antigravityOAuth.activeKeyAuto'), value: '' },
+                      ...agOAuth.rows
+                        .map(row => row.key.trim().toLowerCase())
+                        .filter(key => key !== '')
+                        .map(key => ({ label: key, value: key })),
+                    ]}
+                  />
+                </SettingField>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={() => void saveAgOAuth()} disabled={!agOAuthDirty || agOAuthSaving}>
+                  {agOAuthSaving ? t('common.saving') : t('common.save')}
+                </Button>
+                {agOAuthDirty && !agOAuthSaving && (
+                  <Button variant="ghost" size="sm" onClick={() => setAgOAuthDraft(null)}>
+                    {t('common.cancel')}
+                  </Button>
+                )}
               </div>
             </div>
           </SettingsCard>
@@ -3117,6 +3711,17 @@ export default function Settings() {
                   {responseCacheValidationMessage}
                 </p>
               ) : null}
+
+              <SettingField
+                label={t('settings.responseCache.writePolicy')}
+                description={t('settings.responseCache.writePolicyDesc')}
+              >
+                <SegmentedPillGroup
+                  value={settingsForm.response_cache_write_policy}
+                  onChange={(value) => autoSaveStringField('response_cache_write_policy', value)}
+                  options={responseCacheWritePolicyOptions}
+                />
+              </SettingField>
 
               {/* 可视化预算分配比例条 (Memory Allocation Bar) */}
               <div className="rounded-xl border border-border/70 bg-muted/20 p-3.5 space-y-2.5">

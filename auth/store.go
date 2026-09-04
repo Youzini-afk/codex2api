@@ -123,6 +123,17 @@ type Account struct {
 	// CodexFingerprintMode 见 codex_fingerprint_mode.go：Codex 官方出站请求的
 	// 设备指纹收敛档位（off / device / session / full），默认 off。
 	CodexFingerprintMode string
+	// ClaudeFingerprintMode 见 claude_fingerprint_mode.go:Claude Code 出站身份头
+	// 收敛模式(preserve/force;空=跟随全局默认)。
+	ClaudeFingerprintMode string
+	// Claude Code platform/version policy overrides. Empty values inherit the
+	// corresponding global policy from Store.
+	ClaudeClientPlatformOverride string
+	ClaudeVersionPolicyOverride  string
+	ClaudeClientVersionOverride  string
+	// claudeSessionWindow 是 Claude 账号的全局默认并发会话窗口数(装载时从系统设置
+	// 快照,>0 时作为无账号级/分组覆盖时的基础并发回退)。
+	claudeSessionWindow int64
 	// Codex Agent Identity（auth_mode=agentIdentity）：不存 AT/RT，每次上游请求用
 	// agent_private_key(Ed25519, PKCS#8 base64) 动态签名。AgentTaskID 由 task 注册获得，
 	// 运行时缓存并落库(credentials.task_id)。
@@ -1112,6 +1123,10 @@ func (a *Account) effectiveBaseConcurrencyLocked(storeBaseLimit int64) int64 {
 	}
 	if a.groupBaseConcurrency > 0 {
 		return a.groupBaseConcurrency
+	}
+	// Claude 账号:无账号级/分组覆盖时回退到全局「并发会话窗口数」默认。
+	if a.claudeSessionWindow > 0 {
+		return a.claudeSessionWindow
 	}
 	if storeBaseLimit <= 0 {
 		return 1
@@ -2198,6 +2213,17 @@ func (a *Account) SetUsageSnapshot(pct float64, updatedAt time.Time) {
 	}
 }
 
+// MarkClaudeUsageObservation records a native Claude response (or a bounded
+// probe attempt) even when Anthropic omits unified quota headers. The timestamp
+// participates only in Claude probe freshness; it never fabricates a 5h/7d
+// percentage and therefore cannot make an unmeasured account look quota-safe.
+func (a *Account) MarkClaudeUsageObservation(observedAt time.Time) bool {
+	if a == nil || !a.IsClaudeOAuth() {
+		return false
+	}
+	return a.ApplyUsageObservation(observedAt, func() {})
+}
+
 // GetUsagePercent7d 获取 7d 用量百分比
 func (a *Account) GetUsagePercent7d() (float64, bool) {
 	a.mu.RLock()
@@ -3073,18 +3099,35 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
 		return false
 	}
-	if a.isRelayStyleLocked() {
+	if a.isRelayStyleLocked() && !a.isClaudeOAuthLocked() {
 		return false // wham 探针是 ChatGPT 专属；中转/Grok 账号没有该端点
 	}
 	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false // token 失效，wham 也会 401，探针无意义
+	}
+	// Claude uses the native Messages endpoint rather than WHAM and may legally
+	// omit both unified quota windows. In that case the shared 7d validity bits
+	// remain false by design; use the provider observation timestamp to avoid
+	// sending a paid probe on every background sweep. A cooldown that has just
+	// expired is still worth one confirmation probe.
+	if a.isClaudeOAuthLocked() {
+		if a.Status == StatusCooldown && !a.CooldownUtil.IsZero() && !now.Before(a.CooldownUtil) {
+			return true
+		}
+		if a.UsagePercent5hValid && !a.Reset5hAt.IsZero() && !a.Reset5hAt.After(now) && a.UsageUpdatedAt5h.Before(a.Reset5hAt) {
+			return true
+		}
+		if a.UsagePercent7dValid && !a.Reset7dAt.IsZero() && !a.Reset7dAt.After(now) && a.UsageUpdatedAt.Before(a.Reset7dAt) {
+			return true
+		}
+		return a.usageObservedAt.IsZero() || now.Sub(a.usageObservedAt) > maxAge
 	}
 
 	// 「主动重置次数」只能由 wham 探针刷新（普通 /responses 流量不携带该字段），
 	// 因此用独立的 resetCreditsProbedAt 判断它是否过期。否则活跃账号的用量快照被
 	// 业务流量持续刷新，会让用量看起来一直"新鲜"，从而长期不触发 wham 探针、
 	// 重置次数迟迟探测不出来。
-	resetCreditsStale := a.resetCreditsProbedAt.IsZero() || now.Sub(a.resetCreditsProbedAt) > maxAge
+	resetCreditsStale := !a.isClaudeOAuthLocked() && (a.resetCreditsProbedAt.IsZero() || now.Sub(a.resetCreditsProbedAt) > maxAge)
 
 	if a.premium5hRateLimitedLocked(now) {
 		// premium 5h 限流期间仍允许 wham 刷新重置次数；是否补 Responses
@@ -3417,27 +3460,35 @@ type Store struct {
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
-	allowRemoteMigration     atomic.Bool  // 是否允许远程迁移拉取账号
-	modelMapping             atomic.Value // 模型映射 JSON 字符串
-	codexModelMapping        atomic.Value // Codex 模型映射 JSON 字符串
-	payloadRules             atomic.Value // Payload 请求体重写规则 JSON 字符串
-	reasoningEffortModels    atomic.Value // 带思考强度的模型别名 JSON 数组
-	schedulerMode            atomic.Value // string: "round_robin" / "remaining_quota" / "fill_first"
-	affinityMode             atomic.Value // string: "bounded" / "off" / "strict"
-	affinitySpreadEnabled    atomic.Bool  // 新亲和键按 HRW 哈希散列选号(issue #484)
-	grokAffinityMode         atomic.Value // string: "follow" / "bounded" / "off" / "strict"（"follow"=跟随全局）
-	grokProbeEnabled         atomic.Bool  // 定期探测 Grok 账号状态是否开启（默认关）
-	grokProbeIntervalMin     atomic.Int64 // 定期探测间隔（分钟，默认 30，下限 grokProbeMinIntervalMinutes）
-	grokMaxRateLimitRetry    atomic.Int64 // Grok 请求限流(429)专属换号重试上限（0=跟随全局）
-	grokFollowUpEffort       atomic.Value // GrokFollowUpEffortConfig
-	modelCooldownSettings    atomic.Value // database.ModelCooldownSettings
-	promptFilterConfig       atomic.Value // promptFilterConfigState
-	sessionMu                sync.RWMutex
-	sessionBindings          map[string]sessionAffinity
-	sessionSlotBufferEnabled atomic.Bool
-	sessionSlotBufferNS      atomic.Int64
-	sessionSlotSequence      uint64
-	sessionSlotReservations  map[int64]map[string][]uint64
+	allowRemoteMigration          atomic.Bool  // 是否允许远程迁移拉取账号
+	modelMapping                  atomic.Value // 模型映射 JSON 字符串
+	codexModelMapping             atomic.Value // Codex 模型映射 JSON 字符串
+	payloadRules                  atomic.Value // Payload 请求体重写规则 JSON 字符串
+	reasoningEffortModels         atomic.Value // 带思考强度的模型别名 JSON 数组
+	schedulerMode                 atomic.Value // string: "round_robin" / "remaining_quota" / "fill_first"
+	affinityMode                  atomic.Value // string: "bounded" / "off" / "strict"
+	affinitySpreadEnabled         atomic.Bool  // 新亲和键按 HRW 哈希散列选号(issue #484)
+	claudeFingerprintDefault      atomic.Value // string: Claude 指纹模式全局默认（preserve/force;空=preserve）
+	claudeDefaultTimezone         atomic.Value // string: 导入 Claude 账号时的默认 IANA 时区
+	claudeSecurityConfig          atomic.Value // ClaudeSecurityConfig: ClaudeCode 出站安全策略
+	claudeClientPolicy            atomic.Value // ClaudeClientPolicy: 全局 Claude Code 平台/版本策略快照
+	claudeSessionWindowLimit      int64        // Claude 账号默认并发会话窗口数（0=用全局 maxConcurrency）
+	claudeCLIVersionSyncDisabled  atomic.Bool  // Claude CLI 版本自动同步是否关闭（零值=开启）
+	claudeCLIVersionSyncIntervalH atomic.Int64 // Claude CLI 版本同步间隔小时（0=默认 12）
+	grokAffinityMode              atomic.Value // string: "follow" / "bounded" / "off" / "strict"（"follow"=跟随全局）
+	grokProbeEnabled              atomic.Bool  // 定期探测 Grok 账号状态是否开启（默认关）
+	grokProbeIntervalMin          atomic.Int64 // 定期探测间隔（分钟，默认 30，下限 grokProbeMinIntervalMinutes）
+	grokMaxRateLimitRetry         atomic.Int64 // Grok 请求限流(429)专属换号重试上限（0=跟随全局）
+	grokFollowUpEffort            atomic.Value // GrokFollowUpEffortConfig
+	grokQualityGuard              atomic.Value // GrokQualityGuardConfig（降智检测,issue #587）
+	modelCooldownSettings         atomic.Value // database.ModelCooldownSettings
+	promptFilterConfig            atomic.Value // promptFilterConfigState
+	sessionMu                     sync.RWMutex
+	sessionBindings               map[string]sessionAffinity
+	sessionSlotBufferEnabled      atomic.Bool
+	sessionSlotBufferNS           atomic.Int64
+	sessionSlotSequence           uint64
+	sessionSlotReservations       map[int64]map[string][]uint64
 
 	globalAutoPause5hThreshold    float64  // protected by mu
 	globalAutoPause7dThreshold    float64  // protected by mu
@@ -3454,17 +3505,20 @@ type Store struct {
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
 //
-// boundAt / requestCount 用于 bounded affinity 的逃逸条件:
-//   - 累计请求超过 maxAffinityRequests 后强制解绑,避免单账号被一直薅
-//   - 绑定时长超过 maxAffinityDuration 后同样解绑
+// lastUsedAt 用于 bounded affinity 的逃逸条件(issue #584):
+//   - 绑定空闲超过 sessionAffinityIdleEscape 后解绑,下次走完整挑号。活跃会话
+//     永不因此换号——上游 prompt cache 按账号生效,中途轮换等于整段上下文按
+//     未命中价重新计费;空闲超阈值后上游缓存本来已经过期,此时轮换才零代价。
 //   - 上层在选号时还会检查"绑定账号当前是否还健康",非 healthy 直接换号
 //
-// strict 模式不读这些字段(行为退化为旧实现);off 模式根本不进入这条路径。
+// boundAt / requestCount 仅作观测记录,不再参与逃逸判定。strict 模式不读逃逸
+// 字段(行为退化为旧实现);off 模式根本不进入这条路径。
 type sessionAffinity struct {
 	accountID    int64
 	proxyURL     string
 	boundAt      time.Time
 	requestCount int64
+	lastUsedAt   time.Time
 	expiresAt    time.Time
 }
 
@@ -3492,11 +3546,9 @@ const maxSessionSlotBuffer = 60 * time.Second
 // maxSessionBindings 会话粘性表的软上限。超限时在 bind 路径全量清一轮过期项。
 const maxSessionBindings = 65536
 
-// Bounded affinity 默认阈值。命中任一即触发解绑下次走完整挑号策略。
-const (
-	defaultMaxAffinityRequests = 50
-	defaultMaxAffinityDuration = 5 * time.Minute
-)
+// Bounded affinity 空闲逃逸默认阈值。上游 prompt cache 空闲约 5-10 分钟即被清理,
+// 取 10 分钟保证轮换只发生在缓存已死的边界上。
+const defaultAffinityIdleEscape = 10 * time.Minute
 
 // Affinity 模式常量。affinity_mode 系统设置使用以下值。
 const (
@@ -3531,6 +3583,22 @@ func sessionAffinityTTL() time.Duration {
 		return time.Duration(seconds) * time.Second
 	}
 	return defaultSessionAffinityTTL
+}
+
+// sessionAffinityIdleEscape 返回 bounded 模式的空闲逃逸阈值,可用
+// CODEX_SESSION_AFFINITY_IDLE_ESCAPE 覆盖(Duration 或纯秒数)。
+func sessionAffinityIdleEscape() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CODEX_SESSION_AFFINITY_IDLE_ESCAPE"))
+	if raw == "" {
+		return defaultAffinityIdleEscape
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultAffinityIdleEscape
 }
 
 func cooldownRuntimeContext() (context.Context, context.CancelFunc) {
@@ -3940,9 +4008,11 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetAffinityMode(settings.AffinityMode)
 	s.SetSessionAffinitySpread(settings.SessionAffinitySpread)
 	s.SetGrokAffinityMode(grokAffinityModeFromConfig(settings.GrokConfig))
+	applyClaudeConfigToStore(s, settings.ClaudeConfig)
 	s.SetGrokProbeConfig(grokProbeConfigFromConfig(settings.GrokConfig))
 	s.SetGrokMaxRateLimitRetries(grokMaxRateLimitRetriesFromConfig(settings.GrokConfig))
 	s.SetGrokFollowUpEffortConfig(GrokFollowUpEffortConfigFromJSON(settings.GrokConfig))
+	s.SetGrokQualityGuardConfig(GrokQualityGuardConfigFromJSON(settings.GrokConfig))
 	SetConfiguredGrokOAuthClientID(grokOAuthClientIDFromConfig(settings.GrokConfig))
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
@@ -4842,6 +4912,37 @@ func (s *Store) ReloadProxyPool() error {
 	return nil
 }
 
+// UnusableManagedProxies returns the subset of proxyURLs that are known to the
+// proxy table but absent from the enabled set — disabled, test-failed, or
+// deleted. It mirrors the fail-closed rule in resolveProxyForAccountSnapshot:
+// while the pool is enabled, an account pinned to one of these has no usable
+// egress and will not be scheduled. Callers use it to warn instead of silently
+// importing accounts that cannot serve traffic.
+func (s *Store) UnusableManagedProxies(proxyURLs []string) []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.proxyPoolEnabled {
+		return nil
+	}
+	var unusable []string
+	for _, raw := range proxyURLs {
+		proxyURL := strings.TrimSpace(raw)
+		if proxyURL == "" {
+			continue
+		}
+		if _, managed := s.managedProxySet[proxyURL]; !managed {
+			continue
+		}
+		if _, enabled := s.proxyPoolSet[proxyURL]; !enabled {
+			unusable = append(unusable, proxyURL)
+		}
+	}
+	return unusable
+}
+
 // RemoveProxyURLs immediately removes proxies from the in-memory pool. It uses
 // the same serialization lock as ReloadProxyPool so an older reload snapshot
 // cannot publish the removed URLs afterward.
@@ -5212,6 +5313,13 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	modelMapping := strings.TrimSpace(row.GetCredential("model_mapping"))
 	codexClientMetadataMode := NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	codexFingerprintMode := NormalizeCodexFingerprintMode(row.GetCredential(CodexFingerprintModeCredentialKey))
+	claudeFingerprintMode := NormalizeClaudeFingerprintMode(row.GetCredential(ClaudeFingerprintModeCredentialKey))
+	var claudeClientPlatformOverride, claudeVersionPolicyOverride, claudeClientVersionOverride string
+	if strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamClaude) {
+		claudeClientPlatformOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(ClaudeClientPlatformCredentialKey)))
+		claudeVersionPolicyOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(ClaudeVersionPolicyCredentialKey)))
+		claudeClientVersionOverride = strings.TrimSpace(row.GetCredential(ClaudeClientVersionCredentialKey))
+	}
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
 	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
 	isAntigravityAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamAntigravity) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
@@ -5225,23 +5333,39 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 
 	account := &Account{
-		DBID:                    row.ID,
-		CredentialGeneration:    row.CredentialGeneration,
-		CredentialFamilyID:      row.CredentialFamilyID,
-		RefreshToken:            rt,
-		SessionToken:            st,
-		ProxyURL:                strings.TrimSpace(row.ProxyURL),
-		CustomHeaders:           row.GetCredentialStringMap("custom_headers"),
-		HealthTier:              HealthTierWarm,
-		AddedAt:                 row.CreatedAt.UnixNano(),
-		UpstreamType:            upstreamType,
-		AntigravityProjectID:    strings.TrimSpace(row.GetCredential("project_id")),
-		BaseURL:                 strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		APIKey:                  strings.TrimSpace(apiKey),
-		Models:                  models,
-		ModelMapping:            modelMapping,
-		CodexClientMetadataMode: codexClientMetadataMode,
-		CodexFingerprintMode:    codexFingerprintMode,
+		DBID:                         row.ID,
+		CredentialGeneration:         row.CredentialGeneration,
+		CredentialFamilyID:           row.CredentialFamilyID,
+		RefreshToken:                 rt,
+		SessionToken:                 st,
+		ProxyURL:                     strings.TrimSpace(row.ProxyURL),
+		CustomHeaders:                row.GetCredentialStringMap("custom_headers"),
+		HealthTier:                   HealthTierWarm,
+		AddedAt:                      row.CreatedAt.UnixNano(),
+		UpstreamType:                 upstreamType,
+		AntigravityProjectID:         strings.TrimSpace(row.GetCredential("project_id")),
+		BaseURL:                      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		APIKey:                       strings.TrimSpace(apiKey),
+		Models:                       models,
+		ModelMapping:                 modelMapping,
+		CodexClientMetadataMode:      codexClientMetadataMode,
+		CodexFingerprintMode:         codexFingerprintMode,
+		ClaudeFingerprintMode:        claudeFingerprintMode,
+		ClaudeClientPlatformOverride: claudeClientPlatformOverride,
+		ClaudeVersionPolicyOverride:  claudeVersionPolicyOverride,
+		ClaudeClientVersionOverride:  claudeClientVersionOverride,
+		claudeSessionWindow:          claudeSessionWindowForRow(upstreamType, s.ClaudeSessionWindowLimit()),
+	}
+	if strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamClaude) {
+		if observedRaw := strings.TrimSpace(row.GetCredential(ClaudeUsageProbeAtCredentialKey)); observedRaw != "" {
+			if observedAt, parseErr := time.Parse(time.RFC3339, observedRaw); parseErr == nil {
+				// This is only a freshness hint; quota validity remains false until
+				// an actual Anthropic response supplies a window header.
+				account.MarkClaudeUsageObservation(observedAt)
+			} else {
+				log.Printf("[账号 %d] 解析 claude_usage_probe_at 失败: %v", row.ID, parseErr)
+			}
+		}
 	}
 	if account.CredentialGeneration <= 0 {
 		account.CredentialGeneration = 1
@@ -6529,6 +6653,7 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 		proxyURL:     proxyURL,
 		boundAt:      now,
 		requestCount: 0,
+		lastUsedAt:   now,
 		expiresAt:    now.Add(ttl),
 	}
 
@@ -6546,8 +6671,8 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 			}
 		}
 	}
-	// 同账号的连续 Bind 视为复用,沿用 boundAt 与 requestCount 以保持 bounded 上限计数;
-	// 换账号时则按新绑定从 0 开始计。
+	// 同账号的连续 Bind 视为复用,沿用 boundAt 与 requestCount 保持观测连续性;
+	// 换账号时则按新绑定从 0 开始计。lastUsedAt 恒取当前时间(正在被使用)。
 	if existing, ok := s.sessionBindings[key]; ok && existing.accountID == account.DBID {
 		binding.boundAt = existing.boundAt
 		binding.requestCount = existing.requestCount
@@ -6625,9 +6750,8 @@ func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]boo
 // affinity_mode 决定粘性强度:
 //   - off:     永不读绑定,每次都走完整挑号策略
 //   - bounded (默认): 绑定有效但被以下任一条件解除
-//   - 累计请求超过 defaultMaxAffinityRequests (50)
-//   - 绑定时长超过 defaultMaxAffinityDuration (5min)
 //   - 绑定账号当前已不属于 healthy 桶 (warm/risky/banned)
+//   - 绑定空闲超过 sessionAffinityIdleEscape (默认 10min,上游缓存已过期)
 //   - strict:  完全沿用旧行为,只在 TTL 过期或显式 Unbind 时换号
 //
 // 解除发生时绕过 binding 走完整挑号策略(NextExcludingWithFilter),后续 BindSessionAffinity
@@ -6667,7 +6791,7 @@ func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, excl
 
 // nextForSessionWithFilter 是会话选号的统一实现。preserveBinding=true(续链请求)时
 // 语义收紧为"只认绑定账号"：
-//   - 忽略 affinity_mode=off 与 bounded 的全部逃逸条件（请求数/时长/健康档位）——
+//   - 忽略 affinity_mode=off 与 bounded 的全部逃逸条件（空闲/健康档位）——
 //     续链 id 只在创建它的账号上有效，换号必然 previous_response_not_found，
 //     所以这里刻意覆盖运营者的粘性配置；
 //   - 绑定账号当前取不到（超并发/冷却/被本次请求排除）时返回 nil 而不是回退到
@@ -6711,14 +6835,13 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	}
 	if ok {
 		expired := !binding.expiresAt.After(now)
-		// bounded 模式下追加逃逸条件检查
+		// bounded 模式下追加逃逸条件检查:账号不健康,或绑定已空闲到上游
+		// prompt cache 必然过期。活跃会话不轮换(issue #584)。
 		escape := false
 		if mode == AffinityModeBounded && !preserveBinding {
-			if binding.requestCount >= defaultMaxAffinityRequests {
+			if !s.affinityAccountStillHealthy(binding.accountID) {
 				escape = true
-			} else if !binding.boundAt.IsZero() && now.Sub(binding.boundAt) >= defaultMaxAffinityDuration {
-				escape = true
-			} else if !s.affinityAccountStillHealthy(binding.accountID) {
+			} else if !binding.lastUsedAt.IsZero() && now.Sub(binding.lastUsedAt) >= sessionAffinityIdleEscape() {
 				escape = true
 			}
 		}
@@ -6728,10 +6851,11 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		} else {
 			acc, capacityFull := s.takeByIDModeWithCapacity(binding.accountID, apiKeyID, exclude, filter, preserveBinding, key, policy)
 			if acc != nil {
-				// 命中粘性,记一次复用
+				// 命中粘性,记一次复用并刷新空闲时钟
 				s.sessionMu.Lock()
 				if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
 					current.requestCount++
+					current.lastUsedAt = now
 					s.sessionBindings[key] = current
 				}
 				s.sessionMu.Unlock()
@@ -6745,6 +6869,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
+				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}
@@ -6783,6 +6908,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
+				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}
@@ -7025,10 +7151,13 @@ func (s *Store) getCachedSessionAffinity(key string) (sessionAffinity, bool) {
 	if !ok || binding.AccountID == 0 {
 		return sessionAffinity{}, false
 	}
+	now := time.Now()
 	return sessionAffinity{
-		accountID: binding.AccountID,
-		proxyURL:  strings.TrimSpace(binding.ProxyURL),
-		expiresAt: time.Now().Add(sessionAffinityTTL()),
+		accountID:  binding.AccountID,
+		proxyURL:   strings.TrimSpace(binding.ProxyURL),
+		boundAt:    now,
+		lastUsedAt: now,
+		expiresAt:  now.Add(sessionAffinityTTL()),
 	}, true
 }
 
@@ -8014,6 +8143,19 @@ func (s *Store) GrokFollowUpEffortConfig() GrokFollowUpEffortConfig {
 	return DefaultGrokFollowUpEffortConfig()
 }
 
+// SetGrokQualityGuardConfig 热更新 Grok 降智检测配置（归一化后存储）。
+func (s *Store) SetGrokQualityGuardConfig(cfg GrokQualityGuardConfig) {
+	s.grokQualityGuard.Store(NormalizeGrokQualityGuardConfig(cfg))
+}
+
+// GrokQualityGuardConfig 返回 Grok 降智检测配置（默认关闭）。
+func (s *Store) GrokQualityGuardConfig() GrokQualityGuardConfig {
+	if v, ok := s.grokQualityGuard.Load().(GrokQualityGuardConfig); ok {
+		return v
+	}
+	return DefaultGrokQualityGuardConfig()
+}
+
 // SetGrokMaxRateLimitRetries 热更新 Grok 专属限流重试上限（<0 视为 0=跟随全局）。
 func (s *Store) SetGrokMaxRateLimitRetries(n int) {
 	if n < 0 {
@@ -8893,14 +9035,14 @@ func (s *Store) GetAPIKeyAllowedGroups(apiKeyID int64) []int64 {
 	return cloneInt64Slice(s.apiKeyAllowedGroups[apiKeyID])
 }
 
-// SetAPIKeyUpstreamChannel 设置某 API Key 的上游渠道限定（codex/grok，空=不限）。
+// SetAPIKeyUpstreamChannel 设置某 API Key 的上游渠道限定（codex/grok/antigravity/claude，空=不限）。
 // 仅在取值真正变化时重建调度器。
 func (s *Store) SetAPIKeyUpstreamChannel(apiKeyID int64, channel string) {
 	if apiKeyID <= 0 {
 		return
 	}
 	channel = strings.ToLower(strings.TrimSpace(channel))
-	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok && channel != database.UpstreamChannelAntigravity {
+	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok && channel != database.UpstreamChannelAntigravity && channel != database.UpstreamChannelClaude {
 		channel = ""
 	}
 	s.apiKeyGroupsMu.Lock()
@@ -8990,11 +9132,15 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 			return false
 		}
 	case database.UpstreamChannelCodex:
-		if acc.IsGrokAPI() || acc.IsAntigravityAPI() {
+		if acc.IsGrokAPI() || acc.IsAntigravityAPI() || acc.IsClaudeOAuth() {
 			return false
 		}
 	case database.UpstreamChannelAntigravity:
 		if !acc.IsAntigravityAPI() {
+			return false
+		}
+	case database.UpstreamChannelClaude:
+		if !acc.IsClaudeOAuth() {
 			return false
 		}
 	}
@@ -9561,6 +9707,15 @@ func (s *Store) MarkModelCooldownWithBackoff(acc *Account, model string, duratio
 	if reason == "" {
 		reason = "rate_limited"
 	}
+	// 已有更长且仍在生效的冷却（如 credits_required 的 30 分钟）不得被后续更短的
+	// 通用限流冷却覆盖缩短，否则账号会在几秒后被重新选中并再次撞上同一错误。
+	if current.ResetAt.After(now) && current.ResetAt.After(resetAt) {
+		resetAt = current.ResetAt
+		if current.Reason != "" {
+			reason = current.Reason
+		}
+		level = current.BackoffLevel
+	}
 	cooldown := ModelCooldown{
 		Model:        key,
 		Reason:       reason,
@@ -10093,7 +10248,11 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 
 	switch kind {
 	case "unauthorized":
-		acc.LastUnauthorizedAt = now
+		// The account cooldown path owns LastUnauthorizedAt so it can
+		// distinguish a first 401 from a repeated one. HTTP handlers record
+		// failure metrics before applying that cooldown; updating the timestamp
+		// here would make the current failure look like a prior failure and
+		// incorrectly select the 24-hour backoff.
 		acc.HealthTier = HealthTierBanned
 	case "timeout":
 		acc.LastTimeoutAt = now
@@ -11159,6 +11318,11 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	// Grok 账号走 auth.x.ai 的 OAuth 刷新流程，与 ChatGPT 的 RT 刷新完全不同。
 	if acc.IsGrokAPI() {
 		return s.refreshGrokAccount(ctx, acc, forceRefresh)
+	}
+	// Claude Code OAuth 账号走 platform.claude.com 的 RT 刷新，请求体与端点均与
+	// ChatGPT 不同，单独处理。对所有非 claude 账号此分支恒不进入。
+	if acc.IsClaudeOAuth() {
+		return s.refreshClaudeAccount(ctx, acc, forceRefresh)
 	}
 	acc.mu.RLock()
 	rt := acc.RefreshToken

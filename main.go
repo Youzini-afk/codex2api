@@ -231,6 +231,19 @@ func main() {
 		log.Fatalf("加载响应缓存设置失败: %v", err)
 	}
 	responseCacheCancel()
+	antigravityOAuthCtx, antigravityOAuthCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if raw, err := db.LoadAntigravityOAuthConfig(antigravityOAuthCtx); err != nil {
+		log.Printf("加载 Antigravity OAuth client 设置失败(继续以环境变量为准): %v", err)
+	} else if parsed, parseErr := auth.ParseAntigravityOAuthSettings(raw); parseErr != nil {
+		log.Printf("Antigravity OAuth client 设置解析失败(继续以环境变量为准,请在管理页重新保存): %v", parseErr)
+	} else {
+		auth.SetConfiguredAntigravityOAuth(parsed)
+		if len(parsed.Clients) > 0 {
+			log.Printf("Antigravity OAuth client 设置已加载: %d 个 client", len(parsed.Clients))
+		}
+	}
+	antigravityOAuthCancel()
+
 	appliedResponseCache := proxy.GetResponseCacheAppliedConfig()
 	log.Printf(
 		"响应缓存设置已加载: generation=%d total=%d entry=%d reconstruct=%d",
@@ -319,6 +332,15 @@ func main() {
 		}
 	}
 
+	// Claude CLI 同步版本先于账号加载发布，保证 GenerateClaudeFingerprint 与回写使用同一生效版本。
+	claudeCLIVersionCtx, claudeCLIVersionCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if synced, err := db.GetClaudeSyncedCLIVersion(claudeCLIVersionCtx); err == nil {
+		auth.SetClaudeSyncedCLIVersion(synced)
+	} else {
+		log.Printf("读取 Claude CLI 同步版本失败（使用内置 %s）: %v", auth.BuiltinClaudeCLIVersion, err)
+	}
+	claudeCLIVersionCancel()
+
 	// 5. 初始化账号管理器
 	store := auth.NewStore(db, tc, settings)
 	store.SetSystemSettingsApplyHook(systemSettingsApplyHook(db, rateLimiter))
@@ -359,6 +381,9 @@ func main() {
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
 	// CODEX_DISABLE_CLI_VERSION_SYNC 为硬关闭。
 	proxy.StartCodexCLIVersionSync(backgroundCtx, db, store.GetProxyURL)
+
+	// Claude Code CLI 版本同步：启动先用生效版本回写账号指纹，再按 ClaudeConfig 开关/间隔联网同步。
+	proxy.StartClaudeCLIVersionSync(backgroundCtx, db, store, store.GetProxyURL)
 
 	log.Printf("账号就绪: %d/%d 可用", store.AvailableCount(), store.AccountCount())
 

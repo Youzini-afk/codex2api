@@ -477,7 +477,7 @@ func TestImportAccountsJSONReturnsExistingNoTokenMessageForUnsupportedJSON(t *te
 	ctx.Request = req
 
 	handler := &Handler{}
-	handler.importAccountsJSON(ctx, "", false)
+	handler.importAccountsJSON(ctx, importSettings{})
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
@@ -501,7 +501,7 @@ func TestImportAccountsJSONRejectsInvalidJSONFile(t *testing.T) {
 	ctx.Request = req
 
 	handler := &Handler{}
-	handler.importAccountsJSON(ctx, "", false)
+	handler.importAccountsJSON(ctx, importSettings{})
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
@@ -536,7 +536,7 @@ func TestImportAccountsCommonDoesNotCollapseConflictingChatGPTAccountID(t *testi
 	handler.importAccountsCommon(ctx, []importToken{
 		{name: "sub2api-1", refreshToken: "rt-shared-id-1", accessToken: "at-shared-id-1", chatgptAccountID: "same-exported-id"},
 		{name: "sub2api-2", refreshToken: "rt-shared-id-2", accessToken: "at-shared-id-2", chatgptAccountID: "same-exported-id"},
-	}, "", false)
+	}, importSettings{})
 
 	rows, err := db.ListActive(context.Background())
 	if err != nil {
@@ -588,7 +588,7 @@ func TestImportAccountsCommonUpdatesKnownWorkspaceWhenDuplicatesAllowed(t *testi
 		email:        "Import@Example.com",
 		accountID:    "acc-import",
 		planType:     "team",
-	}}, "", true)
+	}}, importSettings{allowDuplicate: true})
 
 	select {
 	case id := <-probed:
@@ -661,7 +661,7 @@ func TestImportAccountsCommonSkipsExistingOAuthIdentityWithSameCredentials(t *te
 		idToken:      makeOAuthTestIDToken("Same@Example.com", "acc-same", ""),
 		email:        "Same@Example.com",
 		accountID:    "acc-same",
-	}}, "", false)
+	}}, importSettings{})
 
 	var payload map[string]interface{}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -716,7 +716,7 @@ func TestImportAccountsCommonSkipsAmbiguousOAuthIdentityWithExistingAccount(t *t
 	handler.importAccountsCommon(ctx, []importToken{
 		{refreshToken: "rt-new-1", idToken: makeOAuthTestIDToken("ambiguous@example.com", "acc-ambiguous", ""), email: "ambiguous@example.com", accountID: "acc-ambiguous"},
 		{refreshToken: "rt-new-2", idToken: makeOAuthTestIDToken("Ambiguous@Example.com", "acc-ambiguous", ""), email: "Ambiguous@Example.com", accountID: "acc-ambiguous"},
-	}, "", false)
+	}, importSettings{})
 
 	var payload map[string]interface{}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -761,7 +761,7 @@ func TestImportAccountsCommonSkipsAmbiguousKnownWorkspaceWhenDuplicatesAllowed(t
 	handler.importAccountsCommon(ctx, []importToken{
 		{refreshToken: "rt-new-1", idToken: makeOAuthTestIDToken("new-ambiguous@example.com", "acc-new-ambiguous", ""), email: "new-ambiguous@example.com", accountID: "acc-new-ambiguous"},
 		{refreshToken: "rt-new-2", idToken: makeOAuthTestIDToken("New-Ambiguous@Example.com", "acc-new-ambiguous", ""), email: "New-Ambiguous@Example.com", accountID: "acc-new-ambiguous"},
-	}, "", true)
+	}, importSettings{allowDuplicate: true})
 
 	var payload map[string]interface{}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -806,7 +806,7 @@ func TestImportAccountsCommonCollapsesIdenticalOAuthIdentityInFile(t *testing.T)
 	handler.importAccountsCommon(ctx, []importToken{
 		{refreshToken: "rt-same-file", accessToken: "at-same-file", idToken: makeOAuthTestIDToken("same-file@example.com", "acc-same-file", ""), email: "same-file@example.com", accountID: "acc-same-file"},
 		{refreshToken: "rt-same-file", accessToken: "at-same-file", idToken: makeOAuthTestIDToken("Same-File@Example.com", "acc-same-file", ""), email: "Same-File@Example.com", accountID: "acc-same-file"},
-	}, "", false)
+	}, importSettings{})
 
 	if !strings.Contains(recorder.Body.String(), `"type":"complete"`) ||
 		!strings.Contains(recorder.Body.String(), `"success":1`) ||
@@ -848,7 +848,7 @@ func TestImportAccountsCommonTriggersUsageProbeForImportedAccountWithAccessToken
 	handler.importAccountsCommon(ctx, []importToken{{
 		refreshToken: "rt-import-probe",
 		accessToken:  "at-import-probe",
-	}}, "", false)
+	}}, importSettings{})
 
 	select {
 	case id := <-probed:
@@ -887,7 +887,7 @@ func TestImportAccountsCommonKeepsSub2APISharedAccountDifferentUsers(t *testing.
 			chatgptAccountID: "team-workspace",
 			userID:           "user-two",
 		},
-	}, "", false)
+	}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -921,7 +921,7 @@ func TestImportAccountsCommonDedupesSameAccessTokenDifferentFineIdentity(t *test
 	handler.importAccountsCommon(ctx, []importToken{
 		{accessToken: "at-same-hard-duplicate", name: "Same AT User One", email: "one@example.com", chatgptAccountID: "team-workspace", userID: "user-one"},
 		{accessToken: "at-same-hard-duplicate", name: "Same AT User Two", email: "two@example.com", chatgptAccountID: "team-workspace", userID: "user-two"},
-	}, "", false)
+	}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -947,7 +947,7 @@ func TestImportAccountsCommonKeepsAccountIDDifferentUsers(t *testing.T) {
 	handler.importAccountsCommon(ctx, []importToken{
 		{accessToken: "at-account-id-one", name: "Account ID User One", email: "one@example.com", accountID: "legacy-workspace", userID: "user-one"},
 		{accessToken: "at-account-id-two", name: "Account ID User Two", email: "two@example.com", accountID: "legacy-workspace", userID: "user-two"},
-	}, "", false)
+	}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -975,7 +975,7 @@ func TestImportAccountsCommonSkipsExistingScopedUserIDWithChangedAccessToken(t *
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-new-user", name: "Existing User Duplicate", chatgptAccountID: "team-workspace", userID: "same-user"}}, "", false)
+	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-new-user", name: "Existing User Duplicate", chatgptAccountID: "team-workspace", userID: "same-user"}}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -1010,7 +1010,7 @@ func TestImportAccountsCommonSkipsExistingScopedEmailWithChangedAccessToken(t *t
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-new-email", name: "Existing Email Duplicate", accountID: "team-workspace", email: "same@example.com"}}, "", false)
+	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-new-email", name: "Existing Email Duplicate", accountID: "team-workspace", email: "same@example.com"}}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -1040,7 +1040,7 @@ func TestImportAccountsCommonSavesUserIDCredentials(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-save-user-id", name: "Save User ID", chatgptAccountID: "team-workspace", userID: "saved-user-id", email: "saved@example.com"}}, "", false)
+	handler.importAccountsCommon(ctx, []importToken{{accessToken: "at-save-user-id", name: "Save User ID", chatgptAccountID: "team-workspace", userID: "saved-user-id", email: "saved@example.com"}}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -1076,7 +1076,7 @@ func TestImportAccountsCommonDedupesSharedChatGPTAccountWithoutFineIdentity(t *t
 	handler.importAccountsCommon(ctx, []importToken{
 		{refreshToken: "rt-no-fine-1", name: "No Fine One", chatgptAccountID: "same-workspace"},
 		{refreshToken: "rt-no-fine-2", name: "No Fine Two", chatgptAccountID: "same-workspace"},
-	}, "", false)
+	}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -1107,7 +1107,7 @@ func TestImportAccountsCommonSkipsExistingChatGPTAccountWithoutFineIdentity(t *t
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-new-workspace", name: "Existing Workspace Duplicate", chatgptAccountID: "existing-workspace"}}, "", false)
+	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-new-workspace", name: "Existing Workspace Duplicate", chatgptAccountID: "existing-workspace"}}, importSettings{})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -1152,7 +1152,7 @@ func TestImportAccountsCommonMarksImported7dUsageAsRateLimited(t *testing.T) {
 		planType:           "team",
 		codex7DUsedPercent: "100",
 		codex7DResetAt:     resetAt.Format(time.RFC3339),
-	}}, "", false)
+	}}, importSettings{})
 
 	accounts := store.Accounts()
 	if len(accounts) != 1 {
@@ -1205,7 +1205,7 @@ func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
 
-	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-import-refresh-probe"}}, "", false)
+	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-import-refresh-probe"}}, importSettings{})
 
 	select {
 	case id := <-probed:
@@ -1252,7 +1252,7 @@ func TestImportAccountsCommonRefreshesOAuthIdentityRTOnlyImport(t *testing.T) {
 		refreshToken: "rt-oauth-identity-refresh-probe",
 		email:        "identity-refresh@example.com",
 		accountID:    "acc-identity-refresh",
-	}}, "", false)
+	}}, importSettings{})
 
 	select {
 	case id := <-probed:
@@ -1566,7 +1566,7 @@ func TestImportAccountsCommonAllowsDuplicateWithoutWorkspace(t *testing.T) {
 		refreshToken: "rt-dup-2",
 		email:        "dup@example.com",
 		accountID:    "acc-dup",
-	}}, "", true)
+	}}, importSettings{allowDuplicate: true})
 
 	rows, err := db.ListActive(context.Background())
 	if err != nil {
@@ -1602,7 +1602,7 @@ func TestImportAccountsCommonSeparatesCredentialWorkspaceRoutes(t *testing.T) {
 		}
 		handler.importAccountsCommon(ctx, []importToken{{
 			refreshToken: "rt-import-shared",
-		}}, "", allowDuplicate, headers)
+		}}, importSettings{allowDuplicate: allowDuplicate, customHeaders: headers})
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("workspace %q status = %d: %s", workspaceID, recorder.Code, recorder.Body.String())
 		}

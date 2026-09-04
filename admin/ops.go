@@ -346,6 +346,7 @@ func responseCacheConfigOpsResponse(config proxy.ResponseCacheAppliedConfig) ops
 		LocalMaxBytes:       config.LocalMaxBytes,
 		LocalMaxEntryBytes:  config.LocalMaxEntryBytes,
 		ReconstructMaxBytes: config.ReconstructMaxBytes,
+		WritePolicy:         config.WritePolicy,
 	}
 }
 
@@ -373,6 +374,8 @@ func responseCacheOpsResponseFromSnapshot(snapshot proxy.ResponseCacheOpsSnapsho
 		OversizeBypasses:       snapshot.Stats.OversizeBypasses,
 		OversizeRejections:     snapshot.Stats.OversizeRejections,
 		KnownUnavailableErrors: snapshot.Stats.KnownUnavailableErrors,
+		SkippedWrites:          snapshot.Stats.SkippedWrites,
+		ChainOwners:            snapshot.Stats.ChainOwners,
 		LastConfigSyncAt:       lastSyncAt,
 		LastConfigSyncError:    snapshot.LastConfigSyncError,
 	}

@@ -587,6 +587,7 @@ func TestApplyPersistentAccountSnapshotRoutingInvalidationGate(t *testing.T) {
 func TestApplyPersistentAccountSnapshotPreservesRuntimeState(t *testing.T) {
 	store := newIndexedRoutingTestStore(nil)
 	dst := newFastSchedulerTestAccount(1, HealthTierWarm, 100, 1)
+	dst.usageObservedAt = time.Now()
 	atomic.StoreInt64(&dst.ActiveRequests, 3)
 	dst.SuccessStreak = 5
 	dst.FailureStreak = 4
@@ -596,6 +597,9 @@ func TestApplyPersistentAccountSnapshotPreservesRuntimeState(t *testing.T) {
 	store.applyPersistentAccountSnapshot(dst, src, true)
 	if atomic.LoadInt64(&dst.ActiveRequests) != 3 || dst.SuccessStreak != 5 || dst.FailureStreak != 4 {
 		t.Fatalf("runtime state clobbered: active=%d success=%d failure=%d", atomic.LoadInt64(&dst.ActiveRequests), dst.SuccessStreak, dst.FailureStreak)
+	}
+	if dst.usageObservedAt.IsZero() {
+		t.Fatal("persistent snapshot should not erase a newer runtime observation timestamp")
 	}
 
 	rotated := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)

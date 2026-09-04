@@ -4,7 +4,7 @@
 
 ## Overview
 
-Codex2API can manage Google Antigravity accounts as a dedicated upstream channel and expose their models through the OpenAI-compatible `/v1/responses` and `/v1/models` surfaces. Antigravity accounts are isolated from Codex and Grok account groups and can be selected explicitly with an API key whose upstream channel is `antigravity`.
+Codex2API can manage Google Antigravity accounts as a dedicated upstream channel and expose their models through the OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, `/v1/messages`, and `/v1/models` surfaces. Antigravity accounts are isolated from Codex and Grok account groups and can be selected explicitly with an API key whose upstream channel is `antigravity`.
 
 Two credential shapes are supported:
 
@@ -27,14 +27,18 @@ An API Key account can declare its own model list and optional model mapping. Th
 
 ### Browser OAuth
 
-Configure at least one OAuth client before starting the server. No client ID or client secret is embedded in the binary. `ANTIGRAVITY_OAUTH_CLIENTS` is a semicolon-separated list of `key|client_id|client_secret` entries; `ANTIGRAVITY_OAUTH_CLIENT_KEY` optionally selects the active key and otherwise the first configured entry is used.
+OAuth uses the official Antigravity Desktop client when nothing else is configured, so **Start authorization** works out of the box. Custom clients override that fallback. Precedence is environment variable > admin settings > built-in official client:
+
+1. **Admin settings page** (Settings → Antigravity): add `key` / `client_id` / `client_secret` entries and optionally pick the default active client. Changes are stored in `system_settings.antigravity_oauth_config`, take effect immediately without a restart, and the secret is never echoed back by the API (leave the secret blank when editing to keep the stored value).
+2. **Environment variables**: `ANTIGRAVITY_OAUTH_CLIENTS` is a semicolon-separated list of `key|client_id|client_secret` entries; `ANTIGRAVITY_OAUTH_CLIENT_KEY` optionally selects the active key.
+3. **Built-in official Desktop client** (`key=official`): used only when both sources above are empty. This is the same public installed-app credential shipped in the Antigravity desktop app and reused by `sub2api`. Google may revoke a shared client; add your own entry if authorization starts returning `invalid_client`.
 
 ```bash
 ANTIGRAVITY_OAUTH_CLIENTS='primary|your-client-id|your-client-secret'
 ANTIGRAVITY_OAUTH_CLIENT_KEY='primary'
 ```
 
-Keep these values in the deployment secret store rather than source control. Browser authorization returns a clear configuration error when no OAuth client is configured.
+Environment entries take precedence for a matching key, and the active key resolves as environment variable > admin setting > first configured entry > built-in `official`, so a deployment-level override always wins over a misconfigured database value. Keep custom credentials in the deployment secret store or the admin settings page rather than source control.
 
 Open **Accounts → Antigravity → Google OAuth**, start authorization, and complete Google's consent flow. If the loopback callback cannot complete automatically, paste the full callback URL back into the dialog.
 
@@ -63,7 +67,15 @@ Account groups are channel-isolated: an Antigravity account can only join an Ant
 
 ## Supported gateway endpoints
 
-Antigravity inference is currently admitted only through `/v1/responses`; its models are exposed through `/v1/models` and the Codex model manifest. `/v1/responses/compact`, `/v1/chat/completions`, and `/v1/messages` explicitly exclude Antigravity accounts because no compatible adapter exists for those transports. The official Codex executors also reject Antigravity credentials before any network request as a provider-boundary safeguard.
+Antigravity inference is admitted through `/v1/responses`, `/v1/chat/completions`, and `/v1/messages`; its models are exposed through `/v1/models` and the Codex model manifest. Chat and Messages translate their inbound body into a Responses payload before dispatch, which is exactly what the `v1internal` adapter consumes, so all three transports share one admission gate and one adapter. `/v1/responses/compact` still excludes Antigravity accounts because no compaction adapter exists, and the official Codex executors reject Antigravity credentials before any network request as a provider-boundary safeguard.
+
+## Function tools
+
+Responses function tools are bridged into Gemini `functionDeclarations`. Dropping them is not a safe degradation: the upstream still receives the system instruction describing those tools, answers with a call it was never allowed to declare, and terminates the turn as `MALFORMED_FUNCTION_CALL`. Built-in Codex tools (web search, image generation, computer use) have no `v1internal` equivalent and are still ignored. Operators can pin the bridge off for diagnostics, which makes a `tool_choice` that forces a function fail closed with a 400 instead:
+
+```bash
+ANTIGRAVITY_FUNCTION_TOOLS_ENABLED=false
+```
 
 ## API Key Interactions request assumption
 

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -37,7 +38,11 @@ func TestContinuousRetryReplaySpillsAndRemovesTemporaryFile(t *testing.T) {
 		t.Fatal("expected replay to spill to a temporary file")
 	}
 	fileName := replay.file.Name()
-	if _, err := os.Stat(fileName); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(fileName); runtime.GOOS == "windows" {
+		if err != nil {
+			t.Fatalf("Windows spill file is unavailable before close: %v", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("temporary file directory entry still exists after spill")
 	}
 	var downstream bytes.Buffer
@@ -49,6 +54,9 @@ func TestContinuousRetryReplaySpillsAndRemovesTemporaryFile(t *testing.T) {
 	}
 	if err := replay.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(fileName); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("temporary spill file still exists after close")
 	}
 	if _, err := replay.Write([]byte("late")); !errors.Is(err, errContinuousRetryReplayClosed) {
 		t.Fatalf("write after close error = %v", err)

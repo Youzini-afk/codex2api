@@ -386,6 +386,12 @@ function UsageCostCell({ log }: { log: UsageLog }) {
           {log.cached_tokens > 0 && (
             <CostTooltipRow label={t('usage.cacheReadCost')} value={formatUSD(log.cache_read_cost)} />
           )}
+          {(log.cache_write_5m_tokens ?? 0) > 0 && (
+            <CostTooltipRow label={t('usage.cacheWrite5mCost')} value={formatUSD(log.cache_write_5m_cost)} />
+          )}
+          {(log.cache_write_1h_tokens ?? 0) > 0 && (
+            <CostTooltipRow label={t('usage.cacheWrite1hCost')} value={formatUSD(log.cache_write_1h_cost)} />
+          )}
           {log.input_tokens > 0 && (
             <CostTooltipRow label={t('usage.inputUnitPrice')} value={formatTokenPricePerMillion(log.input_price_per_mtoken)} valueClassName="text-sky-300" />
           )}
@@ -394,6 +400,12 @@ function UsageCostCell({ log }: { log: UsageLog }) {
           )}
           {log.cached_tokens > 0 && log.cache_read_price_per_mtoken > 0 && (
             <CostTooltipRow label={t('usage.cacheReadUnitPrice')} value={formatTokenPricePerMillion(log.cache_read_price_per_mtoken)} valueClassName="text-cyan-300" />
+          )}
+          {(log.cache_write_5m_tokens ?? 0) > 0 && (log.cache_write_5m_price_per_mtoken ?? 0) > 0 && (
+            <CostTooltipRow label={t('usage.cacheWrite5mUnitPrice')} value={formatTokenPricePerMillion(log.cache_write_5m_price_per_mtoken)} valueClassName="text-amber-300" />
+          )}
+          {(log.cache_write_1h_tokens ?? 0) > 0 && (log.cache_write_1h_price_per_mtoken ?? 0) > 0 && (
+            <CostTooltipRow label={t('usage.cacheWrite1hUnitPrice')} value={formatTokenPricePerMillion(log.cache_write_1h_price_per_mtoken)} valueClassName="text-amber-300" />
           )}
           {requestedTier && (
             <CostTooltipRow label={t('usage.requestedTier')} value={formatServiceTierLabel(t, requestedTier)} valueClassName="text-slate-200" />
@@ -1723,6 +1735,7 @@ export default function Usage() {
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
   const [antigravityModelOptions, setAntigravityModelOptions] = useState<string[]>([])
+  const [claudeModelOptions, setClaudeModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
@@ -1860,11 +1873,13 @@ export default function Usage() {
         setModelOptions(models)
         setGrokModelOptions(response.grok_models ?? [])
         setAntigravityModelOptions(response.antigravity_models ?? [])
+        setClaudeModelOptions(response.claude_models ?? [])
       } catch {
         if (active) {
           setModelOptions([])
           setGrokModelOptions([])
           setAntigravityModelOptions([])
+          setClaudeModelOptions([])
         }
       }
     }
@@ -1920,9 +1935,11 @@ export default function Usage() {
       ? grokModelOptions
       : channel === 'antigravity'
         ? antigravityModelOptions
-      : channel === 'codex'
-        ? modelOptions
-        : [...modelOptions, ...grokModelOptions, ...antigravityModelOptions]
+        : channel === 'codex'
+          ? modelOptions
+          : channel === 'claude'
+            ? claudeModelOptions
+            : [...modelOptions, ...grokModelOptions, ...antigravityModelOptions, ...claudeModelOptions]
     for (const m of catalog) {
       const key = m.trim()
       if (key && !seen.has(key)) { seen.add(key); merged.push(key) }
@@ -1932,7 +1949,7 @@ export default function Usage() {
       if (key && key !== 'unknown' && !seen.has(key)) { seen.add(key); merged.push(key) }
     }
     return merged
-  }, [modelOptions, grokModelOptions, antigravityModelOptions, modelStats, channel])
+  }, [modelOptions, grokModelOptions, antigravityModelOptions, claudeModelOptions, modelStats, channel])
   const featureStats = stats?.feature_stats
   const endpointStats = stats?.endpoint_stats ?? []
   const apiKeyStats = stats?.api_key_stats ?? []
@@ -2551,6 +2568,14 @@ export default function Usage() {
                           ) : null}
                           {visibleColumns.model && (
                             <Badge variant="outline" className={usageTableBadgeClass}>
+                              {(log.channel === 'codex' || log.channel === 'grok' || log.channel === 'antigravity' || log.channel === 'claude') && (
+                                <ChannelLogo
+                                  channel={log.channel}
+                                  size={13}
+                                  className="mr-1"
+                                  title={log.channel === 'grok' ? 'Grok' : log.channel === 'antigravity' ? 'Antigravity' : log.channel === 'claude' ? 'Claude' : 'Codex'}
+                                />
+                              )}
                               {log.model || '-'}
                             </Badge>
                           )}
@@ -2747,12 +2772,12 @@ export default function Usage() {
                               </Badge>
                             )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
-                              {(log.channel === 'codex' || log.channel === 'grok' || log.channel === 'antigravity') && (
+                              {(log.channel === 'codex' || log.channel === 'grok' || log.channel === 'antigravity' || log.channel === 'claude') && (
                                 <ChannelLogo
                                   channel={log.channel}
                                   size={13}
                                   className="mr-1"
-                                  title={log.channel === 'grok' ? 'Grok' : log.channel === 'antigravity' ? 'Antigravity' : 'Codex'}
+                                  title={log.channel === 'grok' ? 'Grok' : log.channel === 'antigravity' ? 'Antigravity' : log.channel === 'claude' ? 'Claude' : 'Codex'}
                                 />
                               )}
                               {log.model || '-'}
@@ -2841,11 +2866,20 @@ export default function Usage() {
                           )}
                         </TableCell>}
                         {visibleColumns.cached && <TableCell className="text-right">
-                          {log.cached_tokens > 0 ? (
-                            <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
-                              <DatabaseZap className="size-3.5" />
-                              {formatTokens(log.cached_tokens, true)}
-                            </Badge>
+                          {log.cached_tokens > 0 || (log.cache_write_5m_tokens ?? 0) + (log.cache_write_1h_tokens ?? 0) > 0 ? (
+                            <div className="flex flex-col items-end gap-0.5">
+                              {log.cached_tokens > 0 && (
+                                <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
+                                  <DatabaseZap className="size-3.5" />
+                                  {formatTokens(log.cached_tokens, true)}
+                                </Badge>
+                              )}
+                              {(log.cache_write_5m_tokens ?? 0) + (log.cache_write_1h_tokens ?? 0) > 0 && (
+                                <span className={`${usageTableMonoClass} text-[10px] text-amber-600 dark:text-amber-400`} title={t('usage.cacheWriteTooltip', { m5: formatTokens(log.cache_write_5m_tokens ?? 0, true), h1: formatTokens(log.cache_write_1h_tokens ?? 0, true) })}>
+                                  {t('usage.cacheWriteBadge', { tokens: formatTokens((log.cache_write_5m_tokens ?? 0) + (log.cache_write_1h_tokens ?? 0), true) })}
+                                </span>
+                              )}
+                            </div>
                           ) : (
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}

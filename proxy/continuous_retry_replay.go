@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 )
 
 const (
@@ -29,6 +30,7 @@ var (
 type continuousRetryReplay struct {
 	memory      bytes.Buffer
 	file        *os.File
+	tempPath    string
 	size        int64
 	memoryLimit int64
 	totalLimit  int64
@@ -90,8 +92,13 @@ func (r *continuousRetryReplay) Write(data []byte) (int, error) {
 		// The open descriptor is sufficient for replay. Removing the directory
 		// entry immediately prevents abandoned attempts from leaving files behind.
 		if err := os.Remove(file.Name()); err != nil {
-			_ = file.Close()
-			return 0, errContinuousRetryReplayStorage
+			if runtime.GOOS != "windows" {
+				_ = file.Close()
+				return 0, errContinuousRetryReplayStorage
+			}
+			// Windows cannot unlink an open file created by os.CreateTemp.
+			// Keep the path only until Close, then remove it immediately.
+			r.tempPath = file.Name()
 		}
 		r.file = file
 		if r.memory.Len() > 0 {
@@ -164,6 +171,12 @@ func (r *continuousRetryReplay) Close() error {
 			closeErr = errContinuousRetryReplayStorage
 		}
 		r.file = nil
+	}
+	if r.tempPath != "" {
+		if err := os.Remove(r.tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			closeErr = errContinuousRetryReplayStorage
+		}
+		r.tempPath = ""
 	}
 	return closeErr
 }

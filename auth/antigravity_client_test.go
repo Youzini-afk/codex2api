@@ -13,33 +13,71 @@ import (
 	"time"
 )
 
-func TestAntigravityOAuthClientsRequireExplicitConfiguration(t *testing.T) {
+// resetConfiguredAntigravityOAuth 清空系统设置侧的 OAuth client 配置并在测试
+// 结束时保持清空，避免包级 atomic 状态串到其他用例。
+func resetConfiguredAntigravityOAuth(t *testing.T) {
+	t.Helper()
+	SetConfiguredAntigravityOAuth(AntigravityOAuthSettings{})
+	t.Cleanup(func() { SetConfiguredAntigravityOAuth(AntigravityOAuthSettings{}) })
+}
+
+func TestAntigravityOAuthClientsFallBackToOfficialDesktopClient(t *testing.T) {
 	t.Setenv(antigravityOAuthClientsEnv, "")
 	t.Setenv(antigravityActiveOAuthClientEnv, "")
-	clients, active := antigravityOAuthClients()
-	if len(clients) != 0 || active != "" {
-		t.Fatalf("clients/active = %#v/%q, want empty explicit configuration", clients, active)
+	resetConfiguredAntigravityOAuth(t)
+	clients, active := effectiveAntigravityOAuthClients()
+	if len(clients) != 1 || active != AntigravityDefaultOAuthClientKey {
+		t.Fatalf("clients/active = %#v/%q, want built-in official", clients, active)
+	}
+	if clients[0].ClientID != AntigravityDefaultOAuthClientID || clients[0].ClientSecret != AntigravityDefaultOAuthClientSecret {
+		t.Fatalf("built-in client = %#v", clients[0])
+	}
+	if !UsingBuiltinAntigravityOAuth() {
+		t.Fatal("UsingBuiltinAntigravityOAuth() = false, want true when nothing is configured")
 	}
 	client := newAntigravityClient(http.DefaultClient, AntigravityEndpoints{})
-	_, _, err := client.BuildOAuthAuthorizationURL(
+	gotURL, info, err := client.BuildOAuthAuthorizationURL(
 		"http://127.0.0.1:43123/oauth-callback", "state-123", "challenge-456", "",
 	)
-	if err == nil || !strings.Contains(err.Error(), antigravityOAuthClientsEnv) {
-		t.Fatalf("missing configuration error = %v", err)
+	if err != nil {
+		t.Fatalf("BuildOAuthAuthorizationURL() error: %v", err)
+	}
+	if info.Key != AntigravityDefaultOAuthClientKey || info.ClientID != AntigravityDefaultOAuthClientID {
+		t.Fatalf("info = %+v", info)
+	}
+	if !strings.Contains(gotURL, "client_id="+url.QueryEscape(AntigravityDefaultOAuthClientID)) {
+		t.Fatalf("authorization URL missing official client_id: %s", gotURL)
 	}
 }
 
 func TestAntigravityOAuthClientsLoadConfiguredEntriesAndDefaultToFirst(t *testing.T) {
 	t.Setenv(antigravityOAuthClientsEnv, "primary|client-id|client-secret;backup|backup-id|backup-secret")
 	t.Setenv(antigravityActiveOAuthClientEnv, "")
-	clients, active := antigravityOAuthClients()
+	resetConfiguredAntigravityOAuth(t)
+	clients, active := effectiveAntigravityOAuthClients()
 	if len(clients) != 2 || active != "primary" {
 		t.Fatalf("clients/active = %#v/%q", clients, active)
 	}
 	t.Setenv(antigravityActiveOAuthClientEnv, "BACKUP")
-	_, active = antigravityOAuthClients()
+	_, active = effectiveAntigravityOAuthClients()
 	if active != "backup" {
 		t.Fatalf("active = %q, want backup", active)
+	}
+}
+
+func TestAntigravityOAuthCandidatesAppendOfficialDesktopClient(t *testing.T) {
+	client := &AntigravityClient{
+		oauth: []antigravityOAuthClient{{Key: "custom", ClientID: "custom-id", ClientSecret: "custom-secret"}},
+	}
+	got := client.oauthCandidates(AntigravityCredential{RefreshToken: "rt"})
+	if len(got) != 2 || got[0].Key != "custom" || got[1].Key != AntigravityDefaultOAuthClientKey {
+		t.Fatalf("candidates = %#v", got)
+	}
+	// 已配置 official key 时不再重复追加内置条目。
+	client.oauth = append(client.oauth, builtinAntigravityOAuthClient())
+	got = client.oauthCandidates(AntigravityCredential{RefreshToken: "rt"})
+	if len(got) != 2 || got[1].ClientID != AntigravityDefaultOAuthClientID {
+		t.Fatalf("deduped candidates = %#v", got)
 	}
 }
 
@@ -498,5 +536,270 @@ func TestAntigravityClientReturnsRotatedCredentialOnQuotaFailure(t *testing.T) {
 	}
 	if result.Credential.AccessToken != "access-new" || result.Credential.RefreshToken != "refresh-rotated" || result.Profile.Email != "user@example.com" || !result.EntitlementsObserved {
 		t.Fatalf("partial result = %+v", result)
+	}
+}
+
+func TestAntigravitySyncSurfacesValidationRequiredQuotaWarning(t *testing.T) {
+	// 真实 VALIDATION_REQUIRED 错误体超过 512 字节,验证 URL 位于尾部:
+	// 该用例同时证明 warning 解析的是未截断 rawBody,而非渲染用的 Body。
+	validationURL := "https://accounts.google.com/signin/continue?sarp=1&scc=1&continue=https://developers.google.com/gemini-code-assist/auth/auth_success_gemini&plt=AKgnsbv6rSViHMUsE" + strings.Repeat("x", 280)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"subject","email":"user@example.com","verified_email":true}`)
+		case "/load":
+			_, _ = io.WriteString(w, `{"cloudaicompanionProject":"project","paidTier":{"name":"Pro"}}`)
+		case "/quota":
+			_, _ = io.WriteString(w, `{"models":{"gemini-2.5-pro":{"quotaInfo":{"remainingFraction":0.5}}}}`)
+		case "/summary":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"code":403,"message":"Verify your account to continue.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","domain":"cloudcode-pa.googleapis.com","metadata":{"validation_error_message":"Verify your account to continue.","validation_url":"`+validationURL+`"}}]}}`)
+		case "/credits":
+			_, _ = io.WriteString(w, `{"paidTier":{"availableCredits":[]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAntigravityClient(server.Client(), AntigravityEndpoints{
+		UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"}, Quota: []string{server.URL + "/quota"},
+		QuotaSummary: []string{server.URL + "/summary"}, AICredits: []string{server.URL + "/credits"},
+	})
+	client.oauth = nil
+
+	result, err := client.Sync(context.Background(), AntigravityCredential{AccessToken: "access"})
+	if err != nil {
+		t.Fatalf("Sync() error = %v (quota summary failure must not fail the sync)", err)
+	}
+	if result.QuotaGroupsObserved {
+		t.Fatal("QuotaGroupsObserved = true, want false after 403")
+	}
+	if !strings.Contains(result.Warning, "Verify your account to continue.") {
+		t.Fatalf("warning missing upstream message: %q", result.Warning)
+	}
+	if !strings.Contains(result.Warning, validationURL) {
+		t.Fatalf("warning missing untruncated verification URL: %q", result.Warning)
+	}
+	if strings.Contains(result.Warning, "temporarily unavailable") {
+		t.Fatalf("VALIDATION_REQUIRED rendered as temporarily unavailable: %q", result.Warning)
+	}
+}
+
+func TestAntigravitySyncQuotaSummaryTransientFailureKeepsDiagnostic(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"subject","email":"user@example.com","verified_email":true}`)
+		case "/load":
+			_, _ = io.WriteString(w, `{"cloudaicompanionProject":"project","paidTier":{"name":"Pro"}}`)
+		case "/quota":
+			_, _ = io.WriteString(w, `{"models":{"gemini-2.5-pro":{"quotaInfo":{"remainingFraction":0.5}}}}`)
+		case "/summary":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":503,"message":"backend restarting","status":"UNAVAILABLE"}}`)
+		case "/credits":
+			_, _ = io.WriteString(w, `{"paidTier":{"availableCredits":[]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAntigravityClient(server.Client(), AntigravityEndpoints{
+		UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"}, Quota: []string{server.URL + "/quota"},
+		QuotaSummary: []string{server.URL + "/summary"}, AICredits: []string{server.URL + "/credits"},
+	})
+	client.oauth = nil
+
+	result, err := client.Sync(context.Background(), AntigravityCredential{AccessToken: "access"})
+	if err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if !strings.Contains(result.Warning, "Antigravity quota summary is temporarily unavailable") ||
+		!strings.Contains(result.Warning, "backend restarting") {
+		t.Fatalf("warning = %q, want transient wording with upstream detail", result.Warning)
+	}
+}
+
+func TestAntigravitySyncSurfacesTOSViolationAppealLink(t *testing.T) {
+	const appealURL = "https://forms.gle/hGzM9MEUv2azZsrb9"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"subject","email":"user@example.com","verified_email":true}`)
+		case "/load":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"code":403,"message":"This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION","domain":"cloudcode-pa.googleapis.com","metadata":{"appeal_url_link_text":"Submit Appeal","appeal_url":"`+appealURL+`","uiMessage":"true"}}]}}`)
+		case "/quota":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":"forbidden"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAntigravityClient(server.Client(), AntigravityEndpoints{
+		UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"}, Quota: []string{server.URL + "/quota"},
+	})
+	client.oauth = nil
+
+	result, err := client.Sync(context.Background(), AntigravityCredential{AccessToken: "access"})
+	if err != nil {
+		t.Fatalf("Sync() error = %v (a forbidden quota snapshot must not fail the sync)", err)
+	}
+	if !result.Quota.Forbidden || result.EntitlementsObserved {
+		t.Fatalf("quota/entitlements = forbidden=%t observed=%t, want true/false", result.Quota.Forbidden, result.EntitlementsObserved)
+	}
+	if !strings.Contains(result.Warning, "Terms of Service violation") || !strings.Contains(result.Warning, appealURL) {
+		t.Fatalf("warning = %q, want short TOS summary with appeal URL", result.Warning)
+	}
+	if strings.Contains(result.Warning, `"details"`) {
+		t.Fatalf("warning still embeds the raw upstream JSON blob: %q", result.Warning)
+	}
+}
+
+func TestAntigravityClientOnboardsProjectWhenLoadCodeAssistHasNone(t *testing.T) {
+	var mu sync.Mutex
+	onboardCalls := 0
+	var onboardBody map[string]any
+	var onboardAPIClient string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"google-subject","email":"fresh@example.com","verified_email":true,"name":"Fresh"}`)
+		case "/load":
+			// A never-onboarded account: no companion project, camelCase isDefault.
+			_, _ = io.WriteString(w, `{"currentTier":{"id":"free-tier","name":"Free"},"allowedTiers":[{"id":"free-tier","name":"Free","isDefault":true},{"id":"g1-pro-tier","name":"Pro"}]}`)
+		case "/onboard":
+			mu.Lock()
+			onboardCalls++
+			call := onboardCalls
+			onboardAPIClient = r.Header.Get("X-Goog-Api-Client")
+			_ = json.NewDecoder(r.Body).Decode(&onboardBody)
+			mu.Unlock()
+			if call == 1 {
+				_, _ = io.WriteString(w, `{"name":"operations/1","done":false}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"name":"operations/1","done":true,"response":{"cloudaicompanionProject":{"id":"provisioned-project"}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAntigravityClient(server.Client(), AntigravityEndpoints{
+		UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"},
+		OnboardUser: []string{server.URL + "/onboard"},
+	})
+	sleeps := 0
+	client.sleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+
+	credential := AntigravityCredential{AccessToken: "access-token"}
+	_, entitlements, entitlementErr, err := client.fetchIdentityContext(context.Background(), &credential, false)
+	if err != nil {
+		t.Fatalf("fetchIdentityContext() error: %v", err)
+	}
+	if entitlementErr != nil {
+		t.Fatalf("entitlement error: %v", entitlementErr)
+	}
+	if entitlements.ProjectID != "provisioned-project" || credential.ProjectID != "provisioned-project" {
+		t.Fatalf("project = %q / %q, want provisioned-project", entitlements.ProjectID, credential.ProjectID)
+	}
+	if onboardCalls != 2 || sleeps != 1 {
+		t.Fatalf("onboard calls = %d, sleeps = %d, want 2 polls with one wait", onboardCalls, sleeps)
+	}
+	if onboardBody["tierId"] != "free-tier" {
+		t.Fatalf("onboard tierId = %#v, want the advertised default tier", onboardBody["tierId"])
+	}
+	metadata, _ := onboardBody["metadata"].(map[string]any)
+	if metadata["ideType"] != "ANTIGRAVITY" || metadata["pluginType"] != "GEMINI" {
+		t.Fatalf("onboard metadata = %#v", onboardBody["metadata"])
+	}
+	if onboardAPIClient != antigravityOnboardAPIClient {
+		t.Fatalf("X-Goog-Api-Client = %q", onboardAPIClient)
+	}
+	if len(entitlements.AllowedTiers) != 2 || !entitlements.AllowedTiers[0].IsDefault || entitlements.AllowedTiers[1].IsDefault {
+		t.Fatalf("camelCase isDefault was not parsed: %+v", entitlements.AllowedTiers)
+	}
+}
+
+func TestAntigravityClientOnboardFailureSurfacesAsEntitlementWarning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"google-subject","email":"fresh@example.com","verified_email":true}`)
+		case "/load":
+			_, _ = io.WriteString(w, `{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`)
+		case "/onboard":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"code":403,"message":"onboarding denied","status":"PERMISSION_DENIED"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAntigravityClient(server.Client(), AntigravityEndpoints{
+		UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"},
+		OnboardUser: []string{server.URL + "/onboard"},
+	})
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+
+	credential := AntigravityCredential{AccessToken: "access-token"}
+	_, entitlements, entitlementErr, err := client.fetchIdentityContext(context.Background(), &credential, false)
+	if err != nil {
+		t.Fatalf("fetchIdentityContext() error: %v", err)
+	}
+	if entitlementErr == nil || !strings.Contains(entitlementErr.Error(), "onboardUser") {
+		t.Fatalf("entitlement error = %v, want onboardUser failure", entitlementErr)
+	}
+	if entitlements.ProjectID != "" {
+		t.Fatalf("project = %q, want empty after failed onboarding", entitlements.ProjectID)
+	}
+}
+
+func TestAntigravityClientKeepsPreservedProjectWithoutOnboarding(t *testing.T) {
+	onboardCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"google-subject","email":"user@example.com","verified_email":true}`)
+		case "/load":
+			_, _ = io.WriteString(w, `{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`)
+		case "/onboard":
+			onboardCalls++
+			_, _ = io.WriteString(w, `{"done":true,"response":{"cloudaicompanionProject":"other"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newAntigravityClient(server.Client(), AntigravityEndpoints{
+		UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"},
+		OnboardUser: []string{server.URL + "/onboard"},
+	})
+	credential := AntigravityCredential{AccessToken: "access-token", ProjectID: "existing-project"}
+	_, entitlements, entitlementErr, err := client.fetchIdentityContext(context.Background(), &credential, true)
+	if err != nil || entitlementErr != nil {
+		t.Fatalf("errors: %v / %v", err, entitlementErr)
+	}
+	if entitlements.ProjectID != "existing-project" || onboardCalls != 0 {
+		t.Fatalf("project = %q, onboard calls = %d; a preserved project must not trigger onboarding", entitlements.ProjectID, onboardCalls)
 	}
 }

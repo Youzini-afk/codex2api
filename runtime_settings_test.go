@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -151,7 +152,7 @@ func TestApplyRuntimeSystemSettingsValidatesBeforePublishing(t *testing.T) {
 	if limiter.GetRPM() != 12 {
 		t.Fatalf("rate limiter changed before validation: %d", limiter.GetRPM())
 	}
-	if got := proxy.CurrentRuntimeSettings(); got != previousRuntime {
+	if got := proxy.CurrentRuntimeSettings(); !reflect.DeepEqual(got, previousRuntime) {
 		t.Fatalf("proxy runtime changed before validation: got %+v want %+v", got, previousRuntime)
 	}
 }

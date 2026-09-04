@@ -45,21 +45,25 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store                  *auth.Store
-	cache                  cache.TokenCache
-	db                     *database.DB
-	cacheCfgStore          responseCacheSettingsStore
-	rateLimiter            *proxy.RateLimiter
-	systemUpdate           *systemUpdater
-	systemUpdateOnce       sync.Once
-	refreshAccount         func(context.Context, int64) error
-	probeUsage             func(context.Context, *auth.Account) error
-	activate5hWindow       func(context.Context, *auth.Account) error
-	executeUsageProbe      usageProbeRequestFunc
-	syncAccountPlanOnReset func(context.Context, *auth.Account) error
-	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
-	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
-	queryWhamDailyUsage    func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
+	store            *auth.Store
+	cache            cache.TokenCache
+	db               *database.DB
+	cacheCfgStore    responseCacheSettingsStore
+	rateLimiter      *proxy.RateLimiter
+	systemUpdate     *systemUpdater
+	systemUpdateOnce sync.Once
+	refreshAccount   func(context.Context, int64) error
+	probeUsage       func(context.Context, *auth.Account) error
+	// executeClaudeUsageProbe is injectable for tests; production uses the
+	// provider-native Anthropic Messages request directly.
+	executeClaudeUsageProbe func(context.Context, *auth.Account, []byte) (*http.Response, error)
+	activate5hWindow        func(context.Context, *auth.Account) error
+	executeUsageProbe       usageProbeRequestFunc
+	syncAccountPlanOnReset  func(context.Context, *auth.Account) error
+	queryResetCredits       func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit      func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	queryWhamDailyUsage     func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
+	sendCodexInvite         func(context.Context, *auth.Account, string, string, string, []string) (*proxy.CodexInviteResult, error)
 	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
 	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
 	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
@@ -129,6 +133,9 @@ type Handler struct {
 	// accountCachesGen 在账号变更时递增;重建协程安装快照前校验代数,
 	// 防止变更前就开始读库的在途重建把旧数据写回缓存。
 	accountCachesGen atomic.Uint64
+	// Claude 用量采样只改变 Claude 列表投影；独立代数避免频繁采样让
+	// Codex/Grok/Antigravity 的大池快照无谓失效。
+	claudeAccountCachesGen atomic.Uint64
 
 	// 分析图表使用固定大小的聚合结果，避免把完整号池传给浏览器。与账号
 	// 快照分开缓存，只有展开分析区或 Dashboard runway 时才会构建。
@@ -202,6 +209,13 @@ func validateResponseCacheSettingsUpdateRanges(update database.ResponseCacheSett
 			database.ErrInvalidResponseCacheSettings,
 			database.MinResponseCacheReconstructMaxBytes,
 			database.MaxResponseCacheReconstructMaxBytes,
+		)
+	case update.WritePolicy != nil && !database.ValidResponseCacheWritePolicy(*update.WritePolicy):
+		return fmt.Errorf(
+			"%w: response_cache_write_policy must be %q or %q",
+			database.ErrInvalidResponseCacheSettings,
+			database.ResponseCacheWritePolicyAlways,
+			database.ResponseCacheWritePolicyOnDemand,
 		)
 	default:
 		return nil
@@ -317,8 +331,10 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
 		return
 	}
-	// Agent Identity 无 OAuth 身份合并需求（无 RT/AT），探针后直接返回。
-	if account.IsCodexAgentIdentity() {
+	// Agent Identity 无 OAuth 身份合并需求（无 RT/AT），Claude 也使用
+	// Anthropic account UUID 而非 ChatGPT workspace 身份；两者都不能进入
+	// Codex 的 email+workspace 查重链。
+	if !shouldMergeImportedIdentity(account) {
 		return
 	}
 	// AT / codex_at 账号的 OAuth 身份（email + 有效工作区）在插入时无法从
@@ -328,6 +344,10 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	// 合并按 email + 有效工作区身份进行；Chatgpt-Account-Id 覆盖代表独立路由。
 	// 数据库生命周期 ctx 与串行合并锁（防并发导入互相软删）。
 	h.mergeRefreshedDuplicateIntoExistingContext(ctx, accountID, source)
+}
+
+func shouldMergeImportedIdentity(account *auth.Account) bool {
+	return account != nil && !account.IsCodexAgentIdentity() && !account.IsClaudeOAuth()
 }
 
 func (h *Handler) startDBBackgroundTask(task func(context.Context)) bool {
@@ -925,6 +945,8 @@ func parseUsageChannel(c *gin.Context) string {
 		return database.UpstreamChannelGrok
 	case database.UpstreamChannelAntigravity:
 		return database.UpstreamChannelAntigravity
+	case database.UpstreamChannelClaude:
+		return database.UpstreamChannelClaude
 	}
 	return ""
 }
@@ -960,6 +982,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.queryResetCredits = proxy.QueryWhamResetCredits
 	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
 	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
+	handler.sendCodexInvite = proxy.SendCodexInvite
 	handler.whamDailyBackfillLast = make(map[int64]time.Time)
 	handler.whamDailyBackfillInFlight = make(map[int64]struct{})
 	handler.whamDailyBackfillFailedAt = make(map[int64]time.Time)
@@ -1052,6 +1075,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/grok/import", h.BatchImportGrokAccounts)
 	api.POST("/accounts/grok/oauth/auth-url", h.GenerateGrokAuthURL)        // 兼容旧客户端
 	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
+	api.POST("/accounts/claude/oauth/auth-url", h.GenerateClaudeAuthURL)
+	api.POST("/accounts/claude/oauth/exchange-code", h.ExchangeClaudeOAuthCode)
+	api.POST("/accounts/claude/import", h.ImportClaudeToken)
+	api.GET("/accounts/claude/export", h.ExportClaudeAccounts)
+	api.POST("/accounts/:id/claude/models", h.RefreshClaudeModels)
+	api.POST("/accounts/claude/models/refresh", h.RefreshAllClaudeModels)
 	api.POST("/accounts/antigravity", h.AddAntigravityAccount)
 	api.POST("/accounts/antigravity/models", h.FetchAntigravityModels)
 	api.POST("/accounts/antigravity/batch-models", h.BatchUpdateAntigravityModels)
@@ -1102,6 +1131,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/invite/eligibility", h.GetInviteEligibility)
 	api.GET("/accounts/:id/invite/tracking", h.GetInviteTracking)
+	api.POST("/accounts/invite/recipients/check", h.CheckInviteRecipients)
+	api.GET("/accounts/invite/plan", h.GetInviteGuidePlan)
+	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.POST("/accounts/:id/usage/refresh", h.RefreshAccountUsage)
@@ -1155,7 +1187,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/settings/claude-config", h.GetClaudeConfig)
+	api.PUT("/settings/claude-config", h.UpdateClaudeConfig)
+	api.POST("/settings/claude-config/cli-version/sync", h.SyncClaudeCLIVersion)
 	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
+	api.GET("/settings/invite-guide", h.GetInviteGuideSettings)
+	api.PUT("/settings/invite-guide", h.UpdateInviteGuideSettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
@@ -1363,6 +1400,7 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		database.UpstreamChannelCodex:       {},
 		database.UpstreamChannelGrok:        {},
 		database.UpstreamChannelAntigravity: {},
+		database.UpstreamChannelClaude:      {},
 	}
 	counts.total = len(rows)
 	for _, row := range rows {
@@ -1377,6 +1415,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			channel = database.UpstreamChannelGrok
 		} else if strings.EqualFold(upstreamType, auth.UpstreamAntigravity) {
 			channel = database.UpstreamChannelAntigravity
+		} else if strings.EqualFold(upstreamType, auth.UpstreamClaude) {
+			channel = database.UpstreamChannelClaude
 		}
 		usingCredits := false
 		acc := runtimeByID[row.ID]
@@ -1390,6 +1430,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			usingCredits = acc.UsingCredits()
 			if acc.IsGrokAPI() {
 				channel = database.UpstreamChannelGrok
+			} else if acc.IsClaudeOAuth() {
+				channel = database.UpstreamChannelClaude
 			}
 		}
 		perChannel := channelCounts[channel]
@@ -1431,6 +1473,11 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 		if status == "unauthorized" || status == "error" {
 			return false
 		}
+		if acc.IsClaudeOAuth() && row != nil &&
+			strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey)) != "" &&
+			strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey)) == "" {
+			return false
+		}
 		return !snapshot.UsagePercent5hValid && !snapshot.UsagePercent7dValid
 	}
 	if row == nil {
@@ -1444,6 +1491,11 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 	}
 	status := strings.ToLower(strings.TrimSpace(row.Status))
 	if status == "unauthorized" || status == "error" {
+		return false
+	}
+	if strings.EqualFold(upstreamType, auth.UpstreamClaude) &&
+		strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey)) != "" &&
+		strings.TrimSpace(row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey)) == "" {
 		return false
 	}
 	return true
@@ -1489,6 +1541,7 @@ type accountResponse struct {
 	OpenAIResponsesAPI            bool                        `json:"openai_responses_api,omitempty"`
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
+	ClaudeAPI                     bool                        `json:"claude_api,omitempty"`
 	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
 	AgentIdentity                 bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind                  string                      `json:"grok_auth_kind,omitempty"`
@@ -1508,6 +1561,15 @@ type accountResponse struct {
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
 	CodexFingerprintMode          string                      `json:"codex_fingerprint_mode,omitempty"`
+	ClaudeFingerprintMode         string                      `json:"claude_fingerprint_mode,omitempty"`
+	ClaudeUserAgent               string                      `json:"claude_user_agent,omitempty"`
+	ClaudeClientPlatform          string                      `json:"claude_client_platform,omitempty"`
+	ClaudeVersionPolicy           string                      `json:"claude_version_policy,omitempty"`
+	ClaudeClientVersion           string                      `json:"claude_client_version,omitempty"`
+	ClaudeClientPlatformOverride  string                      `json:"claude_client_platform_override,omitempty"`
+	ClaudeVersionPolicyOverride   string                      `json:"claude_version_policy_override,omitempty"`
+	ClaudeClientVersionOverride   string                      `json:"claude_client_version_override,omitempty"`
+	Timezone                      string                      `json:"timezone,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -1525,6 +1587,10 @@ type accountResponse struct {
 	UpdatedAt                     string                      `json:"updated_at"`
 	CodexUsageUpdatedAt           string                      `json:"codex_usage_updated_at,omitempty"`
 	Codex5HUsageUpdatedAt         string                      `json:"codex_5h_usage_updated_at,omitempty"`
+	ClaudeUsageProbeAt            string                      `json:"claude_usage_probe_at,omitempty"`
+	ClaudeUsageProbeError         string                      `json:"claude_usage_probe_error,omitempty"`
+	ClaudeUsageWindows            []auth.ClaudeUsageWindow    `json:"claude_usage_windows,omitempty"`
+	ClaudeUsageWindowsProbed      bool                        `json:"claude_usage_windows_probed,omitempty"` // 已跑过 OAuth usage 采样(前端据此只回填从未采样的旧行)
 	ActiveRequests                int64                       `json:"active_requests"`
 	OccupiedRequests              int64                       `json:"occupied_requests"`
 	SessionSlotBufferEnabled      bool                        `json:"session_slot_buffer_enabled"`
@@ -1904,6 +1970,7 @@ type accountLiteResponse struct {
 	ATOnly             bool   `json:"at_only"`
 	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
 	GrokAPI            bool   `json:"grok_api"`
+	ClaudeAPI          bool   `json:"claude_api"`
 	AgentIdentity      bool   `json:"agent_identity"`
 	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
 }
@@ -1927,6 +1994,7 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+		isClaudeAccount := strings.EqualFold(upstreamType, auth.UpstreamClaude)
 		grokAuthKind := ""
 		if isGrokAccount {
 			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
@@ -1955,9 +2023,10 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			Status:             status,
 			Enabled:            row.Enabled,
 			ProxyURL:           row.ProxyURL,
-			ATOnly:             !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:             !isOpenAIResponsesAccount && !isGrokAccount && !isClaudeAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			GrokAPI:            isGrokAccount,
+			ClaudeAPI:          isClaudeAccount,
 			AgentIdentity:      isAgentIdentityCredentialRow(row),
 			GrokAuthKind:       grokAuthKind,
 		})
@@ -1984,6 +2053,11 @@ type updateAccountSchedulerReq struct {
 	ProxyURL                json.RawMessage `json:"proxy_url"`
 	CustomHeaders           json.RawMessage `json:"custom_headers"`
 	CodexFingerprintMode    json.RawMessage `json:"codex_fingerprint_mode"`
+	ClaudeFingerprintMode   json.RawMessage `json:"claude_fingerprint_mode"`
+	ClaudeClientPlatform    json.RawMessage `json:"claude_client_platform"`
+	ClaudeVersionPolicy     json.RawMessage `json:"claude_version_policy"`
+	ClaudeClientVersion     json.RawMessage `json:"claude_client_version"`
+	Timezone                json.RawMessage `json:"timezone"`
 }
 
 type accountSchedulerUpdate struct {
@@ -2005,6 +2079,11 @@ type accountSchedulerUpdate struct {
 	ProxyURL                database.OptionalString
 	CustomHeaders           optionalCustomHeaders
 	CodexFingerprintMode    database.OptionalString
+	ClaudeFingerprintMode   database.OptionalString
+	ClaudeClientPlatform    database.OptionalString
+	ClaudeVersionPolicy     database.OptionalString
+	ClaudeClientVersion     database.OptionalString
+	Timezone                database.OptionalString
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -2084,6 +2163,41 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	claudeFingerprintMode, err := parseOptionalStringField(req.ClaudeFingerprintMode, "claude_fingerprint_mode", validateClaudeFingerprintMode)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if claudeFingerprintMode.Set {
+		claudeFingerprintMode.Value = auth.NormalizeClaudeFingerprintMode(claudeFingerprintMode.Value)
+	}
+	claudeClientPlatform, err := parseOptionalStringField(req.ClaudeClientPlatform, "claude_client_platform", validateClaudeClientPlatform)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if claudeClientPlatform.Set {
+		claudeClientPlatform.Value = string(auth.ClaudeClientPlatform(strings.ToLower(strings.TrimSpace(claudeClientPlatform.Value))))
+	}
+	claudeVersionPolicy, err := parseOptionalStringField(req.ClaudeVersionPolicy, "claude_version_policy", validateClaudeVersionPolicy)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if claudeVersionPolicy.Set {
+		claudeVersionPolicy.Value = string(auth.ClaudeVersionPolicy(strings.ToLower(strings.TrimSpace(claudeVersionPolicy.Value))))
+	}
+	claudeClientVersion, err := parseOptionalStringField(req.ClaudeClientVersion, "claude_client_version", validateClaudeClientVersion)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if claudeClientVersion.Set {
+		claudeClientVersion.Value = strings.TrimSpace(claudeClientVersion.Value)
+	}
+	if claudeVersionPolicy.Set && (claudeVersionPolicy.Value == string(auth.ClaudeVersionPolicyFixed) || claudeVersionPolicy.Value == string(auth.ClaudeVersionPolicyMinimum)) && (!claudeClientVersion.Set || claudeClientVersion.Value == "") {
+		return accountSchedulerUpdate{}, errors.New("claude_client_version is required for fixed/minimum policy")
+	}
+	timezoneField, err := parseOptionalStringField(req.Timezone, "timezone", validateAccountTimezone)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 	if codexFingerprintMode.Set {
 		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
 	}
@@ -2093,6 +2207,21 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	}
 	if codexFingerprintMode.Set {
 		credentialUpdates[auth.CodexFingerprintModeCredentialKey] = codexFingerprintMode.Value
+	}
+	if claudeFingerprintMode.Set {
+		credentialUpdates[auth.ClaudeFingerprintModeCredentialKey] = claudeFingerprintMode.Value
+	}
+	if claudeClientPlatform.Set {
+		credentialUpdates[auth.ClaudeClientPlatformCredentialKey] = claudeClientPlatform.Value
+	}
+	if claudeVersionPolicy.Set {
+		credentialUpdates[auth.ClaudeVersionPolicyCredentialKey] = claudeVersionPolicy.Value
+	}
+	if claudeClientVersion.Set {
+		credentialUpdates[auth.ClaudeClientVersionCredentialKey] = claudeClientVersion.Value
+	}
+	if timezoneField.Set {
+		credentialUpdates["timezone"] = strings.TrimSpace(timezoneField.Value)
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -2150,8 +2279,57 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ProxyURL:                proxyURL,
 		CustomHeaders:           customHeaders,
 		CodexFingerprintMode:    codexFingerprintMode,
+		ClaudeFingerprintMode:   claudeFingerprintMode,
+		ClaudeClientPlatform:    claudeClientPlatform,
+		ClaudeVersionPolicy:     claudeVersionPolicy,
+		ClaudeClientVersion:     claudeClientVersion,
+		Timezone:                timezoneField,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
+}
+
+// validateClaudeFingerprintMode 允许空串(=跟随全局默认),其余必须是 preserve/force。
+func validateClaudeFingerprintMode(value string) error {
+	if auth.IsValidClaudeFingerprintMode(value) {
+		return nil
+	}
+	return fmt.Errorf("claude_fingerprint_mode must be one of: preserve, force")
+}
+
+func validateClaudeClientPlatform(value string) error {
+	if strings.EqualFold(strings.TrimSpace(value), string(auth.ClaudeClientPlatformAny)) || strings.EqualFold(strings.TrimSpace(value), string(auth.ClaudeClientPlatformCLIOnly)) || strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return fmt.Errorf("claude_client_platform must be any or claude_code_cli_only")
+}
+
+func validateClaudeVersionPolicy(value string) error {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", string(auth.ClaudeVersionPolicyPassthrough), string(auth.ClaudeVersionPolicyFixed), string(auth.ClaudeVersionPolicyMinimum):
+		return nil
+	default:
+		return fmt.Errorf("claude_version_policy must be passthrough, fixed, or minimum")
+	}
+}
+
+func validateClaudeClientVersion(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	_, err := auth.CompareClaudeClientVersions(strings.TrimSpace(value), strings.TrimSpace(value))
+	return err
+}
+
+// validateAccountTimezone 允许空串(=清除);非空必须是可加载的 IANA 时区。
+func validateAccountTimezone(value string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil
+	}
+	if _, err := time.LoadLocation(v); err != nil {
+		return fmt.Errorf("timezone must be a valid IANA timezone, e.g. Asia/Shanghai")
+	}
+	return nil
 }
 
 // validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
@@ -2180,7 +2358,12 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.SchedulerPriority.Set ||
 		u.ProxyURL.Set ||
 		u.CustomHeaders.Set ||
-		u.CodexFingerprintMode.Set
+		u.CodexFingerprintMode.Set ||
+		u.ClaudeFingerprintMode.Set ||
+		u.ClaudeClientPlatform.Set ||
+		u.ClaudeVersionPolicy.Set ||
+		u.ClaudeClientVersion.Set ||
+		u.Timezone.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2308,6 +2491,38 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			}
 		}
 	}
+	if update.Timezone.Set {
+		if update.CredentialUpdates == nil {
+			update.CredentialUpdates = make(map[string]interface{})
+		}
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+			return
+		}
+		applied, err := prepareClaudeTimezoneCredentialUpdateWithHeaders(row, update.Timezone.Value, update.CredentialUpdates, func() map[string]string {
+			if update.CustomHeaders.Set {
+				return update.CustomHeaders.Values
+			}
+			return nil
+		}())
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if applied {
+			if headers, ok := update.CredentialUpdates["custom_headers"].(map[string]string); ok {
+				// The timezone path owns the final safe identity snapshot even
+				// when the request also supplied custom_headers; use that same
+				// snapshot for duplicate checks and immediate runtime updates.
+				update.CustomHeaders = optionalCustomHeaders{Set: true, Values: headers}
+			}
+		}
+	}
 
 	if update.CustomHeaders.Set {
 		h.mergeDuplicateMu.Lock()
@@ -2430,6 +2645,44 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
+	} else if update.Timezone.Set {
+		// A Claude timezone edit rebuilds the restricted identity headers in
+		// CredentialUpdates; publish the same snapshot immediately instead of
+		// waiting for the scheduler outbox/restart to refresh runtime state.
+		if headers, ok := update.CredentialUpdates["custom_headers"].(map[string]string); ok {
+			h.store.ApplyAccountCustomHeaders(id, headers)
+		}
+	}
+	if update.ClaudeFingerprintMode.Set {
+		h.store.ApplyAccountClaudeFingerprintMode(id, update.ClaudeFingerprintMode.Value)
+	}
+	if update.ClaudeClientPlatform.Set || update.ClaudeVersionPolicy.Set || update.ClaudeClientVersion.Set {
+		policy := auth.ClaudeClientPolicy{}
+		if update.ClaudeClientPlatform.Set {
+			policy.Platform = auth.ClaudeClientPlatform(update.ClaudeClientPlatform.Value)
+		}
+		if update.ClaudeVersionPolicy.Set {
+			policy.VersionPolicy = auth.ClaudeVersionPolicy(update.ClaudeVersionPolicy.Value)
+		}
+		if update.ClaudeClientVersion.Set {
+			policy.ClientVersion = update.ClaudeClientVersion.Value
+		}
+		// Empty fields mean inherit global. The runtime account is updated with
+		// only the explicitly changed values by reading its current overrides.
+		if account := h.store.FindByID(id); account != nil {
+			account.Mu().RLock()
+			if !update.ClaudeClientPlatform.Set {
+				policy.Platform = auth.ClaudeClientPlatform(account.ClaudeClientPlatformOverride)
+			}
+			if !update.ClaudeVersionPolicy.Set {
+				policy.VersionPolicy = auth.ClaudeVersionPolicy(account.ClaudeVersionPolicyOverride)
+			}
+			if !update.ClaudeClientVersion.Set {
+				policy.ClientVersion = account.ClaudeClientVersionOverride
+			}
+			account.Mu().RUnlock()
+		}
+		h.store.ApplyAccountClaudeClientPolicy(id, policy)
 	}
 	if update.CodexFingerprintMode.Set {
 		h.store.ApplyAccountCodexFingerprintMode(id, update.CodexFingerprintMode.Value)
@@ -3301,6 +3554,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		msg += "，但分组绑定失败: " + err.Error()
 	}
 
+	newAccountIDs := createdIDs.snapshot()
+	h.scheduleInviteGuideProbes(ctx, newAccountIDs)
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":      msg,
 		"success":      successCount,
@@ -3308,6 +3564,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		"failed":       failCount,
 		"bound_groups": boundGroups,
 		"group_ids":    groupIDs,
+		"created_ids":  newAccountIDs,
 	})
 }
 
@@ -3382,9 +3639,13 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 			Warning: "账号已添加，但分组绑定失败: " + err.Error(),
 		})
 	}
+	newAccountIDs := createdIDs.snapshot()
+	h.scheduleInviteGuideProbes(ctx, newAccountIDs)
+
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
 		Success: successCount, Duplicate: duplicateCount, Failed: failCount,
+		CreatedIDs: newAccountIDs,
 	})
 }
 
@@ -3519,7 +3780,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			customHeaders:  customHeaders,
 		})
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
-			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at", overwriteAccountProxy)
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -3770,7 +4031,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
-			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at", overwriteAccountProxy)
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -4242,8 +4503,9 @@ type updateAccountModelsRequest struct {
 	Models []string `json:"models"`
 }
 
-// UpdateAccountModels 设置 Codex OAuth 账号的支持模型白名单。
-// 空数组 = 清空白名单，放行全部模型；非空时调度器只会把白名单内模型的请求派给该账号。
+// UpdateAccountModels 设置 OAuth 账号的支持模型白名单。
+// Claude 账号仅接受 claude-* 原生模型；空数组 = 清空白名单，放行全部模型；
+// 非空时调度器只会把白名单内模型的请求派给该账号。
 func (h *Handler) UpdateAccountModels(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -4272,7 +4534,11 @@ func (h *Handler) UpdateAccountModels(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
 		return
 	}
-	if account.IsRelayStyle() {
+	if err := validateAccountModelsForAccount(account, models); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if account.IsRelayStyle() && !account.IsClaudeOAuth() {
 		writeError(c, http.StatusBadRequest, "中转/Grok 账号请在账号设置中编辑模型列表")
 		return
 	}
@@ -4286,6 +4552,24 @@ func (h *Handler) UpdateAccountModels(c *gin.Context) {
 	h.store.ApplyAccountModels(id, models)
 	h.db.InsertAccountEventAsync(id, "updated", "account_models")
 	c.JSON(http.StatusOK, gin.H{"models": models})
+}
+
+// validateAccountModelsForAccount keeps provider-specific model namespaces
+// out of the shared account-model endpoint. An empty list intentionally clears
+// the override; a non-empty Claude allowlist must contain only native
+// claude-* IDs so a stale Codex/Grok entry can never make a Claude account
+// appear routable for an incompatible protocol.
+func validateAccountModelsForAccount(account *auth.Account, models []string) error {
+	if account == nil || !account.IsClaudeOAuth() {
+		return nil
+	}
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if !strings.HasPrefix(strings.ToLower(model), "claude-") {
+			return fmt.Errorf("Claude 账号模型必须使用 claude-* 原生模型: %s", model)
+		}
+	}
+	return nil
 }
 
 // SyncAccountUpstreamModels 用账号自身凭据实时拉取上游模型清单，
@@ -4318,6 +4602,18 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 			h.triggerGrokCapabilityProbeForGeneration(id, result.capabilityGeneration)
 		}
 		c.JSON(http.StatusOK, gin.H{"models": result.Models, "state": result.State, "errors": result.Errors})
+		return
+	}
+	if account.IsClaudeOAuth() {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		defer cancel()
+		models, fetchErr := auth.NewClaudeAuth(h.store.ResolveProxyForAccount(account)).FetchModels(ctx, account.GetAccessToken())
+		if fetchErr != nil {
+			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Claude 上游模型清单失败: %s", fetchErr.Error()))
+			return
+		}
+		models = auth.NormalizeAccountModels(models)
+		c.JSON(http.StatusOK, gin.H{"models": models})
 		return
 	}
 	if account.IsOpenAIResponsesAPI() {
@@ -4366,6 +4662,43 @@ type importToken struct {
 	agentTaskID     string
 	chatgptUserID   string
 	agentFedRAMP    bool
+	// proxyURL 是导入文件里携带的代理，仅在 import_proxy 打开时生效。
+	// 它绝不能进 importTokenSeed / 去重指纹：同一个账号换了代理仍然是同一个账号，
+	// 参与指纹会让它被当成两条独立记录导入两遍。
+	proxyURL     string
+	proxyLabel   string
+	proxyEnabled *bool
+}
+
+// importSettings 汇总一次导入请求的表单开关。这些开关要穿过"入口 → 4 个格式
+// 解析函数 → importAccountsCommon"三层，继续用位置参数堆叠会越加越长。
+type importSettings struct {
+	// defaultProxyURL 是表单里填的代理：文件没带代理、或没开 importProxies 时的兜底。
+	defaultProxyURL string
+	// importProxies 打开后采用文件内携带的代理，并把它们注册进代理池。
+	importProxies  bool
+	allowDuplicate bool
+	customHeaders  map[string]string
+}
+
+// proxyForToken 返回该条目最终生效的代理：文件内代理优先，缺失时回落表单值。
+func (s importSettings) proxyForToken(t importToken) string {
+	if s.importProxies {
+		if fromFile := strings.TrimSpace(t.proxyURL); fromFile != "" {
+			return fromFile
+		}
+	}
+	return strings.TrimSpace(s.defaultProxyURL)
+}
+
+// proxyOverwritePolicyForToken 决定 upsert 命中已有账号时怎么处理代理绑定。
+// 文件带来的代理是被动数据，不覆盖目标端已有的绑定（那里可能已经做过精细分配）；
+// 表单里填的代理是操作员的显式换绑意图，维持既有的覆盖语义。
+func (s importSettings) proxyOverwritePolicyForToken(t importToken) proxyOverwritePolicy {
+	if s.importProxies && strings.TrimSpace(t.proxyURL) != "" {
+		return preserveAccountProxy
+	}
+	return overwriteAccountProxy
 }
 
 func (t importToken) isAgentIdentity() bool {
@@ -4470,6 +4803,9 @@ type jsonAccountEntry struct {
 	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
 	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
 	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
+	ProxyURL              string                 `json:"proxy_url"`
+	ProxyLabel            string                 `json:"proxy_label"`
+	ProxyEnabled          *bool                  `json:"proxy_enabled"`
 }
 
 type jsonAccountUser struct {
@@ -4491,6 +4827,20 @@ type sub2apiImportPayload struct {
 type sub2apiAccountEntry struct {
 	Name        string                    `json:"name"`
 	Credentials sub2apiAccountCredentials `json:"credentials"`
+	// 代理是账号属性而不是凭据，不同导出实现有的写在条目根上、有的塞进
+	// credentials，两处都收，根上的优先。
+	ProxyURL     string `json:"proxy_url"`
+	ProxyLabel   string `json:"proxy_label"`
+	ProxyEnabled *bool  `json:"proxy_enabled"`
+}
+
+// proxyFields 返回该条目最终采用的代理三件套：条目根优先，回退到 credentials。
+// URL 决定用哪一组，避免根上只写了 label 却把 URL 从 credentials 拿过来配错。
+func (a sub2apiAccountEntry) proxyFields() (string, string, *bool) {
+	if url := strings.TrimSpace(a.ProxyURL); url != "" {
+		return url, strings.TrimSpace(a.ProxyLabel), a.ProxyEnabled
+	}
+	return strings.TrimSpace(a.Credentials.ProxyURL), strings.TrimSpace(a.Credentials.ProxyLabel), a.Credentials.ProxyEnabled
 }
 
 type sub2apiAccountCredentials struct {
@@ -4527,6 +4877,9 @@ type sub2apiAccountCredentials struct {
 	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
 	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
 	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
+	ProxyURL              string                 `json:"proxy_url"`
+	ProxyLabel            string                 `json:"proxy_label"`
+	ProxyEnabled          *bool                  `json:"proxy_enabled"`
 }
 
 type importJSONScalarString string
@@ -4717,6 +5070,9 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 			agentNode = agentIdentityNodeFromFlatCredentials(entry.AuthMode, entry.AgentRuntimeID, entry.AgentPrivateKey, entry.AgentTaskID, accID, entry.ChatGPTUserID, email, planType, entry.AgentFedRAMP)
 		}
 		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
+			tok.proxyURL = strings.TrimSpace(entry.ProxyURL)
+			tok.proxyLabel = strings.TrimSpace(entry.ProxyLabel)
+			tok.proxyEnabled = entry.ProxyEnabled
 			tokens = append(tokens, tok)
 			continue
 		}
@@ -4740,6 +5096,9 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 				codex5HResetAt:        strings.TrimSpace(entry.Codex5HResetAt),
 				codex5HUsageUpdatedAt: strings.TrimSpace(entry.Codex5HUsageUpdatedAt),
 				codexUsageUpdatedAt:   strings.TrimSpace(entry.CodexUsageUpdatedAt),
+				proxyURL:              strings.TrimSpace(entry.ProxyURL),
+				proxyLabel:            strings.TrimSpace(entry.ProxyLabel),
+				proxyEnabled:          entry.ProxyEnabled,
 			})
 		}
 	}
@@ -4778,6 +5137,7 @@ func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
 		planType := firstNonEmpty(c.PlanType, c.PlanTypeCamel, c.Account.PlanType, c.Account.PlanTypeCamel)
 		accID := firstNonEmpty(c.AccountID, c.User.ID, c.Account.ID)
 		expiresAt := firstNonEmpty(c.ExpiresAt.String(), c.Expired.String(), c.Expires.String())
+		proxyURL, proxyLabel, proxyEnabled := account.proxyFields()
 
 		// Agent Identity 条目：无 RT/ST/AT，单独识别。子对象缺失时回退到
 		// 平铺在 credentials 里的 Agent Identity 字段（sub2api 导出形态）。
@@ -4786,6 +5146,9 @@ func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
 			agentNode = agentIdentityNodeFromFlatCredentials(c.AuthMode, c.AgentRuntimeID, c.AgentPrivateKey, c.AgentTaskID, accID, c.ChatGPTUserID, email, planType, c.AgentFedRAMP)
 		}
 		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
+			tok.proxyURL = proxyURL
+			tok.proxyLabel = proxyLabel
+			tok.proxyEnabled = proxyEnabled
 			return append(tokens, tok)
 		}
 
@@ -4808,6 +5171,9 @@ func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
 				codex5HResetAt:        strings.TrimSpace(c.Codex5HResetAt),
 				codex5HUsageUpdatedAt: strings.TrimSpace(c.Codex5HUsageUpdatedAt),
 				codexUsageUpdatedAt:   strings.TrimSpace(c.CodexUsageUpdatedAt),
+				proxyURL:              proxyURL,
+				proxyLabel:            proxyLabel,
+				proxyEnabled:          proxyEnabled,
 			})
 		}
 	}
@@ -4930,12 +5296,18 @@ func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) strin
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
 func (h *Handler) ImportAccounts(c *gin.Context) {
 	format := c.DefaultPostForm("format", "txt")
-	proxyURL := c.PostForm("proxy_url")
-	allowDuplicate := parseBoolForm(c.PostForm("allow_duplicate"))
 	customHeaders, err := parseCustomHeadersForm(c.PostForm("custom_headers"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
+	}
+	settings := importSettings{
+		defaultProxyURL: c.PostForm("proxy_url"),
+		// TXT 系格式一行一个 token，物理上不可能携带代理。这里忽略开关而不是
+		// 报错，免得前端还要跟着格式切换清理该状态。
+		importProxies:  parseBoolForm(c.PostForm("import_proxy")) && (format == "json" || format == "json_at"),
+		allowDuplicate: parseBoolForm(c.PostForm("allow_duplicate")),
+		customHeaders:  customHeaders,
 	}
 	// 分组校验放在解析文件之前：分组 ID 打错时一个账号都不该被导入。
 	groupCtx, groupCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -4949,13 +5321,13 @@ func (h *Handler) ImportAccounts(c *gin.Context) {
 
 	switch format {
 	case "json":
-		h.importAccountsJSON(c, proxyURL, allowDuplicate, customHeaders)
+		h.importAccountsJSON(c, settings)
 	case "json_at":
-		h.importAccountsJSONPreferAT(c, proxyURL, allowDuplicate, customHeaders)
+		h.importAccountsJSONPreferAT(c, settings)
 	case "at_txt":
-		h.importAccountsATTXT(c, proxyURL, allowDuplicate, customHeaders)
+		h.importAccountsATTXT(c, settings)
 	default:
-		h.importAccountsTXT(c, proxyURL, allowDuplicate, customHeaders)
+		h.importAccountsTXT(c, settings)
 	}
 }
 
@@ -5037,7 +5409,7 @@ func importTokensFromTextFiles(files []uploadedImportFile, makeToken func(string
 }
 
 // importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
-func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
+func (h *Handler) importAccountsTXT(c *gin.Context, settings importSettings) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -5052,11 +5424,11 @@ func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string, allowDuplic
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
+	h.importAccountsCommon(c, tokens, settings)
 }
 
 // importAccountsJSON 通过 JSON 文件导入（兼容 CLIProxyAPI 凭证格式）
-func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
+func (h *Handler) importAccountsJSON(c *gin.Context, settings importSettings) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -5090,12 +5462,12 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDupli
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
+	h.importAccountsCommon(c, allTokens, settings)
 }
 
 // importAccountsJSONPreferAT 通过 JSON 文件导入，但只信任 access_token，
 // 用于一些导出工具中 refresh_token / session_token 是占位/重复值的场景。
-func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
+func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, settings importSettings) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -5136,14 +5508,7 @@ func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, al
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
-}
-
-func firstCustomHeaders(headers []map[string]string) map[string]string {
-	if len(headers) == 0 {
-		return nil
-	}
-	return headers[0]
+	h.importAccountsCommon(c, allTokens, settings)
 }
 
 // importEvent SSE 导入进度事件
@@ -5158,6 +5523,12 @@ type importEvent struct {
 	// Warning 用于「账号已入库、但收尾动作出了问题」这类必须告知却不该当成失败的情况，
 	// 例如导入成功但分组绑定失败。空值时序列化省略，老前端不受影响。
 	Warning string `json:"warning,omitempty"`
+	// CreatedIDs 只在 complete 事件下发，供前端拉取本次导入账号的邀请收益评估。
+	// 空值时省略，老前端不受影响。
+	CreatedIDs []int64 `json:"created_ids,omitempty"`
+	// 代理注册结果，只在开启"导入文件内代理"时非零。同样 omitempty。
+	ProxiesImported int `json:"proxies_imported,omitempty"`
+	ProxiesSkipped  int `json:"proxies_skipped,omitempty"`
 }
 
 // sendImportEvent 推送一条导入进度事件；返回 false 表示下游连接已经写不进去了。
@@ -5325,8 +5696,25 @@ func sendSSEJSON(c *gin.Context, event any) bool {
 }
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
-func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
-	importCustomHeaders := firstCustomHeaders(customHeaders)
+func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, settings importSettings) {
+	importCustomHeaders := settings.customHeaders
+	allowDuplicate := settings.allowDuplicate
+
+	// 代理注册必须跑在任何账号入库之前——包括下面的 Agent Identity 分支。
+	// registerImportedProxies 会原地规范化 tokens 上的代理 URL，失败则整次导入
+	// 中止：继续写只会产出一批绑着未入池代理、因而不可调度的账号。
+	// 这里还没进 SSE（setupSSE 在去重之后），可以正常返回 HTTP 错误。
+	var proxyOutcome importProxyOutcome
+	if settings.importProxies {
+		proxyCtx, proxyCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		outcome, err := h.registerImportedProxies(proxyCtx, tokens)
+		proxyCancel()
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "导入代理失败，未写入任何账号: "+err.Error())
+			return
+		}
+		proxyOutcome = outcome
+	}
 
 	// Agent Identity 条目单独处理（无 RT/ST/AT，按 runtime_id 去重、动态签名），
 	// 从常规 token 流里拆出，计数在收尾时并入总响应。
@@ -5342,7 +5730,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var agentCreatedIDs []int64
 	if len(agentTokens) > 0 {
 		agentCtx, agentCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		agentSuccess, agentDuplicate, agentFailed, agentCreatedIDs = h.importAgentIdentityTokens(agentCtx, agentTokens, proxyURL, allowDuplicate)
+		agentSuccess, agentDuplicate, agentFailed, agentCreatedIDs = h.importAgentIdentityTokens(agentCtx, agentTokens, settings)
 		agentCancel()
 		log.Printf("导入: Agent Identity 条目 %d 个（新增 %d，跳过 %d，失败 %d）", len(agentTokens), agentSuccess, agentDuplicate, agentFailed)
 	}
@@ -5614,13 +6002,21 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		if err := h.bindImportedAccountGroups(c.Request.Context(), agentCreatedIDs, importGroupIDsFromContext(c)); err != nil {
 			log.Printf("导入: Agent Identity 账号分组绑定失败: %v", err)
 		}
-		c.JSON(http.StatusOK, gin.H{
+		response := gin.H{
 			"message":   fmt.Sprintf("导入完成：新增 %d 个，跳过 %d 个，失败 %d 个", agentSuccess, duplicateCount, agentFailed),
 			"success":   agentSuccess,
 			"duplicate": duplicateCount,
 			"failed":    agentFailed,
 			"total":     total,
-		})
+		}
+		if settings.importProxies {
+			response["proxies_imported"] = proxyOutcome.inserted
+			response["proxies_skipped"] = proxyOutcome.skipped
+			if warning := proxyOutcome.warning(); warning != "" {
+				response["warning"] = warning
+			}
+		}
+		c.JSON(http.StatusOK, response)
 		return
 	}
 
@@ -5682,6 +6078,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			defer dbLimiter.release()
 
 			name := tok.name
+			// 文件内代理优先、表单代理兜底；registerImportedProxies 已经把非法值
+			// 清空，所以这里拿到的一定是校验过的 URL。
+			proxyURL := settings.proxyForToken(tok)
 
 			seed := importTokenSeed(tok, conflictingChatGPTIDs)
 			seed.allowDuplicate = allowDuplicate
@@ -5700,7 +6099,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				upsertCtx, upsertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(upsertCtx, name, proxyURL, seed, importSource)
+				id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(upsertCtx, name, proxyURL, seed, importSource, settings.proxyOverwritePolicyForToken(tok))
 				upsertCancel()
 				if err != nil {
 					log.Printf("导入账号 %d/%d 更新或写入失败: %v", idx+1, len(newTokens), err)
@@ -5825,16 +6224,25 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			Warning: "账号已导入，但分组绑定失败: " + err.Error(),
 		})
 	}
+	// 邀请资格探测排在 complete 之前入队，但不等待结果：探测走导入闸门的后台
+	// worker，前端拿到 created_ids 后自行轮询方案接口。阻塞在这里会把一次导入
+	// 的响应拖长到几十秒。
+	h.scheduleInviteGuideProbes(c.Request.Context(), newAccountIDs)
+
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
 		Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
+		CreatedIDs:      newAccountIDs,
+		ProxiesImported: proxyOutcome.inserted,
+		ProxiesSkipped:  proxyOutcome.skipped,
+		Warning:         proxyOutcome.warning(),
 	})
 
 	log.Printf("导入完成: success=%d, updated=%d, duplicate=%d, failed=%d, total=%d", suc, upd, duplicateCount, fai, total)
 }
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
-func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
+func (h *Handler) importAccountsATTXT(c *gin.Context, settings importSettings) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -5849,7 +6257,7 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string, allowDupl
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
+	h.importAccountsCommon(c, tokens, settings)
 }
 
 // GetAccountUsage 查询单个账号的用量统计
@@ -5923,6 +6331,25 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 	if t := account.GetResetSparkAt(); !t.IsZero() {
 		resp["reset_spark_at"] = t.Format(time.RFC3339)
 	}
+	if account.IsClaudeOAuth() && h.db != nil {
+		// The Claude probe records its attempt metadata in credentials. Read the
+		// merged row back so the caller gets the durable timestamp/error even
+		// when the response carried no quota headers.
+		if row, readErr := h.db.GetAccountByID(ctx, id); readErr == nil {
+			if value := row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey); value != "" {
+				resp["claude_usage_probe_at"] = value
+			}
+			if value := row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey); value != "" {
+				resp["claude_usage_probe_error"] = value
+			}
+			if value := row.GetCredential(auth.ClaudeUsageWindowsCredentialKey); value != "" {
+				resp["claude_usage_windows_probed"] = true
+				if windows := parseClaudeUsageWindows(value); len(windows) > 0 {
+					resp["claude_usage_windows"] = windows
+				}
+			}
+		}
+	}
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -5941,7 +6368,7 @@ type batchUpdateAccountsReq struct {
 
 func (h *Handler) accountOperationIdentity(id int64) (string, string) {
 	h.accountListCacheMu.RLock()
-	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelGrok} {
+	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelGrok, database.UpstreamChannelAntigravity, database.UpstreamChannelClaude} {
 		snapshot := h.accountListCache[channel]
 		if snapshot == nil {
 			continue
@@ -6007,6 +6434,7 @@ type recycleBinAccountResponse struct {
 	ATOnly             bool     `json:"at_only"`
 	AccessTokenType    string   `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI bool     `json:"openai_responses_api"`
+	ClaudeAPI          bool     `json:"claude_api"`
 	BaseURL            string   `json:"base_url,omitempty"`
 	Models             []string `json:"models,omitempty"`
 	CreatedAt          string   `json:"created_at"`
@@ -6029,7 +6457,9 @@ func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
 
 	accounts := make([]recycleBinAccountResponse, 0, len(rows))
 	for _, row := range rows {
-		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
+		isClaudeAccount := strings.EqualFold(upstreamType, auth.UpstreamClaude)
 		email := row.GetCredential("email")
 		baseURL := row.GetCredential("base_url")
 		if isOpenAIResponsesAccount && email == "" {
@@ -6044,9 +6474,10 @@ func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
 			Name:               row.Name,
 			Email:              email,
 			PlanType:           planType,
-			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:             !isOpenAIResponsesAccount && !isClaudeAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			AccessTokenType:    accountAccessTokenType(row),
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
+			ClaudeAPI:          isClaudeAccount,
 			BaseURL:            baseURL,
 			Models:             row.GetCredentialStringSlice("models"),
 			CreatedAt:          row.CreatedAt.Format(time.RFC3339),
@@ -8300,6 +8731,7 @@ type updateAPIKeyReq struct {
 	ExpiresInDays   *int                   `json:"expires_in_days"`
 	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
 	Limits          *database.APIKeyLimits `json:"limits"`
+	Enabled         *bool                  `json:"enabled"`
 }
 
 func (h *Handler) UpdateAPIKey(c *gin.Context) {
@@ -8392,6 +8824,10 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	if req.Name != nil {
 		update.Name = *req.Name
 		update.NameSet = true
+	}
+	if req.Enabled != nil {
+		update.Enabled = *req.Enabled
+		update.EnabledSet = true
 	}
 	if req.Limits != nil {
 		update.Limits = sanitizeAPIKeyLimits(*req.Limits)
@@ -8567,6 +9003,10 @@ var knownAPIKeyPlanFilters = map[string]struct{}{
 	"api": {}, "supergrok": {}, "x_basic": {}, "x_premium": {},
 	"x_premium_plus": {}, "supergrok_heavy": {}, "supergrok_lite": {},
 	"supergrok_plus": {},
+	// Claude OAuth profile tiers. Keep these independent from Codex/Grok
+	// labels so a Claude-bound key's plan gate survives normalization.
+	"claude": {}, "max": {}, "max-5x": {}, "max-20x": {},
+	"enterprise": {}, "business": {},
 }
 
 // cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
@@ -8801,11 +9241,18 @@ type settingsResponse struct {
 	GrokFollowUpEffortEnabled           bool   `json:"grok_follow_up_effort_enabled"`
 	GrokFollowUpToolEffort              string `json:"grok_follow_up_tool_effort"`
 	GrokFollowUpSmallEffort             string `json:"grok_follow_up_small_effort"`
+	GrokQualityGuardEnabled             bool   `json:"grok_quality_guard_enabled"`
+	GrokQualityGuardMaxAttempts         int    `json:"grok_quality_guard_max_attempts"`
+	GrokQualityGuardHoldTimeoutSec      int    `json:"grok_quality_guard_hold_timeout_sec"`
+	GrokQualityGuardOnExhausted         string `json:"grok_quality_guard_on_exhausted"`
+	GrokQualityGuardCooldownHours       int    `json:"grok_quality_guard_account_cooldown_hours"`
 	GrokOAuthClientID                   string `json:"grok_oauth_client_id"`
 	// GrokOAuthClientIDEnvOverride 为 true 时，环境变量 GROK_OAUTH_CLIENT_ID 正压着上面这个设置，
 	// 前端据此提示「当前以环境变量为准」。GrokOAuthClientIDEffective 是实际生效值。
-	GrokOAuthClientIDEnvOverride       bool                             `json:"grok_oauth_client_id_env_override"`
-	GrokOAuthClientIDEffective         string                           `json:"grok_oauth_client_id_effective"`
+	GrokOAuthClientIDEnvOverride bool   `json:"grok_oauth_client_id_env_override"`
+	GrokOAuthClientIDEffective   string `json:"grok_oauth_client_id_effective"`
+	// Antigravity OAuth client 配置视图（嵌入展平）。
+	antigravityOAuthSettingsView
 	MaxRetries                         int                              `json:"max_retries"`
 	MaxRateLimitRetries                int                              `json:"max_rate_limit_retries"`
 	RetryIntervalMS                    int                              `json:"retry_interval_ms"`
@@ -8883,6 +9330,7 @@ type settingsResponse struct {
 	ResponseCacheLocalMaxBytes         int64                            `json:"response_cache_local_max_bytes"`
 	ResponseCacheLocalMaxEntryBytes    int64                            `json:"response_cache_local_max_entry_bytes"`
 	ResponseCacheReconstructMaxBytes   int64                            `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheWritePolicy           string                           `json:"response_cache_write_policy"`
 	ResponseCacheConfigGeneration      int64                            `json:"response_cache_config_generation"`
 	RelayModelCooldownMode             string                           `json:"relay_model_cooldown_mode"`
 	RelayModelCooldownSeconds          int                              `json:"relay_model_cooldown_seconds"`
@@ -8895,160 +9343,168 @@ type settingsResponse struct {
 type rawJSON = json.RawMessage
 
 type updateSettingsReq struct {
-	SiteName                            *string   `json:"site_name"`
-	SiteLogo                            *string   `json:"site_logo"`
-	BackgroundImage                     *string   `json:"background_image"`
-	BackgroundOpacity                   *int      `json:"background_opacity"`
-	BackgroundBlur                      *int      `json:"background_blur"`
-	BackgroundGlassOpacity              *int      `json:"background_glass_opacity"`
-	BackgroundGlassBlur                 *int      `json:"background_glass_blur"`
-	MaxConcurrency                      *int      `json:"max_concurrency"`
-	GlobalRPM                           *int      `json:"global_rpm"`
-	TestModel                           *string   `json:"test_model"`
-	TestContent                         *string   `json:"test_content"`
-	TestConcurrency                     *int      `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes    *int      `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes             *int      `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency               *int      `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled  *bool     `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes        *int      `json:"recovery_probe_interval_minutes"`
-	LazyMode                            *bool     `json:"lazy_mode"`
-	ProxyURL                            *string   `json:"proxy_url"`
-	PgMaxConns                          *int      `json:"pg_max_conns"`
-	RedisPoolSize                       *int      `json:"redis_pool_size"`
-	AutoCleanUnauthorized               *bool     `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited                *bool     `json:"auto_clean_rate_limited"`
-	AdminSecret                         *string   `json:"admin_secret"`
-	AutoCleanFullUsage                  *bool     `json:"auto_clean_full_usage"`
-	AutoCleanError                      *bool     `json:"auto_clean_error"`
-	AutoCleanExpired                    *bool     `json:"auto_clean_expired"`
-	AutoResetCreditsEnabled             *bool     `json:"auto_reset_credits_enabled"`
-	AutoResetCreditsBeforeExpiryMin     *int      `json:"auto_reset_credits_before_expiry_min"`
-	AutoActivate5hWindowEnabled         *bool     `json:"auto_activate_5h_window_enabled"`
-	ProxyPoolEnabled                    *bool     `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled                *bool     `json:"fast_scheduler_enabled"`
-	SchedulerEngine                     *string   `json:"scheduler_engine"`
-	CodexForceWebsocket                 *bool     `json:"codex_force_websocket"`
-	CodexRequestCompression             *bool     `json:"codex_request_compression"`
-	CodexWSWeakNetworkMode              *bool     `json:"codex_ws_weak_network_mode"`
-	CodexWSKeepaliveEnabled             *bool     `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec         *int      `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors           *bool     `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled           *bool     `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries             *int      `json:"codex_ws_silent_max_retries"`
-	CodexFastModelAliasEnabled          *bool     `json:"codex_fast_model_alias_enabled"`
-	CodexFastTierInterceptEnabled       *bool     `json:"codex_fast_tier_intercept_enabled"`
-	CodexWSSizeRouterEnabled            *bool     `json:"codex_ws_size_router_enabled"`
-	CodexWSBusyAcquireMaxWaitSec        *int      `json:"codex_ws_busy_acquire_max_wait_sec"`
-	CodexWSBusyOverflowEnabled          *bool     `json:"codex_ws_busy_overflow_enabled"`
-	CodexWSBusyPatienceSec              *int      `json:"codex_ws_busy_patience_sec"`
-	CodexWSStatelessSlots               *int      `json:"codex_ws_stateless_slots"`
-	GithubToken                         *string   `json:"github_token"`
-	GithubProxyURL                      *string   `json:"github_proxy_url"`
-	CodexOverloadPauseEnabled           *bool     `json:"codex_overload_pause_enabled"`
-	CodexOverloadThresholdPercent       *int      `json:"codex_overload_threshold_percent"`
-	CodexOverloadPauseMinutes           *int      `json:"codex_overload_pause_minutes"`
-	CodexOverloadWindowMinutes          *int      `json:"codex_overload_window_minutes"`
-	OverflowAutoCompactEnabled          *bool     `json:"overflow_auto_compact_enabled"`
-	CompactViaResponsesEnabled          *bool     `json:"compact_via_responses_enabled"`
-	CodexPreflightSSEPassthroughEnabled *bool     `json:"codex_preflight_sse_passthrough_enabled"`
-	FirstTokenExcludesWsAcquire         *bool     `json:"first_token_excludes_ws_acquire"`
-	CodexContinueThinkingEnabled        *bool     `json:"codex_continue_thinking_enabled"`
-	CodexContinueMaxRounds              *int      `json:"codex_continue_max_rounds"`
-	UTLSShutdownTimeoutMinutes          *int      `json:"utls_shutdown_timeout_minutes"`
-	CodexCLIVersionSyncEnabled          *bool     `json:"codex_cli_version_sync_enabled"`
-	CodexCLIVersionSyncIntervalHours    *int      `json:"codex_cli_version_sync_interval_hours"`
-	SchedulerMode                       *string   `json:"scheduler_mode"`
-	AffinityMode                        *string   `json:"affinity_mode"`
-	SessionAffinitySpread               *bool     `json:"session_affinity_spread"`
-	SessionSlotBufferEnabled            *bool     `json:"session_slot_buffer_enabled"`
-	SessionSlotBufferSeconds            *int      `json:"session_slot_buffer_seconds"`
-	GrokAffinityMode                    *string   `json:"grok_affinity_mode"`
-	GrokProbeEnabled                    *bool     `json:"grok_probe_enabled"`
-	GrokProbeIntervalMinutes            *int      `json:"grok_probe_interval_minutes"`
-	GrokMaxRateLimitRetries             *int      `json:"grok_max_rate_limit_retries"`
-	GrokFollowUpEffortEnabled           *bool     `json:"grok_follow_up_effort_enabled"`
-	GrokFollowUpToolEffort              *string   `json:"grok_follow_up_tool_effort"`
-	GrokFollowUpSmallEffort             *string   `json:"grok_follow_up_small_effort"`
-	GrokOAuthClientID                   *string   `json:"grok_oauth_client_id"`
-	MaxRetries                          *int      `json:"max_retries"`
-	MaxRateLimitRetries                 *int      `json:"max_rate_limit_retries"`
-	RetryIntervalMS                     *int      `json:"retry_interval_ms"`
-	TransportRetryPolicy                *string   `json:"transport_retry_policy"`
-	ContinuousRetryEnabled              *bool     `json:"continuous_retry_enabled"`
-	ContinuousRetryCatchAll             *bool     `json:"continuous_retry_catch_all"`
-	ContinuousRetryCategories           *[]string `json:"continuous_retry_categories"`
-	ContinuousRetryStatusCodes          *[]int    `json:"continuous_retry_status_codes"`
-	ContinuousRetryErrorCodes           *[]string `json:"continuous_retry_error_codes"`
-	ContinuousRetryMaxDurationSeconds   *int      `json:"continuous_retry_max_duration_seconds"`
-	CodexFingerprintDefaultMode         *string   `json:"codex_fingerprint_default_mode"`
-	AllowRemoteMigration                *bool     `json:"allow_remote_migration"`
-	ModelMapping                        *string   `json:"model_mapping"`
-	CodexModelMapping                   *string   `json:"codex_model_mapping"`
-	PayloadRules                        *string   `json:"payload_rules"`
-	ReasoningEffortModels               *string   `json:"reasoning_effort_models"`
-	ResinURL                            *string   `json:"resin_url"`
-	ResinPlatformName                   *string   `json:"resin_platform_name"`
-	PromptFilterEnabled                 *bool     `json:"prompt_filter_enabled"`
-	PromptFilterMode                    *string   `json:"prompt_filter_mode"`
-	PromptFilterThreshold               *int      `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold         *int      `json:"prompt_filter_strict_threshold"`
-	PromptFilterStrictTerminalEnabled   *bool     `json:"prompt_filter_strict_terminal_enabled"`
-	PromptFilterAdvancedConfig          *string   `json:"prompt_filter_advanced_config"`
-	PromptFilterLogMatches              *bool     `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength           *int      `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords          *string   `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns          *string   `json:"prompt_filter_custom_patterns"`
-	PromptFilterCustomPatternsExpected  *string   `json:"prompt_filter_custom_patterns_expected"`
-	PromptFilterDisabledPatterns        *string   `json:"prompt_filter_disabled_patterns"`
-	PromptFilterReviewEnabled           *bool     `json:"prompt_filter_review_enabled"`
-	PromptFilterReviewAPIKey            *string   `json:"prompt_filter_review_api_key"`
-	PromptFilterReviewBaseURL           *string   `json:"prompt_filter_review_base_url"`
-	PromptFilterReviewModel             *string   `json:"prompt_filter_review_model"`
-	PromptFilterReviewTimeoutSeconds    *int      `json:"prompt_filter_review_timeout_seconds"`
-	PromptFilterReviewFailClosed        *bool     `json:"prompt_filter_review_fail_closed"`
-	ClientCompatMode                    *string   `json:"client_compat_mode"`
-	CodexMinCLIVersion                  *string   `json:"codex_min_cli_version"`
-	CodexUserAgentConfig                *string   `json:"codex_user_agent_config"`
-	ModelsListReadMaxBytes              *int64    `json:"models_list_read_max_bytes"`
-	UsageLogMode                        *string   `json:"usage_log_mode"`
-	UsageLogBatchSize                   *int      `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds        *int      `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                   *string   `json:"stream_flush_policy"`
-	StreamFlushIntervalMS               *int      `json:"stream_flush_interval_ms"`
-	FirstTokenMode                      *string   `json:"first_token_mode"`
-	FirstTokenTimeoutSeconds            *int      `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                   *string   `json:"billing_tier_policy"`
-	ShowFullUsageNumbers                *bool     `json:"show_full_usage_numbers"`
-	PublicKeyUsagePageEnabled           *bool     `json:"public_key_usage_page_enabled"`
-	PublicImageStudioPageEnabled        *bool     `json:"public_image_studio_page_enabled"`
-	PublicAccountPortalPageEnabled      *bool     `json:"public_account_portal_page_enabled"`
-	ImageStorageBackend                 *string   `json:"image_storage_backend"`
-	ImageS3Endpoint                     *string   `json:"image_s3_endpoint"`
-	ImageS3Region                       *string   `json:"image_s3_region"`
-	ImageS3Bucket                       *string   `json:"image_s3_bucket"`
-	ImageS3AccessKey                    *string   `json:"image_s3_access_key"`
-	ImageS3SecretKey                    *string   `json:"image_s3_secret_key"`
-	ImageS3Prefix                       *string   `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle               *bool     `json:"image_s3_force_path_style"`
-	AutoPause5hThreshold                *float64  `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold                *float64  `json:"auto_pause_7d_threshold"`
-	AutoPause5hGuardBandPercent         *float64  `json:"auto_pause_5h_guard_band_percent"`
-	AutoPause5hGuardConcurrency         *int      `json:"auto_pause_5h_guard_concurrency"`
-	SmartPacingEnabled                  *bool     `json:"smart_pacing_enabled"`
-	SmartPacingMinConcurrency           *int      `json:"smart_pacing_min_concurrency"`
-	SmartPacingWindows                  *string   `json:"smart_pacing_windows"`
-	IgnoreUsageLimitStatus              *bool     `json:"ignore_usage_limit_status"`
-	ResponseCacheLocalMaxBytes          *int64    `json:"response_cache_local_max_bytes"`
-	ResponseCacheLocalMaxEntryBytes     *int64    `json:"response_cache_local_max_entry_bytes"`
-	ResponseCacheReconstructMaxBytes    *int64    `json:"response_cache_reconstruct_max_bytes"`
-	ResponseCacheConfigGeneration       rawJSON   `json:"response_cache_config_generation"`
-	RelayModelCooldownMode              *string   `json:"relay_model_cooldown_mode"`
-	RelayModelCooldownSeconds           *int      `json:"relay_model_cooldown_seconds"`
-	RelayModelCooldownBackoffEnabled    *bool     `json:"relay_model_cooldown_backoff_enabled"`
-	OAuthModelCooldownMode              *string   `json:"oauth_model_cooldown_mode"`
-	OAuthModelCooldownSeconds           *int      `json:"oauth_model_cooldown_seconds"`
-	OAuthModelCooldownBackoffEnabled    *bool     `json:"oauth_model_cooldown_backoff_enabled"`
+	SiteName                            *string                          `json:"site_name"`
+	SiteLogo                            *string                          `json:"site_logo"`
+	BackgroundImage                     *string                          `json:"background_image"`
+	BackgroundOpacity                   *int                             `json:"background_opacity"`
+	BackgroundBlur                      *int                             `json:"background_blur"`
+	BackgroundGlassOpacity              *int                             `json:"background_glass_opacity"`
+	BackgroundGlassBlur                 *int                             `json:"background_glass_blur"`
+	MaxConcurrency                      *int                             `json:"max_concurrency"`
+	GlobalRPM                           *int                             `json:"global_rpm"`
+	TestModel                           *string                          `json:"test_model"`
+	TestContent                         *string                          `json:"test_content"`
+	TestConcurrency                     *int                             `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes    *int                             `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes             *int                             `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency               *int                             `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled  *bool                            `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes        *int                             `json:"recovery_probe_interval_minutes"`
+	LazyMode                            *bool                            `json:"lazy_mode"`
+	ProxyURL                            *string                          `json:"proxy_url"`
+	PgMaxConns                          *int                             `json:"pg_max_conns"`
+	RedisPoolSize                       *int                             `json:"redis_pool_size"`
+	AutoCleanUnauthorized               *bool                            `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                *bool                            `json:"auto_clean_rate_limited"`
+	AdminSecret                         *string                          `json:"admin_secret"`
+	AutoCleanFullUsage                  *bool                            `json:"auto_clean_full_usage"`
+	AutoCleanError                      *bool                            `json:"auto_clean_error"`
+	AutoCleanExpired                    *bool                            `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled             *bool                            `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin     *int                             `json:"auto_reset_credits_before_expiry_min"`
+	AutoActivate5hWindowEnabled         *bool                            `json:"auto_activate_5h_window_enabled"`
+	ProxyPoolEnabled                    *bool                            `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                *bool                            `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     *string                          `json:"scheduler_engine"`
+	CodexForceWebsocket                 *bool                            `json:"codex_force_websocket"`
+	CodexRequestCompression             *bool                            `json:"codex_request_compression"`
+	CodexWSWeakNetworkMode              *bool                            `json:"codex_ws_weak_network_mode"`
+	CodexWSKeepaliveEnabled             *bool                            `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec         *int                             `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors           *bool                            `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled           *bool                            `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries             *int                             `json:"codex_ws_silent_max_retries"`
+	CodexFastModelAliasEnabled          *bool                            `json:"codex_fast_model_alias_enabled"`
+	CodexFastTierInterceptEnabled       *bool                            `json:"codex_fast_tier_intercept_enabled"`
+	CodexWSSizeRouterEnabled            *bool                            `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec        *int                             `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled          *bool                            `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec              *int                             `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               *int                             `json:"codex_ws_stateless_slots"`
+	GithubToken                         *string                          `json:"github_token"`
+	GithubProxyURL                      *string                          `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           *bool                            `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       *int                             `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           *int                             `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          *int                             `json:"codex_overload_window_minutes"`
+	OverflowAutoCompactEnabled          *bool                            `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          *bool                            `json:"compact_via_responses_enabled"`
+	CodexPreflightSSEPassthroughEnabled *bool                            `json:"codex_preflight_sse_passthrough_enabled"`
+	FirstTokenExcludesWsAcquire         *bool                            `json:"first_token_excludes_ws_acquire"`
+	CodexContinueThinkingEnabled        *bool                            `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds              *int                             `json:"codex_continue_max_rounds"`
+	UTLSShutdownTimeoutMinutes          *int                             `json:"utls_shutdown_timeout_minutes"`
+	CodexCLIVersionSyncEnabled          *bool                            `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours    *int                             `json:"codex_cli_version_sync_interval_hours"`
+	SchedulerMode                       *string                          `json:"scheduler_mode"`
+	AffinityMode                        *string                          `json:"affinity_mode"`
+	SessionAffinitySpread               *bool                            `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            *bool                            `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            *int                             `json:"session_slot_buffer_seconds"`
+	GrokAffinityMode                    *string                          `json:"grok_affinity_mode"`
+	GrokProbeEnabled                    *bool                            `json:"grok_probe_enabled"`
+	GrokProbeIntervalMinutes            *int                             `json:"grok_probe_interval_minutes"`
+	GrokMaxRateLimitRetries             *int                             `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           *bool                            `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              *string                          `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             *string                          `json:"grok_follow_up_small_effort"`
+	GrokQualityGuardEnabled             *bool                            `json:"grok_quality_guard_enabled"`
+	GrokQualityGuardMaxAttempts         *int                             `json:"grok_quality_guard_max_attempts"`
+	GrokQualityGuardHoldTimeoutSec      *int                             `json:"grok_quality_guard_hold_timeout_sec"`
+	GrokQualityGuardOnExhausted         *string                          `json:"grok_quality_guard_on_exhausted"`
+	GrokQualityGuardCooldownHours       *int                             `json:"grok_quality_guard_account_cooldown_hours"`
+	GrokOAuthClientID                   *string                          `json:"grok_oauth_client_id"`
+	AntigravityOAuthClients             *[]antigravityOAuthClientPayload `json:"antigravity_oauth_clients"`
+	AntigravityOAuthClientKey           *string                          `json:"antigravity_oauth_client_key"`
+	MaxRetries                          *int                             `json:"max_retries"`
+	MaxRateLimitRetries                 *int                             `json:"max_rate_limit_retries"`
+	RetryIntervalMS                     *int                             `json:"retry_interval_ms"`
+	TransportRetryPolicy                *string                          `json:"transport_retry_policy"`
+	ContinuousRetryEnabled              *bool                            `json:"continuous_retry_enabled"`
+	ContinuousRetryCatchAll             *bool                            `json:"continuous_retry_catch_all"`
+	ContinuousRetryCategories           *[]string                        `json:"continuous_retry_categories"`
+	ContinuousRetryStatusCodes          *[]int                           `json:"continuous_retry_status_codes"`
+	ContinuousRetryErrorCodes           *[]string                        `json:"continuous_retry_error_codes"`
+	ContinuousRetryMaxDurationSeconds   *int                             `json:"continuous_retry_max_duration_seconds"`
+	CodexFingerprintDefaultMode         *string                          `json:"codex_fingerprint_default_mode"`
+	AllowRemoteMigration                *bool                            `json:"allow_remote_migration"`
+	ModelMapping                        *string                          `json:"model_mapping"`
+	CodexModelMapping                   *string                          `json:"codex_model_mapping"`
+	PayloadRules                        *string                          `json:"payload_rules"`
+	ReasoningEffortModels               *string                          `json:"reasoning_effort_models"`
+	ResinURL                            *string                          `json:"resin_url"`
+	ResinPlatformName                   *string                          `json:"resin_platform_name"`
+	PromptFilterEnabled                 *bool                            `json:"prompt_filter_enabled"`
+	PromptFilterMode                    *string                          `json:"prompt_filter_mode"`
+	PromptFilterThreshold               *int                             `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold         *int                             `json:"prompt_filter_strict_threshold"`
+	PromptFilterStrictTerminalEnabled   *bool                            `json:"prompt_filter_strict_terminal_enabled"`
+	PromptFilterAdvancedConfig          *string                          `json:"prompt_filter_advanced_config"`
+	PromptFilterLogMatches              *bool                            `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength           *int                             `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords          *string                          `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns          *string                          `json:"prompt_filter_custom_patterns"`
+	PromptFilterCustomPatternsExpected  *string                          `json:"prompt_filter_custom_patterns_expected"`
+	PromptFilterDisabledPatterns        *string                          `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled           *bool                            `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAPIKey            *string                          `json:"prompt_filter_review_api_key"`
+	PromptFilterReviewBaseURL           *string                          `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel             *string                          `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds    *int                             `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed        *bool                            `json:"prompt_filter_review_fail_closed"`
+	ClientCompatMode                    *string                          `json:"client_compat_mode"`
+	CodexMinCLIVersion                  *string                          `json:"codex_min_cli_version"`
+	CodexUserAgentConfig                *string                          `json:"codex_user_agent_config"`
+	UsageLogMode                        *string                          `json:"usage_log_mode"`
+	UsageLogBatchSize                   *int                             `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds        *int                             `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                   *string                          `json:"stream_flush_policy"`
+	StreamFlushIntervalMS               *int                             `json:"stream_flush_interval_ms"`
+	FirstTokenMode                      *string                          `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds            *int                             `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                   *string                          `json:"billing_tier_policy"`
+	ModelsListReadMaxBytes              *int64                           `json:"models_list_read_max_bytes"`
+	ShowFullUsageNumbers                *bool                            `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled           *bool                            `json:"public_key_usage_page_enabled"`
+	PublicImageStudioPageEnabled        *bool                            `json:"public_image_studio_page_enabled"`
+	PublicAccountPortalPageEnabled      *bool                            `json:"public_account_portal_page_enabled"`
+	ImageStorageBackend                 *string                          `json:"image_storage_backend"`
+	ImageS3Endpoint                     *string                          `json:"image_s3_endpoint"`
+	ImageS3Region                       *string                          `json:"image_s3_region"`
+	ImageS3Bucket                       *string                          `json:"image_s3_bucket"`
+	ImageS3AccessKey                    *string                          `json:"image_s3_access_key"`
+	ImageS3SecretKey                    *string                          `json:"image_s3_secret_key"`
+	ImageS3Prefix                       *string                          `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle               *bool                            `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold                *float64                         `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold                *float64                         `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent         *float64                         `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency         *int                             `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                  *bool                            `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency           *int                             `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                  *string                          `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus              *bool                            `json:"ignore_usage_limit_status"`
+	ResponseCacheLocalMaxBytes          *int64                           `json:"response_cache_local_max_bytes"`
+	ResponseCacheLocalMaxEntryBytes     *int64                           `json:"response_cache_local_max_entry_bytes"`
+	ResponseCacheReconstructMaxBytes    *int64                           `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheWritePolicy            *string                          `json:"response_cache_write_policy"`
+	ResponseCacheConfigGeneration       rawJSON                          `json:"response_cache_config_generation"`
+	RelayModelCooldownMode              *string                          `json:"relay_model_cooldown_mode"`
+	RelayModelCooldownSeconds           *int                             `json:"relay_model_cooldown_seconds"`
+	RelayModelCooldownBackoffEnabled    *bool                            `json:"relay_model_cooldown_backoff_enabled"`
+	OAuthModelCooldownMode              *string                          `json:"oauth_model_cooldown_mode"`
+	OAuthModelCooldownSeconds           *int                             `json:"oauth_model_cooldown_seconds"`
+	OAuthModelCooldownBackoffEnabled    *bool                            `json:"oauth_model_cooldown_backoff_enabled"`
 }
 
 func updateSettingsHasFieldsOtherThanCustomPatterns(req updateSettingsReq) bool {
@@ -9494,8 +9950,65 @@ func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
 	return normalizeBackgroundConfig(cfg)
 }
 
-// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试 + 续轮思考配置编码成 grok_config JSON 落库。
-func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string, followUp auth.GrokFollowUpEffortConfig) string {
+// antigravityOAuthClientView 是设置接口返回的 Antigravity OAuth client 条目视图：
+// 不回显 client_secret，只用 has_secret 标记已保存。
+type antigravityOAuthClientView struct {
+	Key       string `json:"key"`
+	ClientID  string `json:"client_id"`
+	HasSecret bool   `json:"has_secret"`
+}
+
+// antigravityOAuthClientPayload 是设置更新提交的条目：client_secret 留空表示
+// 沿用系统设置里同 key 条目已保存的 secret（编辑不回显也不丢失）。
+type antigravityOAuthClientPayload struct {
+	Key          string `json:"key"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+// antigravityOAuthSettingsView 嵌入 settingsResponse，向前端展平输出 Antigravity
+// OAuth client 配置：系统设置条目可编辑，环境变量条目只读展示且同 key 冲突时生效。
+type antigravityOAuthSettingsView struct {
+	AntigravityOAuthClients              []antigravityOAuthClientView `json:"antigravity_oauth_clients"`
+	AntigravityOAuthClientKey            string                       `json:"antigravity_oauth_client_key"`
+	AntigravityOAuthEnvClients           []antigravityOAuthClientView `json:"antigravity_oauth_env_clients"`
+	AntigravityOAuthClientKeyEnvOverride bool                         `json:"antigravity_oauth_client_key_env_override"`
+	AntigravityOAuthActiveKeyEffective   string                       `json:"antigravity_oauth_active_key_effective"`
+	AntigravityOAuthUsingBuiltin         bool                         `json:"antigravity_oauth_using_builtin"`
+	AntigravityOAuthBuiltinClient        antigravityOAuthClientView   `json:"antigravity_oauth_builtin_client"`
+}
+
+func currentAntigravityOAuthSettingsView() antigravityOAuthSettingsView {
+	configured := auth.ConfiguredAntigravityOAuth()
+	clients := make([]antigravityOAuthClientView, 0, len(configured.Clients))
+	for _, client := range configured.Clients {
+		clients = append(clients, antigravityOAuthClientView{
+			Key: client.Key, ClientID: client.ClientID, HasSecret: client.ClientSecret != "",
+		})
+	}
+	envClients := make([]antigravityOAuthClientView, 0)
+	for _, client := range auth.AntigravityOAuthEnvClients() {
+		envClients = append(envClients, antigravityOAuthClientView{
+			Key: client.Key, ClientID: client.ClientID, HasSecret: true,
+		})
+	}
+	_, effectiveKey := auth.EffectiveAntigravityOAuthClients()
+	builtin := auth.BuiltinAntigravityOAuthClient()
+	return antigravityOAuthSettingsView{
+		AntigravityOAuthClients:              clients,
+		AntigravityOAuthClientKey:            configured.ActiveKey,
+		AntigravityOAuthEnvClients:           envClients,
+		AntigravityOAuthClientKeyEnvOverride: auth.AntigravityOAuthActiveKeyFromEnv() != "",
+		AntigravityOAuthActiveKeyEffective:   effectiveKey,
+		AntigravityOAuthUsingBuiltin:         auth.UsingBuiltinAntigravityOAuth(),
+		AntigravityOAuthBuiltinClient: antigravityOAuthClientView{
+			Key: builtin.Key, ClientID: builtin.ClientID, HasSecret: true,
+		},
+	}
+}
+
+// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试 + 续轮思考 + 降智检测配置编码成 grok_config JSON 落库。
+func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string, followUp auth.GrokFollowUpEffortConfig, qualityGuard auth.GrokQualityGuardConfig) string {
 	mode := strings.TrimSpace(affinityMode)
 	switch mode {
 	case auth.AffinityModeFollow, auth.AffinityModeBounded, auth.AffinityModeOff, auth.AffinityModeStrict:
@@ -9512,15 +10025,21 @@ func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinut
 		maxRateLimitRetries = 0
 	}
 	followUp = auth.NormalizeGrokFollowUpEffortConfig(followUp)
+	qualityGuard = auth.NormalizeGrokQualityGuardConfig(qualityGuard)
 	b, err := json.Marshal(map[string]any{
-		"affinity_mode":            mode,
-		"probe_enabled":            probeEnabled,
-		"probe_interval_minutes":   probeIntervalMinutes,
-		"max_rate_limit_retries":   maxRateLimitRetries,
-		"oauth_client_id":          auth.NormalizeGrokOAuthClientID(oauthClientID),
-		"follow_up_effort_enabled": followUp.Enabled,
-		"follow_up_tool_effort":    followUp.ToolEffort,
-		"follow_up_small_effort":   followUp.SmallEffort,
+		"affinity_mode":                        mode,
+		"probe_enabled":                        probeEnabled,
+		"probe_interval_minutes":               probeIntervalMinutes,
+		"max_rate_limit_retries":               maxRateLimitRetries,
+		"oauth_client_id":                      auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"follow_up_effort_enabled":             followUp.Enabled,
+		"follow_up_tool_effort":                followUp.ToolEffort,
+		"follow_up_small_effort":               followUp.SmallEffort,
+		"quality_guard_enabled":                qualityGuard.Enabled,
+		"quality_guard_max_attempts":           qualityGuard.MaxAttempts,
+		"quality_guard_hold_timeout_sec":       qualityGuard.HoldTimeoutSec,
+		"quality_guard_on_exhausted":           qualityGuard.OnExhausted,
+		"quality_guard_account_cooldown_hours": qualityGuard.AccountCooldownHours,
 	})
 	if err != nil {
 		return `{"affinity_mode":"strict"}`
@@ -9638,6 +10157,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	modelCooldownSettings := h.store.GetModelCooldownSettings()
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	c.JSON(http.StatusOK, settingsResponse{
+		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            branding.SiteName,
 		SiteLogo:                            branding.SiteLogo,
 		BackgroundImage:                     bgCfg.Image,
@@ -9653,6 +10173,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
 		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
 		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheWritePolicy:            responseCacheSettings.WritePolicy,
 		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
 		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
 		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,
@@ -9725,6 +10246,11 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
 		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
 		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
+		GrokQualityGuardEnabled:             h.store.GrokQualityGuardConfig().Enabled,
+		GrokQualityGuardMaxAttempts:         h.store.GrokQualityGuardConfig().MaxAttempts,
+		GrokQualityGuardHoldTimeoutSec:      h.store.GrokQualityGuardConfig().HoldTimeoutSec,
+		GrokQualityGuardOnExhausted:         h.store.GrokQualityGuardConfig().OnExhausted,
+		GrokQualityGuardCooldownHours:       h.store.GrokQualityGuardConfig().AccountCooldownHours,
 		GrokOAuthClientID:                   auth.ConfiguredGrokOAuthClientID(),
 		GrokOAuthClientIDEnvOverride:        auth.GrokOAuthClientIDFromEnv() != "",
 		GrokOAuthClientIDEffective:          auth.EffectiveGrokOAuthClientID(),
@@ -10028,10 +10554,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		LocalMaxBytes:       req.ResponseCacheLocalMaxBytes,
 		LocalMaxEntryBytes:  req.ResponseCacheLocalMaxEntryBytes,
 		ReconstructMaxBytes: req.ResponseCacheReconstructMaxBytes,
+		WritePolicy:         req.ResponseCacheWritePolicy,
 	}
 	responseCacheUpdateRequested := responseCacheUpdate.LocalMaxBytes != nil ||
 		responseCacheUpdate.LocalMaxEntryBytes != nil ||
-		responseCacheUpdate.ReconstructMaxBytes != nil
+		responseCacheUpdate.ReconstructMaxBytes != nil ||
+		responseCacheUpdate.WritePolicy != nil
 	if err := validateResponseCacheSettingsUpdateRanges(responseCacheUpdate); err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -10624,6 +11152,29 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: grok_follow_up_effort enabled=%v tool=%s small=%s", cfg.Enabled, cfg.ToolEffort, cfg.SmallEffort)
 	}
 
+	if req.GrokQualityGuardEnabled != nil || req.GrokQualityGuardMaxAttempts != nil || req.GrokQualityGuardHoldTimeoutSec != nil || req.GrokQualityGuardOnExhausted != nil || req.GrokQualityGuardCooldownHours != nil {
+		cfg := h.store.GrokQualityGuardConfig()
+		if req.GrokQualityGuardEnabled != nil {
+			cfg.Enabled = *req.GrokQualityGuardEnabled
+		}
+		if req.GrokQualityGuardMaxAttempts != nil {
+			cfg.MaxAttempts = *req.GrokQualityGuardMaxAttempts
+		}
+		if req.GrokQualityGuardHoldTimeoutSec != nil {
+			cfg.HoldTimeoutSec = *req.GrokQualityGuardHoldTimeoutSec
+		}
+		if req.GrokQualityGuardOnExhausted != nil {
+			cfg.OnExhausted = *req.GrokQualityGuardOnExhausted
+		}
+		if req.GrokQualityGuardCooldownHours != nil {
+			cfg.AccountCooldownHours = *req.GrokQualityGuardCooldownHours
+		}
+		h.store.SetGrokQualityGuardConfig(cfg)
+		applied := h.store.GrokQualityGuardConfig()
+		log.Printf("设置已更新: grok_quality_guard enabled=%v max_attempts=%d hold_timeout=%ds on_exhausted=%s cooldown=%dh",
+			applied.Enabled, applied.MaxAttempts, applied.HoldTimeoutSec, applied.OnExhausted, applied.AccountCooldownHours)
+	}
+
 	// client_id 会拼进授权 URL 与 token 表单，含空白/控制字符或超长的直接拒绝，
 	// 而不是静默归一化成空——那样用户会以为存上了，实际仍在用默认值。
 	if req.GrokOAuthClientID != nil {
@@ -10639,6 +11190,65 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		} else {
 			log.Printf("设置已更新: grok_oauth_client_id = %s", normalized)
 		}
+	}
+
+	if req.AntigravityOAuthClients != nil || req.AntigravityOAuthClientKey != nil {
+		current := auth.ConfiguredAntigravityOAuth()
+		next := current
+		if req.AntigravityOAuthClients != nil {
+			existingSecrets := make(map[string]string, len(current.Clients))
+			for _, client := range current.Clients {
+				existingSecrets[client.Key] = client.ClientSecret
+			}
+			clients := make([]auth.AntigravityOAuthClientConfig, 0, len(*req.AntigravityOAuthClients))
+			for _, payload := range *req.AntigravityOAuthClients {
+				key := strings.ToLower(strings.TrimSpace(payload.Key))
+				secret := strings.TrimSpace(payload.ClientSecret)
+				if secret == "" {
+					// 编辑态不回显 secret：留空沿用同 key 条目已保存的值。
+					secret = existingSecrets[key]
+				}
+				clients = append(clients, auth.AntigravityOAuthClientConfig{
+					Key: key, ClientID: strings.TrimSpace(payload.ClientID), ClientSecret: secret,
+				})
+			}
+			next.Clients = clients
+		}
+		if req.AntigravityOAuthClientKey != nil {
+			next.ActiveKey = strings.ToLower(strings.TrimSpace(*req.AntigravityOAuthClientKey))
+		} else if next.ActiveKey != "" {
+			// 未显式提交活跃 key 时，若原 key 已随条目删除则自动清空，避免整次保存被校验拒绝。
+			found := false
+			for _, client := range next.Clients {
+				if client.Key == next.ActiveKey {
+					found = true
+					break
+				}
+			}
+			if !found {
+				next.ActiveKey = ""
+			}
+		}
+		normalized, normalizeErr := auth.NormalizeAntigravityOAuthSettings(next)
+		if normalizeErr != nil {
+			writeError(c, http.StatusBadRequest, "antigravity_oauth_clients 无效："+normalizeErr.Error())
+			return
+		}
+		encoded, encodeErr := auth.EncodeAntigravityOAuthSettings(normalized)
+		if encodeErr != nil {
+			writeError(c, http.StatusInternalServerError, "antigravity_oauth_clients 编码失败："+encodeErr.Error())
+			return
+		}
+		if h.db == nil {
+			writeError(c, http.StatusInternalServerError, "Antigravity OAuth 设置存储不可用")
+			return
+		}
+		if saveErr := h.db.SaveAntigravityOAuthConfig(c.Request.Context(), encoded); saveErr != nil {
+			writeError(c, http.StatusInternalServerError, "保存 Antigravity OAuth 设置失败："+saveErr.Error())
+			return
+		}
+		auth.SetConfiguredAntigravityOAuth(normalized)
+		log.Printf("设置已更新: antigravity_oauth_clients = %d 个 client, active_key=%q", len(normalized.Clients), normalized.ActiveKey)
 	}
 
 	if req.MaxRetries != nil {
@@ -11182,7 +11792,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
 		ImageStorageConfig:                  imgConfigJSON,
 		BackgroundConfig:                    encodeBackgroundConfig(bgCfg),
-		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID(), h.store.GrokFollowUpEffortConfig()),
+		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID(), h.store.GrokFollowUpEffortConfig(), h.store.GrokQualityGuardConfig()),
 		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
@@ -11367,6 +11977,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	modelCooldownSettings := h.store.GetModelCooldownSettings()
 
 	c.JSON(http.StatusOK, settingsResponse{
+		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            siteName,
 		SiteLogo:                            siteLogo,
 		BackgroundImage:                     bgCfg.Image,
@@ -11382,6 +11993,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
 		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
 		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheWritePolicy:            responseCacheSettings.WritePolicy,
 		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
 		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
 		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,
@@ -11454,6 +12066,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
 		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
 		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
+		GrokQualityGuardEnabled:             h.store.GrokQualityGuardConfig().Enabled,
+		GrokQualityGuardMaxAttempts:         h.store.GrokQualityGuardConfig().MaxAttempts,
+		GrokQualityGuardHoldTimeoutSec:      h.store.GrokQualityGuardConfig().HoldTimeoutSec,
+		GrokQualityGuardOnExhausted:         h.store.GrokQualityGuardConfig().OnExhausted,
+		GrokQualityGuardCooldownHours:       h.store.GrokQualityGuardConfig().AccountCooldownHours,
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
@@ -11592,6 +12209,68 @@ type cpaExportEntry struct {
 	AccessToken           string `json:"access_token"`
 	LastRefresh           string `json:"last_refresh"`
 	RefreshToken          string `json:"refresh_token"`
+	// 代理三件套只在 include_proxy=1 时写出：代理 URL 常带明文用户名密码。
+	// ProxyEnabled 用指针区分"文件没带这个字段"（老文件，按启用处理）与
+	// "源端显式禁用"，bool 的零值会被 omitempty 一起吞掉。
+	ProxyURL     string `json:"proxy_url,omitempty"`
+	ProxyLabel   string `json:"proxy_label,omitempty"`
+	ProxyEnabled *bool  `json:"proxy_enabled,omitempty"`
+}
+
+// exportProxyResolver 决定导出条目是否携带账号绑定的代理。零值表示不携带——
+// 导出代理等于导出代理凭据，必须由调用方显式打开。
+type exportProxyResolver struct {
+	include bool
+	byURL   map[string]*database.ProxyRow
+}
+
+// newExportProxyResolver 在 include 为真时读一次代理表，用来给导出条目补上
+// label / enabled。账号绑的自定义代理（不在代理表里）只带 URL。
+func (h *Handler) newExportProxyResolver(ctx context.Context, include bool) exportProxyResolver {
+	if !include {
+		return exportProxyResolver{}
+	}
+	resolver := exportProxyResolver{include: true, byURL: make(map[string]*database.ProxyRow)}
+	proxies, err := h.db.ListProxies(ctx)
+	if err != nil {
+		// 代理表读失败不该让整次导出失败：URL 在账号行上，label/enabled 只是附注。
+		log.Printf("导出账号: 读取代理表失败，本次仅导出代理 URL: %v", err)
+		return resolver
+	}
+	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		resolver.byURL[strings.TrimSpace(proxy.URL)] = proxy
+	}
+	return resolver
+}
+
+// resolve 返回导出条目该写入的代理 URL / label / 启用状态。
+func (r exportProxyResolver) resolve(rawURL string) (string, string, *bool) {
+	if !r.include {
+		return "", "", nil
+	}
+	proxyURL := strings.TrimSpace(rawURL)
+	if proxyURL == "" {
+		return "", "", nil
+	}
+	row := r.byURL[proxyURL]
+	if row == nil {
+		return proxyURL, "", nil
+	}
+	enabled := row.Enabled
+	return proxyURL, row.Label, &enabled
+}
+
+// exportIncludeProxy 解析 include_proxy 查询参数；未显式传入时取渠道默认值。
+// 用 Query().Has 做存在性判断而不是空串比较：include_proxy=0 必须能压过
+// 默认开启的渠道（Antigravity）。
+func exportIncludeProxy(c *gin.Context, defaultValue bool) bool {
+	if !c.Request.URL.Query().Has("include_proxy") {
+		return defaultValue
+	}
+	return parseBoolForm(c.Query("include_proxy"))
 }
 
 type accountAuthJSONTokens struct {
@@ -11671,7 +12350,8 @@ func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
 }
 
 // accountRowToCPAExportEntry 将数据库账号行转为 CPA 导出条目；无凭证时返回 false。
-func accountRowToCPAExportEntry(row *database.AccountRow) (cpaExportEntry, bool) {
+// proxies 决定是否连同账号绑定的代理一起导出（零值 = 不导出）。
+func accountRowToCPAExportEntry(row *database.AccountRow, proxies exportProxyResolver) (cpaExportEntry, bool) {
 	if row == nil {
 		return cpaExportEntry{}, false
 	}
@@ -11687,6 +12367,7 @@ func accountRowToCPAExportEntry(row *database.AccountRow) (cpaExportEntry, bool)
 	if accountID == "" {
 		accountID = row.GetCredential("account_id")
 	}
+	proxyURL, proxyLabel, proxyEnabled := proxies.resolve(row.ProxyURL)
 	return cpaExportEntry{
 		Type:                  "codex",
 		Email:                 row.GetCredential("email"),
@@ -11703,6 +12384,9 @@ func accountRowToCPAExportEntry(row *database.AccountRow) (cpaExportEntry, bool)
 		AccessToken:           at,
 		LastRefresh:           row.UpdatedAt.Format(time.RFC3339),
 		RefreshToken:          rt,
+		ProxyURL:              proxyURL,
+		ProxyLabel:            proxyLabel,
+		ProxyEnabled:          proxyEnabled,
 	}, true
 }
 
@@ -11754,6 +12438,9 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 		return
 	}
 
+	// 远程迁移同样默认不带代理：目标机未必连得上源机的代理网段，静默继承会让
+	// 整批账号绑上不可达出口。需要时由调用方显式传 include_proxy=1。
+	proxies := h.newExportProxyResolver(ctx, exportIncludeProxy(c, false))
 	idSet := parseExportIDSet(idsParam)
 
 	// 构建运行时状态映射（用于健康过滤）
@@ -11775,13 +12462,14 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 				continue
 			}
 		}
-		entry, ok := accountRowToExportEntry(row)
+		entry, ok := accountRowToExportEntry(row, proxies)
 		if !ok {
 			continue
 		}
 		entries = append(entries, entry)
 	}
 
+	writeSecretResponseHeaders(c)
 	c.JSON(http.StatusOK, entries)
 }
 
@@ -11798,18 +12486,20 @@ func (h *Handler) ExportRecycleBinAccounts(c *gin.Context) {
 		return
 	}
 
+	proxies := h.newExportProxyResolver(ctx, exportIncludeProxy(c, false))
 	idSet := parseExportIDSet(c.Query("ids"))
 	entries := make([]any, 0, len(rows))
 	for _, row := range rows {
 		if idSet != nil && !idSet[row.ID] {
 			continue
 		}
-		entry, ok := accountRowToExportEntry(row)
+		entry, ok := accountRowToExportEntry(row, proxies)
 		if !ok {
 			continue
 		}
 		entries = append(entries, entry)
 	}
+	writeSecretResponseHeaders(c)
 	c.JSON(http.StatusOK, entries)
 }
 
@@ -11909,7 +12599,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 	}
 
 	log.Printf("远程迁移: 从 %s 拉取到 %d 个账号，开始导入", remoteURL, len(tokens))
-	h.importAccountsCommon(c, tokens, "", false)
+	h.importAccountsCommon(c, tokens, importSettings{})
 }
 
 // ==================== Models ====================
@@ -11919,6 +12609,11 @@ func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
 	catalog.GrokModels = h.grokChannelModels()
 	catalog.AntigravityModels = h.antigravityChannelModels()
+	// The request-facing catalog must not advertise models contributed only by
+	// disabled/banned accounts or models currently marked credits_required.
+	// Keep claudeChannelModels for pricing/history, where those entries remain
+	// useful to operators.
+	catalog.ClaudeModels = h.claudeAvailableChannelModels()
 	c.JSON(http.StatusOK, catalog)
 }
 

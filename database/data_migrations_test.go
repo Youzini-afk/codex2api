@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestCurrentDataMigrationsAreUniqueAndIncludeGroupChannel(t *testing.T) {
+func TestCurrentDataMigrationsAreUniqueAndIncludeRequiredMigrations(t *testing.T) {
 	db := &DB{}
 	migrations := db.currentDataMigrations()
 	if len(migrations) == 0 {
@@ -21,8 +21,10 @@ func TestCurrentDataMigrationsAreUniqueAndIncludeGroupChannel(t *testing.T) {
 		}
 		seen[migration.version] = struct{}{}
 	}
-	if migrations[len(migrations)-1].version != dataMigrationGroupChannelV1 {
-		t.Fatalf("last migration=%q, want %q", migrations[len(migrations)-1].version, dataMigrationGroupChannelV1)
+	for _, required := range []string{dataMigrationGroupChannelV1, dataMigrationClaudeProviderV1} {
+		if _, ok := seen[required]; !ok {
+			t.Fatalf("required migration %q is missing", required)
+		}
 	}
 }
 
