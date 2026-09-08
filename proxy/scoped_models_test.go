@@ -204,6 +204,33 @@ func TestScopedModelsModelAllowAppliesToAliasName(t *testing.T) {
 	}
 }
 
+func TestScopedModelsExposeAutomaticReasoningAliasesForRelayModels(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                   1,
+		CodexReasoningEffortAliasEnabled: true,
+	})
+	store.AddAccount(&auth.Account{
+		DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL: "https://relay.example", APIKey: "sk", Models: []string{"gpt-5.5"},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	row := &database.APIKeyRow{ID: 1}
+
+	models := listScopedModelsForTest(t, handler, row)
+	if owner, _, ok := scopedModelByID(models, "gpt-5.5-high"); !ok || owner != "codex2api" {
+		t.Fatalf("automatic reasoning alias owner=%q ok=%v; models=%+v", owner, ok, models)
+	}
+	if _, _, ok := scopedModelByID(models, "gpt-5.5-max"); ok {
+		t.Fatalf("unsupported max alias leaked into scoped catalog: %+v", models)
+	}
+
+	store.SetCodexReasoningEffortAliasEnabled(false)
+	models = listScopedModelsForTest(t, handler, row)
+	if _, _, ok := scopedModelByID(models, "gpt-5.5-high"); ok {
+		t.Fatalf("automatic reasoning alias remained after disable: %+v", models)
+	}
+}
+
 func TestScopedModelRecordsDoesNotNeedDatabase(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
 	store.AddAccount(&auth.Account{DBID: 1, UpstreamType: auth.UpstreamGrok, APIKey: "xai"})
@@ -256,7 +283,7 @@ func TestScopedModelsIncludeExperimentalAPIKeyAntigravityWithoutGrokGates(t *tes
 }
 
 func TestScopedModelsClaudeOnlyKeyDoesNotExposeCodexAliases(t *testing.T) {
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, CodexReasoningEffortAliasEnabled: true})
 	defer store.Stop()
 	store.SetModelMapping(`{"client-alias":"claude-sonnet-4-5"}`)
 	store.AddAccount(&auth.Account{
@@ -270,6 +297,9 @@ func TestScopedModelsClaudeOnlyKeyDoesNotExposeCodexAliases(t *testing.T) {
 	}
 	if _, _, ok := scopedModelByID(models, "client-alias"); ok {
 		t.Fatalf("Codex/global alias leaked into Claude-only catalog: %+v", models)
+	}
+	if _, _, ok := scopedModelByID(models, "claude-sonnet-4-5-high"); ok {
+		t.Fatalf("Codex reasoning suffix leaked into Claude-only catalog: %+v", models)
 	}
 }
 

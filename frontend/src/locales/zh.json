@@ -4093,6 +4093,8 @@
     "firstTokenTimeoutDesc": "流式请求在指定秒数内上游没有返回任何响应事件（response.created / in_progress 之外）时，取消当前上游并按最大重试次数换号重试；0 = 关闭。推理阶段产生的结构/推理帧会被视为已开始响应，不会误触发，因此长推理不会被误中断。",
     "codexFastModelAliasEnabled": "Fast 模型别名",
     "codexFastModelAliasEnabledDesc": "允许模型名以 -fast 结尾时自动注入 service_tier=fast（前提是客户端未显式指定 tier），默认开启。",
+    "codexReasoningEffortAliasEnabled": "思考强度模型别名",
+    "codexReasoningEffortAliasEnabledDesc": "允许 Codex 模型名使用 -none、-low、-medium、-high、-xhigh 等后缀自动设置思考强度；仅按模型能力暴露可用档位，支持的模型还会提供 -max。默认开启。",
     "codexFastTierInterceptEnabled": "Fast Tier 拦截",
     "codexFastTierInterceptEnabledDesc": "拦截并移除客户端显式传入的 fast tier，仅保留 priority / default / flex，用于防止误触发 Fast 计费，默认关闭。",
     "imageStorage": "图片存储",

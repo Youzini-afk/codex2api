@@ -872,6 +872,7 @@ func (s *Store) applyStoreSystemSettings(settings *database.SystemSettings) erro
 	s.SetCodexWSSilentRetryEnabled(settings.CodexWSSilentRetryEnabled)
 	s.SetCodexWSSilentMaxRetries(settings.CodexWSSilentMaxRetries)
 	s.SetCodexFastModelAliasEnabled(settings.CodexFastModelAliasEnabled)
+	s.SetCodexReasoningEffortAliasEnabled(settings.CodexReasoningEffortAliasEnabled)
 	s.SetCodexFastTierInterceptEnabled(settings.CodexFastTierInterceptEnabled)
 	s.SetCodexWSSizeRouterEnabled(settings.CodexWSSizeRouterEnabled)
 	s.SetCodexWSBusyAcquireMaxWaitSec(settings.CodexWSBusyAcquireMaxWaitSec)

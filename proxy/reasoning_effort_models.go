@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/codex2api/security"
@@ -12,6 +13,161 @@ import (
 type ReasoningEffortModel struct {
 	Model  string `json:"model"`
 	Effort string `json:"effort"`
+}
+
+// reasoningEffortAliasSuffixes is deliberately kept separate from the
+// persisted model(effort) aliases.  The suffix aliases are a request/catalog
+// convenience and are only valid for real, currently supported Codex models.
+var reasoningEffortAliasSuffixes = []string{"none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"}
+
+// resolveAutomaticReasoningEffortModelAlias resolves <model>-<effort>.  A
+// model must be present in the current supported catalog; this prevents names
+// for unrelated providers (and image models) from being rewritten. The effort
+// must also belong to that model family's known capability set.
+func resolveAutomaticReasoningEffortModelAlias(model string, supportedModels []string) (ReasoningEffortModel, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" || len(supportedModels) == 0 {
+		return ReasoningEffortModel{}, false
+	}
+	lower := strings.ToLower(model)
+	for _, effort := range reasoningEffortAliasSuffixes {
+		suffix := "-" + effort
+		if !strings.HasSuffix(lower, suffix) {
+			continue
+		}
+		base := strings.TrimSpace(model[:len(model)-len(suffix)])
+		if !isRealSupportedReasoningModel(base, supportedModels) {
+			continue
+		}
+		canonical := canonicalizeCodexModel(base, supportedModels)
+		if !modelIDInList(canonical, supportedModels) || isImageReasoningModel(canonical) {
+			continue
+		}
+		if !automaticReasoningEffortAllowed(canonical, effort) {
+			continue
+		}
+		return ReasoningEffortModel{Model: canonical, Effort: effort}, true
+	}
+	return ReasoningEffortModel{}, false
+}
+
+func isImageReasoningModel(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "image")
+}
+
+func isRealSupportedReasoningModel(model string, supportedModels []string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" || strings.ContainsAny(model, "()") || isImageReasoningModel(model) {
+		return false
+	}
+	if !modelIDInList(model, supportedModels) {
+		return false
+	}
+	// Never recurse through an already generated suffix alias.  A real Codex
+	// model ID ending in one of these words is still safe unless its own base is
+	// also a supported model; the latter is precisely the recursive alias case.
+	lower := strings.ToLower(model)
+	for _, effort := range reasoningEffortAliasSuffixes {
+		suffix := "-" + effort
+		if strings.HasSuffix(lower, suffix) {
+			underlying := strings.TrimSpace(model[:len(model)-len(suffix)])
+			if underlying != "" && modelIDInList(underlying, supportedModels) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// automaticReasoningEffortAliases returns catalog aliases for a real Codex
+// model.  Manual model(effort) aliases and aliases already synthesized by a
+// previous pass are excluded by construction.
+func automaticReasoningEffortAliases(model string) []ReasoningEffortModel {
+	model = strings.TrimSpace(model)
+	if model == "" || strings.ContainsAny(model, "()") || isImageReasoningModel(model) {
+		return nil
+	}
+	lower := strings.ToLower(model)
+	for _, effort := range reasoningEffortAliasSuffixes {
+		if strings.HasSuffix(lower, "-"+effort) {
+			return nil
+		}
+	}
+	efforts := automaticReasoningEffortsForModel(model)
+	result := make([]ReasoningEffortModel, 0, len(efforts))
+	for _, effort := range efforts {
+		result = append(result, ReasoningEffortModel{Model: model, Effort: effort})
+	}
+	return result
+}
+
+// automaticReasoningEffortsForModel exposes only effort values known to work
+// for the current Codex/OpenAI model families. The manual model(effort) editor
+// remains available for experimental or future values such as minimal/ultra.
+func automaticReasoningEffortsForModel(model string) []string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" || isImageReasoningModel(model) {
+		return nil
+	}
+	if model == "codex-auto-review" {
+		return []string{"none", "low", "medium", "high", "xhigh"}
+	}
+	if strings.HasPrefix(model, "gpt-daybreak-") {
+		return []string{"low", "medium", "high", "xhigh", "max"}
+	}
+	if model == "gpt-reserve" || !strings.HasPrefix(model, "gpt-") {
+		return nil
+	}
+	if strings.Contains(model, "-pro") {
+		return []string{"medium", "high", "xhigh"}
+	}
+
+	version := strings.TrimPrefix(model, "gpt-")
+	if dash := strings.IndexByte(version, '-'); dash >= 0 {
+		version = version[:dash]
+	}
+	parts := strings.Split(version, ".")
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil
+	}
+	if major > 5 {
+		return []string{"low", "medium", "high", "xhigh", "max"}
+	}
+	if major != 5 || len(parts) < 2 {
+		return nil
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil
+	}
+	if minor == 3 && strings.Contains(model, "codex") {
+		return []string{"low", "medium", "high", "xhigh"}
+	}
+	if minor < 4 {
+		return nil
+	}
+	efforts := []string{"none", "low", "medium", "high", "xhigh"}
+	if minor >= 6 {
+		efforts = append(efforts, "max")
+	}
+	return efforts
+}
+
+func automaticReasoningEffortAllowed(model, effort string) bool {
+	for _, allowed := range automaticReasoningEffortsForModel(model) {
+		if allowed == effort {
+			return true
+		}
+	}
+	return false
+}
+
+func automaticReasoningEffortModelAlias(entry ReasoningEffortModel) string {
+	if strings.TrimSpace(entry.Model) == "" || strings.TrimSpace(entry.Effort) == "" {
+		return ""
+	}
+	return strings.TrimSpace(entry.Model) + "-" + strings.ToLower(strings.TrimSpace(entry.Effort))
 }
 
 func ReasoningEffortModelAlias(model, effort string) string {

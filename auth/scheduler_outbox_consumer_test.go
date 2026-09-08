@@ -42,6 +42,7 @@ func systemSettingsSyncFixture() *database.SystemSettings {
 		SchedulerEngine:                    "legacy",
 		CodexRequestCompression:            true,
 		CodexFastModelAliasEnabled:         true,
+		CodexReasoningEffortAliasEnabled:   true,
 		CodexWSHideUpstreamErrors:          true,
 		CodexWSSilentRetryEnabled:          true,
 		CodexWSSilentMaxRetries:            2,
@@ -89,6 +90,7 @@ func TestStoreInitReloadsSettingsCommittedAfterBootstrapRead(t *testing.T) {
 	updated.SessionSlotBufferEnabled = true
 	updated.SessionSlotBufferSeconds = 17
 	updated.CodexFastModelAliasEnabled = false
+	updated.CodexReasoningEffortAliasEnabled = false
 	updated.CodexFastTierInterceptEnabled = true
 	updated.CodexRequestCompression = false
 	if err := db.UpdateSystemSettings(ctx, &updated); err != nil {
@@ -111,7 +113,7 @@ func TestStoreInitReloadsSettingsCommittedAfterBootstrapRead(t *testing.T) {
 	if !store.SessionSlotBufferEnabled() || store.GetSessionSlotBuffer() != 17*time.Second {
 		t.Fatalf("session slot buffer = enabled:%t duration:%s", store.SessionSlotBufferEnabled(), store.GetSessionSlotBuffer())
 	}
-	if store.CodexFastModelAliasEnabled() || !store.CodexFastTierInterceptEnabled() || store.CodexRequestCompression() {
+	if store.CodexFastModelAliasEnabled() || store.CodexReasoningEffortAliasEnabled() || !store.CodexFastTierInterceptEnabled() || store.CodexRequestCompression() {
 		t.Fatalf("Codex runtime flags did not converge from committed snapshot")
 	}
 	applied := hookSnapshot.Load()
@@ -250,6 +252,7 @@ func TestSharedDatabaseSettingsConvergeAcrossStores(t *testing.T) {
 	updated.SessionSlotBufferEnabled = true
 	updated.SessionSlotBufferSeconds = 21
 	updated.CodexFastModelAliasEnabled = false
+	updated.CodexReasoningEffortAliasEnabled = false
 	updated.CodexRequestCompression = false
 	if err := db.UpdateSystemSettings(ctx, &updated); err != nil {
 		t.Fatalf("update shared settings: %v", err)
@@ -259,6 +262,7 @@ func TestSharedDatabaseSettingsConvergeAcrossStores(t *testing.T) {
 			first.SchedulerEngine() == "shadow" && second.SchedulerEngine() == "shadow" &&
 			first.SessionSlotBufferEnabled() && second.SessionSlotBufferEnabled() &&
 			!first.CodexFastModelAliasEnabled() && !second.CodexFastModelAliasEnabled() &&
+			!first.CodexReasoningEffortAliasEnabled() && !second.CodexReasoningEffortAliasEnabled() &&
 			!first.CodexRequestCompression() && !second.CodexRequestCompression()
 	})
 }

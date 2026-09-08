@@ -395,6 +395,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		CodexWSSilentRetryEnabled:          true,
 		CodexWSSilentMaxRetries:            2,
 		CodexFastModelAliasEnabled:         true,
+		CodexReasoningEffortAliasEnabled:   true,
 		CodexFastTierInterceptEnabled:      false,
 		CodexWSSizeRouterEnabled:           true,
 		CodexWSBusyAcquireMaxWaitSec:       30,

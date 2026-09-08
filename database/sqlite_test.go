@@ -1582,6 +1582,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		CodexWSSilentRetryEnabled:           true,
 		CodexWSSilentMaxRetries:             4,
 		CodexFastModelAliasEnabled:          false,
+		CodexReasoningEffortAliasEnabled:    false,
 		CodexFastTierInterceptEnabled:       true,
 		CodexWSSizeRouterEnabled:            false,
 		CodexWSBusyAcquireMaxWaitSec:        41,
@@ -1693,6 +1694,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CodexFastModelAliasEnabled {
 		t.Fatalf("CodexFastModelAliasEnabled = true, want false")
+	}
+	if settings.CodexReasoningEffortAliasEnabled {
+		t.Fatalf("CodexReasoningEffortAliasEnabled = true, want false")
 	}
 	if !settings.CodexFastTierInterceptEnabled {
 		t.Fatalf("CodexFastTierInterceptEnabled = false, want true")

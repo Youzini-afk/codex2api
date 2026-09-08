@@ -190,8 +190,13 @@ func ListModelCatalog(ctx context.Context, db *database.DB) (ModelCatalog, error
 	}
 
 	merged := mergeModelInfos(rows)
-	if settings, settingsErr := db.GetSystemSettings(ctx); settingsErr == nil && settings != nil {
-		merged = appendReasoningEffortModelInfos(merged, settings.ReasoningEffortModels)
+	if settings, settingsErr := db.GetSystemSettings(ctx); settingsErr == nil {
+		if settings != nil {
+			merged = appendReasoningEffortModelInfos(merged, settings.ReasoningEffortModels)
+		}
+		if settings == nil || settings.CodexReasoningEffortAliasEnabled {
+			merged = appendAutomaticReasoningEffortModelInfos(merged)
+		}
 	} else if settingsErr != nil && catalog.Warning == "" {
 		catalog.Warning = settingsErr.Error()
 	}
@@ -214,6 +219,38 @@ func ListModelCatalog(ctx context.Context, db *database.DB) (ModelCatalog, error
 		}
 	}
 	return catalog, nil
+}
+
+func appendAutomaticReasoningEffortModelInfos(items []ModelInfo) []ModelInfo {
+	result := append([]ModelInfo(nil), items...)
+	byID := make(map[string]ModelInfo, len(result)+len(result)*len(reasoningEffortAliasSuffixes))
+	for _, item := range result {
+		byID[strings.ToLower(strings.TrimSpace(item.ID))] = item
+	}
+	for _, baseInfo := range items {
+		if !baseInfo.Enabled || isImageModelInfo(baseInfo) || baseInfo.Category != ModelCategoryCodex || baseInfo.Source == ModelSourceReasoningEffort {
+			continue
+		}
+		for _, entry := range automaticReasoningEffortAliases(baseInfo.ID) {
+			alias := automaticReasoningEffortModelAlias(entry)
+			if alias == "" {
+				continue
+			}
+			key := strings.ToLower(alias)
+			if _, exists := byID[key]; exists {
+				continue
+			}
+			aliasInfo := baseInfo
+			aliasInfo.ID = alias
+			aliasInfo.Source = ModelSourceReasoningEffort
+			aliasInfo.Category = ModelCategoryCodex
+			aliasInfo.LastSeenAt = nil
+			aliasInfo.UpdatedAt = nil
+			result = append(result, aliasInfo)
+			byID[key] = aliasInfo
+		}
+	}
+	return result
 }
 
 func builtinCatalog() ModelCatalog {
@@ -351,13 +388,15 @@ func SupportedModelIDs(ctx context.Context, db *database.DB) []string {
 // TextTestModelIDs returns enabled non-image models for account connection tests.
 func TextTestModelIDs(ctx context.Context, db *database.DB) []string {
 	catalog, _ := ListModelCatalog(ctx, db)
-	ids := enabledModelIDs(catalog.Items, true)
-	filtered := ids[:0]
-	for _, id := range ids {
-		if strings.Contains(id, "(") || strings.Contains(id, ")") {
+	filtered := make([]string, 0, len(catalog.Items))
+	for _, item := range catalog.Items {
+		if !item.Enabled || isImageModelInfo(item) || item.Source == ModelSourceReasoningEffort {
 			continue
 		}
-		filtered = append(filtered, id)
+		if strings.Contains(item.ID, "(") || strings.Contains(item.ID, ")") {
+			continue
+		}
+		filtered = append(filtered, item.ID)
 	}
 	return filtered
 }

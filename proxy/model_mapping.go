@@ -212,6 +212,32 @@ func applyReasoningEffortModelToBody(rawBody []byte, entry ReasoningEffortModel)
 	return updatedBody, nil
 }
 
+func (h *Handler) reasoningEffortAliasEnabled() bool {
+	return h != nil && h.store != nil && h.store.CodexReasoningEffortAliasEnabled()
+}
+
+// applyAutomaticReasoningEffortModelAliasToBody strips a recognized suffix
+// even when the feature is disabled, matching the existing -fast alias
+// behavior.  Enabling the feature additionally overwrites both effort fields.
+func (h *Handler) applyAutomaticReasoningEffortModelAliasToBody(rawBody []byte, model string, supportedModels []string) ([]byte, string, bool, error) {
+	entry, ok := resolveAutomaticReasoningEffortModelAlias(model, supportedModels)
+	if !ok {
+		return rawBody, model, false, nil
+	}
+	if !h.reasoningEffortAliasEnabled() {
+		updated, err := sjson.SetBytes(rawBody, "model", entry.Model)
+		if err != nil {
+			return rawBody, model, false, err
+		}
+		return updated, entry.Model, true, nil
+	}
+	updated, err := applyReasoningEffortModelToBody(rawBody, entry)
+	if err != nil {
+		return rawBody, model, false, err
+	}
+	return updated, entry.Model, true, nil
+}
+
 func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedModels []string) ([]byte, string, string, bool) {
 	originalModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
 	effectiveModel := originalModel
@@ -222,6 +248,7 @@ func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedMod
 	updatedBody := rawBody
 	modelForMapping := originalModel
 	mappingApplied := false
+	manualReasoningAliasApplied := false
 	injectFastTier := true
 	if h != nil && h.store != nil {
 		injectFastTier = h.store.CodexFastModelAliasEnabled()
@@ -246,7 +273,18 @@ func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedMod
 		}
 		modelForMapping = entry.Model
 		effectiveModel = entry.Model
+		manualReasoningAliasApplied = true
 		mappingApplied = mappingApplied || !strings.EqualFold(originalModel, entry.Model)
+	}
+	if !manualReasoningAliasApplied {
+		if autoBody, baseModel, ok, err := h.applyAutomaticReasoningEffortModelAliasToBody(updatedBody, modelForMapping, supportedModels); err != nil {
+			return rawBody, originalModel, effectiveModel, false
+		} else if ok {
+			updatedBody = autoBody
+			modelForMapping = baseModel
+			effectiveModel = baseModel
+			mappingApplied = true
+		}
 	}
 
 	mappedModel, ok := resolveConfiguredModelMapping(modelForMapping, h.store.GetCodexModelMapping(), supportedModels)
@@ -374,9 +412,17 @@ func (h *Handler) resolveConfiguredRequestModel(model string, supportedModels []
 		return model, false
 	}
 	resolved := false
+	manualReasoningAliasApplied := false
 	if entry, ok := resolveReasoningEffortModelAlias(model, h.store.GetReasoningEffortModels(), supportedModels); ok {
 		model = entry.Model
 		resolved = true
+		manualReasoningAliasApplied = true
+	}
+	if !manualReasoningAliasApplied {
+		if entry, ok := resolveAutomaticReasoningEffortModelAlias(model, supportedModels); ok {
+			model = entry.Model
+			resolved = true
+		}
 	}
 	mappedModel, ok := resolveConfiguredModelMapping(model, h.store.GetCodexModelMapping(), supportedModels)
 	if !ok || mappedModel == "" || mappedModel == model {

@@ -28,15 +28,16 @@ func TestApplyRuntimeSystemSettingsPublishesExternalProjections(t *testing.T) {
 	limiter := proxy.NewRateLimiter(3)
 	t.Cleanup(limiter.GetEnhancedLimiter().Stop)
 	settings := &database.SystemSettings{
-		GlobalRPM:                     87,
-		UsageLogMode:                  database.UsageLogModeErrors,
-		UsageLogBatchSize:             19,
-		UsageLogFlushIntervalSeconds:  7,
-		BillingTierPolicy:             proxy.BillingTierPolicyActual,
-		CodexFastModelAliasEnabled:    false,
-		CodexFastTierInterceptEnabled: true,
-		CodexRequestCompression:       false,
-		ModelPricingOverrides:         `{"gpt-settings-sync":{"source":"custom","input":1.25}}`,
+		GlobalRPM:                        87,
+		UsageLogMode:                     database.UsageLogModeErrors,
+		UsageLogBatchSize:                19,
+		UsageLogFlushIntervalSeconds:     7,
+		BillingTierPolicy:                proxy.BillingTierPolicyActual,
+		CodexFastModelAliasEnabled:       false,
+		CodexReasoningEffortAliasEnabled: false,
+		CodexFastTierInterceptEnabled:    true,
+		CodexRequestCompression:          false,
+		ModelPricingOverrides:            `{"gpt-settings-sync":{"source":"custom","input":1.25}}`,
 	}
 
 	runtimeSettings, err := applyRuntimeSystemSettings(context.Background(), settings, db, limiter)
@@ -46,7 +47,7 @@ func TestApplyRuntimeSystemSettingsPublishesExternalProjections(t *testing.T) {
 	if runtimeSettings.BillingTierPolicy != proxy.BillingTierPolicyRequested {
 		t.Fatalf("BillingTierPolicy = %q, want env override requested", runtimeSettings.BillingTierPolicy)
 	}
-	if runtimeSettings.CodexFastModelAliasEnabled || !runtimeSettings.CodexFastTierInterceptEnabled || runtimeSettings.CodexRequestCompression {
+	if runtimeSettings.CodexFastModelAliasEnabled || runtimeSettings.CodexReasoningEffortAliasEnabled || !runtimeSettings.CodexFastTierInterceptEnabled || runtimeSettings.CodexRequestCompression {
 		t.Fatalf("proxy runtime settings = %+v", runtimeSettings)
 	}
 	if limiter.GetRPM() != 87 {
@@ -91,6 +92,7 @@ func TestSystemSettingsOutboxHookUpdatesProcessRuntime(t *testing.T) {
 		SchedulerEngine:                    "legacy",
 		CodexRequestCompression:            true,
 		CodexFastModelAliasEnabled:         true,
+		CodexReasoningEffortAliasEnabled:   true,
 		UsageLogMode:                       database.UsageLogModeFull,
 		UsageLogBatchSize:                  20,
 		UsageLogFlushIntervalSeconds:       5,
@@ -118,6 +120,7 @@ func TestSystemSettingsOutboxHookUpdatesProcessRuntime(t *testing.T) {
 	updated := *persisted
 	updated.GlobalRPM = 111
 	updated.CodexFastModelAliasEnabled = false
+	updated.CodexReasoningEffortAliasEnabled = false
 	updated.CodexFastTierInterceptEnabled = true
 	updated.CodexRequestCompression = false
 	if err := db.UpdateSystemSettings(ctx, &updated); err != nil {
@@ -126,7 +129,7 @@ func TestSystemSettingsOutboxHookUpdatesProcessRuntime(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		runtimeSettings := proxy.CurrentRuntimeSettings()
-		if limiter.GetRPM() == 111 && !runtimeSettings.CodexFastModelAliasEnabled &&
+		if limiter.GetRPM() == 111 && !runtimeSettings.CodexFastModelAliasEnabled && !runtimeSettings.CodexReasoningEffortAliasEnabled &&
 			runtimeSettings.CodexFastTierInterceptEnabled && !runtimeSettings.CodexRequestCompression {
 			return
 		}

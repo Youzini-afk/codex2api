@@ -127,6 +127,17 @@ func exactModelAliases(mappingJSON string, targetExists func(string) bool) []str
 	return aliases
 }
 
+func (h *Handler) addAutomaticScopedReasoningAliases(records map[string]*scopedModelRecord, model string, backing modelBacking, targetExists func(string) bool) {
+	if h == nil || h.store == nil || !h.store.CodexReasoningEffortAliasEnabled() || !targetExists(model) {
+		return
+	}
+	for _, entry := range automaticReasoningEffortAliases(model) {
+		if alias := automaticReasoningEffortModelAlias(entry); alias != "" {
+			addScopedModel(records, alias, backing, time.Time{}, true)
+		}
+	}
+}
+
 func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRow) map[string]*scopedModelRecord {
 	records := make(map[string]*scopedModelRecord)
 	if h == nil || h.store == nil || row == nil {
@@ -211,6 +222,9 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 				addScopedModel(records, alias, modelBackingRelay, time.Time{}, true)
 				addTarget(alias)
 			}
+			for _, id := range models {
+				h.addAutomaticScopedReasoningAliases(records, id, modelBackingRelay, targetExists)
+			}
 
 		case account.IsAntigravityAPI():
 			if !account.AntigravityDispatchEnabled() {
@@ -243,6 +257,9 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 				}
 				addScopedModel(records, item.ID, modelBackingCodex, time.Time{}, false)
 				addTarget(item.ID)
+				if item.Source != ModelSourceReasoningEffort {
+					h.addAutomaticScopedReasoningAliases(records, item.ID, modelBackingCodex, targetExists)
+				}
 			}
 		}
 	}

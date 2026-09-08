@@ -3393,25 +3393,26 @@ type Store struct {
 	proxyRoundRobin      uint64              // 轮询计数器
 
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
-	fastScheduler                 atomic.Pointer[FastScheduler]
-	fastSchedulerEnabled          atomic.Bool
-	codexFastModelAliasEnabled    atomic.Bool
-	codexFastTierInterceptEnabled atomic.Bool
-	routingSchedulersMu           sync.RWMutex
-	routingSchedulers             map[int64]*routingSchedulerEntry
-	routingSchedulerAccounts      int
-	routingSchedulerAliases       int
-	routingGeneration             atomic.Uint64
-	indexedMissFallbackNS         atomic.Int64
-	schedulerEngine               atomic.Value // string: legacy / shadow / indexed
-	schedulerMetrics              *schedulerRuntimeMetrics
-	availability                  atomic.Pointer[availabilityHub]
-	schedulerOutboxStarted        atomic.Bool
-	dispatchReconcileStateMu      sync.Mutex
-	dispatchReconcileDone         chan struct{}
-	dispatchReconciledAt          int64
-	systemSettingsApplyMu         sync.Mutex
-	systemSettingsApplyHook       SystemSettingsApplyHook
+	fastScheduler                    atomic.Pointer[FastScheduler]
+	fastSchedulerEnabled             atomic.Bool
+	codexFastModelAliasEnabled       atomic.Bool
+	codexReasoningEffortAliasEnabled atomic.Bool
+	codexFastTierInterceptEnabled    atomic.Bool
+	routingSchedulersMu              sync.RWMutex
+	routingSchedulers                map[int64]*routingSchedulerEntry
+	routingSchedulerAccounts         int
+	routingSchedulerAliases          int
+	routingGeneration                atomic.Uint64
+	indexedMissFallbackNS            atomic.Int64
+	schedulerEngine                  atomic.Value // string: legacy / shadow / indexed
+	schedulerMetrics                 *schedulerRuntimeMetrics
+	availability                     atomic.Pointer[availabilityHub]
+	schedulerOutboxStarted           atomic.Bool
+	dispatchReconcileStateMu         sync.Mutex
+	dispatchReconcileDone            chan struct{}
+	dispatchReconciledAt             int64
+	systemSettingsApplyMu            sync.Mutex
+	systemSettingsApplyHook          SystemSettingsApplyHook
 
 	// Codex 上游 WebSocket 相关（默认全部关闭，不影响现有 HTTP 路径）
 	codexForceWebsocket atomic.Bool // 强制 Codex 上游走 WebSocket（复用连接池）
@@ -3947,6 +3948,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSSilentRetryEnabled:          true,
 			CodexWSSilentMaxRetries:            2,
 			CodexFastModelAliasEnabled:         true,
+			CodexReasoningEffortAliasEnabled:   true,
 			CodexFastTierInterceptEnabled:      false,
 			CodexWSSizeRouterEnabled:           true,
 			CodexWSBusyAcquireMaxWaitSec:       30,
@@ -4067,6 +4069,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
 	s.codexFastModelAliasEnabled.Store(settings.CodexFastModelAliasEnabled)
+	s.codexReasoningEffortAliasEnabled.Store(settings.CodexReasoningEffortAliasEnabled)
 	s.codexFastTierInterceptEnabled.Store(settings.CodexFastTierInterceptEnabled)
 	s.codexWSSizeRouterEnabled.Store(settings.CodexWSSizeRouterEnabled)
 	s.codexWSBusyMaxWaitSec.Store(int64(database.NormalizeCodexWSBusyAcquireMaxWaitSec(settings.CodexWSBusyAcquireMaxWaitSec)))
@@ -4382,6 +4385,22 @@ func (s *Store) CodexFastModelAliasEnabled() bool {
 		return true
 	}
 	return s.codexFastModelAliasEnabled.Load()
+}
+
+// SetCodexReasoningEffortAliasEnabled 设置思考强度后缀模型别名开关。
+func (s *Store) SetCodexReasoningEffortAliasEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexReasoningEffortAliasEnabled.Store(enabled)
+}
+
+// CodexReasoningEffortAliasEnabled 返回思考强度后缀模型别名开关状态（默认 true）。
+func (s *Store) CodexReasoningEffortAliasEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexReasoningEffortAliasEnabled.Load()
 }
 
 // SetCodexFastTierInterceptEnabled 设置 fast tier 拦截开关。

@@ -94,6 +94,9 @@ func TestDefaultBootstrapSettingsPreserveRuntimeDefaults(t *testing.T) {
 	if !settings.CodexFastModelAliasEnabled {
 		t.Fatal("CodexFastModelAliasEnabled = false, want true")
 	}
+	if !settings.CodexReasoningEffortAliasEnabled {
+		t.Fatal("CodexReasoningEffortAliasEnabled = false, want true")
+	}
 	if settings.CodexFastTierInterceptEnabled {
 		t.Fatal("CodexFastTierInterceptEnabled = true, want false")
 	}

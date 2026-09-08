@@ -2612,19 +2612,19 @@ func modelSupportsMaxReasoningEffort(model string) bool {
 		version = version[:dash]
 	}
 	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		return false
-	}
 	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return false
-	}
-	minor, err := strconv.Atoi(parts[1])
 	if err != nil {
 		return false
 	}
 	if major > 5 {
 		return true
+	}
+	if major < 5 || len(parts) < 2 {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
 	}
 	return major == 5 && minor >= 6
 }

@@ -1759,6 +1759,7 @@ export default function Settings() {
     codex_ws_silent_retry_enabled: true,
     codex_ws_silent_max_retries: 2,
     codex_fast_model_alias_enabled: true,
+    codex_reasoning_effort_alias_enabled: true,
     codex_fast_tier_intercept_enabled: false,
     codex_ws_size_router_enabled: true,
     codex_ws_busy_acquire_max_wait_sec: 30,
@@ -2968,6 +2969,12 @@ export default function Settings() {
                       <Switch
                         checked={settingsForm.codex_fast_model_alias_enabled}
                         onCheckedChange={(checked) => autoSaveBooleanField('codex_fast_model_alias_enabled', checked)}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.codexReasoningEffortAliasEnabled')} description={t('settings.codexReasoningEffortAliasEnabledDesc')} layout="switch">
+                      <Switch
+                        checked={settingsForm.codex_reasoning_effort_alias_enabled}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_reasoning_effort_alias_enabled', checked)}
                       />
                     </SettingField>
                     <SettingField label={t('settings.codexFastTierInterceptEnabled')} description={t('settings.codexFastTierInterceptEnabledDesc')} layout="switch">

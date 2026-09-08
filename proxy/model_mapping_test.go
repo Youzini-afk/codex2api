@@ -136,6 +136,66 @@ func TestApplyFastServiceTierModelAliasToBody(t *testing.T) {
 	}
 }
 
+func TestAutomaticReasoningEffortModelAliasToBody(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"GPT-5.6-SOL-HIGH","reasoning_effort":"low","reasoning":{"effort":"low"}}`),
+		[]string{"gpt-5.6-sol", "gpt-5.5"},
+	)
+	if !mapped || original != "GPT-5.6-SOL-HIGH" || effective != "gpt-5.6-sol" {
+		t.Fatalf("original/effective/mapped = %q/%q/%v", original, effective, mapped)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.6-sol" {
+		t.Fatalf("model = %q, want gpt-5.6-sol; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want high; body=%s", got, body)
+	}
+}
+
+func TestAutomaticReasoningEffortModelAliasDisabledOnlyStrips(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.SetCodexReasoningEffortAliasEnabled(false)
+	handler := NewHandler(store, nil, nil, nil)
+	body, _, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-medium","reasoning_effort":"low","reasoning":{"effort":"low"}}`),
+		[]string{"gpt-5.5"},
+	)
+	if !mapped || effective != "gpt-5.5" {
+		t.Fatalf("effective/mapped = %q/%v", effective, mapped)
+	}
+	if got := gjson.GetBytes(body, "reasoning_effort").String(); got != "low" {
+		t.Fatalf("disabled alias should preserve reasoning_effort, got %q", got)
+	}
+	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("disabled alias should preserve reasoning.effort, got %q", got)
+	}
+}
+
+func TestAutomaticReasoningEffortModelAliasMaxGateAndFastCombination(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+	body, _, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.6-sol-max-fast"}`),
+		[]string{"gpt-5.6-sol", "gpt-5.5"},
+	)
+	if !mapped || effective != "gpt-5.6-sol" {
+		t.Fatalf("fast combination effective/mapped = %q/%v", effective, mapped)
+	}
+	if gjson.GetBytes(body, "service_tier").String() != "fast" || gjson.GetBytes(body, "reasoning_effort").String() != "max" {
+		t.Fatalf("fast/max combination was not applied: %s", body)
+	}
+	if _, _, _, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5-max"}`), []string{"gpt-5.5"}); mapped {
+		t.Fatal("old-model -max must not be recognized")
+	}
+}
+
 func TestApplyFastServiceTierModelAliasDoesNotOverrideExplicitTier(t *testing.T) {
 	store := auth.NewStore(nil, nil, nil)
 	handler := NewHandler(store, nil, nil, nil)
@@ -386,6 +446,25 @@ func TestApplyMessagesModelMappingStripsTopLevelReasoningEffort(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "reasoning.summary").String(); got != "auto" {
 		t.Fatalf("reasoning.summary = %q, want auto preserved; body=%s", got, body)
+	}
+}
+
+func TestApplyMessagesAutomaticReasoningSuffixStripsChatField(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := handler.applyMessagesModelMapping(
+		[]byte(`{"model":"gpt-5.5-high","input":[],"reasoning":{"effort":"low","summary":"auto"}}`),
+		[]string{"gpt-5.5"},
+	)
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("body model = %q, want gpt-5.5; body=%s", got, body)
+	}
+	if gjson.GetBytes(body, "reasoning_effort").Exists() {
+		t.Fatalf("top-level reasoning_effort should be stripped; body=%s", body)
+	}
+	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want high; body=%s", got, body)
 	}
 }
 

@@ -1851,6 +1851,7 @@ export interface SystemSettings {
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
   codex_fast_model_alias_enabled: boolean
+  codex_reasoning_effort_alias_enabled: boolean
   codex_fast_tier_intercept_enabled: boolean
   codex_ws_size_router_enabled: boolean
   codex_ws_busy_acquire_max_wait_sec: number

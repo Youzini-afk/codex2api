@@ -4126,6 +4126,8 @@ func TestNormalizeReasoningEffortForModel_MaxGatedByModel(t *testing.T) {
 		{"MAX", "gpt-5.6-terra", "max"},
 		{"max", "gpt-5.6", "max"},
 		{"max", "gpt-6.0", "max"},
+		{"max", "gpt-6-astra", "max"},
+		{"max", "gpt-6-astra", "max"},
 		{"max", "gpt-5.4", "xhigh"},
 		{"max", "gpt-5.5", "xhigh"},
 		{"max", "", "xhigh"},
@@ -4261,7 +4263,7 @@ func TestModelSupportsMaxReasoningEffort(t *testing.T) {
 	cases := map[string]bool{
 		"gpt-5.6-sol":              true,
 		"gpt-5.6":                  true,
-		"gpt-6-astra":              false, // major-only ids have no minor and stay conservative
+		"gpt-6-astra":              true, // current GPT-6 family supports max despite a major-only version segment
 		"gpt-7.0":                  true,
 		"gpt-5.5":                  false,
 		"gpt-5.4-mini":             false,

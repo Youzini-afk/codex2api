@@ -64,16 +64,17 @@ const (
 )
 
 type RuntimeSettings struct {
-	ClientCompatMode              string
-	CodexMinCLIVersion            string
-	CodexUserAgentConfig          string
-	StreamFlushPolicy             string
-	StreamFlushIntervalMS         int
-	FirstTokenMode                string
-	FirstTokenTimeoutSec          int
-	BillingTierPolicy             string
-	CodexFastModelAliasEnabled    bool
-	CodexFastTierInterceptEnabled bool
+	ClientCompatMode                 string
+	CodexMinCLIVersion               string
+	CodexUserAgentConfig             string
+	StreamFlushPolicy                string
+	StreamFlushIntervalMS            int
+	FirstTokenMode                   string
+	FirstTokenTimeoutSec             int
+	BillingTierPolicy                string
+	CodexFastModelAliasEnabled       bool
+	CodexReasoningEffortAliasEnabled bool
+	CodexFastTierInterceptEnabled    bool
 	// ModelsListReadMaxBytes 是上游 /v1/models 与 Codex 模型清单成功响应的读取上限。
 	ModelsListReadMaxBytes int64
 	CodexForceWebsocket    bool // 强制 Codex 上游走 WebSocket（默认 false）
@@ -183,6 +184,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSilentRetry:               defaultCodexWSSilentRetry,
 		CodexWSSilentRetries:             defaultCodexWSSilentRetries,
 		CodexFastModelAliasEnabled:       true,
+		CodexReasoningEffortAliasEnabled: true,
 		CodexFastTierInterceptEnabled:    false,
 		ContinuousRetryPolicy:            database.DefaultContinuousRetryPolicy(),
 		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
@@ -355,6 +357,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
 		next.CodexFastModelAliasEnabled = settings.CodexFastModelAliasEnabled
+		next.CodexReasoningEffortAliasEnabled = settings.CodexReasoningEffortAliasEnabled
 		next.CodexFastTierInterceptEnabled = settings.CodexFastTierInterceptEnabled
 		next.ContinuousRetryPolicy = database.ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy)
 		if strings.TrimSpace(settings.ContinuousRetryPolicy) == "" {

@@ -42,6 +42,7 @@ test('channel-specific cards live in their channel tab, shared cards in general'
     assert.ok(codex.includes(key), `codex tab should contain ${key}`)
   }
   assert.ok(codex.includes('codex_user_agent_config') || codex.includes('codexUserAgentConfig'))
+  assert.ok(codex.includes('codex_reasoning_effort_alias_enabled'), 'Codex tab should expose the reasoning suffix alias switch')
   assert.ok(!codex.includes('settings.usageLogMode'), 'usage log settings are shared, not Codex-only')
   assert.ok(panel('claude').includes('<ClaudeCodeSettingsCard />'))
   assert.ok(panel('antigravity').includes('settings.antigravityOAuth.title'))

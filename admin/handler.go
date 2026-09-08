@@ -9334,6 +9334,7 @@ type settingsResponse struct {
 	CodexWSSilentRetryEnabled           bool   `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries             int    `json:"codex_ws_silent_max_retries"`
 	CodexFastModelAliasEnabled          bool   `json:"codex_fast_model_alias_enabled"`
+	CodexReasoningEffortAliasEnabled    bool   `json:"codex_reasoning_effort_alias_enabled"`
 	CodexFastTierInterceptEnabled       bool   `json:"codex_fast_tier_intercept_enabled"`
 	CodexWSSizeRouterEnabled            bool   `json:"codex_ws_size_router_enabled"`
 	CodexWSBusyAcquireMaxWaitSec        int    `json:"codex_ws_busy_acquire_max_wait_sec"`
@@ -9512,6 +9513,7 @@ type updateSettingsReq struct {
 	CodexWSSilentRetryEnabled           *bool                            `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries             *int                             `json:"codex_ws_silent_max_retries"`
 	CodexFastModelAliasEnabled          *bool                            `json:"codex_fast_model_alias_enabled"`
+	CodexReasoningEffortAliasEnabled    *bool                            `json:"codex_reasoning_effort_alias_enabled"`
 	CodexFastTierInterceptEnabled       *bool                            `json:"codex_fast_tier_intercept_enabled"`
 	CodexWSSizeRouterEnabled            *bool                            `json:"codex_ws_size_router_enabled"`
 	CodexWSBusyAcquireMaxWaitSec        *int                             `json:"codex_ws_busy_acquire_max_wait_sec"`
@@ -10339,6 +10341,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
 		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
+		CodexReasoningEffortAliasEnabled:    h.store.CodexReasoningEffortAliasEnabled(),
 		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
 		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
@@ -11101,6 +11104,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_fast_model_alias_enabled = %t", *req.CodexFastModelAliasEnabled)
 	}
 
+	if req.CodexReasoningEffortAliasEnabled != nil {
+		h.store.SetCodexReasoningEffortAliasEnabled(*req.CodexReasoningEffortAliasEnabled)
+		runtimeCfg.CodexReasoningEffortAliasEnabled = *req.CodexReasoningEffortAliasEnabled
+		log.Printf("设置已更新: codex_reasoning_effort_alias_enabled = %t", *req.CodexReasoningEffortAliasEnabled)
+	}
+
 	if req.CodexFastTierInterceptEnabled != nil {
 		h.store.SetCodexFastTierInterceptEnabled(*req.CodexFastTierInterceptEnabled)
 		runtimeCfg.CodexFastTierInterceptEnabled = *req.CodexFastTierInterceptEnabled
@@ -11843,6 +11852,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
 		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
+		CodexReasoningEffortAliasEnabled:    h.store.CodexReasoningEffortAliasEnabled(),
 		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
 		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
@@ -12159,6 +12169,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
 		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
+		CodexReasoningEffortAliasEnabled:    h.store.CodexReasoningEffortAliasEnabled(),
 		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
 		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),

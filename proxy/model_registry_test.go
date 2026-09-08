@@ -187,6 +187,38 @@ func TestReasoningEffortModelsAreIncludedInCatalog(t *testing.T) {
 	}
 }
 
+func TestAutomaticReasoningEffortAliasesAreCatalogedAndGated(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+	if err := db.UpdateSystemSettings(ctx, &database.SystemSettings{CodexReasoningEffortAliasEnabled: true}); err != nil {
+		t.Fatalf("enable automatic aliases: %v", err)
+	}
+	catalog, err := ListModelCatalog(ctx, db)
+	if err != nil {
+		t.Fatalf("ListModelCatalog: %v", err)
+	}
+	if !slices.Contains(catalog.Models, "gpt-5.5-high") || !slices.Contains(catalog.Models, "gpt-5.6-sol-max") {
+		t.Fatalf("catalog missing automatic aliases: %v", catalog.Models)
+	}
+	if slices.Contains(catalog.Models, "gpt-5.5-max") || slices.Contains(catalog.Models, "gpt-5.5-minimal") ||
+		slices.Contains(catalog.Models, "gpt-5.5-ultra") || slices.Contains(catalog.Models, "gpt-image-2-high") {
+		t.Fatalf("catalog exposed invalid automatic aliases: %v", catalog.Models)
+	}
+	if slices.Contains(TextTestModelIDs(ctx, db), "gpt-5.5-high") {
+		t.Fatal("automatic alias should not be used for direct connection tests")
+	}
+	if err := db.UpdateSystemSettings(ctx, &database.SystemSettings{CodexReasoningEffortAliasEnabled: false}); err != nil {
+		t.Fatalf("disable automatic aliases: %v", err)
+	}
+	catalog, err = ListModelCatalog(ctx, db)
+	if err != nil {
+		t.Fatalf("ListModelCatalog after disable: %v", err)
+	}
+	if slices.Contains(catalog.Models, "gpt-5.5-high") {
+		t.Fatalf("automatic alias remained after disable: %v", catalog.Models)
+	}
+}
+
 func TestExtractManifestModelSlugs(t *testing.T) {
 	manifest := []byte(`{"models":[
 		{"slug":"gpt-5.5","prefer_websockets":true},

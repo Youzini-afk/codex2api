@@ -4093,6 +4093,8 @@
     "firstTokenTimeoutDesc": "For streaming requests, cancel the current upstream call and retry with another account if the upstream returns no response event (other than response.created / in_progress) within N seconds; 0 = disabled. Structural and reasoning frames emitted during the thinking phase count as 'response started', so long reasoning turns are not interrupted by mistake.",
     "codexFastModelAliasEnabled": "Fast Model Alias",
     "codexFastModelAliasEnabledDesc": "Allows model names ending in -fast to automatically inject service_tier=fast when no explicit tier is present (default on).",
+    "codexReasoningEffortAliasEnabled": "Reasoning Effort Model Alias",
+    "codexReasoningEffortAliasEnabledDesc": "Allows Codex model suffixes such as -none, -low, -medium, -high, and -xhigh to set reasoning effort automatically. Only model-supported levels are listed, including -max where available. Enabled by default.",
     "codexFastTierInterceptEnabled": "Fast Tier Intercept",
     "codexFastTierInterceptEnabledDesc": "Strips explicit 'fast' tier from client requests, keeping only priority / default / flex. Designed to prevent accidental fast billing (default off).",
     "imageStorage": "Image Storage",

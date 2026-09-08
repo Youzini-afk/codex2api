@@ -1372,8 +1372,9 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 				usage_probe_responses_fallback_enabled BOOLEAN DEFAULT TRUE,
 				recovery_probe_interval_minutes INT DEFAULT 30,
 			scheduler_mode VARCHAR(20) DEFAULT 'round_robin',
-			codex_fast_model_alias_enabled BOOLEAN DEFAULT TRUE,
-			codex_fast_tier_intercept_enabled BOOLEAN DEFAULT FALSE,
+				codex_fast_model_alias_enabled BOOLEAN DEFAULT TRUE,
+				codex_reasoning_effort_alias_enabled BOOLEAN DEFAULT TRUE,
+				codex_fast_tier_intercept_enabled BOOLEAN DEFAULT FALSE,
 			response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 			response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 			response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
@@ -1521,7 +1522,8 @@ func (db *DB) migratePostgresSchema(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_preflight_sse_passthrough_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS first_token_excludes_ws_acquire BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_max_retries INT DEFAULT 2;
- 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_model_alias_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_model_alias_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_reasoning_effort_alias_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fast_tier_intercept_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_continue_thinking_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_continue_max_rounds INT DEFAULT 8;
@@ -2407,6 +2409,7 @@ type SystemSettings struct {
 	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
 	ShowFullUsageNumbers               bool
 	CodexFastModelAliasEnabled         bool
+	CodexReasoningEffortAliasEnabled   bool
 	CodexFastTierInterceptEnabled      bool
 	PublicKeyUsagePageEnabled          bool
 	PublicImageStudioPageEnabled       bool
@@ -2655,8 +2658,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_ws_hide_upstream_errors, true),
 			       COALESCE(codex_ws_silent_retry_enabled, true),
 			       COALESCE(codex_ws_silent_max_retries, 2),
- 			       COALESCE(codex_fast_model_alias_enabled, true),
-			       COALESCE(codex_fast_tier_intercept_enabled, false),
+				       COALESCE(codex_fast_model_alias_enabled, true),
+				       COALESCE(codex_reasoning_effort_alias_enabled, true),
+				       COALESCE(codex_fast_tier_intercept_enabled, false),
 			       COALESCE(codex_continue_thinking_enabled, false),
 			       COALESCE(codex_continue_max_rounds, 8),
 			       COALESCE(auto_pause_5h_threshold, 0),
@@ -2738,6 +2742,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexWSSilentRetryEnabled,
 		&s.CodexWSSilentMaxRetries,
 		&s.CodexFastModelAliasEnabled,
+		&s.CodexReasoningEffortAliasEnabled,
 		&s.CodexFastTierInterceptEnabled,
 		&s.CodexContinueThinkingEnabled,
 		&s.CodexContinueMaxRounds,
@@ -2949,8 +2954,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	if testContent == "" {
 		testContent = "hi"
 	}
-	// 两侧设置字段取并集后，这条 upsert 有 120 个业务参数；最后两个参数
-	// ($121/$122) 只用于并发保护，不对应 INSERT 列。
+	// 两侧设置字段取并集后，这条 upsert 有 122 个业务参数；最后两个参数
+	// ($123/$124) 只用于并发保护，不对应 INSERT 列。
 	_, err := db.conn.ExecContext(ctx, `
 			INSERT INTO system_settings (
 				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_content, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
@@ -2983,9 +2988,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_keepalive_interval_sec,
 					codex_ws_hide_upstream_errors,
 					codex_ws_silent_retry_enabled,
-					codex_ws_silent_max_retries,
-					codex_fast_model_alias_enabled,
-					codex_fast_tier_intercept_enabled,
+						codex_ws_silent_max_retries,
+						codex_fast_model_alias_enabled,
+						codex_reasoning_effort_alias_enabled,
+						codex_fast_tier_intercept_enabled,
 					auto_pause_5h_threshold,
 					auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent,
@@ -3033,7 +3039,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_request_compression,
 					auto_activate_5h_window_enabled
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121)
+							VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -3073,10 +3079,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-					prompt_filter_custom_patterns = CASE WHEN $122 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+						prompt_filter_custom_patterns = CASE WHEN $123 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-					prompt_filter_review_api_key = CASE WHEN $123 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+						prompt_filter_review_api_key = CASE WHEN $124 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -3108,9 +3114,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_keepalive_interval_sec = EXCLUDED.codex_ws_keepalive_interval_sec,
 					codex_ws_hide_upstream_errors = EXCLUDED.codex_ws_hide_upstream_errors,
 					codex_ws_silent_retry_enabled = EXCLUDED.codex_ws_silent_retry_enabled,
-					codex_ws_silent_max_retries = EXCLUDED.codex_ws_silent_max_retries,
-					codex_fast_model_alias_enabled = EXCLUDED.codex_fast_model_alias_enabled,
-					codex_fast_tier_intercept_enabled = EXCLUDED.codex_fast_tier_intercept_enabled,
+						codex_ws_silent_max_retries = EXCLUDED.codex_ws_silent_max_retries,
+						codex_fast_model_alias_enabled = EXCLUDED.codex_fast_model_alias_enabled,
+						codex_reasoning_effort_alias_enabled = EXCLUDED.codex_reasoning_effort_alias_enabled,
+						codex_fast_tier_intercept_enabled = EXCLUDED.codex_fast_tier_intercept_enabled,
 					auto_pause_5h_threshold = EXCLUDED.auto_pause_5h_threshold,
 					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent = EXCLUDED.auto_pause_5h_guard_band_percent,
@@ -3169,7 +3176,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.SessionAffinitySpread, s.BackgroundConfig, normalizeGrokConfig(s.GrokConfig), s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, s.PublicImageStudioPageEnabled, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
-		s.CodexFastModelAliasEnabled, s.CodexFastTierInterceptEnabled,
+		s.CodexFastModelAliasEnabled, s.CodexReasoningEffortAliasEnabled, s.CodexFastTierInterceptEnabled,
 		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency,
 		s.SmartPacingEnabled, normalizeSmartPacingMinConcurrencyDB(s.SmartPacingMinConcurrency), normalizeSmartPacingWindowsDB(s.SmartPacingWindows),
 		normalizeRetryIntervalMSDB(s.RetryIntervalMS), NormalizeTransportRetryPolicy(s.TransportRetryPolicy),
