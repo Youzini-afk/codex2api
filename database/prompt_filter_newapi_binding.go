@@ -94,19 +94,13 @@ func (db *DB) ensurePromptFilterNewAPIBindingsTable(ctx context.Context) error {
 	} else if _, err := db.conn.ExecContext(ctx, `ALTER TABLE prompt_filter_newapi_bindings ADD COLUMN IF NOT EXISTS prompt_filter_scope VARCHAR(16) NOT NULL DEFAULT 'inherit'`); err != nil {
 		return err
 	}
-	return normalizePromptFilterNewAPIBindings(ctx, db.conn)
-}
-
-func normalizePromptFilterNewAPIBindings(ctx context.Context, execer sqlExecer) error {
 	// Binding-level policy overrides were retired. Keep the legacy columns for
 	// a low-risk rolling migration, but neutralize all stored values so an old
 	// shadow/off row cannot silently override the unified GuardPipeline.
-	_, err := execer.ExecContext(ctx, `UPDATE prompt_filter_newapi_bindings
+	_, err := db.conn.ExecContext(ctx, `UPDATE prompt_filter_newapi_bindings
 		SET policy_mode='inherit', policy_profile='inherit',
 			prompt_filter_scope=CASE WHEN prompt_filter_scope IN ('inherit','local_only','off') THEN prompt_filter_scope ELSE 'inherit' END
-		WHERE policy_mode IS NULL OR policy_mode<>'inherit'
-			OR policy_profile IS NULL OR policy_profile<>'inherit'
-			OR prompt_filter_scope IS NULL OR prompt_filter_scope NOT IN ('inherit','local_only','off')`)
+		WHERE policy_mode<>'inherit' OR policy_profile<>'inherit' OR prompt_filter_scope NOT IN ('inherit','local_only','off')`)
 	return err
 }
 

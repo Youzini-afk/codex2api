@@ -9,6 +9,7 @@ import StatCard from '../components/StatCard'
 import UsageStatsSummary from '../components/UsageStatsSummary'
 import TimeRangeSelector from '../components/TimeRangeSelector'
 import ChannelFilter, { useUsageChannel, type UsageChannel } from '../components/ChannelFilter'
+import { useVisibleChannels } from '../visibleChannels'
 import ChannelLogo from '../components/ChannelLogo'
 import SystemHealthBar from '../components/SystemHealthBar'
 import type {
@@ -80,6 +81,7 @@ export default function Dashboard() {
   const { t } = useTranslation()
   const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
   const [channel, setChannel] = useUsageChannel()
+  const { isChannelVisible } = useVisibleChannels()
   const channelRef = useRef<UsageChannel>(channel)
   const [showPoolRunway, setShowPoolRunway] = useState(getInitialPoolRunwayVisibility)
   const [chartData, setChartData] = useState<ChartAggregation | null>(null)
@@ -272,8 +274,16 @@ export default function Dashboard() {
   const rateLimited = effectiveCounts?.rate_limited ?? 0
   const errorCount = effectiveCounts?.error ?? 0
   const todayRequests = effectiveCounts?.today_requests ?? 0
+  const chartEmptyDescription =
+    timeRange === '1h' && todayRequests > 0
+      ? t('dashboard.chartsEmptyTodayHint', {
+          range: t('dashboard.timeRange1H'),
+          count: todayRequests.toLocaleString(),
+        })
+      : t('dashboard.chartsEmptyDesc')
   const channelBreakdown = !channel && stats?.channels
     ? (['codex', 'grok', 'antigravity', 'claude'] as const)
+        .filter((key) => isChannelVisible(key))
         .map((key) => ({ key, counts: stats.channels?.[key] }))
         .filter((item): item is { key: 'codex' | 'grok' | 'antigravity' | 'claude'; counts: StatsChannelCounts } =>
           Boolean(item.counts && item.counts.total > 0))
@@ -463,6 +473,7 @@ export default function Dashboard() {
                 refreshedAt={chartRefreshedAt}
                 refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
                 timeRange={timeRange}
+                emptyDescription={chartEmptyDescription}
                 loading={chartLoading}
               />
             </Suspense>

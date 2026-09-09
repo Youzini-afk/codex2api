@@ -7,6 +7,7 @@ import { api } from '../api'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import { useAdminAuth } from './AuthGate'
+import { buildVersionLabel } from '../lib/buildVersion'
 import { useTheme } from '../hooks/useTheme'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
@@ -386,7 +387,7 @@ export default function Layout({ children }: PropsWithChildren) {
                         tabIndex={sidebarCollapsed ? -1 : 0}
                         onClick={() => setShowVersionPopover((current) => !current)}
                       >
-                        {__APP_VERSION__}
+                        {buildVersionLabel(__APP_VERSION__)}
                         {hasUpdate && (
                           <span className="absolute -top-1.5 left-1/2 size-2.5 -translate-x-1/2 rounded-full bg-red-500 shadow-sm ring-2 ring-[hsl(var(--sidebar-background))] animate-pulse" />
                         )}
@@ -627,7 +628,7 @@ export default function Layout({ children }: PropsWithChildren) {
                 title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
                 onClick={() => setShowVersionPopover((current) => !current)}
               >
-                {__APP_VERSION__}
+                {buildVersionLabel(__APP_VERSION__)}
                 {hasUpdate && (
                   <span className="absolute -top-1 -right-1 size-2 rounded-full bg-red-500 shadow-sm ring-2 ring-card animate-pulse" />
                 )}
@@ -774,7 +775,7 @@ export default function Layout({ children }: PropsWithChildren) {
                     {t('common.online')}
                   </span>
                   <span className="font-mono text-[11px] font-semibold">
-                    v{__APP_VERSION__}
+                    {buildVersionLabel(__APP_VERSION__)}
                   </span>
                 </div>
               </div>

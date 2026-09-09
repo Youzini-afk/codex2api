@@ -47,6 +47,8 @@ import type {
   APIKeyTokenStat,
   APIKeyAccountStatsResponse,
   APIKeyScopeUsageItem,
+  APIKeyLimits,
+  APIKeyModelRequestUsage,
   APIKeyScopeSummaryItem,
   AccountsResponse,
   AccountAnalysisResponse,
@@ -77,6 +79,10 @@ import type {
   MessageResponse,
   ModelSyncResponse,
   RefreshAllModelsResponse,
+  ProxyRiskScoreSnapshot,
+  ProxyRiskScoringProfile,
+  ProxyRiskScoringJob,
+  PromptLogRetention,
   ModelPricingOverride,
 	OfficialPricingSyncConfig,
 	OfficialPricingSyncResult,
@@ -84,6 +90,9 @@ import type {
   OAuthExchangeResponse,
   OAuthURLResponse,
   ClaudeAuthURLResponse,
+  ClaudeAuthKind,
+  ClaudeSessionKeyExchangeRequest,
+  ClaudeSetupTokenImportRequest,
   ClaudeExchangeCodeRequest,
   ClaudeImportTokenRequest,
   ClaudeCredentialExportEntry,
@@ -117,6 +126,8 @@ import type {
   CPAExportEntry,
   SystemSettings,
   ObservedInstructionsResponse,
+  CodexUserAgentCatalog,
+  CodexUserAgentPreview,
   UpdateAccountSchedulerRequest,
   UpdateAPIKeyRequest,
   UpdatePromptFilterNewAPIBindingRequest,
@@ -136,6 +147,10 @@ import type {
   UpdateAccountGroupRequest,
   UpstreamChannel,
   ClaudeGlobalConfig,
+  VisibleChannelsSettings,
+  ChannelTestSettings,
+  ChannelTestSettingsResponse,
+  AntigravitySettingsResponse,
 } from './types'
 
 const BASE = '/api/admin'
@@ -763,12 +778,27 @@ export const api = {
     request<void>(`/accounts/antigravity/oauth/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
     }),
-  // Claude Code OAuth：第一步取授权 URL（服务端暂存 state→verifier）。
-  generateClaudeAuthURL: () =>
+  // Claude Code OAuth：第一步取授权 URL（服务端暂存 state→verifier）。mode=setup_token
+  // 申请长效 Setup Token(仅推理 scope,1 年有效,无 RT)。
+  generateClaudeAuthURL: (mode: ClaudeAuthKind = 'oauth') =>
     request<ClaudeAuthURLResponse>('/accounts/claude/oauth/auth-url', {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ mode }),
       timeoutMs: 15_000,
+    }),
+  // claude.ai sessionKey(cookie)一键换号:服务端代跑 OAuth 三步。
+  exchangeClaudeSessionKey: (data: ClaudeSessionKeyExchangeRequest) =>
+    request<ClaudeAddAccountResponse>('/accounts/claude/oauth/exchange-session-key', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 120_000,
+    }),
+  // 批量粘贴 sk-ant-oat01- Setup Token。
+  importClaudeSetupTokens: (data: ClaudeSetupTokenImportRequest) =>
+    request<ClaudeImportBundleResponse>('/accounts/claude/import-setup-tokens', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 120_000,
     }),
   // 第二步：用 state+code 换取 token 并入库（可选从代理池分配代理）。
   exchangeClaudeOAuthCode: (data: ClaudeExchangeCodeRequest) =>
@@ -777,12 +807,12 @@ export const api = {
       body: JSON.stringify(data),
       timeoutMs: 90_000,
     }),
-  // CLI 直导：吃 cmd/claude_login -out 产出的 token JSON。
+  // Claude 凭据导入：OAuth、Setup Token 或 Base URL + API Key。
   importClaudeToken: (data: ClaudeImportTokenRequest) =>
     request<ClaudeAddAccountResponse>('/accounts/claude/import', {
       method: 'POST',
       body: JSON.stringify(data),
-      timeoutMs: 20_000,
+      timeoutMs: 60_000,
     }),
   /** Import a versioned Claude credential object or bundle. */
   importClaudeCredentialBundle: (
@@ -981,6 +1011,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ ids }),
     }),
+  getVisibleChannels: () => request<VisibleChannelsSettings>('/settings/visible-channels'),
+  updateVisibleChannels: (channels: readonly UpstreamChannel[]) =>
+    request<VisibleChannelsSettings>('/settings/visible-channels', {
+      method: 'PUT',
+      body: JSON.stringify({ channels }),
+    }),
+  getAntigravitySettings: () => request<AntigravitySettingsResponse>('/settings/antigravity'),
+  updateAntigravitySettings: (patch: { model_redirects?: Record<string, string>; redirect_overrides_effort?: boolean }) =>
+    request<AntigravitySettingsResponse>('/settings/antigravity', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+  getChannelTestSettings: () => request<ChannelTestSettingsResponse>('/settings/channel-tests'),
+  updateChannelTestSettings: (patch: Partial<Record<'antigravity' | 'claude', Partial<ChannelTestSettings>>>) =>
+    request<ChannelTestSettingsResponse>('/settings/channel-tests', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
   getInviteGuideSettings: () => request<{ enabled: boolean }>('/settings/invite-guide'),
   updateInviteGuideSettings: (enabled: boolean) =>
     request<{ enabled: boolean }>('/settings/invite-guide', {
@@ -1175,7 +1223,7 @@ export const api = {
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
-    request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    request<MessageResponse & { limits?: APIKeyLimits }>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   resetAPIKeyQuota: (id: number) =>
     request<MessageResponse>(`/keys/${id}/reset-quota`, { method: 'POST' }),
   resetAllAPIKeyQuotas: () =>
@@ -1183,6 +1231,8 @@ export const api = {
   // 分组 / 账号维度限额的当前用量（issue #439）。
   getAPIKeyScopeUsage: (id: number) =>
     request<{ items: APIKeyScopeUsageItem[] }>(`/keys/${id}/scope-usage`),
+  getAPIKeyModelRequestUsage: (id: number) =>
+    request<{ model_request_usage: APIKeyModelRequestUsage[] }>(`/keys/${id}/model-request-usage`),
   // 列表页用的全量概览：一次拿到所有 Key 的 scope 预算占比。
   getAPIKeysScopeSummary: () =>
     request<{ summary: Record<string, APIKeyScopeSummaryItem[]> }>('/keys-scope-summary'),
@@ -1260,6 +1310,10 @@ export const api = {
     }>('/settings/claude-config/cli-version/sync', { method: 'POST' }),
   getObservedInstructions: () =>
     request<ObservedInstructionsResponse>('/settings/observed-instructions'),
+  getCodexUserAgentCatalog: () =>
+    request<CodexUserAgentCatalog>('/settings/codex-user-agent/catalog'),
+  previewCodexUserAgent: (data: { config: string; client_compat_mode?: string; codex_min_cli_version?: string }) =>
+    request<CodexUserAgentPreview>('/settings/codex-user-agent/preview', { method: 'POST', body: JSON.stringify(data) }),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
   uploadBackground: (file: File) => {
@@ -1333,6 +1387,11 @@ export const api = {
 		request<PromptPolicyIncidentDetailResponse>(`/prompt-policy/incidents/${encodeURIComponent(incidentId)}`),
 	getPromptPolicyAuditHealth: () =>
 		request<PromptPolicyAuditHealth>('/prompt-policy/incidents/health'),
+	getPromptLogRetention: () => request<PromptLogRetention>('/prompt-filter/retention'),
+	updatePromptLogRetention: (retentionDays: number) =>
+		request<PromptLogRetention>('/prompt-filter/retention', { method: 'PUT', body: JSON.stringify({ retention_days: retentionDays }) }),
+	runPromptLogRetention: () =>
+		request<{ started: boolean; retention_days: number }>('/prompt-filter/retention/run', { method: 'POST' }),
 	clearPromptPolicyIncidents: () =>
 		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
 	deletePromptPolicyIncident: (incidentId: string) =>
@@ -1411,6 +1470,8 @@ export const api = {
     request<import('./types').PromptIntelligenceAIProvidersResponse>('/prompt-filter/intelligence/ai-providers'),
   analyzePromptIntelligenceCandidate: (id: number, data: import('./types').PromptIntelligenceAIAnalysisRequest) =>
     request<import('./types').PromptIntelligenceAIAnalysisResponse>(`/prompt-filter/intelligence/candidates/${id}/analyze`, { method: 'POST', body: JSON.stringify(data) }),
+  suggestPromptIntelligenceCandidateDraft: (id: number, data: { provider: import('./types').PromptIntelligenceAIProvider; model?: string; api_key_id?: number }) =>
+    request<import('./types').PromptIntelligenceDraftSuggestion>(`/prompt-filter/intelligence/candidates/${id}/draft/suggest`, { method: 'POST', body: JSON.stringify(data), timeoutMs: 90_000 }),
   applyPromptIntelligenceIdentityUpdate: (candidateId: number, evidenceId: number) =>
     request<{ identity_update: import('./types').PromptIdentityUpdateResult }>(`/prompt-filter/intelligence/candidates/${candidateId}/identity-updates/${evidenceId}/apply`, { method: 'POST' }),
   rollbackPromptIntelligenceIdentityUpdate: (candidateId: number, evidenceId: number) =>
@@ -1552,6 +1613,26 @@ export const api = {
     request<{ message: string; cleaned: number; unbound: number }>('/proxies/clean-error', { method: 'POST' }),
   autoBalanceProxies: (data: { channel?: 'codex' | 'grok' | 'claude'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
     request<AutoBalanceProxiesResult>('/proxies/auto-balance', { method: 'POST', body: JSON.stringify(data) }),
+  listProxyRiskScoringProfiles: () =>
+    request<{ profiles: ProxyRiskScoringProfile[] }>('/proxy-risk-scoring/profiles'),
+  createProxyRiskScoringProfile: (data: Partial<ProxyRiskScoringProfile> & { scamalytics_key?: string }) =>
+    request<ProxyRiskScoringProfile>('/proxy-risk-scoring/profiles', { method: 'POST', body: JSON.stringify(data) }),
+  updateProxyRiskScoringProfile: (id: number, data: Partial<ProxyRiskScoringProfile> & { scamalytics_key?: string }) =>
+    request<ProxyRiskScoringProfile>(`/proxy-risk-scoring/profiles/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteProxyRiskScoringProfile: (id: number) =>
+    request<MessageResponse>(`/proxy-risk-scoring/profiles/${id}`, { method: 'DELETE' }),
+  testProxyRiskScoringProfile: (id: number) =>
+    request<{ success: boolean; latency_ms?: number; score?: number | null; risk_level?: string; credits_remaining?: number | null; snapshot?: ProxyRiskScoreSnapshot | null; message?: string; error?: string }>(`/proxy-risk-scoring/profiles/${id}/test`, { method: 'POST' }),
+  startProxyRiskScoringJob: (data: { profile_id?: number; proxy_ids?: number[]; force?: boolean }) =>
+    request<ProxyRiskScoringJob>('/proxies/risk-score', { method: 'POST', body: JSON.stringify(data) }),
+  getProxyRiskScoringJob: (id: string, after = 0) =>
+    request<ProxyRiskScoringJob>(`/proxies/risk-score/jobs/${encodeURIComponent(id)}${after > 0 ? `?after=${after}` : ''}`),
+  cancelProxyRiskScoringJob: (id: string) =>
+    request<MessageResponse>(`/proxies/risk-score/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  getProxyRiskScore: (id: number) =>
+    request<ProxyRiskScoreSnapshot | { score: null; status: 'unscored' }>(`/proxies/${id}/risk-score`),
+  getProxyRiskScoreHistory: (id: number, profileId: number, page = 1, pageSize = 20) =>
+    request<{ items: ProxyRiskScoreSnapshot[]; total: number; page: number; page_size: number }>(`/proxies/${id}/risk-score/history?profile_id=${profileId}&page=${page}&page_size=${pageSize}`),
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
   // OAuth
@@ -1573,6 +1654,7 @@ export interface ProxyRow {
   test_location: string
   test_latency_ms: number
   test_status: 'untested' | 'success' | 'error'
+  risk_score?: ProxyRiskScoreSnapshot | null
   /** 绑定到该代理的账号数(服务端聚合,前端免拉全量账号)。 */
   bound_count: number
 }

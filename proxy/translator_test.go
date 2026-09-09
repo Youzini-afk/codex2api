@@ -3388,7 +3388,7 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.id").String(); got != "call_custom" {
 		t.Fatalf("tool call id = %q, want call_custom; chunk=%s", got, chunk)
 	}
-	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.name").String(); got != "run_custom" {
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.custom.name").String(); got != "run_custom" {
 		t.Fatalf("tool call name = %q, want run_custom; chunk=%s", got, chunk)
 	}
 
@@ -3404,7 +3404,7 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	if chunk == nil {
 		t.Fatal("should emit chunk for custom_tool_call_input delta")
 	}
-	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `{"cmd":` {
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.custom.input").String(); got != `{"cmd":` {
 		t.Fatalf("custom tool input delta = %q, want arguments delta; chunk=%s", got, chunk)
 	}
 
@@ -3420,7 +3420,7 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	if chunk == nil {
 		t.Fatal("should emit chunk for custom_tool_call_input call_id delta")
 	}
-	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `"pwd"}` {
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.custom.input").String(); got != `"pwd"}` {
 		t.Fatalf("custom tool input call_id delta = %q, want arguments delta; chunk=%s", got, chunk)
 	}
 
@@ -4263,7 +4263,8 @@ func TestModelSupportsMaxReasoningEffort(t *testing.T) {
 	cases := map[string]bool{
 		"gpt-5.6-sol":              true,
 		"gpt-5.6":                  true,
-		"gpt-6-astra":              true, // current GPT-6 family supports max despite a major-only version segment
+		"gpt-6-astra":              true, // official model page lists Max for Astra; major-only ids follow major > 5
+		"gpt-6":                    true,
 		"gpt-7.0":                  true,
 		"gpt-5.5":                  false,
 		"gpt-5.4-mini":             false,

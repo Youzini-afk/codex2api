@@ -210,6 +210,13 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 发送请求，失败时最多重试 2 次（重建连接）。
 	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
 	// 可能与当前请求的 proxy 组合不同，按参数重算 key 会漏删。
+	if err := proxy.ConsumeAPIKeyModelRequestQuota(ctx, gjson.GetBytes(wsBody, "model").String()); err != nil {
+		if !wc.cancelUnsentReadLease(pr.RequestID) {
+			e.manager.DiscardConnection(wc)
+		}
+		wc.session.RemovePendingRequest(pr.RequestID)
+		return nil, err
+	}
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
 	for retries := 0; shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
@@ -342,8 +349,11 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		headers.Set("X-Codex-Beta-Features", "remote_compaction_v2")
 	}
 
-	// Originator
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); !usedGeneratedHeaders && originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
+	// Originator：与 HTTP 路径同规则——生成 UA 时跟随生成的客户端前缀，
+	// 透传官方客户端时沿用下游值。
+	if usedGeneratedHeaders {
+		headers.Set("Originator", proxy.CodexOriginatorForGeneratedUserAgent(headers.Get("User-Agent")))
+	} else if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
 		headers.Set("Originator", originator)
 	} else {
 		headers.Set("Originator", proxy.Originator)

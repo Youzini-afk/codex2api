@@ -47,6 +47,8 @@ import (
 type Handler struct {
 	store             *auth.Store
 	modelRefreshFuncs map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
+	proxyRiskJobsMu   sync.RWMutex
+	proxyRiskJobs     map[string]*proxyRiskScoringJob
 	cache             cache.TokenCache
 	db                *database.DB
 	cacheCfgStore     responseCacheSettingsStore
@@ -58,13 +60,17 @@ type Handler struct {
 	// executeClaudeUsageProbe is injectable for tests; production uses the
 	// provider-native Anthropic Messages request directly.
 	executeClaudeUsageProbe func(context.Context, *auth.Account, []byte) (*http.Response, error)
-	activate5hWindow        func(context.Context, *auth.Account) error
-	executeUsageProbe       usageProbeRequestFunc
-	syncAccountPlanOnReset  func(context.Context, *auth.Account) error
-	queryResetCredits       func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
-	consumeResetCredit      func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
-	queryWhamDailyUsage     func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
-	sendCodexInvite         func(context.Context, *auth.Account, string, string, string, []string) (*proxy.CodexInviteResult, error)
+	// refreshClaudeTokensForImport is injectable for tests; production uses the
+	// real platform.claude.com refresh grant (see refreshClaudeCredentialsForImport).
+	refreshClaudeTokensForImport func(ctx context.Context, proxyURL, refreshToken string) (*auth.ClaudeTokenData, error)
+	activate5hWindow             func(context.Context, *auth.Account) error
+	executeUsageProbe            usageProbeRequestFunc
+	syncAccountPlanOnReset       func(context.Context, *auth.Account) error
+	queryResetCredits            func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit           func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	queryWhamDailyUsage          func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
+	queryWhamDailyTokenBreakdown func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error)
+	sendCodexInvite              func(context.Context, *auth.Account, string, string, string, []string) (*proxy.CodexInviteResult, error)
 	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
 	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
 	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
@@ -74,6 +80,7 @@ type Handler struct {
 	whamDailyBackfillInFlight  map[int64]struct{}
 	whamDailyBackfillFailedAt  map[int64]time.Time
 	whamDailySyncedOnce        map[int64]struct{}
+	whamDailyDeepSynced        map[int64]whamDailyDeepState
 	recordAccountEvent         func(int64, string, string)
 	proxyProbe                 func(context.Context, string, string) proxyProbeResult
 	reloadProxyPoolFn          func() error
@@ -93,6 +100,8 @@ type Handler struct {
 	imageProxy                 *proxy.Handler
 	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
 	antigravityCapabilityProbe antigravityCapabilityExecutor
+	// Claude / Antigravity 渠道连通性测试配置的进程内缓存（首次读库，PUT 刷新）。
+	channelTestCfg atomic.Pointer[database.ChannelTestConfig]
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
 	// 在大文件导入时堆出成千上万个阻塞协程。
@@ -963,6 +972,7 @@ func parseUsageChannel(c *gin.Context) string {
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
 		store:                store,
+		proxyRiskJobs:        make(map[string]*proxyRiskScoringJob),
 		cache:                tc,
 		db:                   db,
 		cacheCfgStore:        db,
@@ -990,6 +1000,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.queryResetCredits = proxy.QueryWhamResetCredits
 	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
 	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
+	handler.queryWhamDailyTokenBreakdown = proxy.QueryWhamDailyTokenBreakdown
 	handler.sendCodexInvite = proxy.SendCodexInvite
 	handler.whamDailyBackfillLast = make(map[int64]time.Time)
 	handler.whamDailyBackfillInFlight = make(map[int64]struct{})
@@ -1085,7 +1096,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
 	api.POST("/accounts/claude/oauth/auth-url", h.GenerateClaudeAuthURL)
 	api.POST("/accounts/claude/oauth/exchange-code", h.ExchangeClaudeOAuthCode)
+	api.POST("/accounts/claude/oauth/exchange-session-key", h.ExchangeClaudeSessionKey)
 	api.POST("/accounts/claude/import", h.ImportClaudeToken)
+	api.POST("/accounts/claude/import-setup-tokens", h.ImportClaudeSetupTokens) // 兼容旧名:同时接受 oat01/ort01
+	api.POST("/accounts/claude/import-tokens", h.ImportClaudeSetupTokens)
 	api.GET("/accounts/claude/export", h.ExportClaudeAccounts)
 	api.POST("/accounts/:id/claude/models", h.RefreshClaudeModels)
 	api.POST("/accounts/claude/models/refresh", h.RefreshAllClaudeModels)
@@ -1177,6 +1191,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
 	api.POST("/keys/:id/reset-quota", h.ResetAPIKeyQuota)
 	api.GET("/keys/:id/scope-usage", h.GetAPIKeyScopeUsage)
+	api.GET("/keys/:id/model-request-usage", h.GetAPIKeyModelRequestUsage)
 	api.GET("/keys-scope-summary", h.GetAPIKeysScopeSummary)
 	api.POST("/keys/:id/scope-quota/reset", h.ResetAPIKeyScopeQuota)
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
@@ -1195,17 +1210,28 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/settings/codex-user-agent/catalog", h.GetCodexUserAgentCatalog)
+	api.POST("/settings/codex-user-agent/preview", h.PreviewCodexUserAgent)
 	api.GET("/settings/claude-config", h.GetClaudeConfig)
 	api.PUT("/settings/claude-config", h.UpdateClaudeConfig)
 	api.POST("/settings/claude-config/cli-version/sync", h.SyncClaudeCLIVersion)
 	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.GET("/settings/invite-guide", h.GetInviteGuideSettings)
 	api.PUT("/settings/invite-guide", h.UpdateInviteGuideSettings)
+	api.GET("/settings/visible-channels", h.GetVisibleChannelsSettings)
+	api.PUT("/settings/visible-channels", h.UpdateVisibleChannelsSettings)
+	api.GET("/settings/channel-tests", h.GetChannelTestSettings)
+	api.PUT("/settings/channel-tests", h.UpdateChannelTestSettings)
+	api.GET("/settings/antigravity", h.GetAntigravitySettings)
+	api.PUT("/settings/antigravity", h.UpdateAntigravitySettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
 	api.GET("/prompt-filter/logs/match", h.MatchPromptFilterLog)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
+	api.GET("/prompt-filter/retention", h.GetPromptLogRetention)
+	api.PUT("/prompt-filter/retention", h.UpdatePromptLogRetention)
+	api.POST("/prompt-filter/retention/run", h.RunPromptLogRetentionNow)
 	api.GET("/prompt-policy/incidents", h.ListPromptPolicyIncidents)
 	api.DELETE("/prompt-policy/incidents", h.ClearPromptPolicyIncidents)
 	api.DELETE("/prompt-policy/incidents/:incident_id", h.DeletePromptPolicyIncident)
@@ -1243,6 +1269,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/intelligence/candidates/:id/identity-updates/:evidence_id/apply", h.ApplyPromptIntelligenceIdentityUpdate)
 	api.POST("/prompt-filter/intelligence/candidates/:id/identity-updates/:evidence_id/rollback", h.RollbackPromptIntelligenceIdentityUpdate)
 	api.POST("/prompt-filter/intelligence/candidates/:id/draft", h.CreatePromptIntelligenceCandidateDraft)
+	api.POST("/prompt-filter/intelligence/candidates/:id/draft/suggest", h.SuggestPromptIntelligenceCandidateDraft)
 	api.POST("/prompt-filter/intelligence/candidates/:id/publish", h.PublishPromptIntelligenceCandidate)
 	api.POST("/prompt-filter/intelligence/candidates/:id/dismiss", h.DismissPromptIntelligenceCandidate)
 	api.GET("/models", h.ListModels)
@@ -1275,6 +1302,16 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/proxies/test", h.TestProxy)
 	api.POST("/proxies/test-all", h.TestAllProxies)
 	api.POST("/proxies/auto-balance", h.AutoBalanceProxies)
+	api.GET("/proxy-risk-scoring/profiles", h.ListProxyRiskScoringProfiles)
+	api.POST("/proxy-risk-scoring/profiles", h.CreateProxyRiskScoringProfile)
+	api.PATCH("/proxy-risk-scoring/profiles/:profile_id", h.UpdateProxyRiskScoringProfile)
+	api.DELETE("/proxy-risk-scoring/profiles/:profile_id", h.DeleteProxyRiskScoringProfile)
+	api.POST("/proxy-risk-scoring/profiles/:profile_id/test", h.TestProxyRiskScoringProfile)
+	api.POST("/proxies/risk-score", h.StartProxyRiskScoringJob)
+	api.GET("/proxies/risk-score/jobs/:job_id", h.GetProxyRiskScoringJob)
+	api.POST("/proxies/risk-score/jobs/:job_id/cancel", h.CancelProxyRiskScoringJob)
+	api.GET("/proxies/:id/risk-score", h.GetProxyRiskScore)
+	api.GET("/proxies/:id/risk-score/history", h.ListProxyRiskScoreHistory)
 
 	// OAuth 授权流程
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
@@ -1525,22 +1562,23 @@ func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 // ==================== Accounts ====================
 
 type accountResponse struct {
-	DetailLoaded          bool   `json:"detail_loaded,omitempty"`
-	ID                    int64  `json:"id"`
-	Name                  string `json:"name"`
-	Email                 string `json:"email"`
-	EmailDomain           string `json:"email_domain,omitempty"`
-	ChatGPTAccountID      string `json:"chatgpt_account_id,omitempty"`
-	TokenWorkspaceID      string `json:"token_workspace_id,omitempty"`
-	WorkspaceIDOverride   string `json:"workspace_id_override,omitempty"`
-	EffectiveWorkspaceID  string `json:"effective_workspace_id,omitempty"`
-	PlanType              string `json:"plan_type"`
-	SubscriptionExpiresAt string `json:"subscription_expires_at,omitempty"`
-	Status                string `json:"status"`
-	ErrorMessage          string `json:"error_message,omitempty"`
-	ATOnly                bool   `json:"at_only"`
-	CreditEnabled         bool   `json:"credit_enabled"`
-	CreditSkipUsageWindow bool   `json:"credit_skip_usage_window"`
+	UpstreamRequestIDHeader string `json:"upstream_request_id_header"`
+	DetailLoaded            bool   `json:"detail_loaded,omitempty"`
+	ID                      int64  `json:"id"`
+	Name                    string `json:"name"`
+	Email                   string `json:"email"`
+	EmailDomain             string `json:"email_domain,omitempty"`
+	ChatGPTAccountID        string `json:"chatgpt_account_id,omitempty"`
+	TokenWorkspaceID        string `json:"token_workspace_id,omitempty"`
+	WorkspaceIDOverride     string `json:"workspace_id_override,omitempty"`
+	EffectiveWorkspaceID    string `json:"effective_workspace_id,omitempty"`
+	PlanType                string `json:"plan_type"`
+	SubscriptionExpiresAt   string `json:"subscription_expires_at,omitempty"`
+	Status                  string `json:"status"`
+	ErrorMessage            string `json:"error_message,omitempty"`
+	ATOnly                  bool   `json:"at_only"`
+	CreditEnabled           bool   `json:"credit_enabled"`
+	CreditSkipUsageWindow   bool   `json:"credit_skip_usage_window"`
 	// UsingCredits 是与 Status 并列的独立信号：用量窗口已打满但积分顶着，
 	// 状态仍是 active（可调度），前端据此在状态徽章旁并列一个「使用积分」徽章。
 	UsingCredits                  bool                        `json:"using_credits,omitempty"`
@@ -1551,6 +1589,8 @@ type accountResponse struct {
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
 	ClaudeAPI                     bool                        `json:"claude_api,omitempty"`
+	ClaudeAuthKind                string                      `json:"claude_auth_kind,omitempty"`
+	ClaudeBaseURL                 string                      `json:"claude_base_url,omitempty"`
 	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
 	AgentIdentity                 bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind                  string                      `json:"grok_auth_kind,omitempty"`
@@ -1569,6 +1609,7 @@ type accountResponse struct {
 	Models                        []string                    `json:"models,omitempty"`
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
+	CodexPassthroughMode          string                      `json:"codex_passthrough_mode,omitempty"`
 	CodexFingerprintMode          string                      `json:"codex_fingerprint_mode,omitempty"`
 	ClaudeFingerprintMode         string                      `json:"claude_fingerprint_mode,omitempty"`
 	ClaudeUserAgent               string                      `json:"claude_user_agent,omitempty"`
@@ -2044,6 +2085,7 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 }
 
 type updateAccountSchedulerReq struct {
+	UpstreamRequestIDHeader json.RawMessage `json:"upstream_request_id_header"`
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
 	UsageReservePercent5h   json.RawMessage `json:"usage_reserve_percent_5h"`
@@ -2210,7 +2252,14 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if codexFingerprintMode.Set {
 		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
 	}
+	requestIDHeader, err := parseOptionalStringField(req.UpstreamRequestIDHeader, "upstream_request_id_header", auth.ValidateUpstreamRequestIDHeader)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 	credentialUpdates := make(map[string]interface{})
+	if requestIDHeader.Set {
+		credentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey] = strings.TrimSpace(requestIDHeader.Value)
+	}
 	if customHeaders.Set {
 		credentialUpdates["custom_headers"] = cloneCustomHeaders(customHeaders.Values)
 	}
@@ -2546,6 +2595,17 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
 			return
 		}
+		// Claude API Key 账号的 custom_headers 是出站自定义头(issue #647):网关保留头
+		// (Authorization / x-api-key / Content-Type / Accept 等)不允许覆盖。
+		if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamClaude) && claudeAuthKindForRow(row, true) == auth.ClaudeAuthKindAPIKey {
+			normalized, err := normalizeClaudeAPIKeyCustomHeaders(update.CustomHeaders.Values)
+			if err != nil {
+				writeError(c, http.StatusBadRequest, err.Error())
+				return
+			}
+			update.CustomHeaders.Values = normalized
+			update.CredentialUpdates["custom_headers"] = cloneCustomHeaders(normalized)
+		}
 		seed := tokenCredentialSeedFromAccountRow(row)
 		previousOverride := openaiidentity.WorkspaceOverrideFromHeaders(seed.customHeaders)
 		seed.customHeaders = cloneCustomHeaders(update.CustomHeaders.Values)
@@ -2651,6 +2711,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.ProxyURL.Set {
 		h.store.ApplyAccountProxyURL(id, update.ProxyURL.Value)
+	}
+	if value, ok := update.CredentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey].(string); ok {
+		h.store.ApplyAccountUpstreamRequestIDHeader(id, value)
 	}
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
@@ -4166,6 +4229,7 @@ type addOpenAIResponsesAccountReq struct {
 	Models                  []string          `json:"models"`
 	ModelMapping            string            `json:"model_mapping"`
 	CodexClientMetadataMode *string           `json:"codex_client_metadata_mode"`
+	CodexPassthroughMode    *string           `json:"codex_passthrough_mode"`
 	ProxyURL                string            `json:"proxy_url"`
 	CustomHeaders           map[string]string `json:"custom_headers"`
 }
@@ -4238,6 +4302,14 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		}
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(*req.CodexClientMetadataMode)
 	}
+	codexPassthroughMode := auth.CodexPassthroughModeOff
+	if req.CodexPassthroughMode != nil {
+		if !auth.IsValidCodexPassthroughMode(*req.CodexPassthroughMode) {
+			writeError(c, http.StatusBadRequest, "codex_passthrough_mode 必须是 off、auto 或 always")
+			return
+		}
+		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(*req.CodexPassthroughMode)
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -4270,6 +4342,7 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		"models":                                 models,
 		"model_mapping":                          modelMapping,
 		"codex_client_metadata_mode":             codexClientMetadataMode,
+		"codex_passthrough_mode":                 codexPassthroughMode,
 		"plan_type":                              "api",
 		"email":                                  baseURL,
 	}
@@ -4293,6 +4366,7 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		Models:                  models,
 		ModelMapping:            modelMapping,
 		CodexClientMetadataMode: codexClientMetadataMode,
+		CodexPassthroughMode:    codexPassthroughMode,
 		CustomHeaders:           customHeaders,
 		Email:                   baseURL,
 		PlanType:                "api",
@@ -4448,6 +4522,14 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		}
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(*req.CodexClientMetadataMode)
 	}
+	codexPassthroughMode := auth.NormalizeCodexPassthroughMode(row.GetCredential("codex_passthrough_mode"))
+	if req.CodexPassthroughMode != nil {
+		if !auth.IsValidCodexPassthroughMode(*req.CodexPassthroughMode) {
+			writeError(c, http.StatusBadRequest, "codex_passthrough_mode 必须是 off、auto 或 always")
+			return
+		}
+		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(*req.CodexPassthroughMode)
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -4470,6 +4552,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		"models":                                 models,
 		"model_mapping":                          modelMapping,
 		"codex_client_metadata_mode":             codexClientMetadataMode,
+		"codex_passthrough_mode":                 codexPassthroughMode,
 		"plan_type":                              "api",
 		"email":                                  baseURL,
 		"custom_headers":                         cloneCustomHeaders(customHeaders),
@@ -4491,7 +4574,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, modelMapping, codexClientMetadataMode, req.ProxyURL)
+		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, modelMapping, codexClientMetadataMode, codexPassthroughMode, req.ProxyURL)
 		h.store.ApplyAccountCustomHeaders(id, customHeaders)
 	}
 	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
@@ -4677,7 +4760,7 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 	if account.IsClaudeOAuth() {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 		defer cancel()
-		models, fetchErr := auth.NewClaudeAuth(h.store.ResolveProxyForAccount(account)).FetchModels(ctx, account.GetAccessToken())
+		models, fetchErr := auth.NewClaudeAuth(h.store.ResolveProxyForAccount(account)).FetchModelsForAccount(ctx, account)
 		if fetchErr != nil {
 			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Claude 上游模型清单失败: %s", fetchErr.Error()))
 			return
@@ -8410,18 +8493,20 @@ func parseUsageLogsFilter(c *gin.Context, startTime, endTime time.Time) (databas
 	}
 
 	filter := database.UsageLogFilter{
-		Start:     startTime,
-		End:       endTime,
-		Page:      1,
-		PageSize:  20,
-		Email:     strings.TrimSpace(c.Query("email")),
-		Model:     strings.TrimSpace(c.Query("model")),
-		Endpoint:  strings.TrimSpace(c.Query("endpoint")),
-		APIKeyID:  apiKeyID,
-		AccountID: accountID,
-		ErrorKind: strings.TrimSpace(c.Query("error_kind")),
-		Query:     strings.TrimSpace(c.Query("q")),
-		Channel:   parseUsageChannel(c),
+		RequestID:         strings.TrimSpace(c.Query("request_id")),
+		UpstreamRequestID: strings.TrimSpace(c.Query("upstream_request_id")),
+		Start:             startTime,
+		End:               endTime,
+		Page:              1,
+		PageSize:          20,
+		Email:             strings.TrimSpace(c.Query("email")),
+		Model:             strings.TrimSpace(c.Query("model")),
+		Endpoint:          strings.TrimSpace(c.Query("endpoint")),
+		APIKeyID:          apiKeyID,
+		AccountID:         accountID,
+		ErrorKind:         strings.TrimSpace(c.Query("error_kind")),
+		Query:             strings.TrimSpace(c.Query("q")),
+		Channel:           parseUsageChannel(c),
 	}
 
 	if pageStr := c.Query("page"); pageStr != "" {
@@ -8794,6 +8879,11 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	var limits database.APIKeyLimits
 	if req.Limits != nil {
 		limits = sanitizeAPIKeyLimits(*req.Limits)
+		limits.ModelRequestLimits, err = normalizeAdminAPIKeyModelRequestLimits(req.Limits.ModelRequestLimits, nil)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
 		if err := h.validateAPIKeyGroupIDs(ctx, limits.NoAffinityGroupIDs, "limits.no_affinity_group_ids"); err != nil {
 			writeError(c, http.StatusBadRequest, err.Error())
 			return
@@ -8958,6 +9048,11 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	}
 	if req.Limits != nil {
 		update.Limits = sanitizeAPIKeyLimits(*req.Limits)
+		update.Limits.ModelRequestLimits, err = normalizeAdminAPIKeyModelRequestLimits(req.Limits.ModelRequestLimits, row.Limits.ModelRequestLimits)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
 		if err := h.validateAPIKeyGroupIDs(ctx, update.Limits.NoAffinityGroupIDs, "limits.no_affinity_group_ids"); err != nil {
 			writeError(c, http.StatusBadRequest, err.Error())
 			return
@@ -8983,7 +9078,11 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 		h.db.InvalidateScopeQuotaKeyCache()
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
-	writeMessage(c, http.StatusOK, "API Key 已更新")
+	savedLimits := row.Limits
+	if update.LimitsSet {
+		savedLimits = update.Limits
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "API Key 已更新", "limits": savedLimits})
 }
 
 // sanitizeAPIKeyLimits 把请求体里来的 limits 归一:负值置 0,空白模型名过滤,字符串小写。
@@ -9031,6 +9130,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		AllowLive:              in.AllowLive,
 		UpstreamChannel:        in.ResolveUpstreamChannel(),
 		ScopeLimits:            database.NormalizeAPIKeyScopeLimits(in.ScopeLimits),
+		ModelRequestLimits:     in.ModelRequestLimits,
 	}
 	// 归一后旧 bool 与新 policy 保持一致，避免两处配置漂移。
 	out.DisableImageGeneration = out.ImageGenerationPolicy == database.ImageGenerationPolicyBlock
@@ -9357,24 +9457,27 @@ type settingsResponse struct {
 	CodexCLIVersionSyncEnabled          bool   `json:"codex_cli_version_sync_enabled"`
 	CodexCLIVersionSyncIntervalHours    int    `json:"codex_cli_version_sync_interval_hours"`
 	CodexSyncedCLIVersion               string `json:"codex_synced_cli_version"`
-	SchedulerMode                       string `json:"scheduler_mode"`
-	AffinityMode                        string `json:"affinity_mode"`
-	SessionAffinitySpread               bool   `json:"session_affinity_spread"`
-	SessionSlotBufferEnabled            bool   `json:"session_slot_buffer_enabled"`
-	SessionSlotBufferSeconds            int    `json:"session_slot_buffer_seconds"`
-	GrokAffinityMode                    string `json:"grok_affinity_mode"`
-	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
-	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
-	GrokMaxRateLimitRetries             int    `json:"grok_max_rate_limit_retries"`
-	GrokFollowUpEffortEnabled           bool   `json:"grok_follow_up_effort_enabled"`
-	GrokFollowUpToolEffort              string `json:"grok_follow_up_tool_effort"`
-	GrokFollowUpSmallEffort             string `json:"grok_follow_up_small_effort"`
-	GrokQualityGuardEnabled             bool   `json:"grok_quality_guard_enabled"`
-	GrokQualityGuardMaxAttempts         int    `json:"grok_quality_guard_max_attempts"`
-	GrokQualityGuardHoldTimeoutSec      int    `json:"grok_quality_guard_hold_timeout_sec"`
-	GrokQualityGuardOnExhausted         string `json:"grok_quality_guard_on_exhausted"`
-	GrokQualityGuardCooldownHours       int    `json:"grok_quality_guard_account_cooldown_hours"`
-	GrokOAuthClientID                   string `json:"grok_oauth_client_id"`
+	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
+	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
+	CodexEffectiveCLIVersion       string `json:"codex_effective_cli_version"`
+	SchedulerMode                  string `json:"scheduler_mode"`
+	AffinityMode                   string `json:"affinity_mode"`
+	SessionAffinitySpread          bool   `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled       bool   `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds       int    `json:"session_slot_buffer_seconds"`
+	GrokAffinityMode               string `json:"grok_affinity_mode"`
+	GrokProbeEnabled               bool   `json:"grok_probe_enabled"`
+	GrokProbeIntervalMinutes       int    `json:"grok_probe_interval_minutes"`
+	GrokMaxRateLimitRetries        int    `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled      bool   `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort         string `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort        string `json:"grok_follow_up_small_effort"`
+	GrokQualityGuardEnabled        bool   `json:"grok_quality_guard_enabled"`
+	GrokQualityGuardMaxAttempts    int    `json:"grok_quality_guard_max_attempts"`
+	GrokQualityGuardHoldTimeoutSec int    `json:"grok_quality_guard_hold_timeout_sec"`
+	GrokQualityGuardOnExhausted    string `json:"grok_quality_guard_on_exhausted"`
+	GrokQualityGuardCooldownHours  int    `json:"grok_quality_guard_account_cooldown_hours"`
+	GrokOAuthClientID              string `json:"grok_oauth_client_id"`
 	// GrokOAuthClientIDEnvOverride 为 true 时，环境变量 GROK_OAUTH_CLIENT_ID 正压着上面这个设置，
 	// 前端据此提示「当前以环境变量为准」。GrokOAuthClientIDEffective 是实际生效值。
 	GrokOAuthClientIDEnvOverride bool   `json:"grok_oauth_client_id_env_override"`
@@ -10364,6 +10467,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
@@ -12192,6 +12296,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
@@ -12843,6 +12948,62 @@ func (h *Handler) SyncCodexCLIVersion(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// ==================== Codex User-Agent 形态目录与预览 ====================
+
+// GetCodexUserAgentCatalog 返回 Codex 客户端形态目录(形态、平台、终端、末尾标记名、
+// CLI 版本→构建号配对与默认号池配比),供设置页做搭配选择。
+func (h *Handler) GetCodexUserAgentCatalog(c *gin.Context) {
+	c.JSON(http.StatusOK, proxy.CodexUserAgentCatalog())
+}
+
+type codexUserAgentPreviewRequest struct {
+	Config             string `json:"config"`
+	ClientCompatMode   string `json:"client_compat_mode"`
+	CodexMinCLIVersion string `json:"codex_min_cli_version"`
+}
+
+// PreviewCodexUserAgent 按表单里尚未保存的 UA 配置算出真实出站身份(User-Agent /
+// Originator / Version),与执行链路同一套规则;号池模式下对前几个 Codex 账号逐个抽样。
+// 兼容模式与最低 CLI 版本可随请求传入(表单值),缺省用当前生效设置。
+func (h *Handler) PreviewCodexUserAgent(c *gin.Context) {
+	var req codexUserAgentPreviewRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	settings := proxy.CurrentRuntimeSettings()
+	compatMode := strings.TrimSpace(req.ClientCompatMode)
+	if compatMode == "" {
+		compatMode = settings.ClientCompatMode
+	}
+	minVersion := strings.TrimSpace(req.CodexMinCLIVersion)
+	if minVersion == "" {
+		minVersion = settings.CodexMinCLIVersion
+	}
+	versionFloor := ""
+	if compatMode == proxy.ClientCompatModeAuto {
+		versionFloor = minVersion
+	}
+	var sampleIDs []int64
+	if h.store != nil {
+		for _, acc := range h.store.Accounts() {
+			if acc == nil || acc.IsRelayStyle() || acc.IsOpenAIResponsesAPI() || acc.IsAntigravityAPI() {
+				continue
+			}
+			sampleIDs = append(sampleIDs, acc.ID())
+			if len(sampleIDs) >= 6 {
+				break
+			}
+		}
+	}
+	preview, err := proxy.PreviewCodexUserAgentConfig(req.Config, versionFloor, sampleIDs)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, preview)
 }
 
 // ==================== 账号趋势 ====================

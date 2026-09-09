@@ -5,29 +5,6 @@ import (
 	"testing"
 )
 
-func TestCurrentDataMigrationsAreUniqueAndIncludeRequiredMigrations(t *testing.T) {
-	db := &DB{}
-	migrations := db.currentDataMigrations()
-	if len(migrations) == 0 {
-		t.Fatal("currentDataMigrations returned no migrations")
-	}
-	seen := make(map[string]struct{}, len(migrations))
-	for _, migration := range migrations {
-		if migration.version == "" || migration.migrate == nil {
-			t.Fatalf("invalid migration spec: %#v", migration)
-		}
-		if _, duplicate := seen[migration.version]; duplicate {
-			t.Fatalf("duplicate current data migration %q", migration.version)
-		}
-		seen[migration.version] = struct{}{}
-	}
-	for _, required := range []string{dataMigrationGroupChannelV1, dataMigrationClaudeProviderV1} {
-		if _, ok := seen[required]; !ok {
-			t.Fatalf("required migration %q is missing", required)
-		}
-	}
-}
-
 func TestGroupChannelDataMigrationClassifiesOnlyAllGrokGroupsAndWritesMarker(t *testing.T) {
 	db, err := New("sqlite", ":memory:")
 	if err != nil {

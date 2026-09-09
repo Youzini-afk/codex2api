@@ -24,6 +24,7 @@ import (
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
@@ -51,14 +52,7 @@ func main() {
 	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s, tz=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label(), time.Local)
 
 	// 2. 初始化数据库
-	if cfg.Database.AutoMigrateFromSQLite {
-		log.Printf("SQLite→PostgreSQL 一次性自动迁移已启用；迁移完成前不会启动后台数据库写入器")
-	}
-	db, err := database.NewWithOptions(cfg.Database.Driver, cfg.Database.DSN(), database.Options{
-		Schema:                    cfg.Database.Schema,
-		AutoMigrateFromSQLite:     cfg.Database.AutoMigrateFromSQLite,
-		SQLiteMigrationSourcePath: cfg.Database.SQLiteMigrationSourcePath,
-	})
+	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN(), cfg.Database.Schema)
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
@@ -91,7 +85,7 @@ func main() {
 			SiteName:                           database.DefaultSiteName,
 			MaxConcurrency:                     2,
 			GlobalRPM:                          0,
-			TestModel:                          "gpt-5.4",
+			TestModel:                          auth.DefaultTestModel,
 			TestContent:                        auth.DefaultTestContent,
 			TestConcurrency:                    50,
 			MaxRateLimitRetries:                1,
@@ -116,7 +110,7 @@ func main() {
 			PromptFilterCustomPatterns:         "[]",
 			PromptFilterDisabledPatterns:       "[]",
 			ClientCompatMode:                   proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                 "0.144.1",
+			CodexMinCLIVersion:                 "0.153.3",
 			UsageLogMode:                       database.UsageLogModeFull,
 			UsageLogBatchSize:                  200,
 			UsageLogFlushIntervalSeconds:       5,
@@ -154,7 +148,7 @@ func main() {
 			SiteName:                           database.DefaultSiteName,
 			MaxConcurrency:                     2,
 			GlobalRPM:                          0,
-			TestModel:                          "gpt-5.4",
+			TestModel:                          auth.DefaultTestModel,
 			TestContent:                        auth.DefaultTestContent,
 			TestConcurrency:                    50,
 			MaxRateLimitRetries:                1,
@@ -176,7 +170,7 @@ func main() {
 			PromptFilterCustomPatterns:         "[]",
 			PromptFilterDisabledPatterns:       "[]",
 			ClientCompatMode:                   proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                 "0.144.1",
+			CodexMinCLIVersion:                 "0.153.3",
 			UsageLogMode:                       database.UsageLogModeFull,
 			UsageLogBatchSize:                  200,
 			UsageLogFlushIntervalSeconds:       5,
@@ -245,6 +239,18 @@ func main() {
 		}
 	}
 	antigravityOAuthCancel()
+	antigravityCfgCtx, antigravityCfgCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if raw, err := db.LoadAntigravityConfig(antigravityCfgCtx); err != nil {
+		log.Printf("加载 Antigravity 渠道设置失败(模型重定向不生效): %v", err)
+	} else if parsed, parseErr := auth.ParseAntigravitySettings(raw); parseErr != nil {
+		log.Printf("Antigravity 渠道设置解析失败(模型重定向不生效,请在管理页重新保存): %v", parseErr)
+	} else {
+		auth.SetConfiguredAntigravitySettings(parsed)
+		if len(parsed.ModelRedirects) > 0 {
+			log.Printf("Antigravity 模型重定向已加载: %d 条", len(parsed.ModelRedirects))
+		}
+	}
+	antigravityCfgCancel()
 
 	appliedResponseCache := proxy.GetResponseCacheAppliedConfig()
 	log.Printf(
@@ -378,6 +384,8 @@ func main() {
 	adminHandler.StartWhamDailyUsageProbe(backgroundCtx)
 	// 官方模型价目轮询默认关闭；启用后只在网络解析完成后做一次短数据库写入。
 	adminHandler.StartOfficialPricingSync(backgroundCtx)
+	// Prompt 审核日志保留清理：默认保留 7 天，每小时分批清理过期行，CY 关联行不动。
+	adminHandler.StartPromptLogRetention(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -587,6 +595,7 @@ func main() {
 		}
 		c.JSON(200, gin.H{
 			"status":          "ok",
+			"build_version":   version.Current(),
 			"available":       available,
 			"total":           total,
 			"counts_complete": countsComplete,
@@ -649,6 +658,9 @@ func main() {
 	adminHandler.WaitAutoActivate5hWindow()
 	wsKeepalive.Stop()
 	wsrelay.ShutdownExecutor()
+	if !proxy.DrainResponseCacheBackendWrites(2 * time.Second) {
+		log.Printf("部分响应上下文后台写入未在关闭窗口内完成")
+	}
 	store.Stop()
 	// 所有请求入口和后台生产者停止后，再排空仍可能访问 Store、缓存或数据库的短任务。
 	if !db.DrainBackgroundTasks(2 * time.Second) {

@@ -460,7 +460,7 @@ func TestPostgresSchedulerOutboxReplayWatermarkCoversOutOfOrderCommit(t *testing
 		t.Skip("CODEX2API_TEST_POSTGRES_DSN is not set")
 	}
 	schema := fmt.Sprintf("scheduler_outbox_order_%d", time.Now().UnixNano())
-	cleanupPostgresMigrationSchema(t, dsn, schema)
+	cleanupPostgresSchedulerOutboxSchema(t, dsn, schema)
 
 	db, err := New("postgres", dsn, schema)
 	if err != nil {
@@ -468,7 +468,7 @@ func TestPostgresSchedulerOutboxReplayWatermarkCoversOutOfOrderCommit(t *testing
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		cleanupPostgresMigrationSchema(t, dsn, schema)
+		cleanupPostgresSchedulerOutboxSchema(t, dsn, schema)
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -528,5 +528,19 @@ func TestPostgresSchedulerOutboxReplayWatermarkCoversOutOfOrderCommit(t *testing
 	}
 	if len(events) != 2 || events[0].ID != idA || events[1].ID != idB {
 		t.Fatalf("replayed ids = %+v, want [%d %d]", events, idA, idB)
+	}
+}
+
+func cleanupPostgresSchedulerOutboxSchema(t *testing.T, dsn, schema string) {
+	t.Helper()
+	conn, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open PostgreSQL cleanup connection: %v", err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := conn.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+quotePostgresIdent(schema)+` CASCADE`); err != nil {
+		t.Fatalf("drop PostgreSQL test schema %q: %v", schema, err)
 	}
 }

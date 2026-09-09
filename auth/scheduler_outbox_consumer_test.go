@@ -29,7 +29,7 @@ func systemSettingsSyncFixture() *database.SystemSettings {
 	return &database.SystemSettings{
 		MaxConcurrency:                     2,
 		GlobalRPM:                          0,
-		TestModel:                          "gpt-5.4",
+		TestModel:                          DefaultTestModel,
 		TestContent:                        DefaultTestContent,
 		TestConcurrency:                    4,
 		BackgroundRefreshIntervalMinutes:   2,
@@ -257,13 +257,24 @@ func TestSharedDatabaseSettingsConvergeAcrossStores(t *testing.T) {
 	if err := db.UpdateSystemSettings(ctx, &updated); err != nil {
 		t.Fatalf("update shared settings: %v", err)
 	}
+	if err := db.UpdateClaudeConfig(ctx, `{"fingerprint_mode":"force","default_timezone":"Asia/Shanghai","session_window_limit":6,"cli_version_sync_enabled":false,"cli_version_sync_interval_hours":9,"first_token_timeout_seconds":45,"stream_keepalive_enabled":false}`); err != nil {
+		t.Fatalf("update shared Claude settings: %v", err)
+	}
 	waitForSchedulerProjection(t, func() bool {
 		return first.GetMaxConcurrency() == 13 && second.GetMaxConcurrency() == 13 &&
 			first.SchedulerEngine() == "shadow" && second.SchedulerEngine() == "shadow" &&
 			first.SessionSlotBufferEnabled() && second.SessionSlotBufferEnabled() &&
 			!first.CodexFastModelAliasEnabled() && !second.CodexFastModelAliasEnabled() &&
 			!first.CodexReasoningEffortAliasEnabled() && !second.CodexReasoningEffortAliasEnabled() &&
-			!first.CodexRequestCompression() && !second.CodexRequestCompression()
+			!first.CodexRequestCompression() && !second.CodexRequestCompression() &&
+			first.ClaudeFingerprintModeDefault() == ClaudeFingerprintModeForce &&
+			second.ClaudeFingerprintModeDefault() == ClaudeFingerprintModeForce &&
+			first.ClaudeDefaultTimezone() == "Asia/Shanghai" && second.ClaudeDefaultTimezone() == "Asia/Shanghai" &&
+			first.ClaudeSessionWindowLimit() == 6 && second.ClaudeSessionWindowLimit() == 6 &&
+			!first.ClaudeCLIVersionSyncEnabled() && !second.ClaudeCLIVersionSyncEnabled() &&
+			first.ClaudeCLIVersionSyncIntervalHours() == 9 && second.ClaudeCLIVersionSyncIntervalHours() == 9 &&
+			first.ClaudeFirstTokenTimeoutSeconds() == 45 && second.ClaudeFirstTokenTimeoutSeconds() == 45 &&
+			!first.ClaudeStreamKeepaliveEnabled() && !second.ClaudeStreamKeepaliveEnabled()
 	})
 }
 

@@ -498,6 +498,7 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 		!slices.Equal(dst.GroupIDs, src.GroupIDs) ||
 		!slices.Equal(dst.AllowedAPIKeyIDs, src.AllowedAPIKeyIDs)
 	dst.RefreshToken = src.RefreshToken
+	dst.UpstreamRequestIDHeader = src.UpstreamRequestIDHeader
 	dst.SessionToken = src.SessionToken
 	dst.AccessToken = src.AccessToken
 	dst.ExpiresAt = src.ExpiresAt
@@ -515,6 +516,7 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.Models = cloneStringSlice(src.Models)
 	dst.ModelMapping = src.ModelMapping
 	dst.CodexClientMetadataMode = src.CodexClientMetadataMode
+	dst.CodexPassthroughMode = src.CodexPassthroughMode
 	dst.CodexFingerprintMode = src.CodexFingerprintMode
 	dst.ClaudeFingerprintMode = src.ClaudeFingerprintMode
 	dst.claudeSessionWindow = src.claudeSessionWindow
@@ -890,6 +892,7 @@ func (s *Store) applyStoreSystemSettings(settings *database.SystemSettings) erro
 	s.SetCodexCLIVersionSyncEnabled(settings.CodexCLIVersionSyncEnabled)
 	s.SetCodexCLIVersionSyncIntervalHours(settings.CodexCLIVersionSyncIntervalHours)
 	s.SetCodexFingerprintDefaultMode(settings.CodexFingerprintDefaultMode)
+	applyClaudeConfigToStore(s, settings.ClaudeConfig)
 
 	s.SetAllowRemoteMigration(settings.AllowRemoteMigration)
 	s.SetModelMapping(settings.ModelMapping)

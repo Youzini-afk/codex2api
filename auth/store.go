@@ -73,8 +73,44 @@ func IsValidCodexClientMetadataMode(value string) bool {
 	}
 }
 
+// Codex 身份透传档位，仅对 OpenAI Responses 中转账号生效。
+// off    = 保持默认出站身份（生成/兜底 Codex 身份头，丢弃下游 x-codex-* 头）。
+// auto   = 仅当下游请求本身携带官方 Codex 客户端身份（UA/Originator）时，
+//
+//	把该身份原样透传给中转；其余请求维持 off 行为。
+//
+// always = 完全透传：无论下游是谁，原样转发其身份头（与 sub2api 透传模式对齐）。
 const (
-	DefaultTestContent  = "hi"
+	CodexPassthroughModeOff    = "off"
+	CodexPassthroughModeAuto   = "auto"
+	CodexPassthroughModeAlways = "always"
+)
+
+func NormalizeCodexPassthroughMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case CodexPassthroughModeAuto:
+		return CodexPassthroughModeAuto
+	case CodexPassthroughModeAlways:
+		return CodexPassthroughModeAlways
+	default:
+		return CodexPassthroughModeOff
+	}
+}
+
+func IsValidCodexPassthroughMode(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case CodexPassthroughModeOff, CodexPassthroughModeAuto, CodexPassthroughModeAlways:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	DefaultTestContent = "hi"
+	// DefaultTestModel 是连通性测试的出厂默认模型;须是当前上游仍在线、free/plus/pro
+	// 三档都可用的模型(gpt-5.4 已于 2026-09 下线)。
+	DefaultTestModel    = "gpt-5.5"
 	MaxTestContentRunes = 8192
 )
 
@@ -90,8 +126,13 @@ func NormalizeTestContent(content string) string {
 
 // Account 运行时账号状态
 type Account struct {
-	mu          sync.RWMutex
-	usageSyncMu sync.Mutex
+	codexLiteSupport          map[string]bool
+	codexCapabilityGeneration int64
+	codexCapabilityObservedAt int64
+	UpstreamRequestIDHeader   string
+	mu                        sync.RWMutex
+	usageSyncMu               sync.Mutex
+	modelCatalogMu            sync.Mutex
 	// grokRuntimeFactsMu serializes inference-response observations for this
 	// account. The sink performs generation-fenced database writes before it
 	// publishes any hard gate or routing invalidation back to memory.
@@ -125,12 +166,18 @@ type Account struct {
 	Models                      []string
 	ModelMapping                string
 	CodexClientMetadataMode     string
+	// CodexPassthroughMode 是 OpenAI Responses 中转账号的 Codex 身份透传档位
+	// （off / auto / always），见 codex passthrough 常量定义。
+	CodexPassthroughMode string
 	// CodexFingerprintMode 见 codex_fingerprint_mode.go：Codex 官方出站请求的
 	// 设备指纹收敛档位（off / device / session / full），默认 off。
 	CodexFingerprintMode string
 	// ClaudeFingerprintMode 见 claude_fingerprint_mode.go:Claude Code 出站身份头
 	// 收敛模式(preserve/force;空=跟随全局默认)。
 	ClaudeFingerprintMode string
+	// ClaudeAuthKind 见 claude_auth_kind.go:Claude 凭据形态(oauth / setup_token / api_key)。
+	ClaudeAuthKind string
+	ClaudeBaseURL  string
 	// Claude Code platform/version policy overrides. Empty values inherit the
 	// corresponding global policy from Store.
 	ClaudeClientPlatformOverride string
@@ -577,6 +624,17 @@ func (a *Account) OpenAIResponsesCodexClientMetadataMode() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return NormalizeCodexClientMetadataMode(a.CodexClientMetadataMode)
+}
+
+// OpenAIResponsesCodexPassthroughMode 返回 OpenAI Responses 中转账号生效的
+// Codex 身份透传档位；空值与非法的存量数据都回落到 off，升级后行为不变。
+func (a *Account) OpenAIResponsesCodexPassthroughMode() string {
+	if a == nil {
+		return CodexPassthroughModeOff
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return NormalizeCodexPassthroughMode(a.CodexPassthroughMode)
 }
 
 func (a *Account) OpenAIResponsesCredentials() (baseURL, apiKey string) {
@@ -3091,7 +3149,7 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	defer a.mu.RUnlock()
 	now := time.Now()
 
-	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
+	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError || a.isClaudeAPIKeyLocked() {
 		return false
 	}
 	if a.isRelayStyleLocked() && !a.isClaudeOAuthLocked() {
@@ -3319,6 +3377,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
+	proxyAuditLabels                   map[string]ProxyAuditLabel
 	mu                                 sync.RWMutex
 	accountMutationMu                  sync.Mutex // serializes account-set and scheduler mutations without nesting their locks
 	accounts                           []*Account
@@ -3351,6 +3410,7 @@ type Store struct {
 	usageProbe                         func(context.Context, *Account) error
 	usageProbeCompletion               func()
 	usageProbeBatch                    atomic.Bool
+	antigravityCatalogBatch            atomic.Bool
 	recoveryProbeBatch                 atomic.Bool
 	autoCleanUnauthorized              atomic.Bool
 	autoCleanRateLimited               atomic.Bool
@@ -4113,7 +4173,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.smartPacingWindows = normalizeSmartPacingWindows(settings.SmartPacingWindows)
 
 	// 加载代理池（含全部托管 URL，供禁用后 fail-closed 识别）
-	if settings.ProxyPoolEnabled && s.proxyPoolLoader != nil {
+	if s.proxyPoolLoader != nil {
 		if err := s.ReloadProxyPool(); err != nil {
 			log.Printf("代理池加载失败: %v", err)
 		}
@@ -4923,17 +4983,29 @@ func (s *Store) ReloadProxyPool() error {
 	}
 	enabledURLs := collectProxyURLs(proxies)
 	managedURLs := enabledURLs
+	auditRows := proxies
 	if inventory := s.proxyInventoryLoader; inventory != nil {
 		allProxies, invErr := inventory(ctx)
 		if invErr != nil {
 			return invErr
 		}
 		managedURLs = collectProxyURLs(allProxies)
+		auditRows = allProxies
 	}
 	s.mu.Lock()
 	s.proxyPool = enabledURLs
 	s.proxyPoolSet = buildProxyPoolSet(enabledURLs)
 	s.managedProxySet = buildProxyPoolSet(managedURLs)
+	s.proxyAuditLabels = make(map[string]ProxyAuditLabel, len(auditRows))
+	for _, row := range auditRows {
+		if row != nil {
+			name := strings.TrimSpace(row.Label)
+			if name == "" {
+				name = "proxy"
+			}
+			s.proxyAuditLabels[row.URL] = ProxyAuditLabel{ID: row.ID, Name: name}
+		}
+	}
 	s.mu.Unlock()
 	log.Printf("代理池已重新加载: %d 个活跃代理", len(enabledURLs))
 	return nil
@@ -5339,13 +5411,15 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	models := normalizeModelList(row.GetCredentialStringSlice("models"))
 	modelMapping := strings.TrimSpace(row.GetCredential("model_mapping"))
 	codexClientMetadataMode := NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
+	codexPassthroughMode := NormalizeCodexPassthroughMode(row.GetCredential("codex_passthrough_mode"))
 	codexFingerprintMode := NormalizeCodexFingerprintMode(row.GetCredential(CodexFingerprintModeCredentialKey))
 	claudeFingerprintMode := NormalizeClaudeFingerprintMode(row.GetCredential(ClaudeFingerprintModeCredentialKey))
-	var claudeClientPlatformOverride, claudeVersionPolicyOverride, claudeClientVersionOverride string
+	var claudeClientPlatformOverride, claudeVersionPolicyOverride, claudeClientVersionOverride, claudeAuthKind string
 	if strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamClaude) {
 		claudeClientPlatformOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(ClaudeClientPlatformCredentialKey)))
 		claudeVersionPolicyOverride = strings.ToLower(strings.TrimSpace(row.GetCredential(ClaudeVersionPolicyCredentialKey)))
 		claudeClientVersionOverride = strings.TrimSpace(row.GetCredential(ClaudeClientVersionCredentialKey))
+		claudeAuthKind = InferClaudeAuthKind(row.GetCredential(ClaudeAuthKindCredentialKey), at, rt)
 	}
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
 	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
@@ -5367,6 +5441,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		SessionToken:                 st,
 		ProxyURL:                     strings.TrimSpace(row.ProxyURL),
 		CustomHeaders:                row.GetCredentialStringMap("custom_headers"),
+		UpstreamRequestIDHeader:      row.GetCredential(UpstreamRequestIDHeaderCredentialKey),
 		HealthTier:                   HealthTierWarm,
 		AddedAt:                      row.CreatedAt.UnixNano(),
 		UpstreamType:                 upstreamType,
@@ -5376,8 +5451,11 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		Models:                       models,
 		ModelMapping:                 modelMapping,
 		CodexClientMetadataMode:      codexClientMetadataMode,
+		CodexPassthroughMode:         codexPassthroughMode,
 		CodexFingerprintMode:         codexFingerprintMode,
 		ClaudeFingerprintMode:        claudeFingerprintMode,
+		ClaudeAuthKind:               claudeAuthKind,
+		ClaudeBaseURL:                row.GetCredential(ClaudeBaseURLCredentialKey),
 		ClaudeClientPlatformOverride: claudeClientPlatformOverride,
 		ClaudeVersionPolicyOverride:  claudeVersionPolicyOverride,
 		ClaudeClientVersionOverride:  claudeClientVersionOverride,
@@ -5547,6 +5625,11 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 				log.Printf("[账号 %d] 解析 expires_at 失败: %v", row.ID, err)
 			}
 		}
+	}
+	if account.isClaudeAPIKeyLocked() {
+		account.RefreshToken = ""
+		account.SessionToken = ""
+		account.ExpiresAt = time.Time{}
 	}
 	if subExp := row.GetCredential("subscription_expires_at"); subExp != "" {
 		if parsed, err := time.Parse(time.RFC3339, subExp); err == nil {
@@ -5796,6 +5879,7 @@ func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
 					row.GetCredentialStringSlice("models"),
 					row.GetCredential("model_mapping"),
 					row.GetCredential("codex_client_metadata_mode"),
+					row.GetCredential("codex_passthrough_mode"),
 					row.ProxyURL,
 				)
 				s.ApplyAccountCustomHeaders(row.ID, row.GetCredentialStringMap("custom_headers"))
@@ -5805,6 +5889,7 @@ func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
 			groupIDs := normalizeAllowedGroupIDs(memberships[row.ID])
 			allowedAPIKeyIDs := normalizeAllowedAPIKeyIDs(row.GetCredentialInt64Slice("allowed_api_key_ids"))
 			acc.mu.Lock()
+			acc.UpstreamRequestIDHeader = row.GetCredential(UpstreamRequestIDHeaderCredentialKey)
 			accountMetadataChanged := !int64SliceEqual(normalizeAllowedGroupIDs(acc.GroupIDs), groupIDs) ||
 				!int64SliceEqual(normalizeAllowedAPIKeyIDs(acc.AllowedAPIKeyIDs), allowedAPIKeyIDs)
 			if accountMetadataChanged {
@@ -5928,6 +6013,8 @@ func (s *Store) StartBackgroundRefresh() {
 	go func() {
 		defer s.wg.Done()
 		refreshTimer := time.NewTimer(s.GetBackgroundRefreshInterval())
+		catalogTimer := time.NewTimer(10 * time.Second)
+		defer catalogTimer.Stop()
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
@@ -5963,6 +6050,9 @@ func (s *Store) StartBackgroundRefresh() {
 
 		for {
 			select {
+			case <-catalogTimer.C:
+				s.triggerAntigravityCatalogRefresh()
+				catalogTimer.Reset(antigravityCatalogRefreshInterval)
 			case <-refreshTimer.C:
 				if s.GetLazyMode() {
 					s.TriggerUsageProbeAsync()
@@ -6897,7 +6987,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
-				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
+				log.Printf("会话粘性容量溢出: 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}
@@ -6936,7 +7026,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
-				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
+				log.Printf("会话粘性容量溢出: 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}
@@ -7910,7 +8000,7 @@ func (s *Store) GetTestModel() string {
 	if v, ok := s.testModel.Load().(string); ok && v != "" {
 		return v
 	}
-	return "gpt-5.4"
+	return DefaultTestModel
 }
 
 // SetTestContent dynamically updates connection test input text.
@@ -9299,19 +9389,19 @@ func (s *Store) accountAllowedForAPIKey(acc *Account, apiKeyID int64) bool {
 	return acc.AllowsAPIKey(apiKeyID) && s.APIKeyAllowsAccount(apiKeyID, acc)
 }
 
-func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, proxyURL string) bool {
+func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, codexPassthroughMode, proxyURL string) bool {
 	if s != nil && s.db != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if row, err := s.db.GetAccountByID(ctx, dbID); err == nil &&
 			strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), UpstreamOpenAIResponses) {
-			return s.applyOpenAIResponsesConfig(ctx, row, dbID, baseURL, apiKey, models, modelMapping, codexClientMetadataMode, proxyURL)
+			return s.applyOpenAIResponsesConfig(ctx, row, dbID, baseURL, apiKey, models, modelMapping, codexClientMetadataMode, codexPassthroughMode, proxyURL)
 		}
 	}
-	return s.applyOpenAIResponsesConfig(context.Background(), nil, dbID, baseURL, apiKey, models, modelMapping, codexClientMetadataMode, proxyURL)
+	return s.applyOpenAIResponsesConfig(context.Background(), nil, dbID, baseURL, apiKey, models, modelMapping, codexClientMetadataMode, codexPassthroughMode, proxyURL)
 }
 
-func (s *Store) applyOpenAIResponsesConfig(ctx context.Context, row *database.AccountRow, dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, proxyURL string) bool {
+func (s *Store) applyOpenAIResponsesConfig(ctx context.Context, row *database.AccountRow, dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, codexPassthroughMode, proxyURL string) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
@@ -9328,6 +9418,7 @@ func (s *Store) applyOpenAIResponsesConfig(ctx context.Context, row *database.Ac
 		models = row.GetCredentialStringSlice("models")
 		modelMapping = row.GetCredential("model_mapping")
 		codexClientMetadataMode = row.GetCredential("codex_client_metadata_mode")
+		codexPassthroughMode = row.GetCredential("codex_passthrough_mode")
 		proxyURL = row.ProxyURL
 		credentialGeneration = row.CredentialGeneration
 	}
@@ -9349,6 +9440,7 @@ func (s *Store) applyOpenAIResponsesConfig(ctx context.Context, row *database.Ac
 	acc.Models = normalizeModelList(models)
 	acc.ModelMapping = strings.TrimSpace(modelMapping)
 	acc.CodexClientMetadataMode = NormalizeCodexClientMetadataMode(codexClientMetadataMode)
+	acc.CodexPassthroughMode = NormalizeCodexPassthroughMode(codexPassthroughMode)
 	acc.ProxyURL = strings.TrimSpace(proxyURL)
 	acc.Email = acc.BaseURL
 	acc.PlanType = "api"
@@ -11668,13 +11760,29 @@ func antigravityCredentialFromStoreRow(row *database.AccountRow) AntigravityCred
 }
 
 func antigravityRefreshModels(result AntigravitySyncResult) []string {
-	models := make([]string, 0, len(result.Quota.Models))
-	for _, model := range result.Quota.Models {
+	return AntigravityDiscoveredModels(result.Quota)
+}
+
+// Keep the complete raw catalog in the quota snapshot, but never publish IDs
+// explicitly marked internal by the provider into the dispatch model list.
+func AntigravityDiscoveredModels(quota AntigravityQuotaSnapshot) []string {
+	internal := make(map[string]bool)
+	for _, id := range quota.InternalModelIDs {
+		internal[strings.ToLower(id)] = true
+	}
+	models := append([]string(nil), quota.CatalogModelIDs...)
+	for _, model := range quota.Models {
 		if id := strings.TrimSpace(model.ModelID); id != "" {
 			models = append(models, id)
 		}
 	}
-	return normalizeModelList(models)
+	visible := models[:0]
+	for _, id := range models {
+		if !internal[strings.ToLower(id)] {
+			visible = append(visible, id)
+		}
+	}
+	return normalizeModelList(visible)
 }
 
 func antigravityCredentialRotated(row *database.AccountRow, credential AntigravityCredential) bool {

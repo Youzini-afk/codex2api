@@ -7,6 +7,7 @@
 - [配置层级](#配置层级)
 - [环境变量配置](#环境变量配置)
 - [系统设置（数据库）](#系统设置数据库)
+- [API Key 模型周请求次数预算](#api-key-模型周请求次数预算)
 - [配置文件示例](#配置文件示例)
 - [配置优先级](#配置优先级)
 
@@ -83,8 +84,6 @@ Codex2API 采用三层配置架构：
 | `DATABASE_NAME` | 是 | - | PostgreSQL 数据库名 |
 | `DATABASE_SCHEMA` | 否 | - | PostgreSQL schema；适合 Supabase 等多项目共享 database 的场景。配置后启动时自动 `CREATE SCHEMA IF NOT EXISTS` 并将所有连接的 `search_path` 指向该 schema。仅允许字母/数字/下划线，长度 ≤63；留空保持默认（通常是 `public`）。|
 | `DATABASE_SSLMODE` | 否 | disable | SSL 模式: disable/require/verify-full |
-| `DATABASE_AUTO_MIGRATE_FROM_SQLITE` | 否 | `false` | 一次性 SQLite→PostgreSQL 全量自动迁移开关。仅 `DATABASE_DRIVER=postgres` 有效；值非法、源文件不存在或目标已有业务数据都会拒绝启动 |
-| `DATABASE_MIGRATION_SQLITE_PATH` | 启用迁移时 | `DATABASE_PATH`；Zeabur 再回退 `/data/codex2api.db` | 只读 SQLite 源文件。显式值优先于旧的 `DATABASE_PATH` |
 
 也支持连接字符串形式，例如 `DATABASE_URL`、`POSTGRES_CONNECTION_STRING`、`POSTGRESQL_CONNECTION_STRING`。
 ### 生图工作台
@@ -114,28 +113,6 @@ Codex2API 采用三层配置架构：
 | `DATABASE_PATH` | 是 | - | SQLite 数据库文件路径，如 `/data/codex2api.db` |
 
 在 Zeabur 环境中，如果未配置数据库且未显式指定 `DATABASE_DRIVER`，会自动回退为 SQLite，并默认使用 `/data/codex2api.db`。
-
-#### 一次性 SQLite→PostgreSQL 自动迁移
-
-该能力默认关闭，并且只面向“现有 SQLite → 全新空 PostgreSQL”的一次性切换；不会 merge、覆盖或清空已有 PostgreSQL 数据。迁移会复制账号、凭据 JSON、API Key、设置、用量日志/基线、分组、代理、生图 metadata、prompt filter/candidate/policy/risk/trust 等当前业务表；`data_migrations` 和旧 `prompt_filter_secrets` 不复制。
-
-安全流程如下：
-
-1. **Suspend/停止所有仍会写旧 SQLite 的 Codex2API 实例**。实现使用 SQLite 只读一致性事务/快照，但无法取得跨进程排他锁；旧实例继续写入时，快照之后的新写入不会被迁移，因此不能把“在线迁移”视为安全流程。
-2. 在停写后优先创建 Zeabur 持久卷快照，或用 `sqlite3 /data/codex2api.db ".backup '/data/codex2api.pre-postgres.db'"` 生成一致备份，并确认新部署继续挂载原 `/data`。如果环境只能做文件级冷备，必须先确认所有 SQLite 进程已完全停止，并把主库与存在的 `codex2api.db-wal` / `codex2api.db-shm` 作为同一组备份；WAL 模式下单独 `cp` 主库文件不是安全备份。
-3. 创建全新的空 PostgreSQL，配置 PostgreSQL 和 Redis 连接；Redis 切换与数据库复制相互独立，不会迁移 Redis 缓存。
-4. 首次启动临时设置：
-
-   ```env
-   DATABASE_DRIVER=postgres
-   DATABASE_AUTO_MIGRATE_FROM_SQLITE=true
-   DATABASE_MIGRATION_SQLITE_PATH=/data/codex2api.db
-   ```
-
-5. 检查启动日志中的逐表行数和完成日志，再核验账号数、API Key、系统设置、历史用量、prompt/risk 数据和生图记录。首次操作仍必须 Suspend 旧服务并只保留一个新应用实例；PostgreSQL advisory lock 只是防止误启动的多个自动迁移 worker 重复初始化的附加保护，不代替停写和单实例要求。它覆盖目标预检、schema 初始化和导入；原始复制、行数校验、数据回填和完成 marker 在同一导入事务中。所有可预见的数据、语义与 marker 失败都先于最后的序列校正；PostgreSQL `setval` 本身不随事务回滚，因此极少数序列校正或提交结果不确定的错误可能留下 ID 空洞，但不会提交部分业务数据或完成 marker，修复后可重试。已有完成 marker 时会幂等跳过。
-6. 核验成功后把 `DATABASE_AUTO_MIGRATE_FROM_SQLITE` 改回 `false`（或删除）并重新部署；长期保留 SQLite 备份，不要删除或覆盖源文件。
-
-`/data/images`、`/data/backgrounds` 的实际文件不会搬运、改名或删除；迁移只复制图片 metadata 和相关设置。因此 PostgreSQL 切换后仍必须挂载原 `/data`。若源库没有任何真实业务数据（只有全零默认 baseline）、源文件缺失，或目标任一业务表非空，服务会 fail closed，不会启动一个空站。
 
 ### 缓存配置
 
@@ -325,6 +302,49 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 
 ---
 
+## API Key 模型周请求次数预算
+
+在管理后台 **API Key → 高级限制** 中，可以为同一个 Key 给指定模型分配每周调用次数。例如 `gpt-6*` 每周合计 50 次，用完后其他未匹配模型仍可调用；不配置 `model_request_limits` 时保持原有行为。次数由管理员分配，系统不会假设某个上游套餐的每周额度。
+
+通过创建或更新 API Key 接口配置 `limits.model_request_limits`：
+
+```json
+{
+  "limits": {
+    "model_request_limits": [
+      {
+        "model": "gpt-6*",
+        "window": "week",
+        "max_requests": 50,
+        "timezone": "Asia/Shanghai",
+        "reset_weekday": 1,
+        "reset_time": "00:00"
+      }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 服务端生成的稳定规则 ID；新增规则省略，修改次数上限或调整顺序时保留 |
+| `model` | 最终映射后的模型名，支持精确名称和 `*` 通配；一条规则的所有匹配模型共享次数 |
+| `window` | 当前仅支持 `week`，省略时默认为 `week` |
+| `max_requests` | 每个固定周窗口的请求次数上限，必须为正整数 |
+| `timezone` | IANA 时区，默认 `Asia/Shanghai`，与服务器 `TZ` 独立 |
+| `reset_weekday` | 重置星期，`1` 为周一，`7` 为周日，省略或 `0` 时默认为周一 |
+| `reset_time` | 时区内的重置时间，`HH:MM`，默认 `00:00` |
+
+周窗口按指定时区的日历计算，包括夏令时变化。窗口是固定周期，例如上海时间本周一 00:00 到下周一 00:00；它与现有金额、Token 的滑动 `7d` 限额独立，所有限制同时生效。命中多条模型规则时，各条规则都要有余额并各计一次，因此可以同时配置 `gpt-6*` 系列总预算与 `gpt-6-astra` 单模型预算。
+
+计数单位是一个外部 HTTP 请求，或 WebSocket 连接中的一个 `response.create`。全局和账号模型映射完成后，网关在尝试向上游发送时原子扣额；内部换号、传输回退与重试复用同一请求身份，同一规则最多计一次。已经尝试发送的请求即使失败、超时或取消也计入，入口校验、无可用账号和发送前拒绝不计入。客户端重新发起请求属于新请求。若内部重试映射到另一模型，则新命中的规则也需要额度。跨周继续重试不重复扣同一规则，已扣次数仍归属首次扣额窗口。
+
+规则的 `id` 与模型匹配条件、时区及重置安排共同标识一个预算。已有规则只允许修改 `max_requests` 或列表顺序，保留已用次数；模型或重置安排需要变化时，删除旧规则并新增规则，新规则从零计数。提高次数上限立即提供更多余额；将上限调低到已用次数以下会停止放行该规则。更新请求不带 `limits` 时保留全部限制；传入 `limits` 时按完整限制对象替换，`model_request_limits: []` 移除模型周预算。
+
+计数与请求幂等记录保存在 PostgreSQL / SQLite 的独立表中，启动时自动创建。PostgreSQL 多实例共享同一权威计数；SQLite 轻量模式使用相同语义。重启服务、清理 Redis/内存缓存、删除用量日志或重置金额额度不会清零模型周预算，到下一窗口自然获得新额度。扣额数据库不可用时，有模型周预算的相关请求返回服务不可用，避免并发超发。
+
+后台 Key 编辑窗口和公开 `/key-usage` 页面展示本周已用、剩余、上限及下次重置时间。展示不受用量图表的 `today` / `7d` / `30d` / `all` 筛选影响，始终显示规则当前周窗口。该预算用于分配网关调用次数，不保证与上游套餐的计量口径相同；超额响应与查询接口见 [API 文档](API.md#api-key-模型周请求次数预算)。
+
 ## 配置文件示例
 
 ### 标准生产环境 (.env)
@@ -492,7 +512,11 @@ curl -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/ops/overview
 
 ### Q: SQLite 和 PostgreSQL 可以切换吗？
 
-**A:** 可以。切到全新的空 PostgreSQL 时可使用上面的“一次性 SQLite→PostgreSQL 自动迁移”；必须先停写、备份，首次启动临时打开迁移开关，核验后关闭开关并保留旧库。目标已有业务数据时不会自动合并，需另行制定人工迁移方案。
+**A:** 可以，但需要：
+1. 停止服务
+2. 修改 DATABASE_DRIVER 和相关配置
+3. 启动服务（新数据库会重新初始化）
+4. 重新导入账号数据
 
 ### Q: 如何查看当前生效的配置？
 

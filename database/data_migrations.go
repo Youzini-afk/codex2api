@@ -41,32 +41,26 @@ type oauthIdentityDedupeAccount struct {
 	updatedAt   time.Time
 }
 
-type dataMigrationSpec struct {
-	version string
-	migrate func(context.Context, *sql.Tx) error
-}
-
-func (db *DB) currentDataMigrations() []dataMigrationSpec {
-	return []dataMigrationSpec{
-		{version: dataMigrationOAuthIdentityDedupeV1, migrate: db.dedupeOAuthIdentityAccounts},
-		{version: dataMigrationOAuthIdentityDedupeV2, migrate: db.dedupeOAuthIdentityAccounts},
-		{version: dataMigrationUsageLogChannelV1, migrate: db.backfillUsageLogChannel},
-		{version: dataMigrationWorkspaceIdentityV3, migrate: db.migrateWorkspaceIdentityV3},
-		{version: dataMigrationGroupChannelV1, migrate: db.classifyAccountGroupChannels},
-		{version: dataMigrationClaudeProviderV1, migrate: db.backfillClaudeProviderData},
-	}
-}
-
 func (db *DB) runDataMigrations(ctx context.Context) error {
 	if err := db.ensureDataMigrationsTable(ctx); err != nil {
 		return err
 	}
-	for _, migration := range db.currentDataMigrations() {
-		if err := db.runDataMigrationOnce(ctx, migration.version, migration.migrate); err != nil {
-			return err
-		}
+	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV1, db.dedupeOAuthIdentityAccounts); err != nil {
+		return err
 	}
-	return nil
+	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts); err != nil {
+		return err
+	}
+	if err := db.runDataMigrationOnce(ctx, dataMigrationUsageLogChannelV1, db.backfillUsageLogChannel); err != nil {
+		return err
+	}
+	if err := db.runDataMigrationOnce(ctx, dataMigrationWorkspaceIdentityV3, db.migrateWorkspaceIdentityV3); err != nil {
+		return err
+	}
+	if err := db.runDataMigrationOnce(ctx, dataMigrationGroupChannelV1, db.classifyAccountGroupChannels); err != nil {
+		return err
+	}
+	return db.runDataMigrationOnce(ctx, dataMigrationClaudeProviderV1, db.backfillClaudeProviderData)
 }
 
 // classifyAccountGroupChannels 把成员清一色是 Grok 账号的存量分组归到 grok 渠道。
@@ -255,11 +249,7 @@ func (db *DB) runDataMigrationsWithTimeout() error {
 }
 
 func (db *DB) ensureDataMigrationsTable(ctx context.Context) error {
-	return ensureDataMigrationsTableWithExecutor(ctx, db.conn)
-}
-
-func ensureDataMigrationsTableWithExecutor(ctx context.Context, execer sqlExecer) error {
-	_, err := execer.ExecContext(ctx, `
+	_, err := db.conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS data_migrations (
 			version TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
@@ -279,57 +269,27 @@ func (db *DB) runDataMigrationOnce(ctx context.Context, version string, migrate 
 		}
 		defer tx.Rollback()
 
-		if err := runDataMigrationOnceInTx(ctx, tx, version, migrate); err != nil {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO data_migrations (version, applied_at)
+			VALUES ($1, CURRENT_TIMESTAMP)
+			ON CONFLICT(version) DO NOTHING
+		`, version)
+		if err != nil {
+			return fmt.Errorf("记录 data migration %s 失败: %w", version, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
 			return err
+		}
+		if affected == 0 {
+			return tx.Commit()
+		}
+
+		if err := migrate(ctx, tx); err != nil {
+			return fmt.Errorf("执行 data migration %s 失败: %w", version, err)
 		}
 		return tx.Commit()
 	})
-}
-
-func runDataMigrationOnceInTx(ctx context.Context, tx *sql.Tx, version string, migrate func(context.Context, *sql.Tx) error) error {
-	res, err := tx.ExecContext(ctx, `
-		INSERT INTO data_migrations (version, applied_at)
-		VALUES ($1, CURRENT_TIMESTAMP)
-		ON CONFLICT(version) DO NOTHING
-	`, version)
-	if err != nil {
-		return fmt.Errorf("记录 data migration %s 失败: %w", version, err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return nil
-	}
-	if err := migrate(ctx, tx); err != nil {
-		return fmt.Errorf("执行 data migration %s 失败: %w", version, err)
-	}
-	return nil
-}
-
-// runDataMigrationsInTx executes every current migration inside a caller-owned
-// transaction. force resets only the markers owned by this binary, so rows
-// imported after an earlier empty-schema startup still receive every semantic
-// backfill without discarding unrelated future/extension markers.
-func (db *DB) runDataMigrationsInTx(ctx context.Context, tx *sql.Tx, force bool) error {
-	if err := ensureDataMigrationsTableWithExecutor(ctx, tx); err != nil {
-		return err
-	}
-	migrations := db.currentDataMigrations()
-	if force {
-		for _, migration := range migrations {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM data_migrations WHERE version=$1`, migration.version); err != nil {
-				return fmt.Errorf("重置 data migration %s 标记失败: %w", migration.version, err)
-			}
-		}
-	}
-	for _, migration := range migrations {
-		if err := runDataMigrationOnceInTx(ctx, tx, migration.version, migration.migrate); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (db *DB) dedupeOAuthIdentityAccounts(ctx context.Context, tx *sql.Tx) error {

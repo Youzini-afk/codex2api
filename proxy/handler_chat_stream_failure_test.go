@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/config"
@@ -15,6 +16,17 @@ import (
 )
 
 func newChatStreamTerminalTestHandler(t *testing.T, events []string) (*Handler, *atomic.Int32) {
+	t.Helper()
+	return newChatStreamServeTestHandler(t, func(w http.ResponseWriter) {
+		for _, event := range events {
+			_, _ = io.WriteString(w, "data: "+event+"\n\n")
+		}
+	})
+}
+
+// newChatStreamServeTestHandler 搭一个走 Resin HTTP 上游的 /v1/chat/completions
+// 测试环境，假上游按 serve 回调自由控制写入节奏（含 flush/静默）。
+func newChatStreamServeTestHandler(t *testing.T, serve func(w http.ResponseWriter)) (*Handler, *atomic.Int32) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -25,14 +37,12 @@ func newChatStreamTerminalTestHandler(t *testing.T, events []string) (*Handler, 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		for _, event := range events {
-			_, _ = io.WriteString(w, "data: "+event+"\n\n")
-		}
+		serve(w)
 	}))
 	t.Cleanup(upstream.Close)
 	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
 
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 1})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.5", MaxRetries: 1})
 	t.Cleanup(store.Stop)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
 	return NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil), &calls
@@ -42,7 +52,7 @@ func invokeChatCompletionsStream(t *testing.T, handler *Handler) *httptest.Respo
 	t.Helper()
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	handler.ChatCompletions(ctx)
 	return recorder
@@ -87,6 +97,50 @@ func TestChatCompletionsSuccessfulStreamStillAppendsDoneSentinel(t *testing.T) {
 	}
 }
 
+// TestChatCompletionsStreamKeepsDownstreamAliveDuringUpstreamSilence 验证 issue #623
+// 修复：首个内容 chunk 之后上游静默期间，/v1/chat/completions 翻译流也要定期写
+// SSE 注释刷新下游 idle timer，且首字前不得写出任何字节。
+func TestChatCompletionsStreamKeepsDownstreamAliveDuringUpstreamSilence(t *testing.T) {
+	shortenDownstreamSSEKeepalive(t)
+	handler, calls := newChatStreamServeTestHandler(t, func(w http.ResponseWriter) {
+		writeCodexSSE(w,
+			`{"type":"response.created","response":{"id":"resp_silent"}}`,
+			`{"type":"response.output_text.delta","delta":"started"}`,
+		)
+		time.Sleep(40 * time.Millisecond)
+		writeCodexSSE(w,
+			`{"type":"response.output_text.delta","delta":"-resumed"}`,
+			`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		)
+	})
+
+	recorder := invokeChatCompletionsStream(t, handler)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", recorder.Code, body)
+	}
+	firstContent := strings.Index(body, `"content":"started"`)
+	keepalive := strings.Index(body, downstreamSSEKeepaliveComment)
+	resumed := strings.Index(body, `"content":"-resumed"`)
+	if firstContent < 0 || keepalive < 0 || resumed < 0 {
+		t.Fatalf("stream must carry first content, a keepalive comment and the resumed content; body=%q", body)
+	}
+	if keepalive < firstContent || keepalive > resumed {
+		t.Fatalf("keepalive must land inside the upstream silence window (after %d, before %d), got %d; body=%q", firstContent, resumed, keepalive, body)
+	}
+	for frame := range strings.SplitSeq(body, "\n\n") {
+		if strings.Contains(frame, ": keepalive") && strings.TrimSpace(frame) != ": keepalive" {
+			t.Fatalf("keepalive comment interleaved with an SSE frame: %q", frame)
+		}
+	}
+	if got := strings.Count(body, "data: [DONE]\n\n"); got != 1 {
+		t.Fatalf("[DONE] count = %d, want 1; body=%q", got, body)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
 func TestChatCompletionsCatchAllDiscardsOutputFromFailedAttempt(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	enableCatchAllContinuousRetry(t)
@@ -107,7 +161,7 @@ func TestChatCompletionsCatchAllDiscardsOutputFromFailedAttempt(t *testing.T) {
 	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 0,
+		MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.5", MaxRetries: 0,
 	})
 	t.Cleanup(store.Stop)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
@@ -145,7 +199,7 @@ func TestChatCompletionsCatchAllDiscardsExplicitErrorEventAfterPartialOutput(t *
 	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 0,
+		MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.5", MaxRetries: 0,
 	})
 	t.Cleanup(store.Stop)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})

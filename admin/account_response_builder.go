@@ -123,6 +123,10 @@ func (h *Handler) buildAccountResponse(
 	if isOpenAIResponsesAccount && includeDetails {
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	}
+	codexPassthroughMode := ""
+	if isOpenAIResponsesAccount && includeDetails {
+		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(row.GetCredential("codex_passthrough_mode"))
+	}
 	balanceQueryURL := ""
 	if isOpenAIResponsesAccount && includeDetails {
 		balanceQueryURL = row.GetCredential(openAIResponsesBalanceQueryURLCredential)
@@ -180,7 +184,14 @@ func (h *Handler) buildAccountResponse(
 	effectiveWorkspaceID := openaiidentity.EffectiveWorkspaceID(tokenWorkspaceID, headers)
 	if includeDetails {
 		modelMapping = row.GetCredential("model_mapping")
-		if isClaudeAccount {
+		if isClaudeAccount && claudeAuthKindForRow(row, true) == auth.ClaudeAuthKindAPIKey {
+			// API Key custom_headers are operator configuration (never a generated
+			// fingerprint) and can't contain gateway-owned secrets (reserved names
+			// are rejected on write), so they are shown in full like Codex relay
+			// accounts. The UA preview reflects custom header > identity emulation.
+			customHeaders = headers
+			claudeUserAgent = auth.ClaudeAPIKeyUpstreamUserAgent(headers, claudeFingerprintMode)
+		} else if isClaudeAccount {
 			// Claude detail responses may be consumed by admin tooling, but must
 			// never expose arbitrary historical custom headers such as
 			// Authorization/Cookie/x-api-key. Keep only the provider identity
@@ -221,6 +232,8 @@ func (h *Handler) buildAccountResponse(
 		GrokAPI:                      isGrokAccount,
 		AntigravityAPI:               isAntigravityAccount,
 		ClaudeAPI:                    isClaudeAccount,
+		ClaudeAuthKind:               claudeAuthKindForRow(row, isClaudeAccount),
+		ClaudeBaseURL:                row.GetCredential(auth.ClaudeBaseURLCredentialKey),
 		AntigravityAuthKind:          antigravityAuthKind,
 		AgentIdentity:                isAgentIdentityCredentialRow(row),
 		GrokAuthKind:                 grokAuthKind,
@@ -237,6 +250,7 @@ func (h *Handler) buildAccountResponse(
 		Models:                       row.GetCredentialStringSlice("models"),
 		ModelMapping:                 modelMapping,
 		CodexClientMetadataMode:      codexClientMetadataMode,
+		CodexPassthroughMode:         codexPassthroughMode,
 		CodexFingerprintMode:         codexFingerprintMode,
 		ClaudeFingerprintMode:        claudeFingerprintMode,
 		ClaudeUserAgent:              claudeUserAgent,
@@ -248,6 +262,7 @@ func (h *Handler) buildAccountResponse(
 		ClaudeClientVersionOverride:  claudeClientVersionOverride,
 		Timezone:                     accountTimezone,
 		CustomHeaders:                customHeaders,
+		UpstreamRequestIDHeader:      row.GetCredential(auth.UpstreamRequestIDHeaderCredentialKey),
 		ProxyURL:                     row.ProxyURL,
 		Enabled:                      row.Enabled,
 		Locked:                       row.Locked,
@@ -492,6 +507,7 @@ func stripAccountDetailFields(resp *accountResponse) {
 	}
 	resp.ModelMapping = ""
 	resp.CodexClientMetadataMode = ""
+	resp.CodexPassthroughMode = ""
 	resp.CustomHeaders = nil
 	resp.AllowedAPIKeyIDs = nil
 	resp.Usage5hDetail = nil

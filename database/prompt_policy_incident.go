@@ -279,6 +279,17 @@ func (db *DB) ensurePromptPolicyIncidentsTable(ctx context.Context) error {
 			return err
 		}
 	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_policy_incidents SET prompt_available = CASE WHEN COALESCE(prompt_text, '') <> '' OR COALESCE(prompt_preview, '') <> '' THEN true ELSE false END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
+		return err
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_policy_incidents SET local_comparison = CASE
+		WHEN local_evaluation_state = 'legacy_unknown' THEN 'legacy_unknown'
+		WHEN local_evaluation_state <> 'completed' THEN 'not_comparable'
+		WHEN local_outcome <> 'no_hit' THEN 'local_detected'
+		WHEN prompt_available THEN 'upstream_only'
+		ELSE 'evidence_unavailable' END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
+		return err
+	}
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_prompt_policy_incidents_request ON prompt_policy_incidents(request_correlation_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_policy_incidents_created ON prompt_policy_incidents(created_at)`,
@@ -294,55 +305,21 @@ func (db *DB) ensurePromptPolicyIncidentsTable(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := normalizePromptPolicyIncidentData(ctx, db.conn, false); err != nil {
+	if err := db.migrateLegacyPromptPolicyIncidents(ctx); err != nil {
 		return err
 	}
 	return db.ensurePromptRiskEventsTable(ctx)
 }
 
 func (db *DB) migrateLegacyPromptPolicyIncidents(ctx context.Context) error {
-	return migrateLegacyPromptPolicyIncidentsWithExecutor(ctx, db.conn, false)
-}
-
-func migrateLegacyPromptPolicyIncidentsWithExecutor(ctx context.Context, execer sqlExecer, allocateIDs bool) error {
-	idColumn := ""
-	idValue := ""
-	if allocateIDs {
-		// Imported explicit IDs do not advance a fresh PostgreSQL sequence. Use
-		// IDs above the imported maximum for legacy rows, then let the caller's
-		// final all-table sequence reset establish the runtime next values.
-		idColumn = "id, "
-		idValue = "(SELECT COALESCE(MAX(id), 0) FROM prompt_policy_incidents) + ROW_NUMBER() OVER (ORDER BY pfl.id), "
-	}
-	query := `INSERT INTO prompt_policy_incidents (` + idColumn + `
+	query := `INSERT INTO prompt_policy_incidents (
 		incident_id, created_at, endpoint, request_protocol, request_provider, model, api_key_id, api_key_name, api_key_masked,
 		upstream_error_code, upstream_error, local_evaluation_state, local_matched_patterns
-	) SELECT ` + idValue + `'legacy-' || CAST(pfl.id AS TEXT), pfl.created_at, pfl.endpoint, pfl.request_protocol, pfl.request_provider, pfl.model, pfl.api_key_id, pfl.api_key_name, pfl.api_key_masked,
-		pfl.error_code, pfl.full_text, $1, '[]' FROM prompt_filter_logs pfl WHERE pfl.source='upstream_cyber_policy'
-		AND NOT EXISTS (SELECT 1 FROM prompt_policy_incidents ppi WHERE ppi.incident_id='legacy-' || CAST(pfl.id AS TEXT))
+	) SELECT 'legacy-' || CAST(id AS TEXT), created_at, endpoint, request_protocol, request_provider, model, api_key_id, api_key_name, api_key_masked,
+		error_code, full_text, $1, '[]' FROM prompt_filter_logs WHERE source='upstream_cyber_policy'
 	ON CONFLICT(incident_id) DO NOTHING`
-	_, err := execer.ExecContext(ctx, query, PromptPolicyEvaluationLegacyUnknown)
+	_, err := db.conn.ExecContext(ctx, query, PromptPolicyEvaluationLegacyUnknown)
 	return err
-}
-
-func normalizePromptPolicyIncidentData(ctx context.Context, execer sqlExecer, allocateLegacyIDs bool) error {
-	// Import legacy rows first so the derived-field pass also covers incidents
-	// materialized from prompt_filter_logs during this same initialization.
-	if err := migrateLegacyPromptPolicyIncidentsWithExecutor(ctx, execer, allocateLegacyIDs); err != nil {
-		return err
-	}
-	if _, err := execer.ExecContext(ctx, `UPDATE prompt_policy_incidents SET prompt_available = CASE WHEN COALESCE(prompt_text, '') <> '' OR COALESCE(prompt_preview, '') <> '' THEN true ELSE false END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
-		return err
-	}
-	if _, err := execer.ExecContext(ctx, `UPDATE prompt_policy_incidents SET local_comparison = CASE
-		WHEN local_evaluation_state = 'legacy_unknown' THEN 'legacy_unknown'
-		WHEN local_evaluation_state <> 'completed' THEN 'not_comparable'
-		WHEN local_outcome <> 'no_hit' THEN 'local_detected'
-		WHEN prompt_available THEN 'upstream_only'
-		ELSE 'evidence_unavailable' END WHERE COALESCE(local_comparison, '') = ''`); err != nil {
-		return err
-	}
-	return nil
 }
 
 func normalizePromptPolicyIncidentInput(input PromptPolicyIncidentInput) (PromptPolicyIncidentInput, error) {
@@ -793,6 +770,11 @@ func (db *DB) DeletePromptPolicyIncident(ctx context.Context, incidentID string)
 		if _, err := tx.ExecContext(ctx, `UPDATE prompt_rule_candidate_evidence SET prompt_policy_incident_id=NULL WHERE prompt_policy_incident_id=$1`, incidentID); err != nil {
 			return err
 		}
+		// 管理员主动删除 CY 时，其关联的审核日志 / 风险事件 / 来源记录一并清理；
+		// 保留策略平时会绕开这些行，只有这里才是它们的出口。
+		if err := deletePromptIncidentEvidenceTx(ctx, tx, incidentID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM prompt_policy_incidents WHERE incident_id=$1`, incidentID); err != nil {
 			return err
 		}
@@ -926,13 +908,30 @@ func (db *DB) ClearPromptPolicyIncidents(ctx context.Context) error {
 	if db == nil {
 		return nil
 	}
-	if db.isSQLite() {
-		if _, err := db.conn.ExecContext(ctx, `DELETE FROM prompt_policy_incidents`); err != nil {
+	return db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
 			return err
 		}
-		_, err := db.conn.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name='prompt_policy_incidents'`)
-		return err
-	}
-	_, err := db.conn.ExecContext(ctx, `TRUNCATE TABLE prompt_policy_incidents RESTART IDENTITY`)
-	return err
+		defer tx.Rollback()
+		// 清空 CY 同时清空其全部证据链（日志 / 风险事件 / 来源记录）。
+		if err := deleteAllPromptIncidentEvidenceTx(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE usage_logs SET prompt_policy_incident_id=NULL WHERE prompt_policy_incident_id IS NOT NULL`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE prompt_rule_candidate_evidence SET prompt_policy_incident_id=NULL WHERE prompt_policy_incident_id IS NOT NULL`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM prompt_policy_incidents`); err != nil {
+			return err
+		}
+		if db.isSQLite() {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name='prompt_policy_incidents'`); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
 }
