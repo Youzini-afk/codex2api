@@ -75,6 +75,7 @@ type RuntimeSettings struct {
 	CodexFastModelAliasEnabled       bool
 	CodexReasoningEffortAliasEnabled bool
 	CodexFastTierInterceptEnabled    bool
+	CodexForceFastEnabled            bool
 	// ModelsListReadMaxBytes 是上游 /v1/models 与 Codex 模型清单成功响应的读取上限。
 	ModelsListReadMaxBytes int64
 	CodexForceWebsocket    bool // 强制 Codex 上游走 WebSocket（默认 false）
@@ -186,6 +187,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexFastModelAliasEnabled:       true,
 		CodexReasoningEffortAliasEnabled: true,
 		CodexFastTierInterceptEnabled:    false,
+		CodexForceFastEnabled:            false,
 		ContinuousRetryPolicy:            database.DefaultContinuousRetryPolicy(),
 		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
 		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
@@ -359,6 +361,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexFastModelAliasEnabled = settings.CodexFastModelAliasEnabled
 		next.CodexReasoningEffortAliasEnabled = settings.CodexReasoningEffortAliasEnabled
 		next.CodexFastTierInterceptEnabled = settings.CodexFastTierInterceptEnabled
+		next.CodexForceFastEnabled = settings.CodexForceFastEnabled
 		next.ContinuousRetryPolicy = database.ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy)
 		if strings.TrimSpace(settings.ContinuousRetryPolicy) == "" {
 			next.ContinuousRetryPolicy = database.DefaultContinuousRetryPolicy()

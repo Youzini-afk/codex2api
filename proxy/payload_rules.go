@@ -605,8 +605,11 @@ func payloadAppendAlreadyApplied(prev, text string) bool {
 
 // EffectiveRequestedServiceTier 返回请求体经当前规则改写后将真正发往上游的 service_tier，
 // 供用量日志按覆写后的值归因 requested/billing tier。输入须与 ExecuteRequest 喂给引擎的一致
-// （生图请求旁路规则，与 executor.go 保持一致）。无规则命中时返回原值。
+// （生图请求旁路规则，与 executor.go 保持一致）。强制 Fast 优先于规则与客户端值。
 func EffectiveRequestedServiceTier(body []byte, model string, headers http.Header, identity *PayloadRuleIdentity) string {
+	if CurrentRuntimeSettings().CodexForceFastEnabled {
+		return "priority"
+	}
 	if responsesBodyRequestsImageGeneration(body) {
 		return extractServiceTier(body)
 	}

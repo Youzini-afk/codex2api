@@ -542,6 +542,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
 		requestBody = sanitizeServiceTierForUpstream(requestBody)
 	}
+	// 管理员强制 Fast 在规则与拦截之后生效，HTTP/WS 共用同一出站档位。
+	requestBody = applyCodexForceFast(requestBody)
 	// 指纹收敛在 WS/HTTP 分叉前统一改写请求体，两条上游路径共享结果；请求头侧的
 	// 收敛（ApplyCodexFingerprintHeaders）从同一份「账号 + 下游头」推导，取值一致。
 	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)

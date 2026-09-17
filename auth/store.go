@@ -3458,6 +3458,7 @@ type Store struct {
 	codexFastModelAliasEnabled       atomic.Bool
 	codexReasoningEffortAliasEnabled atomic.Bool
 	codexFastTierInterceptEnabled    atomic.Bool
+	codexForceFastEnabled            atomic.Bool
 	routingSchedulersMu              sync.RWMutex
 	routingSchedulers                map[int64]*routingSchedulerEntry
 	routingSchedulerAccounts         int
@@ -4131,6 +4132,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexFastModelAliasEnabled.Store(settings.CodexFastModelAliasEnabled)
 	s.codexReasoningEffortAliasEnabled.Store(settings.CodexReasoningEffortAliasEnabled)
 	s.codexFastTierInterceptEnabled.Store(settings.CodexFastTierInterceptEnabled)
+	s.codexForceFastEnabled.Store(settings.CodexForceFastEnabled)
 	s.codexWSSizeRouterEnabled.Store(settings.CodexWSSizeRouterEnabled)
 	s.codexWSBusyMaxWaitSec.Store(int64(database.NormalizeCodexWSBusyAcquireMaxWaitSec(settings.CodexWSBusyAcquireMaxWaitSec)))
 	s.codexWSBusyOverflowEnabled.Store(settings.CodexWSBusyOverflowEnabled)
@@ -4477,6 +4479,18 @@ func (s *Store) CodexFastTierInterceptEnabled() bool {
 		return false
 	}
 	return s.codexFastTierInterceptEnabled.Load()
+}
+
+// SetCodexForceFastEnabled 设置 Codex 生成请求强制 Fast 开关。
+func (s *Store) SetCodexForceFastEnabled(enabled bool) {
+	if s != nil {
+		s.codexForceFastEnabled.Store(enabled)
+	}
+}
+
+// CodexForceFastEnabled 返回强制 Fast 开关状态（默认 false）。
+func (s *Store) CodexForceFastEnabled() bool {
+	return s != nil && s.codexForceFastEnabled.Load()
 }
 
 // SetCodexWSBusyAcquireMaxWaitSec 设置 busy session 等待上限（秒）。

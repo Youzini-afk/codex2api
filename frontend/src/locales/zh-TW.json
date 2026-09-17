@@ -160,6 +160,8 @@
     "proxyPoolLinkedHint": "已關聯代理池節點（按位址綁定）：在「代理」頁修改該節點位址會同步到所有綁定帳號，刪除則自動解除綁定。"
   },
   "settings": {
+    "codexForceFastEnabled": "強制 Codex Fast",
+    "codexForceFastEnabledDesc": "所有送往 Codex 上游的生成請求統一使用 Fast（service_tier=priority），無需 fast 標記。覆蓋用戶端層級、請求改寫規則與 Fast Tier 攔截，HTTP / WebSocket 均生效。可能增加用量消耗，預設關閉。",
     "pricing": {
       "contextThreshold": "長上下文閾值",
       "revertThreshold": "還原為 {{value}} tokens",

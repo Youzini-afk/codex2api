@@ -251,6 +251,7 @@ func TestSharedDatabaseSettingsConvergeAcrossStores(t *testing.T) {
 	updated.SchedulerEngine = "shadow"
 	updated.SessionSlotBufferEnabled = true
 	updated.SessionSlotBufferSeconds = 21
+	updated.CodexForceFastEnabled = true
 	updated.CodexFastModelAliasEnabled = false
 	updated.CodexReasoningEffortAliasEnabled = false
 	updated.CodexRequestCompression = false
@@ -264,6 +265,7 @@ func TestSharedDatabaseSettingsConvergeAcrossStores(t *testing.T) {
 		return first.GetMaxConcurrency() == 13 && second.GetMaxConcurrency() == 13 &&
 			first.SchedulerEngine() == "shadow" && second.SchedulerEngine() == "shadow" &&
 			first.SessionSlotBufferEnabled() && second.SessionSlotBufferEnabled() &&
+			first.CodexForceFastEnabled() && second.CodexForceFastEnabled() &&
 			!first.CodexFastModelAliasEnabled() && !second.CodexFastModelAliasEnabled() &&
 			!first.CodexReasoningEffortAliasEnabled() && !second.CodexReasoningEffortAliasEnabled() &&
 			!first.CodexRequestCompression() && !second.CodexRequestCompression() &&

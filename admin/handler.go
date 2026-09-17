@@ -9436,6 +9436,7 @@ type settingsResponse struct {
 	CodexFastModelAliasEnabled          bool   `json:"codex_fast_model_alias_enabled"`
 	CodexReasoningEffortAliasEnabled    bool   `json:"codex_reasoning_effort_alias_enabled"`
 	CodexFastTierInterceptEnabled       bool   `json:"codex_fast_tier_intercept_enabled"`
+	CodexForceFastEnabled               bool   `json:"codex_force_fast_enabled"`
 	CodexWSSizeRouterEnabled            bool   `json:"codex_ws_size_router_enabled"`
 	CodexWSBusyAcquireMaxWaitSec        int    `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
@@ -9618,6 +9619,7 @@ type updateSettingsReq struct {
 	CodexFastModelAliasEnabled          *bool                            `json:"codex_fast_model_alias_enabled"`
 	CodexReasoningEffortAliasEnabled    *bool                            `json:"codex_reasoning_effort_alias_enabled"`
 	CodexFastTierInterceptEnabled       *bool                            `json:"codex_fast_tier_intercept_enabled"`
+	CodexForceFastEnabled               *bool                            `json:"codex_force_fast_enabled"`
 	CodexWSSizeRouterEnabled            *bool                            `json:"codex_ws_size_router_enabled"`
 	CodexWSBusyAcquireMaxWaitSec        *int                             `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          *bool                            `json:"codex_ws_busy_overflow_enabled"`
@@ -10446,6 +10448,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
 		CodexReasoningEffortAliasEnabled:    h.store.CodexReasoningEffortAliasEnabled(),
 		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
+		CodexForceFastEnabled:               h.store.CodexForceFastEnabled(),
 		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
@@ -11220,6 +11223,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_fast_tier_intercept_enabled = %t", *req.CodexFastTierInterceptEnabled)
 	}
 
+	if req.CodexForceFastEnabled != nil {
+		h.store.SetCodexForceFastEnabled(*req.CodexForceFastEnabled)
+		runtimeCfg.CodexForceFastEnabled = *req.CodexForceFastEnabled
+		log.Printf("设置已更新: codex_force_fast_enabled = %t", *req.CodexForceFastEnabled)
+	}
+
 	if req.CodexWSBusyAcquireMaxWaitSec != nil {
 		v := database.NormalizeCodexWSBusyAcquireMaxWaitSec(*req.CodexWSBusyAcquireMaxWaitSec)
 		h.store.SetCodexWSBusyAcquireMaxWaitSec(v)
@@ -11958,6 +11967,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
 		CodexReasoningEffortAliasEnabled:    h.store.CodexReasoningEffortAliasEnabled(),
 		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
+		CodexForceFastEnabled:               h.store.CodexForceFastEnabled(),
 		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
@@ -12275,6 +12285,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexFastModelAliasEnabled:          h.store.CodexFastModelAliasEnabled(),
 		CodexReasoningEffortAliasEnabled:    h.store.CodexReasoningEffortAliasEnabled(),
 		CodexFastTierInterceptEnabled:       h.store.CodexFastTierInterceptEnabled(),
+		CodexForceFastEnabled:               h.store.CodexForceFastEnabled(),
 		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),

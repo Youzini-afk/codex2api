@@ -1990,6 +1990,7 @@ export interface SystemSettings {
   codex_fast_model_alias_enabled: boolean
   codex_reasoning_effort_alias_enabled: boolean
   codex_fast_tier_intercept_enabled: boolean
+  codex_force_fast_enabled: boolean
   codex_ws_size_router_enabled: boolean
   codex_ws_busy_acquire_max_wait_sec: number
   codex_ws_busy_overflow_enabled: boolean

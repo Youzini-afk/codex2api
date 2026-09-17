@@ -4242,6 +4242,8 @@
     "codexFastModelAliasEnabledDesc": "Allows model names ending in -fast to automatically inject service_tier=fast when no explicit tier is present (default on).",
     "codexReasoningEffortAliasEnabled": "Reasoning Effort Model Alias",
     "codexReasoningEffortAliasEnabledDesc": "Allows Codex model suffixes such as -none, -low, -medium, -high, and -xhigh to set reasoning effort automatically. Only model-supported levels are listed, including -max where available. Enabled by default.",
+    "codexForceFastEnabled": "Force Codex Fast",
+    "codexForceFastEnabledDesc": "Send all generation requests to the Codex upstream with Fast (service_tier=priority), even without a fast flag. Overrides client tiers, payload rules, and Fast Tier Intercept for both HTTP and WebSocket. May increase usage consumption. Off by default.",
     "codexFastTierInterceptEnabled": "Fast Tier Intercept",
     "codexFastTierInterceptEnabledDesc": "Strips explicit 'fast' tier from client requests, keeping only priority / default / flex. Designed to prevent accidental fast billing (default off).",
     "imageStorage": "Image Storage",

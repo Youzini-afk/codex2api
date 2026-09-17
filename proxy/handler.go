@@ -6172,6 +6172,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		var reqErr error
 		if compactViaResponses {
 			upstreamEndpointLabel = "/v1/responses"
+			if CurrentRuntimeSettings().CodexForceFastEnabled {
+				serviceTier = "priority"
+			}
 			resp, reqErr = ExecuteRequest(c.Request.Context(), account, appendCompactionTriggerToResponsesBody(codexBody), upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, false)
 		} else {
 			resp, reqErr = ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)

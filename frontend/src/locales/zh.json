@@ -4242,6 +4242,8 @@
     "codexFastModelAliasEnabledDesc": "允许模型名以 -fast 结尾时自动注入 service_tier=fast（前提是客户端未显式指定 tier），默认开启。",
     "codexReasoningEffortAliasEnabled": "思考强度模型别名",
     "codexReasoningEffortAliasEnabledDesc": "允许 Codex 模型名使用 -none、-low、-medium、-high、-xhigh 等后缀自动设置思考强度；仅按模型能力暴露可用档位，支持的模型还会提供 -max。默认开启。",
+    "codexForceFastEnabled": "强制 Codex Fast",
+    "codexForceFastEnabledDesc": "所有发往 Codex 上游的生成请求统一使用 Fast（service_tier=priority），无需 fast 标识。覆盖客户端层级、请求改写规则和 Fast Tier 拦截，HTTP / WebSocket 均生效。可能增加用量消耗，默认关闭。",
     "codexFastTierInterceptEnabled": "Fast Tier 拦截",
     "codexFastTierInterceptEnabledDesc": "拦截并移除客户端显式传入的 fast tier，仅保留 priority / default / flex，用于防止误触发 Fast 计费，默认关闭。",
     "imageStorage": "图片存储",
