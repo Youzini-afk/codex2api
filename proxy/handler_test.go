@@ -1623,16 +1623,20 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	}
 }
 
+// TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence 验证 HTTP SSE
+// 入站请求在上游静默期间仍向下游发送保活。
 func TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	previousExec := WebsocketExecuteFunc
 	previousSettings := CurrentRuntimeSettings()
-	previousInterval := downstreamSSEKeepaliveInterval
+	previousSSEInterval := downstreamSSEKeepaliveInterval
+	previousRetryInterval := continuousRetryKeepaliveInterval
 	t.Cleanup(func() {
 		WebsocketExecuteFunc = previousExec
 		ApplyRuntimeSettings(previousSettings)
-		downstreamSSEKeepaliveInterval = previousInterval
+		downstreamSSEKeepaliveInterval = previousSSEInterval
+		continuousRetryKeepaliveInterval = previousRetryInterval
 	})
 
 	nextSettings := previousSettings
@@ -1640,6 +1644,7 @@ func TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence(t *testin
 	nextSettings.CodexContinueThinking = false
 	ApplyRuntimeSettings(nextSettings)
 	downstreamSSEKeepaliveInterval = 5 * time.Millisecond
+	continuousRetryKeepaliveInterval = 5 * time.Millisecond
 
 	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		pr, pw := io.Pipe()
@@ -3766,6 +3771,30 @@ func TestClassify429CapacityUsesModelCooldown(t *testing.T) {
 	}
 }
 
+func TestClassify429BareThrottleUsesAccountCooldown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	decision := classify429RateLimit(&auth.Account{PlanType: "plus"}, nil, nil, now, "gpt-5.5")
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited" {
+		t.Fatalf("decision = %#v, want account-scoped transient throttle", decision)
+	}
+	if decision.Cooldown != auth.TransientRateLimitBackoffBase {
+		t.Fatalf("Cooldown = %v, want %v", decision.Cooldown, auth.TransientRateLimitBackoffBase)
+	}
+}
+
+func TestClassify429RetryAfterExtendsTransientHint(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("Retry-After", "45")
+	decision := classify429RateLimit(&auth.Account{PlanType: "plus"}, []byte(`{"error":{"type":"rate_limit_error"}}`), resp, now, "gpt-5.4")
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited" {
+		t.Fatalf("decision = %#v, want account-scoped transient throttle", decision)
+	}
+	if decision.Cooldown != 45*time.Second {
+		t.Fatalf("Cooldown = %v, want 45s Retry-After", decision.Cooldown)
+	}
+}
+
 func TestClassify429Header7dUsesAccountCooldown(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	resp := &http.Response{Header: make(http.Header)}
@@ -4359,7 +4388,7 @@ func TestApplyResponseFailedSemantic429KeepsExplicitModelCapacityScoped(t *testi
 	}
 }
 
-func TestApplyResponseFailedSemantic429SparkUsesTransientModelCooldown(t *testing.T) {
+func TestApplyResponseFailedSemantic429SparkUsesTransientAccountCooldown(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
 	account := &auth.Account{DBID: 205, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
 	account.SetUsageSnapshot5h(40, time.Now().Add(2*time.Hour))
@@ -4372,17 +4401,20 @@ func TestApplyResponseFailedSemantic429SparkUsesTransientModelCooldown(t *testin
 
 	decision := handler.applyResponseFailedCooldown(account, payload, resp, "gpt-5.3-codex-spark")
 
-	if decision.Scope != rateLimitScopeModel || decision.Reason != "rate_limited_model" {
-		t.Fatalf("decision = %#v, want transient Spark model cooldown", decision)
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited" {
+		t.Fatalf("decision = %#v, want transient Spark account cooldown", decision)
 	}
-	if !account.IsModelRateLimited("gpt-5.3-codex-spark") {
-		t.Fatal("transient Spark 429 should apply the configured model cooldown policy")
+	if account.IsModelRateLimited("gpt-5.3-codex-spark") {
+		t.Fatal("transient Spark 429 must not hide behind a model-only cooldown")
 	}
-	if decision.Cooldown < 4*time.Minute || decision.Cooldown > 6*time.Minute {
-		t.Fatalf("transient Spark cooldown = %v, want default OAuth model policy around 5m", decision.Cooldown)
+	if decision.Cooldown < 10*time.Second || decision.Cooldown > 20*time.Second {
+		t.Fatalf("transient Spark cooldown = %v, want about 15s", decision.Cooldown)
 	}
-	if account.HasActiveCooldown() || account.IsPremium5hRateLimited() {
-		t.Fatal("transient Spark 429 must not create an account-level cooldown")
+	if !account.HasActiveCooldown() || account.GetCooldownReason() != auth.ResponsesRateLimitedCooldownReason {
+		t.Fatal("transient Spark 429 should freeze the whole account")
+	}
+	if account.IsPremium5hRateLimited() {
+		t.Fatal("transient Spark 429 must not create a premium 5h cooldown")
 	}
 	if pct5h, ok := account.GetUsagePercent5h(); !ok || pct5h != 40 {
 		t.Fatalf("main 5h snapshot = (%v, %v), want unchanged 40", pct5h, ok)
@@ -4678,20 +4710,23 @@ func TestSyncCodexUsageStateUpdatesPlanTypeFromHeader(t *testing.T) {
 	}
 }
 
-func TestApply429CooldownUnknown429UsesModelCooldown(t *testing.T) {
+func TestApply429CooldownUnknown429UsesAccountCooldown(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
 	account := &auth.Account{DBID: 102, PlanType: "pro"}
 
 	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"rate_limit_error","message":"Too many requests"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.5")
 
-	if decision.Scope != rateLimitScopeModel {
-		t.Fatalf("decision.Scope = %q, want model", decision.Scope)
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited" {
+		t.Fatalf("decision = %#v, want account-scoped transient throttle", decision)
 	}
-	if got := time.Until(decision.ResetAt); got < 4*time.Minute || got > 6*time.Minute {
-		t.Fatalf("resetAt delta = %v, want about 5m", got)
+	if got := time.Until(decision.ResetAt); got < 10*time.Second || got > 20*time.Second {
+		t.Fatalf("resetAt delta = %v, want about 15s", got)
 	}
-	if !account.IsModelRateLimited("gpt-5.5") {
-		t.Fatal("expected model cooldown")
+	if account.IsModelRateLimited("gpt-5.5") {
+		t.Fatal("transient 429 must not cool only the requested model")
+	}
+	if !account.HasActiveCooldown() {
+		t.Fatal("expected account cooldown")
 	}
 }
 
@@ -4894,6 +4929,126 @@ func TestSyncCodexUsageStateCreditAccountSkips7dUsageLimit(t *testing.T) {
 	pct7d, ok := account.GetUsagePercent7d()
 	if !ok || pct7d != 100 {
 		t.Fatalf("usage_percent_7d = (%v, %v), want 100 with valid snapshot", pct7d, ok)
+	}
+}
+
+func TestSyncCodexUsageStateTeamMemberNullBalanceCreditsSkips7dUsageLimit(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New returned error: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "team-null-bal", map[string]interface{}{
+		"plan_type": "team",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials returned error: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
+	account := &auth.Account{
+		DBID:                  id,
+		AccessToken:           "at",
+		PlanType:              "team",
+		Status:                auth.StatusReady,
+		HealthTier:            auth.HealthTierHealthy,
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+	}
+	// Team 成员 has_credits=true 且 balance=null (无显式数值)
+	account.SetCreditBalanceDetails(nil, true, false, false, nil, "")
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "20")
+	resp.Header.Set("x-codex-primary-window-minutes", "300")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "1200")
+	resp.Header.Set("x-codex-secondary-used-percent", "100")
+	resp.Header.Set("x-codex-secondary-window-minutes", "10080")
+	resp.Header.Set("x-codex-secondary-reset-after-seconds", "3600")
+
+	result := SyncCodexUsageState(store, account, resp)
+
+	if !result.HasUsage7d || result.UsagePct7d != 100 {
+		t.Fatalf("usage sync result = %+v, want 7d snapshot at 100", result)
+	}
+	if result.Usage7dRateLimited {
+		t.Fatalf("Usage7dRateLimited = true, want false for team account with null balance credits")
+	}
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited for credit account", got)
+	}
+	if !account.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true while team credits cover the window")
+	}
+	if !account.UsingCredits() {
+		t.Fatal("UsingCredits() = false, want true while team credits cover the window")
+	}
+}
+
+func TestSyncCodexUsageStateSparseCreditsHeadersObservation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New returned error: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "sparse-credit-test", map[string]interface{}{
+		"plan_type": "team",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials returned error: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
+	account := &auth.Account{
+		DBID:                  id,
+		AccessToken:           "at",
+		PlanType:              "team",
+		Status:                auth.StatusReady,
+		HealthTier:            auth.HealthTierHealthy,
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+	}
+
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "100")
+	resp.Header.Set("x-codex-primary-window-minutes", "300")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "3600")
+	resp.Header.Set("x-codex-credits-has-credits", "true")
+	resp.Header.Set("x-codex-credits-unlimited", "false")
+	resp.Header.Set("x-codex-credits-balance", "25.50")
+	resp.Header.Set("x-codex-rate-limit-reached-type", "")
+
+	result := SyncCodexUsageState(store, account, resp)
+
+	if !result.CreditsObserved {
+		t.Fatal("CreditsObserved = false, want true")
+	}
+	credits, ok := account.GetCreditBalance()
+	if !ok || !credits.HasCredits || credits.Balance == nil || *credits.Balance != "25.50" {
+		t.Fatalf("account credit balance not updated: %+v, ok=%t", credits, ok)
+	}
+	if !result.UsageWindowLimitsIgnored {
+		t.Fatal("UsageWindowLimitsIgnored = false, want true with credits available")
+	}
+
+	// Now test receiving workspace hard stop header
+	respStop := &http.Response{Header: make(http.Header)}
+	respStop.Header.Set("x-codex-primary-used-percent", "100")
+	respStop.Header.Set("x-codex-primary-window-minutes", "300")
+	respStop.Header.Set("x-codex-primary-reset-after-seconds", "3600")
+	respStop.Header.Set("x-codex-rate-limit-reached-type", "workspace_member_credits_depleted")
+
+	resultStop := SyncCodexUsageState(store, account, respStop)
+	if resultStop.RateLimitReachedType != "workspace_member_credits_depleted" {
+		t.Fatalf("RateLimitReachedType = %q, want workspace_member_credits_depleted", resultStop.RateLimitReachedType)
+	}
+	if resultStop.UsageWindowLimitsIgnored {
+		t.Fatal("UsageWindowLimitsIgnored = true, want false under workspace hard stop")
 	}
 }
 
@@ -6324,5 +6479,77 @@ func TestCodexUnsupportedModelFromBody(t *testing.T) {
 				t.Fatalf("codexUnsupportedModelFromBody(%q) = %q, want %q", test.body, got, test.want)
 			}
 		})
+	}
+}
+
+// 带用量头但没有 reached-type 的响应要清掉之前学到的 workspace hard-stop，
+// 否则工作区充值后积分顶替永远回不来。(issue #662 审查)
+func TestSyncCodexUsageStateClearsStaleWorkspaceHardStop(t *testing.T) {
+	account := &auth.Account{
+		AccessToken:           "at",
+		PlanType:              "team",
+		Status:                auth.StatusReady,
+		HealthTier:            auth.HealthTierHealthy,
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+	}
+	account.SetCreditBalanceDetails(nil, true, false, false, nil, "")
+
+	stop := &http.Response{Header: make(http.Header)}
+	stop.Header.Set("x-codex-primary-used-percent", "100")
+	stop.Header.Set("x-codex-primary-window-minutes", "300")
+	stop.Header.Set("x-codex-primary-reset-after-seconds", "3600")
+	stop.Header.Set("x-codex-rate-limit-reached-type", "workspace_member_credits_depleted")
+	if result := SyncCodexUsageState(nil, account, stop); result.UsageWindowLimitsIgnored {
+		t.Fatal("UsageWindowLimitsIgnored = true under workspace hard stop, want false")
+	}
+
+	// 无 x-codex 头的响应（比如 5xx）不改变判断。
+	if result := SyncCodexUsageState(nil, account, &http.Response{Header: make(http.Header)}); result.UsageWindowLimitsIgnored {
+		t.Fatal("response without usage headers cleared the hard stop")
+	}
+
+	recovered := &http.Response{Header: make(http.Header)}
+	recovered.Header.Set("x-codex-primary-used-percent", "100")
+	recovered.Header.Set("x-codex-primary-window-minutes", "300")
+	recovered.Header.Set("x-codex-primary-reset-after-seconds", "3600")
+	if result := SyncCodexUsageState(nil, account, recovered); !result.UsageWindowLimitsIgnored {
+		t.Fatal("UsageWindowLimitsIgnored = false after response without reached-type, want true")
+	}
+}
+
+// sparse credits 头不完整（只有 balance）时整组丢弃，不能把 wham 的正确快照盖成「没积分」。
+func TestSyncCodexUsageStateIgnoresPartialCreditsHeaders(t *testing.T) {
+	account := &auth.Account{
+		AccessToken:           "at",
+		PlanType:              "team",
+		Status:                auth.StatusReady,
+		HealthTier:            auth.HealthTierHealthy,
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+	}
+	account.SetCreditBalanceDetails(nil, true, false, false, nil, "")
+
+	partial := &http.Response{Header: make(http.Header)}
+	partial.Header.Set("x-codex-primary-used-percent", "100")
+	partial.Header.Set("x-codex-primary-window-minutes", "300")
+	partial.Header.Set("x-codex-primary-reset-after-seconds", "3600")
+	partial.Header.Set("x-codex-credits-balance", "12.00")
+	result := SyncCodexUsageState(nil, account, partial)
+	if result.CreditsObserved {
+		t.Fatal("CreditsObserved = true for partial credits headers, want false")
+	}
+	if !result.UsageWindowLimitsIgnored {
+		t.Fatal("partial credits headers clobbered has_credits=true")
+	}
+
+	malformed := &http.Response{Header: make(http.Header)}
+	malformed.Header.Set("x-codex-credits-has-credits", "yes")
+	malformed.Header.Set("x-codex-credits-unlimited", "false")
+	if result := SyncCodexUsageState(nil, account, malformed); result.CreditsObserved {
+		t.Fatal("CreditsObserved = true for unparsable has-credits header, want false")
+	}
+	if credits, _ := account.GetCreditBalance(); !credits.HasCredits {
+		t.Fatalf("malformed headers overwrote credits: %+v", credits)
 	}
 }

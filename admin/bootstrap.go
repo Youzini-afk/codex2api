@@ -355,6 +355,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 	return &database.SystemSettings{
 		SiteName:                           database.DefaultSiteName,
 		MaxConcurrency:                     2,
+		CodexTelemetryEnabled:              false,
 		GlobalRPM:                          0,
 		TestModel:                          auth.DefaultTestModel,
 		TestContent:                        auth.DefaultTestContent,
@@ -384,7 +385,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		UsageLogFlushIntervalSeconds:       5,
 		StreamFlushPolicy:                  proxy.StreamFlushPolicyImmediate,
 		StreamFlushIntervalMS:              20,
-		FirstTokenMode:                     proxy.FirstTokenModeStrict,
+		FirstTokenMode:                     proxy.FirstTokenModeLoose,
 		FirstTokenTimeoutSeconds:           0,
 		BillingTierPolicy:                  proxy.BillingTierPolicyActual,
 		AffinityMode:                       "bounded",

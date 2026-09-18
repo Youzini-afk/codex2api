@@ -1280,6 +1280,32 @@ func normalizeResponsesInputItemIDs(body map[string]any) bool {
 	return modified
 }
 
+// responsesInputInternalMetadataField 是 Codex CLI 在自定义 provider 名为 "OpenAI"
+// 时附在 input 项顶层的内部元数据，ChatGPT 后端不接受该字段直接 400。
+const responsesInputInternalMetadataField = "internal_chat_message_metadata_passthrough"
+
+// stripResponsesInputInternalMetadata 只删 input[] 顶层项上的内部元数据字段，
+// 不碰 content/arguments 里恰好同名的用户内容。
+func stripResponsesInputInternalMetadata(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := itemMap[responsesInputInternalMetadataField]; exists {
+			delete(itemMap, responsesInputInternalMetadataField)
+			modified = true
+		}
+	}
+	return modified
+}
+
 func normalizeResponsesContentPartTypes(body map[string]any) bool {
 	inputItems, ok := body["input"].([]any)
 	if !ok {
@@ -1835,6 +1861,7 @@ func buildChatResponsesRequest(req openAIRequest) map[string]any {
 	normalizeResponsesContentPartTypes(out)
 	normalizeResponsesInputMessageContent(out)
 	normalizeResponsesInputItemIDs(out)
+	stripResponsesInputInternalMetadata(out)
 
 	// 2. reasoning effort + summary
 	// 显式向 Codex 请求 summary,否则上游不会发 response.reasoning_summary_text.delta,
@@ -2227,6 +2254,8 @@ type responsesBodyPrepareOptions struct {
 	expandPreviousResponse       bool
 	preservePreviousResponseID   bool
 	deferStructuredStringLengths bool
+	skipExpandedInput            bool
+	naturalImageIntent           *bool
 	cachedResponseItems          []json.RawMessage
 	// cacheOwner 是 previous_response_id 展开时使用的缓存归属命名空间
 	//（见 responseCacheOwner）。owner 不匹配的缓存按未命中处理，防跨用户注入。
@@ -2289,6 +2318,19 @@ func PrepareResponsesWebSocketBody(rawBody []byte) ([]byte, string) {
 	})
 }
 
+// The native turn only needs the outbound body. Preserve the public preparation
+// function's replay-input result for callers that actually consume it.
+func prepareResponsesWebSocketTurnBody(rawBody []byte) ([]byte, bool) {
+	var naturalImageIntent bool
+	body, _ := prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		preservePreviousResponseID:   true,
+		deferStructuredStringLengths: true,
+		skipExpandedInput:            true,
+		naturalImageIntent:           &naturalImageIntent,
+	})
+	return body, naturalImageIntent
+}
+
 const codexReasoningEncryptedContentInclude = "reasoning.encrypted_content"
 
 func ensureDefaultCodexInclude(body map[string]any) {
@@ -2334,6 +2376,11 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""
+	}
+	if opts.naturalImageIntent != nil {
+		// Inspect the original prompt before compatibility rewrites or automatic
+		// image-tool injection. Reuse this parse when selecting the transport.
+		*opts.naturalImageIntent = promptTextRequestsImageGeneration(extractResponsesPromptText(body))
 	}
 
 	// 1. 强制设置 Codex 必需字段
@@ -2441,6 +2488,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	normalizeResponsesToolCallArgumentTypes(body)
 	sanitizeMalformedResponsesFunctionCalls(body)
 	normalizeResponsesInputItemIDs(body)
+	stripResponsesInputInternalMetadata(body)
 	dropBareReasoningInputItems(body)
 	// 6c. 修复工具调用/输出的 call_id 配对（issue #414）。
 	// previous_response_id 保留给上游的原生续链场景跳过：历史存于上游服务端，
@@ -2473,6 +2521,9 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 
 	result, err := json.Marshal(body)
 	if err != nil {
+		if opts.skipExpandedInput {
+			return rawBody, ""
+		}
 		var expandedInputRaw string
 		if input, ok := body["input"]; ok {
 			if encoded, inputErr := json.Marshal(input); inputErr == nil {
@@ -2482,6 +2533,9 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		return rawBody, expandedInputRaw
 	}
 	result = normalizeCompactionTriggerFinal(result, false)
+	if opts.skipExpandedInput {
+		return result, ""
+	}
 	// Reuse the serialized input, including any final compaction adjustment.
 	// Serializing the same input tree separately doubles work on long histories.
 	return result, gjson.GetBytes(result, "input").Raw
@@ -3682,13 +3736,16 @@ type TokenDetails struct {
 }
 
 type UsageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-	InputTokens      int `json:"input_tokens,omitempty"`
-	OutputTokens     int `json:"output_tokens,omitempty"`
-	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
-	CachedTokens     int `json:"cached_tokens,omitempty"`
+	ImageInputTokens       int `json:"image_input_tokens,omitempty"`
+	ImageOutputTokens      int `json:"image_output_tokens,omitempty"`
+	CachedImageInputTokens int `json:"cached_image_input_tokens,omitempty"`
+	PromptTokens           int `json:"prompt_tokens"`
+	CompletionTokens       int `json:"completion_tokens"`
+	TotalTokens            int `json:"total_tokens"`
+	InputTokens            int `json:"input_tokens,omitempty"`
+	OutputTokens           int `json:"output_tokens,omitempty"`
+	ReasoningTokens        int `json:"reasoning_tokens,omitempty"`
+	CachedTokens           int `json:"cached_tokens,omitempty"`
 	// CacheWrite* 是 Anthropic 提示缓存写入 token（cache_creation_input_tokens 及其 5m/1h 细分）。
 	CacheWriteTokens   int `json:"cache_write_tokens,omitempty"`
 	CacheWrite5mTokens int `json:"cache_write_5m_tokens,omitempty"`
@@ -4403,7 +4460,11 @@ func extractUsageFromResult(usage gjson.Result) *UsageInfo {
 	outputTokens := int(usage.Get("output_tokens").Int())
 	reasoningTokens := int(usage.Get("output_tokens_details.reasoning_tokens").Int())
 	cachedTokens := int(usage.Get("input_tokens_details.cached_tokens").Int())
-	return newUsageInfo(inputTokens, outputTokens, reasoningTokens, cachedTokens)
+	result := newUsageInfo(inputTokens, outputTokens, reasoningTokens, cachedTokens)
+	result.ImageInputTokens = min(max(0, int(usage.Get("input_tokens_details.image_tokens").Int())), max(0, inputTokens))
+	result.ImageOutputTokens = min(max(0, int(usage.Get("output_tokens_details.image_tokens").Int())), max(0, outputTokens))
+	result.CachedImageInputTokens = min(max(0, int(usage.Get("input_tokens_details.cached_tokens_details.image_tokens").Int())), min(result.ImageInputTokens, max(0, cachedTokens)))
+	return result
 }
 
 // ExtractToolCallsFromOutputValidated extracts completed tool calls and rejects

@@ -848,6 +848,9 @@ func (h *Handler) markImageJobFailedDetached(jobID int64, message string, durati
 func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPayload, apiKey *database.APIKeyRow, opts imageJobRunOptions) {
 	ctx, cancel := context.WithTimeout(context.Background(), imageJobTimeout(req.N))
 	defer cancel()
+	ctx, settleBilling := proxy.DeferImageJobBilling(ctx)
+	deliveredImages := 0
+	defer func() { settleBilling(deliveredImages) }()
 	start := time.Now()
 	if err := h.db.MarkImageJobRunning(ctx, jobID); err != nil {
 		logImageJobError(jobID, err)
@@ -951,6 +954,7 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 	)
 
 	assets, assetWarnings, err := h.saveImageJobAssets(ctx, jobID, req, responseJSON)
+	deliveredImages = len(assets)
 	partialErrors = append(partialErrors, assetWarnings...)
 	if err != nil {
 		if len(assets) == 0 {
@@ -958,7 +962,7 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 			h.markImageJobFailedDetached(jobID, err.Error(), durationMs)
 			return
 		}
-		// Outputs saved before the failure are already stored and billed.
+		// Outputs saved before the failure remain available and will be billed.
 		// Report the failure as a warning so they stay reachable instead of
 		// becoming orphaned files behind a failed job.
 		partialErrors = append(partialErrors, err.Error())
@@ -1022,6 +1026,9 @@ func buildAdminImageEditRequest(req imageGenerationJobPayload) ([]byte, error) {
 func (h *Handler) runImageEditJob(jobID int64, req imageGenerationJobPayload, apiKey *database.APIKeyRow, opts imageJobRunOptions) {
 	ctx, cancel := context.WithTimeout(context.Background(), imageJobTimeout(req.N))
 	defer cancel()
+	ctx, settleBilling := proxy.DeferImageJobBilling(ctx)
+	deliveredImages := 0
+	defer func() { settleBilling(deliveredImages) }()
 	start := time.Now()
 	if err := h.db.MarkImageJobRunning(ctx, jobID); err != nil {
 		logImageJobError(jobID, err)
@@ -1105,6 +1112,7 @@ func (h *Handler) runImageEditJob(jobID int64, req imageGenerationJobPayload, ap
 	)
 
 	assets, assetWarnings, err := h.saveImageJobAssets(ctx, jobID, req, responseJSON)
+	deliveredImages = len(assets)
 	partialErrors = append(partialErrors, assetWarnings...)
 	if err != nil {
 		if len(assets) == 0 {
@@ -1340,6 +1348,9 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 			}
 		}
 		width, height := imageDimensions(imageBytes)
+		if width <= 0 || height <= 0 {
+			return saved, warnings, fmt.Errorf("output %d: 上游返回的图片无法解码", idx+1)
+		}
 		actualSize := ""
 		if width > 0 && height > 0 {
 			actualSize = fmt.Sprintf("%dx%d", width, height)
@@ -1539,7 +1550,7 @@ func imageAssetDir() string {
 
 // normalizeImageStudioModel 生图台只接受 Codex 生图模型族(gpt-image-2 及 -2k/-4k 档位
 // 别名、带日期快照名);其他名字回落到 gpt-image-2。
-// gpt-image-2.5 flare / sunburst 暂不公开,但这里按 gpt-image-* 前缀放行,属于预留透传。
+// Flare/Sunburst、日期快照和尺寸别名均按 gpt-image-* 前缀准入。
 func normalizeImageStudioModel(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" || proxy.IsGPTImageModel(model) {

@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"runtime"
 )
 
 const (
@@ -30,7 +29,7 @@ var (
 type continuousRetryReplay struct {
 	memory      bytes.Buffer
 	file        *os.File
-	tempPath    string
+	filePath    string
 	size        int64
 	memoryLimit int64
 	totalLimit  int64
@@ -89,16 +88,10 @@ func (r *continuousRetryReplay) Write(data []byte) (int, error) {
 		if err != nil {
 			return 0, errContinuousRetryReplayStorage
 		}
-		// The open descriptor is sufficient for replay. Removing the directory
-		// entry immediately prevents abandoned attempts from leaving files behind.
+		// The open descriptor is sufficient for replay on POSIX.
+		// On Windows, open files cannot be unlinked, so record filePath to remove on Close.
 		if err := os.Remove(file.Name()); err != nil {
-			if runtime.GOOS != "windows" {
-				_ = file.Close()
-				return 0, errContinuousRetryReplayStorage
-			}
-			// Windows cannot unlink an open file created by os.CreateTemp.
-			// Keep the path only until Close, then remove it immediately.
-			r.tempPath = file.Name()
+			r.filePath = file.Name()
 		}
 		r.file = file
 		if r.memory.Len() > 0 {
@@ -106,7 +99,7 @@ func (r *continuousRetryReplay) Write(data []byte) (int, error) {
 				_ = r.Close()
 				return 0, errContinuousRetryReplayStorage
 			}
-			r.memory.Reset()
+			r.memory = bytes.Buffer{}
 		}
 	}
 	n, err := r.file.Write(data)
@@ -164,7 +157,7 @@ func (r *continuousRetryReplay) Close() error {
 		return nil
 	}
 	r.closed = true
-	r.memory.Reset()
+	r.memory = bytes.Buffer{}
 	var closeErr error
 	if r.file != nil {
 		if err := r.file.Close(); err != nil {
@@ -172,11 +165,9 @@ func (r *continuousRetryReplay) Close() error {
 		}
 		r.file = nil
 	}
-	if r.tempPath != "" {
-		if err := os.Remove(r.tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			closeErr = errContinuousRetryReplayStorage
-		}
-		r.tempPath = ""
+	if r.filePath != "" {
+		_ = os.Remove(r.filePath)
+		r.filePath = ""
 	}
 	return closeErr
 }

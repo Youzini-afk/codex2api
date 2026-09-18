@@ -59,7 +59,7 @@ func durationFromEnv(key string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d < 0 {
-		log.Printf("[CodexTransport] %s=%q 非法，沿用默认 %s", key, raw, fallback)
+		log.Printf("[Config] %s=%q 非法，沿用默认 %s", key, raw, fallback)
 		return fallback
 	}
 	return d
@@ -547,6 +547,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	// 指纹收敛在 WS/HTTP 分叉前统一改写请求体，两条上游路径共享结果；请求头侧的
 	// 收敛（ApplyCodexFingerprintHeaders）从同一份「账号 + 下游头」推导，取值一致。
 	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
+	// 账号绑定时区：改写 environment_context 的时区/日期，与指纹收敛一样在分叉前统一处理。
+	requestBody = ApplyCodexTimezoneToBody(requestBody, account, time.Now())
 	// lite 信号收敛：签名在 payload 规则改写后采集（规则可注入/删除 WS 标记，改写
 	// 前采集会让注入失效、删除被回填），模型也已被入口映射/规则定稿——已知不支持
 	// lite 的模型带信号上游必 400，发出前剥离。
@@ -560,6 +562,14 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if account.IsCodexAgentIdentity() {
 		wantWebsocket = false
 	}
+	telemetryAttempt := beginCodexTelemetry(codexTelemetryRequest{
+		account: account, body: requestBody, sessionID: sessionID, proxyOverride: proxyOverride,
+		apiKey: apiKey, deviceCfg: deviceCfg, headers: headers,
+	})
+	defer func() { telemetryAttempt.observeResult(upstreamResponse, upstreamErr) }()
+	// 凭据级 turn state 强制注入：模型已由入口映射/规则定稿，传输方式也已定。
+	// 未配置的账号这里是空操作。
+	ctx, requestBody, headers = prepareCodexTurnStateInjection(ctx, account, requestBody, headers, wantWebsocket && WebsocketExecuteFunc != nil)
 	poolRouteKey := ""
 	if wantWebsocket {
 		sessionID = strings.TrimSpace(sessionID)
@@ -679,14 +689,10 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	// requestBody——它们解析 JSON，拿到压缩帧只会静默失配。
 	outboundBody, contentEncoding := CompressCodexRequestBody(requestBody)
 
-	// Resin 反向代理模式：改写 URL，使用标准 HTTP 客户端
-	var client *http.Client
-	if IsResinEnabled() {
-		endpoint = BuildReverseProxyURL(endpoint)
-		client = getResinHTTPClient(account)
-	} else {
-		client = getPooledClient(account, proxyURL)
-	}
+	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
+	egress := ResolveCodexEgress(account, endpoint, proxyURL)
+	endpoint = egress.URL
+	client := egress.Client()
 
 	send := func() (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(outboundBody))
@@ -696,6 +702,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 		// ==================== 请求头（伪装 Codex CLI） ====================
 		applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+		// 凭据级 turn state 注入在账号自定义头之后落定：自定义头不该顶掉它。
+		applyCodexTurnStateInjectionHeader(ctx, req.Header)
 		// Content-Encoding 在通用头装配之后设置：真实客户端也是在编码完成时才补这个头
 		// （codex-rs/http-client/src/request.rs prepare_encoded_json），且账号自定义头
 		// 不该有能力声明一个与实际字节不符的编码。
@@ -705,11 +713,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// routing hint 由网关按最终出站 body 合成，须在账号自定义头之后设置。
 		ApplyCodexRoutingHint(req.Header, account, requestBody)
 
-		// Resin 反代：注入账号身份头
-		if IsResinEnabled() {
-			req.Header.Set("X-Resin-Account", ResinAccountID(account))
-		}
-		logCodexFingerprintDebug("http", account, proxyURL, req.Header)
+		egress.ApplyHeaders(req.Header)
+		logCodexFingerprintDebug("http", account, egress.DialProxyURL, req.Header)
 
 		if err := ConsumeAPIKeyModelRequestQuota(ctx, gjson.GetBytes(requestBody, "model").String()); err != nil {
 			return nil, err
@@ -997,6 +1002,9 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	// 必须用 prepareCodexResponsesLiteTransport 之后的 headers（它可能返回克隆），
 	// 与下方 applyCodexRequestHeaders 取同一份下游头，两处推导结果才一致。
 	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
+	requestBody = ApplyCodexTimezoneToBody(requestBody, account, time.Now())
+	// 凭据级 turn state 强制注入：compact 与普通轮共用同一条回合状态。
+	ctx, requestBody, headers = prepareCodexTurnStateInjection(ctx, account, requestBody, headers, false)
 
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
@@ -1008,14 +1016,10 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	// compact 端点
 	endpoint := CodexBaseURL + "/responses/compact"
 
-	// Resin 反向代理模式
-	var client *http.Client
-	if IsResinEnabled() {
-		endpoint = BuildReverseProxyURL(endpoint)
-		client = getResinHTTPClient(account)
-	} else {
-		client = getPooledClient(account, proxyURL)
-	}
+	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
+	egress := ResolveCodexEgress(account, endpoint, proxyURL)
+	endpoint = egress.URL
+	client := egress.Client()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
@@ -1023,13 +1027,12 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	}
 
 	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+	applyCodexTurnStateInjectionHeader(ctx, req.Header)
 	// routing hint 由网关按最终出站 body 合成，须在账号自定义头之后设置。
 	ApplyCodexRoutingHint(req.Header, account, requestBody)
 
-	if IsResinEnabled() {
-		req.Header.Set("X-Resin-Account", ResinAccountID(account))
-	}
-	logCodexFingerprintDebug("compact", account, proxyURL, req.Header)
+	egress.ApplyHeaders(req.Header)
+	logCodexFingerprintDebug("compact", account, egress.DialProxyURL, req.Header)
 
 	if err := ConsumeAPIKeyModelRequestQuota(ctx, gjson.GetBytes(requestBody, "model").String()); err != nil {
 		return nil, err

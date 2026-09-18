@@ -193,6 +193,7 @@ const CHANNELS_STREAMING: readonly UpstreamChannel[] = ['codex', 'grok', 'antigr
 const CHANNELS_RELAY: readonly UpstreamChannel[] = ['codex', 'antigravity']
 const SETTINGS_TAB_KEYS: readonly SettingsTabKey[] = ['codex', 'claude', 'antigravity', 'grok', 'appearance', 'general']
 const DEFAULT_SETTINGS_TAB: SettingsTabKey = 'codex'
+const HIDDEN_IMAGE_DRIVER_MODELS = new Set(['gpt-5.3-codex-spark', 'codex-auto-review', 'gpt-reserve'])
 const isSettingsTabKey = (value: string | null): value is SettingsTabKey =>
   value !== null && (SETTINGS_TAB_KEYS as readonly string[]).includes(value)
 // 旧版单页锚点 → Tab 映射，保证外部深链不失效。
@@ -207,6 +208,7 @@ const LEGACY_SECTION_TABS: Record<string, SettingsTabKey> = {
   'settings-codex-quota': 'codex',
   'settings-codex-transport': 'codex',
   'settings-codex-client': 'codex',
+  'settings-codex-images': 'codex',
   'settings-grok': 'grok',
   'settings-claude': 'claude',
   'settings-antigravity': 'antigravity',
@@ -219,6 +221,7 @@ const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: str
     { id: 'settings-codex-quota', labelKey: 'settings.nav.codexQuota', icon: <Gauge /> },
     { id: 'settings-codex-transport', labelKey: 'settings.nav.codexTransport', icon: <Wifi /> },
     { id: 'settings-codex-client', labelKey: 'settings.nav.codexClient', icon: <Terminal /> },
+    { id: 'settings-codex-images', labelKey: 'settings.nav.codexImages', icon: <ImageIcon /> },
     { id: 'settings-models', labelKey: 'settings.nav.models', icon: <Layers /> },
   ],
   claude: [{ id: 'settings-claude', labelKey: 'settings.nav.claude', icon: <ChannelLogo channel="claude" size={16} /> }],
@@ -237,7 +240,7 @@ const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: str
 // 分区滚动高亮的判定线：分区顶部越过视口该高度即视为当前分区（要盖过粘性 Tab 栏）。
 const SETTINGS_SECTION_SPY_OFFSET_PX = 140
 // 手动保存字段的脏检查里跳过的键：生成号是服务端只读，自定义 Prompt 规则由规则页单独保存。
-const SETTINGS_DIRTY_IGNORED_KEYS: ReadonlySet<string> = new Set(['response_cache_config_generation', 'prompt_filter_custom_patterns'])
+const SETTINGS_DIRTY_IGNORED_KEYS: ReadonlySet<string> = new Set(['response_cache_config_generation', 'prompt_filter_custom_patterns', 'codex_images_default_main_model', 'codex_egress'])
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
@@ -279,9 +282,6 @@ const normalizeReasoningEffortValue = (effort: string) => {
 
 const normalizeBillingTierPolicyValue = (value?: string | null): 'actual' | 'requested' =>
   value === 'requested' ? 'requested' : 'actual'
-
-const normalizeFirstTokenModeValue = (value?: string | null): 'strict' | 'loose' =>
-  value === 'loose' ? 'loose' : 'strict'
 
 const getSettingsPatchValues = (settings: SystemSettings, keys: Array<keyof SystemSettings>): Partial<SystemSettings> => {
   const patch: Record<string, unknown> = {}
@@ -2136,10 +2136,6 @@ export default function Settings() {
     { label: t('settings.streamFlushImmediate'), value: 'immediate' },
     { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
   ]
-  const firstTokenModeOptions = [
-    { label: t('settings.firstTokenModeStrict'), value: 'strict' },
-    { label: t('settings.firstTokenModeLoose'), value: 'loose' },
-  ]
   const imageStorageBackendOptions = [
     { label: t('settings.imageStorageLocal'), value: 'local' },
     { label: t('settings.imageStorageS3'), value: 's3' },
@@ -2148,8 +2144,11 @@ export default function Settings() {
     const cacheNormalized = normalizeResponseCacheSettings(settings)
     const normalized = {
       ...cacheNormalized,
+      codex_images_main_model: cacheNormalized.codex_images_main_model ?? '',
+      codex_telemetry_enabled: cacheNormalized.codex_telemetry_enabled ?? false,
+      codex_telemetry_timing_debug: cacheNormalized.codex_telemetry_timing_debug ?? false,
       billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
-      first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
+      first_token_mode: 'loose',
       models_list_read_max_bytes:
         Number.isFinite(cacheNormalized.models_list_read_max_bytes) && cacheNormalized.models_list_read_max_bytes >= MIB
           ? cacheNormalized.models_list_read_max_bytes
@@ -2182,6 +2181,7 @@ export default function Settings() {
 	    usage_probe_responses_fallback_enabled: true,
 	    recovery_probe_interval_minutes: 30,
     lazy_mode: false,
+    codex_oauth_keepalive_enabled: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -2198,6 +2198,8 @@ export default function Settings() {
     auto_reset_credits_before_expiry_min: 60,
     auto_activate_5h_window_enabled: false,
     codex_force_websocket: false,
+    codex_telemetry_enabled: false,
+    codex_telemetry_timing_debug: false,
     codex_request_compression: true,
     codex_ws_weak_network_mode: false,
     codex_ws_keepalive_enabled: false,
@@ -2297,6 +2299,7 @@ export default function Settings() {
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
     codex_min_cli_version: '0.153.3',
+    codex_images_main_model: '',
     codex_cli_version_sync_enabled: true,
     codex_cli_version_sync_interval_hours: 12,
     codex_user_agent_config: '{}',
@@ -2305,7 +2308,7 @@ export default function Settings() {
     usage_log_flush_interval_seconds: 5,
     stream_flush_policy: 'immediate',
     stream_flush_interval_ms: 20,
-    first_token_mode: 'strict',
+    first_token_mode: 'loose',
     first_token_timeout_seconds: 0,
     first_token_excludes_ws_acquire: false,
     billing_tier_policy: 'actual',
@@ -2864,6 +2867,9 @@ export default function Settings() {
   const isExternalDatabase = settingsForm.database_driver === 'postgres'
   const isExternalCache = settingsForm.cache_driver === 'redis'
   const showConnectionPool = isExternalDatabase || isExternalCache
+  // Resin 生效与否以后端摘要为准(保存后随响应刷新),不按表单里未保存的草稿猜。
+  const codexEgress = persistedSettings?.codex_egress
+  const resinActive = Boolean(codexEgress?.resin_enabled)
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
   const siteLogoPreview = sanitizeBrandingLogo(settingsForm.site_logo) || DEFAULT_SITE_LOGO
@@ -2899,6 +2905,14 @@ export default function Settings() {
     )
     .map((model) => ({ label: model.id, value: model.id }))
   const enabledModelCount = visibleModelItems.filter((model) => model.enabled).length
+  const imagesDefaultMainModel = settingsForm.codex_images_default_main_model || 'gpt-5.6-luna'
+  const imagesMainModelOptions = [
+    { value: '', label: t('settings.codexImagesDefault', { model: imagesDefaultMainModel }) },
+    ...textModelOptions,
+  ]
+  if (settingsForm.codex_images_main_model && !imagesMainModelOptions.some((option) => option.value === settingsForm.codex_images_main_model)) {
+    imagesMainModelOptions.push({ value: settingsForm.codex_images_main_model, label: settingsForm.codex_images_main_model })
+  }
   const modelsLastSyncedLabel = modelsLastSyncedAt ? formatBeijingTime(modelsLastSyncedAt) : t('settings.modelsNeverSynced')
   const modelsSourceLabel = modelsSourceURL || 'https://developers.openai.com/codex/models'
   const anthropicMappingCount = useMemo(
@@ -3301,6 +3315,13 @@ export default function Settings() {
                               auto_clean_full_usage: enabled ? false : settingsFormRef.current.auto_clean_full_usage,
                             })
                           }}
+                        />
+                      </SettingField>
+                      <SettingField label={t('settings.codexOAuthKeepalive')} description={t('settings.codexOAuthKeepaliveDesc')} layout="switch">
+                        <Switch
+                          aria-label={t('settings.codexOAuthKeepalive')}
+                          checked={settingsForm.codex_oauth_keepalive_enabled}
+                          onCheckedChange={(checked) => autoSaveBooleanField('codex_oauth_keepalive_enabled', checked)}
                         />
                       </SettingField>
                       {inviteGuideEnabled !== null && (
@@ -4061,6 +4082,24 @@ export default function Settings() {
                         )}
                       </div>
                     </SettingField>
+                    <SettingField
+                      label={t('settings.codexTelemetry')}
+                      description={t('settings.codexTelemetryDesc')}
+                    >
+                      <Switch
+                        checked={settingsForm.codex_telemetry_enabled}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_telemetry_enabled', checked)}
+                      />
+                    </SettingField>
+                    <SettingField
+                      label={t('settings.codexTelemetryTiming')}
+                      description={t('settings.codexTelemetryTimingDesc')}
+                    >
+                      <Switch
+                        checked={settingsForm.codex_telemetry_timing_debug}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_telemetry_timing_debug', checked)}
+                      />
+                    </SettingField>
                     {/* CLI 版本自动同步：开关 + 间隔成对横排，行高一致 */}
                     <div className="sm:col-span-2 grid gap-0 overflow-hidden rounded-lg border border-border/60 bg-muted/15 sm:grid-cols-2 sm:divide-x sm:divide-border/60">
                       <div className="flex min-h-[48px] items-center justify-between gap-3 px-3 py-2.5">
@@ -4310,6 +4349,26 @@ export default function Settings() {
                   </div>
                 </div>
               </SettingsCard>
+              </SettingsSection>
+
+              <SettingsSection id="settings-codex-images" title={t('settings.nav.codexImages')} description={t('settings.nav.codexImagesDesc')} icon={<ImageIcon className="size-4" />}>
+                <SettingsCard title={t('settings.codexImagesDriver')} description={t('settings.codexImagesDriverDesc')} icon={<ImageIcon className="size-4" />}>
+                  <div className="space-y-4">
+                    <div className={SETTINGS_FIELD_GRID}>
+                      <SettingField label={t('settings.codexImagesMainModel')} description={t('settings.codexImagesMainModelDesc')}>
+                        <Select
+                          value={settingsForm.codex_images_main_model}
+                          options={imagesMainModelOptions.filter(({ value }) => !HIDDEN_IMAGE_DRIVER_MODELS.has(value.toLowerCase()))}
+                          onValueChange={(value) => autoSaveStringField('codex_images_main_model', value)}
+                        />
+                      </SettingField>
+                    </div>
+                    <div className="rounded-lg border border-border/60 bg-muted/20 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
+                      <p>{t('settings.codexImagesScope')}</p>
+                      <p className="mt-1.5">{t('settings.codexImagesFallback')}</p>
+                    </div>
+                  </div>
+                </SettingsCard>
               </SettingsSection>
 
               <SettingsSection id="settings-models" title={t('settings.nav.models')} description={t('settings.nav.modelsDesc')} icon={<Layers className="size-4" />}>
@@ -5557,13 +5616,6 @@ export default function Settings() {
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: value }))}
                       />
                     </SettingField>
-                    <SettingField label={t('settings.firstTokenMode')} description={t('settings.firstTokenModeDesc')}>
-                      <SegmentedPillGroup
-                        value={settingsForm.first_token_mode}
-                        onChange={(value) => autoSaveStringField('first_token_mode', value)}
-                        options={firstTokenModeOptions}
-                      />
-                    </SettingField>
                     <SettingField label={t('settings.firstTokenTimeout')} description={t('settings.firstTokenTimeoutDesc')}>
                       <DraftNumberInput
                         min={0}
@@ -5635,7 +5687,11 @@ export default function Settings() {
                     <Badge variant="outline" className="text-[11px]">
                       {t('settings.nav.restartRequired')}
                     </Badge>
-                  ) : null
+                  ) : (
+                    <Badge variant={resinActive ? 'default' : 'outline'} className="text-[11px]">
+                      {resinActive ? t('settings.resinActiveBadge') : t('settings.resinInactiveBadge')}
+                    </Badge>
+                  )
                 }
               >
                 <div className="space-y-4">
@@ -5665,10 +5721,28 @@ export default function Settings() {
                   ) : null}
                   {showConnectionPool ? (
                     <div className="border-t border-border/80 pt-4">
-                      <h4 className="text-[13px] font-semibold text-foreground sm:text-sm">{t('settings.resinTitle')}</h4>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h4 className="text-[13px] font-semibold text-foreground sm:text-sm">{t('settings.resinTitle')}</h4>
+                        <Badge variant={resinActive ? 'default' : 'outline'} className="text-[11px]">
+                          {resinActive ? t('settings.resinActiveBadge') : t('settings.resinInactiveBadge')}
+                        </Badge>
+                      </div>
                       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t('settings.resinDesc')}</p>
                     </div>
                   ) : null}
+                  {/* 三套出口并存时必须明说谁在生效(issue #679):Resin 是整层覆盖,不是叠加。 */}
+                  <div
+                    className={cn(
+                      'rounded-lg border px-3 py-2 text-xs leading-relaxed',
+                      resinActive
+                        ? 'border-amber-500/30 bg-amber-500/5 text-amber-800 dark:text-amber-200'
+                        : 'border-border/60 bg-muted/20 text-muted-foreground',
+                    )}
+                  >
+                    {resinActive
+                      ? t('settings.resinActiveNote', { endpoint: codexEgress?.resin_endpoint || '', platform: codexEgress?.resin_platform_name || '' })
+                      : t('settings.resinInactiveNote')}
+                  </div>
                   <div className={SETTINGS_FIELD_GRID}>
                     <SettingField label={t('settings.resinUrl')} description={t('settings.resinUrlDesc')}>
                       <Input

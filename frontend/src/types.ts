@@ -235,7 +235,40 @@ export interface GrokPlanInfo {
   billing: boolean
 }
 
+export type SubscriptionBusinessStatus = 'active' | 'expiring_today' | 'expired' | 'grace_period' | 'unknown'
+export type SubscriptionSyncState = 'confirmed' | 'pending' | 'failed' | 'unknown' | 'unsupported'
+export type SubscriptionAutoRenew = 'enabled' | 'disabled' | 'unsupported' | 'unknown'
+
+/** 订阅状态对象:业务状态(到期判定)与同步状态(数据新鲜度)分开表达。 */
+export interface SubscriptionStatus {
+  business_status: SubscriptionBusinessStatus
+  plan?: string
+  expires_at?: ISODateString
+  days_remaining: number
+  days_overdue: number
+  last_known_status?: SubscriptionBusinessStatus
+  auto_renew: SubscriptionAutoRenew
+  grace_until?: ISODateString
+  last_checked_at?: ISODateString
+  source?: 'jwt' | 'plan_header' | 'provider_api' | string
+  sync_state: SubscriptionSyncState
+  renewal_detected_at?: ISODateString
+  error?: string
+  timezone: string
+}
+
+export type SubscriptionRefreshOutcome = 'updated' | 'unchanged' | 'no_subscription' | 'unsupported' | 'failed'
+
+export interface SubscriptionRefreshResponse {
+  outcome: SubscriptionRefreshOutcome
+  error?: string
+  subscription?: SubscriptionStatus
+  subscription_expires_at?: ISODateString
+}
+
 export interface AccountRow {
+  codex_last_refresh_at?: string
+  codex_refresh_error?: string
   upstream_request_id_header?: string | null
   detail_loaded?: boolean
   id: number
@@ -248,6 +281,8 @@ export interface AccountRow {
   effective_workspace_id?: string
   plan_type: string
   subscription_expires_at?: string
+  /** 服务端按业务时区计算的订阅状态对象;不跟踪订阅的套餐(api/无到期时间的 free)缺省。 */
+  subscription?: SubscriptionStatus
   status: AccountStatus
   error_message?: string
   at_only?: boolean
@@ -300,6 +335,12 @@ export interface AccountRow {
   claude_usage_windows_probed?: boolean
   timezone?: string
   custom_headers?: Record<string, string> | null
+  /** Forced X-Codex-Turn-State injected on every outbound Codex request; empty = off. */
+  codex_turn_state?: string
+  /** Comma-separated model scope for the injection; empty = all models. */
+  codex_turn_state_models?: string
+  /** RFC3339 timestamp of the last time the injected value changed; absent = unknown. */
+  codex_turn_state_set_at?: string
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -354,10 +395,13 @@ export interface AccountRow {
   usage_percent_spark?: number | null
   rate_limit_reset_credits?: number | null
   applicable_reset_credits?: number | null
+  credits_valid?: boolean
   credits_balance?: string | null
   credits_has_credits?: boolean | null
   credits_unlimited?: boolean | null
   credits_overage_limit_reached?: boolean | null
+  credits_spend_control_reached?: boolean | null
+  credits_rate_limit_reached_type?: string | null
   auto_pause_5h_threshold?: number | null
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
@@ -488,6 +532,31 @@ export interface AccountLiveStateResponse {
   session_slot_buffer_enabled: boolean
 }
 
+export type SubscriptionFilter =
+  | 'all'
+  | 'active'
+  | 'expiring_9d'
+  | 'expiring_3d'
+  | 'expiring_today'
+  | 'expired'
+  | 'grace_period'
+  | 'pending'
+  | 'failed'
+  | 'unknown'
+
+export const SUBSCRIPTION_FILTER_OPTIONS: SubscriptionFilter[] = [
+  'all',
+  'expiring_9d',
+  'expiring_3d',
+  'expiring_today',
+  'expired',
+  'grace_period',
+  'active',
+  'pending',
+  'failed',
+  'unknown',
+]
+
 export interface AccountsPageParams {
   channel?: UpstreamChannel
   page: number
@@ -504,6 +573,8 @@ export interface AccountsPageParams {
   healthTier?: 'healthy' | 'warm' | 'risky' | 'banned' | 'attention'
   proxyUrl?: string
   proxyFilter?: 'all' | 'unbound' | 'this' | 'other'
+  /** 订阅状态筛选(Codex 渠道),值见 SUBSCRIPTION_FILTER_OPTIONS。 */
+  subscription?: SubscriptionFilter
   sort?: 'requests' | 'today' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
   order?: 'asc' | 'desc'
 }
@@ -589,6 +660,7 @@ export interface AccountOperationSelector {
   ungrouped?: boolean
   refreshable_only?: boolean
   subscription_unlocked?: boolean
+  subscription?: SubscriptionFilter
 }
 
 // 单张「主动重置次数」券的有效期明细（issue #322）。
@@ -1395,6 +1467,8 @@ export interface UpdateAccountSchedulerRequest {
   claude_version_policy?: 'passthrough' | 'fixed' | 'minimum' | null
   claude_client_version?: string | null
   timezone?: string | null
+  codex_turn_state?: string | null
+  codex_turn_state_models?: string | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -1943,6 +2017,15 @@ export interface AntigravityOAuthClientSetting {
   client_secret?: string
 }
 
+/** Codex 渠道当前由谁承担出站:resin 为整层覆盖,proxy_chain 表示按 账号 > 分组 > 代理池 > 全局 > 直连 解析。 */
+export interface CodexEgressSummary {
+  mode: 'resin' | 'proxy_chain' | string
+  resin_enabled: boolean
+  /** 打码后的 Resin 地址(不含 token),仅用于展示。 */
+  resin_endpoint?: string
+  resin_platform_name?: string
+}
+
 export interface SystemSettings {
   site_name: string
   site_logo: string
@@ -1962,6 +2045,7 @@ export interface SystemSettings {
 	  usage_probe_responses_fallback_enabled: boolean
 	  recovery_probe_interval_minutes: number
   lazy_mode: boolean
+  codex_oauth_keepalive_enabled: boolean
   proxy_url?: string
   pg_max_conns: number
   redis_pool_size: number
@@ -1980,6 +2064,8 @@ export interface SystemSettings {
   fast_scheduler_enabled: boolean
   scheduler_engine: 'legacy' | 'shadow' | 'indexed'
   codex_force_websocket: boolean
+  codex_telemetry_enabled: boolean
+  codex_telemetry_timing_debug: boolean
   codex_request_compression: boolean
   codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
@@ -2082,6 +2168,8 @@ export interface SystemSettings {
   reasoning_effort_models: string
   resin_url: string
   resin_platform_name: string
+  /** 后端权威的 Codex 出口摘要(只读):Resin 启用时代理池/分组/账号/全局代理对 Codex 渠道均不参与出站。 */
+  codex_egress?: CodexEgressSummary
   prompt_filter_enabled: boolean
   prompt_filter_mode: 'monitor' | 'warn' | 'block' | string
   prompt_filter_threshold: number
@@ -2105,6 +2193,8 @@ export interface SystemSettings {
   prompt_filter_review_fail_closed: boolean
   client_compat_mode: 'preserve' | 'auto' | 'force' | string
   codex_min_cli_version: string
+  codex_images_main_model: string
+  codex_images_default_main_model?: string
   codex_cli_version_sync_enabled: boolean
   codex_cli_version_sync_interval_hours: number
   codex_synced_cli_version?: string
@@ -3344,10 +3434,17 @@ export interface APIKeyAccountStatsResponse {
 }
 
 export interface UsageLog {
+  user_billing_mode?: '' | 'token' | 'per_image'
+  image_unit_price?: number
+  billed_image_count?: number
   request_id?: string
   upstream_request_id?: string
   upstream_proxy_id?: number
   upstream_proxy_name?: string
+  /** X-Codex-Turn-State value the gateway injected on this attempt ("" = none). */
+  injected_turn_state?: string
+  /** X-Codex-Turn-State value observed from the upstream response ("" = none). */
+  upstream_turn_state?: string
   id: number
   account_id: number
   // 上游渠道(codex/grok),写入时固化;历史行回填,可能为空
@@ -3377,8 +3474,16 @@ export interface UsageLog {
   stream: boolean
   compact: boolean
   has_compaction_history: boolean
+  ultra?: boolean
   via_websocket?: boolean
   cached_tokens: number
+  image_input_tokens?: number
+  image_output_tokens?: number
+  cached_image_input_tokens?: number
+  image_input_cost?: number
+  image_cache_read_cost?: number
+  image_input_price_per_mtoken?: number
+  cached_image_input_price_per_mtoken?: number
   cache_write_5m_tokens: number
   cache_write_1h_tokens: number
   service_tier: string
@@ -3462,6 +3567,10 @@ export interface ChartAggregation {
 }
 
 export interface ModelPricingOverride {
+  user_billing_mode?: 'token' | 'per_image'
+  image_unit_price?: number
+  image_input?: number
+  cached_image_input?: number
   source?: string
   input?: number
   cached_input?: number
@@ -3727,6 +3836,16 @@ export interface UpdateAPIKeyRequest {
   enabled?: boolean
 }
 
+export interface ImageStudioQuota {
+  image_pricing?: Record<string, { user_billing_mode: 'token' | 'per_image'; image_unit_price?: number }>
+  quota_limit: number
+  quota_used: number
+  quota_remaining: number | null
+  expires_at: ISODateString | null
+  status: 'active' | 'expired' | 'quota_exhausted'
+  refresh_after_seconds: number
+}
+
 export interface PublicAPIKeyUsageKey {
   name: string
   key: string
@@ -3792,6 +3911,9 @@ export interface PublicAPIKeyUsageBreakdown {
 }
 
 export interface PublicAPIKeyUsageLog {
+  user_billing_mode?: '' | 'token' | 'per_image'
+  image_unit_price?: number
+  billed_image_count?: number
   id: number
   endpoint: string
   model: string
@@ -3817,6 +3939,7 @@ export interface PublicAPIKeyUsageLog {
   stream: boolean
   compact: boolean
   has_compaction_history: boolean
+  ultra?: boolean
   via_websocket: boolean
   upstream_error_kind: string
   created_at: ISODateString

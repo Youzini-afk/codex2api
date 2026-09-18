@@ -518,6 +518,10 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.CodexClientMetadataMode = src.CodexClientMetadataMode
 	dst.CodexPassthroughMode = src.CodexPassthroughMode
 	dst.CodexFingerprintMode = src.CodexFingerprintMode
+	dst.Timezone = src.Timezone
+	dst.CodexTurnState = src.CodexTurnState
+	dst.CodexTurnStateModels = src.CodexTurnStateModels
+	dst.CodexTurnStateSetAt = src.CodexTurnStateSetAt
 	dst.ClaudeFingerprintMode = src.ClaudeFingerprintMode
 	dst.claudeSessionWindow = src.claudeSessionWindow
 	dst.CodexAuthMode = src.CodexAuthMode
@@ -867,6 +871,7 @@ func (s *Store) applyStoreSystemSettings(settings *database.SystemSettings) erro
 	}
 
 	s.SetCodexForceWebsocket(settings.CodexForceWebsocket)
+	s.SetCodexOAuthKeepalive(settings.CodexOAuthKeepaliveEnabled)
 	s.SetCodexRequestCompression(settings.CodexRequestCompression)
 	s.SetCodexWSKeepaliveEnabled(settings.CodexWSKeepaliveEnabled)
 	s.SetCodexWSKeepaliveIntervalSec(settings.CodexWSKeepaliveIntervalSec)
