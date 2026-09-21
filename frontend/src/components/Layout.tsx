@@ -12,6 +12,7 @@ import { useTheme } from '../hooks/useTheme'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
 import SecurityBanner from './SecurityBanner'
+import GrokImportProgressHost from './GrokImportProgressHost'
 import { cn } from '@/lib/utils'
 import { CinematicThemeSwitcher } from '@/components/ui/cinematic-theme-switcher'
 
@@ -333,6 +334,7 @@ export default function Layout({ children }: PropsWithChildren) {
 
   return (
     <div className="relative min-h-dvh">
+      <GrokImportProgressHost />
       {backgroundImage ? (
         <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
           {isBackgroundVideo ? (
