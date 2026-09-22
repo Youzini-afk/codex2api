@@ -213,6 +213,12 @@ func TestMarkTransientRateLimitedProgressiveBackoff(t *testing.T) {
 	if first < 14*time.Second || first > 16*time.Second {
 		t.Fatalf("first cooldown = %v, want about 15s", first)
 	}
+	if got := acc.GetCooldownReason(); got != TransientRateLimitedCooldownReason {
+		t.Fatalf("transient cooldown reason = %q, want %q", got, TransientRateLimitedCooldownReason)
+	}
+	if got := acc.GetCooldownReason(); got == ResponsesRateLimitedCooldownReason {
+		t.Fatal("transient throttle must not use the authoritative Responses reason")
+	}
 	if got := acc.TransientRateLimitBackoff(); got != 1 {
 		t.Fatalf("backoff after first = %d, want 1", got)
 	}
@@ -237,6 +243,28 @@ func TestMarkTransientRateLimitedProgressiveBackoff(t *testing.T) {
 	}
 	if got := acc.TransientRateLimitBackoff(); got != 2 {
 		t.Fatalf("backoff after escalate = %d, want 2", got)
+	}
+}
+
+func TestSetModelCooldownSettingsOffClearsExistingTransientCooldown(t *testing.T) {
+	store := newTransientRateLimitTestStore()
+	acc := &Account{DBID: 8, AccessToken: "token", Status: StatusReady}
+	store.AddAccount(acc)
+	store.MarkTransientRateLimited(acc, 0)
+	if !acc.HasActiveCooldown() {
+		t.Fatal("transient throttle did not create a cooldown")
+	}
+
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{
+		RelayMode: database.ModelCooldownModeOff,
+		OAuthMode: database.ModelCooldownModeOff,
+	})
+
+	if acc.HasActiveCooldown() {
+		t.Fatal("turning off 429 cooldown must clear an existing transient freeze")
+	}
+	if got := acc.GetCooldownReason(); got != "" {
+		t.Fatalf("cooldown reason after disabling policy = %q, want empty", got)
 	}
 }
 

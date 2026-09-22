@@ -16,6 +16,11 @@ const premium5hCooldownReason = "rate_limited_5h"
 // bypass only the latter when IgnoreUsageLimitStatus is enabled.
 const ResponsesRateLimitedCooldownReason = "responses_rate_limited"
 
+// TransientRateLimitedCooldownReason marks a short account-wide throttle.
+// It is deliberately separate from an authoritative Responses quota rejection:
+// the UI must not infer a 5h/7d reset from a seconds-long ordinary 429.
+const TransientRateLimitedCooldownReason = "transient_rate_limited"
+
 // NormalizePlanType canonicalizes a plan string for behavior-level comparisons.
 // OpenAI reports the $100 Pro tier as "prolite"; functionally it is a Pro plan
 // with a smaller usage cap, so we fold it into "pro" so that downstream plan

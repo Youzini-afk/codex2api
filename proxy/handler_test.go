@@ -4399,7 +4399,7 @@ func TestApplyResponseFailedSemantic429IgnoresOuterHeadersForOrdinaryModel(t *te
 	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited" {
 		t.Fatalf("decision = %#v, want ordinary semantic 429 account fallback", decision)
 	}
-	if !account.HasActiveCooldown() || account.GetCooldownReason() != auth.ResponsesRateLimitedCooldownReason {
+	if !account.HasActiveCooldown() || account.GetCooldownReason() != auth.TransientRateLimitedCooldownReason {
 		t.Fatal("ordinary semantic 429 should retain the existing short account cooldown")
 	}
 	if account.IsPremium5hRateLimited() {
@@ -4458,7 +4458,7 @@ func TestApplyResponseFailedSemantic429SparkUsesTransientAccountCooldown(t *test
 	if decision.Cooldown < 10*time.Second || decision.Cooldown > 20*time.Second {
 		t.Fatalf("transient Spark cooldown = %v, want about 15s", decision.Cooldown)
 	}
-	if !account.HasActiveCooldown() || account.GetCooldownReason() != auth.ResponsesRateLimitedCooldownReason {
+	if !account.HasActiveCooldown() || account.GetCooldownReason() != auth.TransientRateLimitedCooldownReason {
 		t.Fatal("transient Spark 429 should freeze the whole account")
 	}
 	if account.IsPremium5hRateLimited() {

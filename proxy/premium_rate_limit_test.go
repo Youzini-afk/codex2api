@@ -97,8 +97,29 @@ func TestApply429CooldownUnknownRateLimitSetsAccountCooldown(t *testing.T) {
 	if acc.IsModelRateLimited("gpt-5.4") {
 		t.Fatal("transient 429 must not be scoped to one model alias")
 	}
-	if !acc.HasActiveCooldown() || acc.GetCooldownReason() != auth.ResponsesRateLimitedCooldownReason {
+	if !acc.HasActiveCooldown() || acc.GetCooldownReason() != auth.TransientRateLimitedCooldownReason {
 		t.Fatal("transient 429 should freeze the whole account")
+	}
+}
+
+func TestApply429CooldownOAuthOffDoesNotLeaveTransientAccountCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                   4,
+		TestConcurrency:                  1,
+		TestModel:                        "gpt-5.4",
+		OAuthModelCooldownMode:           database.ModelCooldownModeOff,
+		OAuthModelCooldownSeconds:        300,
+		OAuthModelCooldownBackoffEnabled: true,
+	})
+	acc := &auth.Account{DBID: 7, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+
+	decision := Apply429Cooldown(store, acc, []byte(`{"error":{"type":"rate_limit_error"}}`), nil, "gpt-5.4")
+
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited" {
+		t.Fatalf("Apply429Cooldown() = %#v, want account-scoped transient throttle", decision)
+	}
+	if acc.HasActiveCooldown() {
+		t.Fatal("OAuth model cooldown off must not leave a transient account cooldown")
 	}
 }
 

@@ -455,9 +455,9 @@ func accountAnalysisUsage(item *accountListSnapshotItem, window string) (float64
 func accountAnalysisShortRateLimited(item *accountListSnapshotItem) bool {
 	status := strings.ToLower(item.Status)
 	reason := strings.ToLower(item.CooldownReason)
-	return status == "rate_limited" || status == auth.ResponsesRateLimitedCooldownReason ||
+	return status == "rate_limited" || status == auth.TransientRateLimitedCooldownReason || status == auth.ResponsesRateLimitedCooldownReason ||
 		status == "rate_limited_5h" || status == "cooldown" ||
-		reason == "rate_limited" || reason == auth.ResponsesRateLimitedCooldownReason ||
+		reason == "rate_limited" || reason == auth.TransientRateLimitedCooldownReason || reason == auth.ResponsesRateLimitedCooldownReason ||
 		reason == "rate_limited_5h"
 }
 

@@ -54,6 +54,12 @@ function isFutureTime(value?: string): boolean {
 function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
   const status = (account.status || "").toLowerCase();
   const reason = (account.cooldown_reason || "").toLowerCase();
+  if (
+    status === "transient_rate_limited" ||
+    reason === "transient_rate_limited"
+  ) {
+    return null;
+  }
   if (status === "rate_limited_5h") return "5h";
   if (status === "rate_limited_7d") return "7d";
   if (reason === "rate_limited_5h") return "5h";

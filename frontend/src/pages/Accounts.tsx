@@ -12935,6 +12935,14 @@ function isRateLimitedAccount(account: AccountRow): boolean {
   // 照常放行。健康分类与筛选按"可用"计，否则一个正在正常干活的账号会被算进限流数、
   // 被「限流」筛选捞出来，与旁边的积分徽章互相矛盾。
   if (account.using_credits) return false;
+  const status = (account.status || "").toLowerCase();
+  const reason = (account.cooldown_reason || "").toLowerCase();
+  if (
+    status === "transient_rate_limited" ||
+    reason === "transient_rate_limited"
+  ) {
+    return true;
+  }
   return getAccountRateLimitWindow(account) !== null;
 }
 
@@ -12943,6 +12951,14 @@ function getAccountRateLimitWindow(
 ): RateLimitWindow | null {
   const status = (account.status || "").toLowerCase();
   const reason = (account.cooldown_reason || "").toLowerCase();
+  // A seconds-long ordinary 429 is not a 5h/7d usage window. Its own
+  // cooldown_until is rendered separately by AccountStatusCountdown.
+  if (
+    status === "transient_rate_limited" ||
+    reason === "transient_rate_limited"
+  ) {
+    return null;
+  }
   const explicitlyRateLimited =
     status === "rate_limited" ||
     status === "responses_rate_limited" ||
@@ -14971,6 +14987,7 @@ function getAccountStatusCountdownUntil(
   const status = account.status;
   const rateLimited =
     status === "rate_limited" ||
+    status === "transient_rate_limited" ||
     status === "responses_rate_limited" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d";

@@ -8374,6 +8374,15 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		return decision
 	}
 	if decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited" {
+		// The OAuth account-wide transient freeze is still part of the 429
+		// protection path. Respect the same policy switch shown in the admin UI:
+		// when it is off, do not leave a seconds-long local cooldown behind a
+		// plain upstream throttle. Explicit usage-window decisions above remain
+		// authoritative and are intentionally unaffected.
+		policy := store.ResolveModelCooldownPolicy(account)
+		if policy.Mode == database.ModelCooldownModeOff || policy.Seconds <= 0 {
+			return decision
+		}
 		// Pass only an actual upstream hint. Reusing the synthetic 15s floor
 		// here would slide the same cooldown forward on every in-flight 429.
 		applied := store.MarkTransientRateLimited(account, transient429RetryAfter(body, resp, time.Now()))

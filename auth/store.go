@@ -2087,7 +2087,8 @@ func (a *Account) FreshDispatchUsageLimited() bool {
 	if a.usageWindowBlocksFreshDispatchLocked(now) {
 		return true
 	}
-	return a.Status == StatusCooldown && now.Before(a.CooldownUtil) && isUsageLimitCooldownReason(a.CooldownReason)
+	return a.Status == StatusCooldown && now.Before(a.CooldownUtil) &&
+		(isUsageLimitCooldownReason(a.CooldownReason) || a.isTransientRateLimitCooldownLocked())
 }
 
 func (a *Account) recomputeEffectiveIgnoreUsageLimitStatus(global bool) {
@@ -3444,7 +3445,8 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 		// 恢复探针由 ProbeUsageSnapshot 按权威判定与 fallback 设置决定。
 		return resetCreditsStale
 	}
-	if a.Status == StatusCooldown && isUsageLimitCooldownReason(a.CooldownReason) && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
+	if a.Status == StatusCooldown && isUsageLimitCooldownReason(a.CooldownReason) &&
+		!a.isTransientRateLimitCooldownLocked() && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		// 429 冷却期间仍允许 wham 刷新重置次数；Responses 权威模式可在同一轮
 		// 补一次真实恢复探针，其他模式保持 wham-only。
 		return resetCreditsStale
@@ -3534,7 +3536,9 @@ func (a *Account) InLimitedState() bool {
 	if a.premium5hRateLimitedLocked(now) {
 		return true
 	}
-	if a.Status == StatusCooldown && isUsageLimitCooldownReason(a.CooldownReason) && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
+	if a.Status == StatusCooldown &&
+		(isUsageLimitCooldownReason(a.CooldownReason) || a.isTransientRateLimitCooldownLocked()) &&
+		(a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return true
 	}
 	return false
@@ -4040,6 +4044,12 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 		return
 	}
 	reason := normalizeCooldownReason(record.Reason)
+	// Older instances used the authoritative Responses reason for transient
+	// freezes. A shared cache entry may outlive one process, so normalize that
+	// legacy transient record before exposing it to the runtime/UI.
+	if record.Kind == cache.CooldownKindTransient && reason == ResponsesRateLimitedCooldownReason {
+		reason = TransientRateLimitedCooldownReason
+	}
 	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
 	acc.mu.Lock()
 	current := runtimeCooldownRecord{Reason: acc.CooldownReason, ResetAt: acc.CooldownUtil}
@@ -4059,7 +4069,7 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 	acc.CooldownUtil = record.ResetAt
 	acc.CooldownReason = reason
 	acc.transientRateLimitUntil = time.Time{}
-	if record.Kind == cache.CooldownKindTransient && reason == ResponsesRateLimitedCooldownReason {
+	if record.Kind == cache.CooldownKindTransient && reason == TransientRateLimitedCooldownReason {
 		acc.transientRateLimitUntil = record.ResetAt
 		acc.transientRateLimitBackoff = max(acc.transientRateLimitBackoff, record.BackoffLevel)
 		acc.armTransientRateLimitRecoveryLocked(s)
@@ -6568,7 +6578,8 @@ func (s *Store) CollectCleanTargets(targetStatus string, match func(*Account) bo
 			continue
 		}
 		status := acc.RuntimeStatus()
-		if status != targetStatus && !(targetStatus == "rate_limited" && status == ResponsesRateLimitedCooldownReason) {
+		if status != targetStatus && !(targetStatus == "rate_limited" &&
+			(status == ResponsesRateLimitedCooldownReason || status == TransientRateLimitedCooldownReason)) {
 			continue
 		}
 		// 正在用积分顶替限流的账号显示为限流，但实际仍在正常调度——清理会误删好账号。
@@ -6598,7 +6609,7 @@ func (s *Store) CollectRateLimitedManualTargets() []*Account {
 			continue
 		}
 		status := acc.RuntimeStatus()
-		if status != "rate_limited" && status != ResponsesRateLimitedCooldownReason && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
+		if status != "rate_limited" && status != TransientRateLimitedCooldownReason && status != ResponsesRateLimitedCooldownReason && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
 			continue
 		}
 		if acc.UsingCredits() {
@@ -10540,6 +10551,7 @@ func (s *Store) SetModelCooldownSettings(settings database.ModelCooldownSettings
 		return
 	}
 	s.modelCooldownSettings.Store(database.NormalizeModelCooldownSettings(settings))
+	s.clearDisabledTransientRateLimitCooldowns()
 }
 
 func (s *Store) GetModelCooldownSettings() database.ModelCooldownSettings {

@@ -363,7 +363,7 @@ func (s *Store) shouldBackgroundRefresh(acc *Account, codexOnly bool) bool {
 			return false
 		}
 		switch acc.CooldownReason {
-		case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limit", "usage_limited", ResponsesRateLimitedCooldownReason:
+		case "rate_limited", TransientRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limit", "usage_limited", ResponsesRateLimitedCooldownReason:
 			return true
 		default:
 			return false

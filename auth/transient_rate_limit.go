@@ -45,7 +45,9 @@ func nextTransientRateLimitCooldown(level int, retryAfter time.Duration) time.Du
 // MarkTransientRateLimited applies an account-wide short freeze for a Codex
 // throttle. Concurrent 429s that land while the current window is still open
 // reuse that deadline instead of climbing the backoff ladder. An already
-// longer quota cooldown is left untouched.
+// longer quota cooldown is left untouched. The runtime reason is deliberately
+// distinct from ResponsesRateLimitedCooldownReason so a seconds-long throttle
+// cannot be rendered as a 5h/7d quota reset.
 //
 // Unlike a quota cooldown the freeze is seconds long, so it neither triggers
 // a WHAM usage probe nor is written to the database: under a burst that would
@@ -92,12 +94,12 @@ func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration)
 	// Publish all local fields in one critical section; concurrent failures
 	// cannot observe the new backoff without the window that caused it.
 	acc.LastRateLimitedAt = now
-	acc.setCooldownUntilLocked(until, ResponsesRateLimitedCooldownReason)
+	acc.setCooldownUntilLocked(until, TransientRateLimitedCooldownReason)
 	acc.transientRateLimitUntil = until
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.armTransientRateLimitRecoveryLocked(s)
 	record := runtimeCooldownRecord{
-		Kind: cache.CooldownKindTransient, Reason: ResponsesRateLimitedCooldownReason,
+		Kind: cache.CooldownKindTransient, Reason: TransientRateLimitedCooldownReason,
 		ResetAt: until, UpdatedAt: now, BackoffLevel: acc.transientRateLimitBackoff,
 	}
 	acc.mu.Unlock()
@@ -110,8 +112,43 @@ func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration)
 	return max(time.Until(deadline), 0)
 }
 
+// clearDisabledTransientRateLimitCooldowns releases short account-wide 429
+// freezes whose effective OAuth policy has just been switched off. Quota and
+// authoritative Responses cooldowns are deliberately left untouched.
+func (s *Store) clearDisabledTransientRateLimitCooldowns() {
+	if s == nil {
+		return
+	}
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil || s.ResolveModelCooldownPolicy(acc).Mode != "off" {
+			continue
+		}
+		acc.mu.Lock()
+		if !acc.isTransientRateLimitCooldownLocked() {
+			acc.mu.Unlock()
+			continue
+		}
+		acc.Status = StatusReady
+		acc.CooldownUtil = time.Time{}
+		acc.CooldownReason = ""
+		acc.transientRateLimitUntil = time.Time{}
+		acc.transientRateLimitBackoff = 0
+		if acc.transientRateLimitTimer != nil {
+			acc.transientRateLimitTimer.Stop()
+			acc.transientRateLimitTimer = nil
+		}
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierWarm
+		}
+		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+		acc.mu.Unlock()
+		s.fastSchedulerUpdate(acc)
+		s.deleteCachedAccountCooldown(acc.DBID)
+	}
+}
+
 func (a *Account) isTransientRateLimitCooldownLocked() bool {
-	return a.Status == StatusCooldown && a.CooldownReason == ResponsesRateLimitedCooldownReason &&
+	return a.Status == StatusCooldown && a.CooldownReason == TransientRateLimitedCooldownReason &&
 		!a.transientRateLimitUntil.IsZero() && a.CooldownUtil.Equal(a.transientRateLimitUntil)
 }
 

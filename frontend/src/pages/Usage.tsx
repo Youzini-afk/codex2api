@@ -123,7 +123,7 @@ function UpstreamResponseModelBadge({
   }
   return (
     <div
-      className="break-all pl-3 text-[11px]"
+      className="w-full break-all pl-3 text-[11px]"
       title={titleLines.join('\n')}
     >
       <span className="mr-1 text-muted-foreground">↳ {t('usage.upstreamResponseModel')}:</span>
@@ -1786,21 +1786,32 @@ export default function Usage() {
   }, [buildDimensionFilterParams, filterStatus, filterErrorKind])
 
   // 选中某个账号(或密钥/模型/搜索)后,卡片只统计命中的请求;累计字段始终全局。
+  // 若 loadStats 依赖 buildDimensionFilterParams,则每次筛选变化都会让 useDataLoader
+  // 以非静默方式自动重跑,把整页换成骨架屏、卸载搜索框并丢失焦点,表现为"每输入一个字都像刷新页面"。
+  // 因此 loadStats 保持稳定引用(从 ref 读取最新筛选),首次加载仍走全页骨架屏,
+  // 后续筛选变化由下方 useEffect 用 reloadSilently 原地静默刷新,搜索框焦点不丢失。
+  const statsFilterParamsRef = useRef(buildDimensionFilterParams)
+  statsFilterParamsRef.current = buildDimensionFilterParams
+  const statsTimeRangeRef = useRef(timeRange)
+  statsTimeRangeRef.current = timeRange
+
   const loadStats = useCallback(async () => {
     const todayRange = getTodayRangeISO()
+    const filterParams = statsFilterParamsRef.current()
+    const currentTimeRange = statsTimeRangeRef.current
     const [stats, settings] = await Promise.all([
-      api.getUsageStats(buildDimensionFilterParams()),
+      api.getUsageStats(filterParams),
       api.getSettings().catch((): SystemSettings | null => null),
     ])
-    const todayStats = timeRange === '1h'
+    const todayStats = currentTimeRange === '1h'
       ? await api.getUsageStats({
-          ...buildDimensionFilterParams(),
+          ...filterParams,
           start: todayRange.start,
           end: todayRange.end,
         }).catch((): UsageStats | null => null)
       : null
     return { stats, settings, todayStats }
-  }, [buildDimensionFilterParams, timeRange])
+  }, [])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -1810,6 +1821,17 @@ export default function Usage() {
     initialData: { stats: null, settings: null, todayStats: null },
     load: loadStats,
   })
+
+  // 维度筛选(时间范围/账号/密钥/模型/端点/搜索/形态)变化时,静默原地刷新统计卡片:
+  // 保留页面与搜索框焦点,避免整页骨架屏闪烁;首次加载已由 useDataLoader 全页骨架屏承担。
+  const statsFiltersFirstRunRef = useRef(true)
+  useEffect(() => {
+    if (statsFiltersFirstRunRef.current) {
+      statsFiltersFirstRunRef.current = false
+      return
+    }
+    void reloadSilently()
+  }, [buildDimensionFilterParams, reloadSilently])
 
   // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
@@ -2654,9 +2676,6 @@ export default function Usage() {
                               {log.model || '-'}
                             </Badge>
                           )}
-                          {log.upstream_model_mismatch === true && log.upstream_response_model && (
-                            <UpstreamResponseModelBadge log={log} sentModel={log.effective_model || log.model} />
-                          )}
                           {log.reasoning_effort ? (
                             <ReasoningEffortBadge effort={log.reasoning_effort} />
                           ) : null}
@@ -2675,6 +2694,9 @@ export default function Usage() {
                             hasCompactionHistory={log.has_compaction_history}
                           />
                           <InternalRequestBadge log={log} />
+                          {log.upstream_model_mismatch === true && log.upstream_response_model && (
+                            <UpstreamResponseModelBadge log={log} sentModel={log.effective_model || log.model} />
+                          )}
                         </div>
                         {visibleColumns.time && (
                           <div className="shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
@@ -2890,9 +2912,6 @@ export default function Usage() {
                                 → {log.effective_model}
                               </Badge>
                             )}
-                            {log.upstream_model_mismatch === true && log.upstream_response_model && (
-                              <UpstreamResponseModelBadge log={log} sentModel={log.effective_model || log.model} />
-                            )}
                             {log.reasoning_effort ? (
                               <ReasoningEffortBadge effort={log.reasoning_effort} />
                             ) : null}
@@ -2908,6 +2927,9 @@ export default function Usage() {
                                 <Zap className="size-3" />
                                 {formatServiceTierLabel(t, log.billing_service_tier || log.service_tier)}
                               </Badge>
+                            )}
+                            {log.upstream_model_mismatch === true && log.upstream_response_model && (
+                              <UpstreamResponseModelBadge log={log} sentModel={log.effective_model || log.model} />
                             )}
                           </div>
                         </TableCell>}

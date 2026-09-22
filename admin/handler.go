@@ -1612,11 +1612,11 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 	switch status {
-	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", auth.TransientRateLimitedCooldownReason, auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
 		return true
 	}
 	switch cooldownReason {
-	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
+	case "rate_limited", auth.TransientRateLimitedCooldownReason, auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
 		return true
 	}
 	return false
@@ -1663,6 +1663,8 @@ type accountResponse struct {
 	AgentIdentity                 bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind                  string                      `json:"grok_auth_kind,omitempty"`
 	GrokPlan                      *auth.GrokPlan              `json:"grok_plan,omitempty"`
+	GrokPlanDisplay               *database.GrokPlanDisplay   `json:"grok_plan_display,omitempty"`
+	GrokModels                    *database.GrokModelSummary  `json:"grok_models,omitempty"`
 	GrokBilling                   json.RawMessage             `json:"grok_billing,omitempty"`
 	GrokRateLimit                 *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
 	GrokFreeQuota                 *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
@@ -1922,6 +1924,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		return
 	}
 
+	if err := h.db.HydrateGrokDisplay(ctx, rows); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
 	// 合并内存中的调度指标
 	accountMap := make(map[int64]*auth.Account)
 	if view == "page" {
@@ -2059,6 +2066,10 @@ func (h *Handler) GetAccount(c *gin.Context) {
 		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
 	}
 
+	if err := h.db.HydrateGrokDisplay(ctx, []*database.AccountRow{row}); err != nil {
+		writeInternalError(c, err)
+		return
+	}
 	runtimeAccount := h.store.FindByID(id)
 	resp := h.buildAccountResponse(row, runtimeAccount, requestCounts[id], usage5h[id], usage7d[id], true)
 	if runtimeAccount != nil {
