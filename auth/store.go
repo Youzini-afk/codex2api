@@ -10551,7 +10551,7 @@ func (s *Store) SetModelCooldownSettings(settings database.ModelCooldownSettings
 		return
 	}
 	s.modelCooldownSettings.Store(database.NormalizeModelCooldownSettings(settings))
-	s.clearDisabledTransientRateLimitCooldowns()
+	s.reconcileTransientRateLimitPolicies()
 }
 
 func (s *Store) GetModelCooldownSettings() database.ModelCooldownSettings {

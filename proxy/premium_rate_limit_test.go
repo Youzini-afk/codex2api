@@ -18,7 +18,36 @@ func newProxyPremiumTestStore() *auth.Store {
 		BackgroundRefreshIntervalMinutes: 2,
 		UsageProbeMaxAgeMinutes:          10,
 		RecoveryProbeIntervalMinutes:     30,
+		OAuthModelCooldownMode:           database.ModelCooldownModeAdaptive,
+		OAuthModelCooldownSeconds:        15,
+		OAuthModelCooldownBackoffEnabled: true,
 	})
+}
+
+func TestApply429CooldownFixedOAuthPolicyUsesConfiguredDuration(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                   4,
+		TestConcurrency:                  1,
+		TestModel:                        "gpt-5.4",
+		OAuthModelCooldownMode:           database.ModelCooldownModeFixed,
+		OAuthModelCooldownSeconds:        20,
+		OAuthModelCooldownBackoffEnabled: true,
+	})
+	defer store.Stop()
+	acc := &auth.Account{DBID: 99, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
+	start := time.Now()
+	decision := Apply429Cooldown(store, acc, []byte(`{"error":{"type":"rate_limit_error"}}`), nil, "gpt-5.4")
+
+	if decision.Reason != "rate_limited" || decision.Scope != rateLimitScopeAccount {
+		t.Fatalf("decision = %#v, want transient account throttle", decision)
+	}
+	if decision.ResetAt.Before(start.Add(19*time.Second)) || decision.ResetAt.After(start.Add(21*time.Second)) {
+		t.Fatalf("ResetAt = %v, want about 20s from now", decision.ResetAt)
+	}
+	decision = Apply429Cooldown(store, acc, []byte(`{"error":{"type":"rate_limit_error"}}`), &http.Response{Header: http.Header{"Retry-After": []string{"120"}}}, "gpt-5.4")
+	if remaining := time.Until(decision.ResetAt); remaining > 20*time.Second {
+		t.Fatalf("fixed policy was extended by Retry-After: %v", remaining)
+	}
 }
 
 func TestApply429CooldownRepeatedThrottleKeepsDeadlineAcrossModels(t *testing.T) {

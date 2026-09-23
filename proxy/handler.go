@@ -8383,9 +8383,9 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		if policy.Mode == database.ModelCooldownModeOff || policy.Seconds <= 0 {
 			return decision
 		}
-		// Pass only an actual upstream hint. Reusing the synthetic 15s floor
-		// here would slide the same cooldown forward on every in-flight 429.
-		applied := store.MarkTransientRateLimited(account, transient429RetryAfter(body, resp, time.Now()))
+		// Pass only an actual upstream hint. Reusing a synthetic floor here would
+		// slide the same cooldown forward on every in-flight 429.
+		applied := store.MarkTransientRateLimitedWithPolicy(account, transient429RetryAfter(body, resp, time.Now()), policy)
 		decision.Cooldown = applied
 		if applied > 0 {
 			decision.ResetAt = time.Now().Add(applied)

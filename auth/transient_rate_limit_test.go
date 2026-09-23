@@ -199,10 +199,51 @@ func TestTransientRateLimitDoesNotArmUsageProbe(t *testing.T) {
 
 func newTransientRateLimitTestStore() *Store {
 	return NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:  4,
-		TestConcurrency: 1,
-		TestModel:       "gpt-5.4",
+		MaxConcurrency:                   4,
+		TestConcurrency:                  1,
+		TestModel:                        "gpt-5.4",
+		OAuthModelCooldownMode:           database.ModelCooldownModeAdaptive,
+		OAuthModelCooldownSeconds:        15,
+		OAuthModelCooldownBackoffEnabled: true,
 	})
+}
+
+func TestMarkTransientRateLimitedFixedPolicyUsesConfiguredDuration(t *testing.T) {
+	store := newTransientRateLimitTestStore()
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{
+		OAuthMode:           database.ModelCooldownModeFixed,
+		OAuthSeconds:        20,
+		OAuthBackoffEnabled: true,
+	})
+	acc := &Account{DBID: 41, AccessToken: "token", Status: StatusReady}
+
+	first := store.MarkTransientRateLimitedWithPolicy(acc, 2*time.Minute, store.ResolveModelCooldownPolicy(acc))
+	if first < 19*time.Second || first > 21*time.Second {
+		t.Fatalf("fixed cooldown = %v, want about 20s", first)
+	}
+	second := store.MarkTransientRateLimitedWithPolicy(acc, 2*time.Minute, store.ResolveModelCooldownPolicy(acc))
+	if second > 20*time.Second {
+		t.Fatalf("fixed cooldown was extended by Retry-After: %v", second)
+	}
+}
+
+func TestSetModelCooldownSettingsFixedShortensExistingTransientCooldown(t *testing.T) {
+	store := newTransientRateLimitTestStore()
+	acc := &Account{DBID: 42, AccessToken: "token", Status: StatusReady}
+	store.AddAccount(acc)
+	store.MarkTransientRateLimited(acc, 2*time.Minute)
+	if remaining, ok := acc.TransientRateLimitRemaining(time.Now()); !ok || remaining < time.Minute {
+		t.Fatalf("setup cooldown = %v, %v; want a long active window", remaining, ok)
+	}
+
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{
+		OAuthMode:           database.ModelCooldownModeFixed,
+		OAuthSeconds:        20,
+		OAuthBackoffEnabled: true,
+	})
+	if remaining, ok := acc.TransientRateLimitRemaining(time.Now()); !ok || remaining > 20*time.Second {
+		t.Fatalf("fixed policy left old cooldown active: %v, %v", remaining, ok)
+	}
 }
 
 func TestMarkTransientRateLimitedProgressiveBackoff(t *testing.T) {
