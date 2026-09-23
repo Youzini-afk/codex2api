@@ -473,9 +473,6 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		if err := db.migrate(ctx); err != nil {
 			return nil, fmt.Errorf("数据库迁移失败: %w", err)
 		}
-		if err := db.ensureCodexTurnStateTemplateSchema(ctx); err != nil {
-			return nil, fmt.Errorf("初始化 Turn-State 模板表失败: %w", err)
-		}
 		if err := db.ensureQualityTestSchema(ctx); err != nil {
 			return nil, fmt.Errorf("初始化检测记录表失败: %w", err)
 		}
@@ -1587,7 +1584,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_activate_5h_window_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fingerprint_default_mode VARCHAR(64) DEFAULT 'off';
+	ALTER TABLE system_settings ALTER COLUMN codex_fingerprint_default_mode TYPE VARCHAR(64);
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864;
@@ -2460,8 +2458,6 @@ type SystemSettings struct {
 	CodexMinCLIVersion                 string
 	CodexUserAgentConfig               string
 	CodexTelemetryEnabled              bool
-	CodexTurnStateTemplateCacheEnabled bool   // X-Codex-Turn-State Fernet 模板缓存（实验性，默认 false）
-	CodexTurnStateAccountMode          string // personal|team|auto（默认 auto）
 	CodexTelemetryTimingDebug          bool
 	CodexImagesMainModel               string // 空值沿用部署默认的生图文本驱动模型
 	UsageLogMode                       string
@@ -2654,6 +2650,9 @@ func NormalizeSchedulerEngine(value string, legacyFastEnabled bool) string {
 // GetSystemSettings 加载全局设置
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
+	// 模板缓存列仍留在表里，读取后丢弃，避免改动既有 SELECT 列序。
+	var ignoredTurnStateTemplateCache bool
+	var ignoredTurnStateAccountMode string
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT COALESCE(site_name, 'CodexProxy'), COALESCE(site_logo, ''),
 		       max_concurrency, global_rpm, test_model, COALESCE(test_content, 'hi'), test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
@@ -2861,8 +2860,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ClaudeConfig,
 		&s.CodexImagesMainModel,
 		&s.CodexTelemetryEnabled,
-		&s.CodexTurnStateTemplateCacheEnabled,
-		&s.CodexTurnStateAccountMode,
+		&ignoredTurnStateTemplateCache,
+		&ignoredTurnStateAccountMode,
 		&s.CodexOAuthKeepaliveEnabled,
 		&s.CodexTelemetryTimingDebug,
 	)
@@ -2994,11 +2993,13 @@ func continuousRetryPolicySelectQuery(forUpdate bool) string {
 	return query
 }
 
-// NormalizeCodexFingerprintDefaultMode 把新账号默认指纹收敛档位归一到四个已知
+// NormalizeCodexFingerprintDefaultMode 把新账号默认指纹收敛档位归一到已知
 // 取值之一；空值和非法值回落 off（与 auth.NormalizeCodexFingerprintMode 语义一致，
 // database 包不能反向依赖 auth，故此处独立实现）。
 func NormalizeCodexFingerprintDefaultMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "single_machine_multi_window":
+		return "single_machine_multi_window"
 	case "device":
 		return "device"
 	case "session":
@@ -3305,8 +3306,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.CodexForceFastEnabled,
 		strings.TrimSpace(s.CodexImagesMainModel),
 		s.CodexTelemetryEnabled,
-		s.CodexTurnStateTemplateCacheEnabled,
-		s.CodexTurnStateAccountMode,
+		false,
+		"auto",
 		s.CodexOAuthKeepaliveEnabled,
 		s.CodexTelemetryTimingDebug,
 		s.PreservePromptFilterCustomPatterns,
@@ -6322,6 +6323,11 @@ func usageLogDimensionWhere(f UsageLogFilter, nextIdx int) ([]string, []interfac
 	}
 	if f.Query != "" {
 		p := addArg("%" + f.Query + "%")
+		// 注意:这里只匹配账号 name,不匹配 accounts.credentials。
+		// credentials 是不透明 JSON(含模型目录、URL、token 等结构化数据),把它纳入
+		// LIKE 会让搜索词(如 "5.6")命中凭据里的模型目录,从而把该账号全部日志(含
+		// gpt-6-* 等不含搜索词的记录)带入结果;同时对用户输入的 LIKE 模式扫描凭据
+		// 内容本身也不安全。按账号名/邮箱仍可通过 name 命中。
 		parts = append(parts, fmt.Sprintf(`(
 			LOWER(COALESCE(u.error_message, '')) LIKE LOWER(%[1]s)
  OR LOWER(COALESCE(u.request_id, '')) LIKE LOWER(%[1]s)
@@ -6339,7 +6345,6 @@ func usageLogDimensionWhere(f UsageLogFilter, nextIdx int) ([]string, []interfac
 					SELECT search_accounts.id
 					FROM accounts search_accounts
 					WHERE LOWER(COALESCE(search_accounts.name, '')) LIKE LOWER(%[1]s)
-						OR LOWER(COALESCE(CAST(search_accounts.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
 				)
 		)`, p))
 	}

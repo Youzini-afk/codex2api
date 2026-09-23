@@ -228,8 +228,6 @@ func (db *DB) installSQLiteSchedulerOutboxTriggers(ctx context.Context) error {
 		  OR COALESCE(json_extract(OLD.credentials,'$.model_mapping'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.model_mapping'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.custom_headers'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.custom_headers'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.upstream_request_id_header'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.upstream_request_id_header'),'')
-		  OR COALESCE(json_extract(OLD.credentials,'$.codex_turn_state'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.codex_turn_state'),'')
-		  OR COALESCE(json_extract(OLD.credentials,'$.codex_turn_state_models'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.codex_turn_state_models'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.allowed_api_key_ids'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.allowed_api_key_ids'),'')
 			  OR COALESCE(json_extract(OLD.credentials,'$.plan_type'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.plan_type'),'')
 			  OR COALESCE(json_extract(OLD.credentials,'$.project_id'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.project_id'),'')
@@ -475,8 +473,6 @@ func (db *DB) installPostgresSchedulerOutboxTriggers(ctx context.Context) error 
 				codex2api_antigravity_scheduler_fences(OLD.credentials) IS DISTINCT FROM codex2api_antigravity_scheduler_fences(NEW.credentials) OR
 				COALESCE(OLD.credentials->>'dispatch_count_limit','') IS DISTINCT FROM COALESCE(NEW.credentials->>'dispatch_count_limit','') OR
 			COALESCE(OLD.credentials->>'upstream_request_id_header','') IS DISTINCT FROM COALESCE(NEW.credentials->>'upstream_request_id_header','') OR
-			COALESCE(OLD.credentials->>'codex_turn_state','') IS DISTINCT FROM COALESCE(NEW.credentials->>'codex_turn_state','') OR
-			COALESCE(OLD.credentials->>'codex_turn_state_models','') IS DISTINCT FROM COALESCE(NEW.credentials->>'codex_turn_state_models','') OR
 			COALESCE(OLD.credentials->>'scheduler_priority','') IS DISTINCT FROM COALESCE(NEW.credentials->>'scheduler_priority','') OR
 			COALESCE(OLD.credentials->>'auth_mode','') IS DISTINCT FROM COALESCE(NEW.credentials->>'auth_mode','') OR
 			COALESCE(OLD.credentials->>'agent_runtime_id','') IS DISTINCT FROM COALESCE(NEW.credentials->>'agent_runtime_id','') OR
