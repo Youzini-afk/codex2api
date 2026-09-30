@@ -486,6 +486,7 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 		return
 	}
 
+	daybreak := src.DaybreakSnapshot()
 	dst.mu.Lock()
 	identityChanged := dst.CredentialGeneration != src.CredentialGeneration
 	// Routing sub-pools only need invalidation when membership-relevant fields
@@ -511,6 +512,15 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.ProxyURL = src.ProxyURL
 	dst.CustomHeaders = cloneStringMap(src.CustomHeaders)
 	dst.UpstreamType = src.UpstreamType
+	// Capability refreshes share the account outbox projection. Preserve a
+	// newer live observation, but never carry it across an identity change.
+	daybreakIdentity := dst.daybreakIdentityLocked()
+	if dst.daybreak.Identity != daybreakIdentity {
+		dst.daybreak = database.DaybreakSnapshot{}
+	}
+	if daybreak.Identity == daybreakIdentity && daybreak.ObservedAt >= dst.daybreak.ObservedAt {
+		dst.daybreak = daybreak
+	}
 	dst.BaseURL = src.BaseURL
 	dst.APIKey = src.APIKey
 	dst.Models = cloneStringSlice(src.Models)
@@ -518,6 +528,8 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.CodexClientMetadataMode = src.CodexClientMetadataMode
 	dst.CodexPassthroughMode = src.CodexPassthroughMode
 	dst.CodexFingerprintMode = src.CodexFingerprintMode
+	dst.ExcelBPSEnabled = src.ExcelBPSEnabled
+	dst.ExcelBPSOptOut = src.ExcelBPSOptOut
 	dst.Timezone = src.Timezone
 	dst.ClaudeFingerprintMode = src.ClaudeFingerprintMode
 	dst.claudeSessionWindow = src.claudeSessionWindow
@@ -536,6 +548,8 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.GrokLivePlanObservedAt = src.GrokLivePlanObservedAt
 	dst.GrokLivePlanExpiresAt = src.GrokLivePlanExpiresAt
 	dst.GrokLivePlanKnown = src.GrokLivePlanKnown
+	dst.GrokDisplayPlan = src.GrokDisplayPlan
+	dst.GrokDisplayPlanExpiresAt = src.GrokDisplayPlanExpiresAt
 	dst.GrokAccessAllowed = cloneBoolPtr(src.GrokAccessAllowed)
 	dst.GrokAccessExpiresAt = src.GrokAccessExpiresAt
 	dst.GrokBillingExhausted = src.GrokBillingExhausted

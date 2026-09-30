@@ -5,8 +5,10 @@ import "strings"
 const longContextThreshold = 272000
 
 type ModelPricing struct {
-	UserBillingMode                 string
-	ImageUnitPrice                  float64
+	UserBillingMode string
+	ImageUnitPrice  float64
+	// MediaUnitCost 是媒体模型的上游单位成本(USD/张 或 USD/秒,见 MediaBillingUnit)。
+	MediaUnitCost                   float64
 	ImageInputPricePerMToken        float64
 	CacheReadImagePricePerMToken    float64
 	InputPricePerMToken             float64
@@ -274,12 +276,18 @@ var (
 
 func GetModelPricing(model string) *ModelPricing {
 	normalized := normalizeBillingModelName(model)
+	if alias := daybreakPricingAliasKey(model); alias != "" && alias != normalized {
+		return daybreakAliasPricing(normalized, alias)
+	}
 	canonical := normalized
 	if imageModel := GPTImage25BillingModel(normalized); imageModel != "" {
 		canonical = imageModel
 	}
 	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
 		canonical = codexModel
+	}
+	if key := GrokMediaPricingKey(normalized); key != "" {
+		canonical = key
 	}
 	base := baseModelPricing(normalized, canonical)
 	// 新型号沿用兜底基础价，但覆盖必须独立，不能继承另一个型号的手工价格。
@@ -304,7 +312,7 @@ func GetModelPricing(model string) *ModelPricing {
 	canonicalOv, hasCanonical := lookupModelPricingOverride(canonical)
 	var aliasOv ModelPricingOverride
 	hasAlias := false
-	aliasKey := PricingManagementModelKey(normalized)
+	aliasKey := PricingManagementModelKey(model)
 	if aliasKey != "" && aliasKey != canonical {
 		if ov, ok := lookupModelPricingOverride(aliasKey); ok {
 			if ov.Source == ModelPricingSourceCustom || !hasCanonical || canonicalOv.Source != ModelPricingSourceCustom {
@@ -328,6 +336,9 @@ func GetModelPricing(model string) *ModelPricing {
 // baseModelPricing 返回代码内置的模型定价（不含覆盖）。normalized 为归一化后的模型名，
 // canonical 为 codex 归一后的规范名（用于规则表查找）。
 func baseModelPricing(normalized, canonical string) *ModelPricing {
+	if key := GrokMediaPricingKey(normalized); key != "" {
+		return grokMediaBasePricing(key)
+	}
 	if GPTImage25BillingModel(canonical) != "" {
 		return &gptImage25Pricing
 	}
@@ -493,6 +504,8 @@ func normalizeBillingModelName(model string) string {
 	} else if idx := strings.LastIndex(model, "/"); idx != -1 {
 		model = model[idx+1:]
 	}
+	// Daybreak 的规范计费模型仍是基础模型，专属价格覆盖由别名键处理。
+	model = strings.TrimSuffix(strings.TrimSuffix(model, "-daybreak-blue"), "-daybreak-red")
 	return strings.TrimLeft(model, "/")
 }
 

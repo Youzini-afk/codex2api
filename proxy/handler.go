@@ -1298,6 +1298,7 @@ func (h *Handler) SetRuntimeCache(tc cache.TokenCache) {
 	if h.cfg != nil && h.cfg.APIKeyAuthCacheEnabled && h.db != nil {
 		h.authCache = newAPIKeyAuthCache(h.db, tc)
 	}
+	excelBPSHealth.configure(h.store, tc)
 }
 
 // NewHandlerWithDeviceProfile 创建处理器（带设备指纹配置）
@@ -1562,6 +1563,7 @@ func populateInternalUsageMetaFromContext(c *gin.Context, input *database.UsageL
 }
 
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
+	applyDaybreakUsageModel(c, input)
 	populateAPIKeyMetaFromContext(c, input)
 	populateInternalUsageMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
@@ -3866,6 +3868,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	} else if nativeRemoteCompactionV2 {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
 	} else {
+		rememberDaybreakRequest(c, rawBody)
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	}
 	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
@@ -4150,6 +4153,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		attemptLogEffectiveModel := logEffectiveModel
 		// relay/Grok 账号默认走 HTTP，这里排除全局强制 WS，避免日志把它们错标成 via_websocket。
 		// 打开了上游 WebSocket 的 OpenAI Responses 中转账号在体积判断之后单独改回 WS。
+		// Excel Basispoints is HTTP/SSE only. Keep the native transport decision so
+		// a pre-output fallback to native Codex retains its normal WS behavior.
+		excelBPSRoute := excelBPSRouteAvailable(account, effectiveModel)
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
@@ -4183,6 +4189,30 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
+
+		if excelBPSRoute {
+			bpsBody := codexBody
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(bpsBody, account, logModel, effectiveModel); ok {
+				bpsBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			threadKey := sessionIdentity.affinityID
+			if threadKey == "" {
+				threadKey = affinityKey
+			}
+			scope := fmt.Sprintf("account:%d:key:%d:thread:%s", account.ID(), apiKeyID, affinityKey)
+			// A later previous_response_id must expand a Basispoints turn exactly
+			// like a native one, from the same caller-owned response cache.
+			cacheCompleted := func(completed []byte) {
+				cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), completed, nil)
+			}
+			if reason := excelBPSLiveWebSearchReason(rawBody); reason != "" && c.GetString(excelBPSNativeFallbackKey) == "" {
+				markExcelBPSNativeFallback(c, account, reason)
+			} else if h.handleExcelBPS(c, account, bpsBody, scope, threadKey, proxyURL, false, isStream, excelBPSConversationScoped(c.Request.Header, sessionIdentity), "/v1/responses", logModel, attemptEffectiveModel, reasoningEffort, affinityKey, affinityGuard, start, cacheCompleted) {
+				return
+			}
+		}
 
 		if account.IsRelayStyle() {
 			relayContinuationAttempted = true
@@ -6101,6 +6131,23 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		downstreamHeaders := c.Request.Header.Clone()
 
+		if excelBPSRouteAvailable(account, effectiveModel) {
+			bpsBody := codexBody
+			if mappedBody, mappedModel, ok := h.applyAccountCompactModelMappingToBody(bpsBody, account, routingModel, effectiveModel); ok {
+				bpsBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			threadKey := sessionIdentity.affinityID
+			if threadKey == "" {
+				threadKey = affinityKey
+			}
+			scope := fmt.Sprintf("account:%d:key:%d:thread:%s", account.ID(), apiKeyID, affinityKey)
+			if h.handleExcelBPS(c, account, bpsBody, scope, threadKey, proxyURL, true, false, excelBPSConversationScoped(c.Request.Header, sessionIdentity), "/v1/responses/compact", logModel, attemptEffectiveModel, reasoningEffort, affinityKey, affinityGuard, start, nil) {
+				return
+			}
+		}
+
 		if account.IsOpenAIResponsesAPI() {
 			relayContinuationAttempted = true
 			baseURL, _ := account.OpenAIResponsesCredentials()
@@ -6736,6 +6783,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	h.capturePromptRequestIngress(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
+	rememberDaybreakRequest(c, rawBody)
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 
 	// Validate request
@@ -6838,6 +6886,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
+	// A pre-output Basispoints fallback keeps later attempts of this request native.
+	excelBPSFallback := ""
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -7018,6 +7068,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
 			guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
+				if excelBPSRouteAvailable(account, effectiveModel) {
+					bpsResp, served, bpsErr := h.openExcelBPSStream(upstreamCtx, c, account, codexBody, excelBPSIngress{
+						Endpoint: "/v1/chat/completions", LogModel: logModel, EffectiveModel: effectiveModel,
+						ReasoningEffort: reasoningEffort, Scope: excelBPSIngressScope(account, apiKeyID, affinityKey),
+						ThreadKey: firstNonEmptyString(sessionIdentity.affinityID, affinityKey), ProxyURL: proxyURL,
+						PersistReplay: excelBPSConversationScoped(c.Request.Header, sessionIdentity), Fallback: &excelBPSFallback,
+					})
+					if served {
+						if bpsErr == nil {
+							useWebsocket, upstreamEndpoint, serviceTier = false, excelBPSUpstreamURL, ""
+						}
+						return bpsResp, bpsErr
+					}
+				}
 				return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 			})
 		}
@@ -8483,7 +8547,12 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			}
 			return codex429Decision{}
 		}
-		h.store.MarkCooldown(account, 30*time.Minute, "payment_required")
+		// A bare 402/403 is not proof that this credential is out of
+		// balance. The upstream also uses these statuses for transient
+		// policy, routing, and endpoint responses. Do not turn one such
+		// request into a durable account-level payment_required gate; the
+		// usage probe and AT refresh are the authoritative account checks.
+		// Explicit usage exhaustion is handled above by IsUsageLimitReachedError.
 	}
 	return codex429Decision{}
 }
@@ -8961,6 +9030,9 @@ func (h *Handler) ListModels(c *gin.Context) {
 
 func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 	models := SupportedModelIDs(ctx, h.db)
+	if h != nil && h.store != nil {
+		models = append(models, DaybreakModelIDs(h.store.Accounts(), models)...)
+	}
 	seen := make(map[string]struct{}, len(models))
 	for _, model := range models {
 		seen[strings.ToLower(strings.TrimSpace(model))] = struct{}{}

@@ -73,6 +73,7 @@ type Handler struct {
 	activate5hWindow             func(context.Context, *auth.Account) error
 	executeUsageProbe            usageProbeRequestFunc
 	syncAccountPlanOnReset       func(context.Context, *auth.Account) error
+	queryResetUsage              func(context.Context, *auth.Account, string) (*proxy.WhamUsage, *http.Response, error)
 	queryResetCredits            func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit           func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	queryWhamDailyUsage          func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
@@ -110,7 +111,11 @@ type Handler struct {
 	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
 	antigravityCapabilityProbe antigravityCapabilityExecutor
 	// Claude / Antigravity 渠道连通性测试配置的进程内缓存（首次读库，PUT 刷新）。
-	channelTestCfg atomic.Pointer[database.ChannelTestConfig]
+	channelTestCfg        atomic.Pointer[database.ChannelTestConfig]
+	channelMonitorWake    chan struct{}
+	channelMonitorSlots   chan struct{}
+	channelMonitorRunning sync.Map
+	channelMonitorID      string
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
 	// 在大文件导入时堆出成千上万个阻塞协程。
@@ -342,6 +347,7 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	if account.GetAccessToken() == "" && !account.IsCodexAgentIdentity() {
 		return
 	}
+	defer h.refreshImportedDaybreak(ctx, accountID)
 	probeFn := h.usageProbeFunc()
 	if probeFn == nil {
 		return
@@ -682,7 +688,7 @@ func (h *Handler) scheduleImportedAccountWarmup(acc *auth.Account, id int64, sou
 		h.triggerImportedAccountUsageProbe(id, source)
 		return
 	}
-	if h.store != nil && !h.store.GetLazyMode() {
+	if h.store != nil {
 		h.runImportProbeTask(func(ctx context.Context) {
 			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
 		})
@@ -697,6 +703,12 @@ func (h *Handler) commitImportedRuntimeAccounts(accounts []*auth.Account, source
 	}
 	h.store.AddAccounts(accounts)
 	if skipRefresh {
+		for _, account := range accounts {
+			if account != nil && account.GetAccessToken() != "" {
+				id := account.ID()
+				h.runImportProbeTask(func(ctx context.Context) { h.refreshImportedDaybreak(ctx, id) })
+			}
+		}
 		return
 	}
 	for _, acc := range accounts {
@@ -1032,6 +1044,9 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		chartCacheData:       make(map[string]*chartCacheEntry),
 		accountListCache:     make(map[string]*accountListSnapshot),
 		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
+		channelMonitorWake:   make(chan struct{}, 1),
+		channelMonitorSlots:  make(chan struct{}, 4),
+		channelMonitorID:     fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
@@ -1132,6 +1147,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.GET("/accounts/:id/openai-responses/balance", h.GetOpenAIResponsesBalance)
+	api.GET("/accounts/:id/channel-monitor", h.GetChannelMonitorConfig)
+	api.PUT("/accounts/:id/channel-monitor", h.UpdateChannelMonitorConfig)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
 	api.POST("/accounts/grok/batch-models", h.BatchUpdateGrokModels)
@@ -1180,6 +1197,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
 	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
+	api.POST("/accounts/:id/bps-pause/clear", h.ClearAccountExcelBPSPause)
+	api.GET("/channel-monitors", h.ListChannelMonitors)
+	api.GET("/channel-monitors/billing-rates", h.ListChannelMonitorBillingRates)
+	api.POST("/channel-monitors/:id/probe", h.ProbeChannelMonitorNow)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
@@ -1206,6 +1227,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/invite/plan", h.GetInviteGuidePlan)
 	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
+	api.GET("/accounts/:id/model-detector", h.DetectCodexModel)
 	api.GET("/accounts/:id/quality-test/options", h.QualityTestOptions)
 	api.POST("/accounts/:id/quality-test", h.CreateQualityTestJob)
 	api.GET("/quality-tests", h.ListQualityTests)
@@ -1337,6 +1359,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/models/sync", h.SyncModels)
 	api.POST("/models/refresh-all", h.RefreshAllModels)
 	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
+	api.POST("/codex-client-versions/sync", h.SyncCodexClientVersions)
 	api.GET("/model-pricing", h.ListModelPricing)
 	api.PUT("/model-pricing", h.UpdateModelPricing)
 	api.POST("/model-pricing/sync", h.SyncModelPricing)
@@ -1655,6 +1678,10 @@ type accountResponse struct {
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
 	ClaudeAPI                     bool                        `json:"claude_api,omitempty"`
+	ExcelBPSEnabled               bool                        `json:"openai_excel_bps,omitempty"`
+	ExcelBPSOptOut                bool                        `json:"openai_excel_bps_opt_out,omitempty"`
+	ExcelBPSEffective             bool                        `json:"openai_excel_bps_effective,omitempty"`
+	ExcelBPSPause                 *proxy.ExcelBPSPauseView    `json:"bps_pause,omitempty"`
 	ClaudeAuthKind                string                      `json:"claude_auth_kind,omitempty"`
 	ClaudeBaseURL                 string                      `json:"claude_base_url,omitempty"`
 	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
@@ -1689,6 +1716,7 @@ type accountResponse struct {
 	ClaudeVersionPolicyOverride   string                      `json:"claude_version_policy_override,omitempty"`
 	ClaudeClientVersionOverride   string                      `json:"claude_client_version_override,omitempty"`
 	Timezone                      string                      `json:"timezone,omitempty"`
+	AccountHref                   string                      `json:"account_href,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -1725,6 +1753,9 @@ type accountResponse struct {
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
 	UsagePercentSpark             *float64                    `json:"usage_percent_spark"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
+	DaybreakSupported             bool                        `json:"daybreak_supported"`
+	DaybreakModels                map[string][]string         `json:"daybreak_models,omitempty"`
+	DaybreakCheckedAt             int64                       `json:"daybreak_checked_at,omitempty"`
 	ApplicableResetCredits        *int                        `json:"applicable_reset_credits"`
 	CreditsValid                  bool                        `json:"credits_valid"`
 	CreditsBalance                *string                     `json:"credits_balance"`
@@ -2102,6 +2133,9 @@ type accountLiteResponse struct {
 	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
 	GrokAPI            bool   `json:"grok_api"`
 	ClaudeAPI          bool   `json:"claude_api"`
+	ExcelBPSEnabled    bool   `json:"openai_excel_bps"`
+	ExcelBPSOptOut     bool   `json:"openai_excel_bps_opt_out"`
+	ExcelBPSEffective  bool   `json:"openai_excel_bps_effective"`
 	AgentIdentity      bool   `json:"agent_identity"`
 	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
 }
@@ -2116,8 +2150,10 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 
 	// 运行时状态覆盖 DB 状态(与完整视图一致),其余富化一律跳过。
 	runtimeStatus := make(map[int64]string)
+	excelBPSEffective := make(map[int64]bool)
 	for _, acc := range h.store.Accounts() {
 		runtimeStatus[acc.DBID] = acc.RuntimeStatus()
+		excelBPSEffective[acc.DBID] = acc.IsExcelBPSEnabled()
 	}
 
 	accounts := make([]accountLiteResponse, 0, len(rows))
@@ -2158,6 +2194,9 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			GrokAPI:            isGrokAccount,
 			ClaudeAPI:          isClaudeAccount,
+			ExcelBPSEnabled:    row.GetCredentialBool(auth.ExcelBPSCredentialKey),
+			ExcelBPSOptOut:     row.GetCredentialBool(auth.ExcelBPSOptOutCredentialKey),
+			ExcelBPSEffective:  excelBPSEffective[row.ID],
 			AgentIdentity:      isAgentIdentityCredentialRow(row),
 			GrokAuthKind:       grokAuthKind,
 		})
@@ -2190,6 +2229,9 @@ type updateAccountSchedulerReq struct {
 	ClaudeVersionPolicy     json.RawMessage `json:"claude_version_policy"`
 	ClaudeClientVersion     json.RawMessage `json:"claude_client_version"`
 	Timezone                json.RawMessage `json:"timezone"`
+	AccountHref             json.RawMessage `json:"account_href"`
+	ExcelBPSEnabled         json.RawMessage `json:"openai_excel_bps"`
+	ExcelBPSOptOut          json.RawMessage `json:"openai_excel_bps_opt_out"`
 }
 
 type accountSchedulerUpdate struct {
@@ -2216,6 +2258,9 @@ type accountSchedulerUpdate struct {
 	ClaudeVersionPolicy     database.OptionalString
 	ClaudeClientVersion     database.OptionalString
 	Timezone                database.OptionalString
+	AccountHref             database.OptionalString
+	ExcelBPSEnabled         database.OptionalBool
+	ExcelBPSOptOut          database.OptionalBool
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -2330,6 +2375,18 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	accountHref, err := parseOptionalStringField(req.AccountHref, "account_href", validateAccountHref)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	excelBPSEnabled, err := parseOptionalBoolField(req.ExcelBPSEnabled, "openai_excel_bps")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	excelBPSOptOut, err := parseOptionalBoolField(req.ExcelBPSOptOut, "openai_excel_bps_opt_out")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 	if codexFingerprintMode.Set {
 		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
 	}
@@ -2361,6 +2418,19 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	}
 	if timezoneField.Set {
 		credentialUpdates[auth.AccountTimezoneCredentialKey] = strings.TrimSpace(timezoneField.Value)
+	}
+	if accountHref.Set {
+		normalized, err := auth.NormalizeAccountHref(accountHref.Value)
+		if err != nil {
+			return accountSchedulerUpdate{}, err
+		}
+		credentialUpdates[auth.AccountHrefCredentialKey] = normalized
+	}
+	if excelBPSEnabled.Set {
+		credentialUpdates[auth.ExcelBPSCredentialKey] = excelBPSEnabled.Value
+	}
+	if excelBPSOptOut.Set {
+		credentialUpdates[auth.ExcelBPSOptOutCredentialKey] = excelBPSOptOut.Value
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -2423,6 +2493,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ClaudeVersionPolicy:     claudeVersionPolicy,
 		ClaudeClientVersion:     claudeClientVersion,
 		Timezone:                timezoneField,
+		AccountHref:             accountHref,
+		ExcelBPSEnabled:         excelBPSEnabled,
+		ExcelBPSOptOut:          excelBPSOptOut,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
 }
@@ -2474,6 +2547,13 @@ func validateAccountTimezone(value string) error {
 	return nil
 }
 
+// validateAccountHref 允许空串(=清除跳转地址,回退 api-base),其余必须是
+// http/https 绝对地址;归一化在写库前由 auth.NormalizeAccountHref 完成。
+func validateAccountHref(value string) error {
+	_, err := auth.NormalizeAccountHref(value)
+	return err
+}
+
 // validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
 func validateCodexFingerprintMode(value string) error {
 	if value == "" || auth.IsValidCodexFingerprintMode(value) {
@@ -2505,7 +2585,10 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.ClaudeClientPlatform.Set ||
 		u.ClaudeVersionPolicy.Set ||
 		u.ClaudeClientVersion.Set ||
-		u.Timezone.Set
+		u.Timezone.Set ||
+		u.AccountHref.Set ||
+		u.ExcelBPSEnabled.Set ||
+		u.ExcelBPSOptOut.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2845,6 +2928,17 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.Timezone.Set {
 		h.store.ApplyAccountTimezone(id, update.Timezone.Value)
+	}
+	if value, ok := update.CredentialUpdates[auth.ExcelBPSCredentialKey].(bool); ok {
+		h.store.ApplyAccountExcelBPSEnabled(id, value)
+	}
+	if value, ok := update.CredentialUpdates[auth.ExcelBPSOptOutCredentialKey].(bool); ok {
+		h.store.ApplyAccountExcelBPSOptOut(id, value)
+	}
+	// Changing an account's Basispoints mode is an explicit decision; it
+	// supersedes any automatic pause or cooldown of that route.
+	if update.ExcelBPSEnabled.Set || update.ExcelBPSOptOut.Set {
+		proxy.ClearExcelBPSPause(id)
 	}
 }
 
@@ -4891,12 +4985,17 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
+	daybreakSnapshot := account.BeginDaybreakObservation()
 	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
 	if err != nil {
 		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
 		return
 	}
 	proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
+	if err := (proxy.DaybreakObservation{Account: account, Snapshot: daybreakSnapshot, Body: manifest.Body}).Save(ctx, h.db); err != nil {
+		writeError(c, http.StatusBadGateway, "保存 Daybreak 能力失败: "+err.Error())
+		return
+	}
 	models := auth.NormalizeAccountModels(proxy.ExtractManifestModelSlugs(manifest.Body))
 	if len(models) == 0 {
 		writeError(c, http.StatusBadGateway, "上游模型清单未返回可用模型")
@@ -9349,11 +9448,11 @@ func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
 }
 
 // knownAPIKeyPlanFilters 是账号套餐白名单允许的取值集合。与前端 PlanMultiSelect 的
-// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite
+// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite/promax
 // 相互独立)。未知值在 cleanPlanAllow 中被丢弃,避免把打字错误写进过滤条件后导致该
 // Key 永远选不到账号。
 var knownAPIKeyPlanFilters = map[string]struct{}{
-	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "promax": {}, "team": {}, "k12": {}, "go": {},
 	// Grok live /user.subscriptionTier values. These labels are authorization
 	// inputs only when auth.Store has a fresh live fact; JWT/archive labels never
 	// satisfy plan_allow. "api" is the explicit xAI API-key channel plan.
@@ -9553,6 +9652,7 @@ type settingsResponse struct {
 	AutoCleanError                      bool   `json:"auto_clean_error"`
 	AutoCleanExpired                    bool   `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             bool   `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsOnExhaustionEnabled bool   `json:"auto_reset_credits_on_exhaustion_enabled"`
 	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
@@ -9560,6 +9660,12 @@ type settingsResponse struct {
 	SchedulerEngine                     string `json:"scheduler_engine"`
 	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
 	CodexRequestCompression             bool   `json:"codex_request_compression"`
+	CodexBasispointsEnabled             bool   `json:"codex_basispoints_enabled"`
+	CodexBasispointsModels              string `json:"codex_basispoints_models"`
+	CodexBasispoints403AutoPause        bool   `json:"codex_basispoints_403_auto_pause"`
+	CodexBasispoints403ProbeIntervalMin int    `json:"codex_basispoints_403_probe_interval_minutes"`
+	CodexBasispoints429CooldownSec      int    `json:"codex_basispoints_429_cooldown_seconds"`
+	CodexBasispointsCacheWriteAsInput   bool   `json:"codex_basispoints_cache_creation_as_input"`
 	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         int    `json:"codex_ws_keepalive_interval_sec"`
@@ -9591,6 +9697,9 @@ type settingsResponse struct {
 	CodexCLIVersionSyncEnabled          bool   `json:"codex_cli_version_sync_enabled"`
 	CodexCLIVersionSyncIntervalHours    int    `json:"codex_cli_version_sync_interval_hours"`
 	CodexSyncedCLIVersion               string `json:"codex_synced_cli_version"`
+	CodexSyncedDesktopMacBuild          string `json:"codex_synced_desktop_mac_build"`
+	CodexSyncedDesktopWindowsBuild      string `json:"codex_synced_desktop_windows_build"`
+	CodexSyncedVSCodeBuild              string `json:"codex_synced_vscode_build"`
 	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
 	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
 	CodexEffectiveCLIVersion       string `json:"codex_effective_cli_version"`
@@ -9743,6 +9852,7 @@ type updateSettingsReq struct {
 	AutoCleanError                      *bool                            `json:"auto_clean_error"`
 	AutoCleanExpired                    *bool                            `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             *bool                            `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsOnExhaustionEnabled *bool                            `json:"auto_reset_credits_on_exhaustion_enabled"`
 	AutoResetCreditsBeforeExpiryMin     *int                             `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         *bool                            `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    *bool                            `json:"proxy_pool_enabled"`
@@ -9750,6 +9860,12 @@ type updateSettingsReq struct {
 	SchedulerEngine                     *string                          `json:"scheduler_engine"`
 	CodexForceWebsocket                 *bool                            `json:"codex_force_websocket"`
 	CodexRequestCompression             *bool                            `json:"codex_request_compression"`
+	CodexBasispointsEnabled             *bool                            `json:"codex_basispoints_enabled"`
+	CodexBasispointsModels              *string                          `json:"codex_basispoints_models"`
+	CodexBasispoints403AutoPause        *bool                            `json:"codex_basispoints_403_auto_pause"`
+	CodexBasispoints403ProbeIntervalMin *int                             `json:"codex_basispoints_403_probe_interval_minutes"`
+	CodexBasispoints429CooldownSec      *int                             `json:"codex_basispoints_429_cooldown_seconds"`
+	CodexBasispointsCacheWriteAsInput   *bool                            `json:"codex_basispoints_cache_creation_as_input"`
 	CodexWSWeakNetworkMode              *bool                            `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             *bool                            `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         *int                             `json:"codex_ws_keepalive_interval_sec"`
@@ -10514,12 +10630,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	}
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	autoResetCreditsOnExhaustionEnabled := runtimeCfg.AutoResetCreditsOnExhaustionEnabled
 	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	autoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// uTLS 优雅关闭等待上限（issue #446）：与自动消费同款，数据库是多实例下的权威来源。
 	utlsShutdownTimeoutMinutes := runtimeCfg.UTLSShutdownTimeoutMin
 	if dbSettings != nil {
 		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
+		autoResetCreditsOnExhaustionEnabled = dbSettings.AutoResetCreditsOnExhaustionEnabled
 		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
 		autoActivate5hWindowEnabled = dbSettings.AutoActivate5hWindowEnabled
 		utlsShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(dbSettings.UTLSShutdownTimeoutMinutes)
@@ -10577,6 +10695,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             autoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: autoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         autoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -10584,6 +10703,12 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexRequestCompression:             h.store.CodexRequestCompression(),
+		CodexBasispointsEnabled:             runtimeCfg.CodexBasispointsEnabled,
+		CodexBasispointsModels:              runtimeCfg.CodexBasispointsModels,
+		CodexBasispoints403AutoPause:        !runtimeCfg.CodexBasispoints403PauseDisabled,
+		CodexBasispoints403ProbeIntervalMin: runtimeCfg.CodexBasispoints403ProbeIntervalMin,
+		CodexBasispoints429CooldownSec:      runtimeCfg.CodexBasispoints429CooldownSec,
+		CodexBasispointsCacheWriteAsInput:   runtimeCfg.CodexBasispointsCacheWriteAsInput,
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -10615,6 +10740,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -10823,6 +10951,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	if req.CodexBasispoints403ProbeIntervalMin != nil && !database.ValidCodexBasispoints403ProbeIntervalMinutes(*req.CodexBasispoints403ProbeIntervalMin) {
+		writeError(c, http.StatusBadRequest, "codex_basispoints_403_probe_interval_minutes 必须是 1 到 10080 之间的整数")
+		return
+	}
+	if req.CodexBasispoints429CooldownSec != nil && !database.ValidCodexBasispoints429CooldownSeconds(*req.CodexBasispoints429CooldownSec) {
+		writeError(c, http.StatusBadRequest, "codex_basispoints_429_cooldown_seconds 必须是 1 到 600 之间的整数")
+		return
+	}
 	if req.PromptFilterCustomPatternsExpected != nil && req.PromptFilterCustomPatterns == nil {
 		writeError(c, http.StatusBadRequest, "Prompt 自定义规则版本快照不能单独提交")
 		return
@@ -10993,6 +11129,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	modelPricingOverrides := "{}"
 	modelPricingSyncURL := ""
 	persistedAutoResetCreditsEnabled := false
+	persistedAutoResetCreditsOnExhaustionEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedAutoActivate5hWindowEnabled := false
 	codexImagesMainModel := ""
@@ -11018,6 +11155,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		modelPricingOverrides = existingSettings.ModelPricingOverrides
 		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
+		persistedAutoResetCreditsOnExhaustionEnabled = existingSettings.AutoResetCreditsOnExhaustionEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedAutoActivate5hWindowEnabled = existingSettings.AutoActivate5hWindowEnabled
 		codexImagesMainModel = existingSettings.CodexImagesMainModel
@@ -11093,11 +11231,27 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	adminSecretChanged := h.adminSecretEnv == "" && req.AdminSecret != nil && strings.TrimSpace(currentAdminSecret) != strings.TrimSpace(previousAdminSecret)
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	previousAutoResetCreditsOnExhaustionEnabled := runtimeCfg.AutoResetCreditsOnExhaustionEnabled
+	previousBasispointsEnabled := runtimeCfg.CodexBasispointsEnabled
+	previousBasispointsModels := runtimeCfg.CodexBasispointsModels
+	previousBasispoints403PauseDisabled := runtimeCfg.CodexBasispoints403PauseDisabled
+	previousBasispoints403ProbeIntervalMin := runtimeCfg.CodexBasispoints403ProbeIntervalMin
+	previousBasispoints429CooldownSec := runtimeCfg.CodexBasispoints429CooldownSec
+	previousBasispointsCacheWriteAsInput := runtimeCfg.CodexBasispointsCacheWriteAsInput
+	if existingSettings != nil {
+		runtimeCfg.CodexBasispointsEnabled = existingSettings.CodexBasispointsEnabled
+		runtimeCfg.CodexBasispointsModels = existingSettings.CodexBasispointsModels
+		runtimeCfg.CodexBasispoints403PauseDisabled = existingSettings.CodexBasispoints403PauseDisabled
+		runtimeCfg.CodexBasispoints403ProbeIntervalMin = database.NormalizeCodexBasispoints403ProbeIntervalMinutes(existingSettings.CodexBasispointsProbeMinutes)
+		runtimeCfg.CodexBasispoints429CooldownSec = database.NormalizeCodexBasispoints429CooldownSeconds(existingSettings.CodexBasispoints429CooldownSeconds)
+		runtimeCfg.CodexBasispointsCacheWriteAsInput = existingSettings.CodexBasispointsCacheWriteAsInput
+	}
 	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	previousAutoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
 	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
 	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
+	runtimeCfg.AutoResetCreditsOnExhaustionEnabled = persistedAutoResetCreditsOnExhaustionEnabled
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
 	runtimeCfg.AutoActivate5hWindowEnabled = persistedAutoActivate5hWindowEnabled
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
@@ -11113,7 +11267,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	continuousRetryChanged := req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil || req.ContinuousRetryMaxDurationSeconds != nil
 	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
-	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
+	autoResetCreditsChanged := (req.AutoResetCreditsOnExhaustionEnabled != nil && *req.AutoResetCreditsOnExhaustionEnabled != persistedAutoResetCreditsOnExhaustionEnabled) ||
+		(req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
 		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
 	autoActivate5hChanged := req.AutoActivate5hWindowEnabled != nil && *req.AutoActivate5hWindowEnabled != persistedAutoActivate5hWindowEnabled
 	usageLogMode := h.db.GetUsageLogMode()
@@ -11321,6 +11476,30 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexRequestCompression(*req.CodexRequestCompression)
 		runtimeCfg.CodexRequestCompression = *req.CodexRequestCompression
 		log.Printf("设置已更新: codex_request_compression = %t", *req.CodexRequestCompression)
+	}
+	if req.CodexBasispointsEnabled != nil {
+		runtimeCfg.CodexBasispointsEnabled = *req.CodexBasispointsEnabled
+		log.Printf("设置已更新: codex_basispoints_enabled = %t", *req.CodexBasispointsEnabled)
+	}
+	if req.CodexBasispointsModels != nil {
+		runtimeCfg.CodexBasispointsModels = database.NormalizeCodexBasispointsModels(*req.CodexBasispointsModels)
+		log.Printf("设置已更新: codex_basispoints_models = %q", runtimeCfg.CodexBasispointsModels)
+	}
+	if req.CodexBasispoints403AutoPause != nil {
+		runtimeCfg.CodexBasispoints403PauseDisabled = !*req.CodexBasispoints403AutoPause
+		log.Printf("设置已更新: codex_basispoints_403_auto_pause = %t", *req.CodexBasispoints403AutoPause)
+	}
+	if req.CodexBasispoints403ProbeIntervalMin != nil {
+		runtimeCfg.CodexBasispoints403ProbeIntervalMin = *req.CodexBasispoints403ProbeIntervalMin
+		log.Printf("设置已更新: codex_basispoints_403_probe_interval_minutes = %d", *req.CodexBasispoints403ProbeIntervalMin)
+	}
+	if req.CodexBasispoints429CooldownSec != nil {
+		runtimeCfg.CodexBasispoints429CooldownSec = *req.CodexBasispoints429CooldownSec
+		log.Printf("设置已更新: codex_basispoints_429_cooldown_seconds = %d", *req.CodexBasispoints429CooldownSec)
+	}
+	if req.CodexBasispointsCacheWriteAsInput != nil {
+		runtimeCfg.CodexBasispointsCacheWriteAsInput = *req.CodexBasispointsCacheWriteAsInput
+		log.Printf("设置已更新: codex_basispoints_cache_creation_as_input = %t", *req.CodexBasispointsCacheWriteAsInput)
 	}
 
 	if req.CodexWSWeakNetworkMode != nil {
@@ -11855,6 +12034,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetIgnoreUsageLimitStatus(*req.IgnoreUsageLimitStatus)
 		log.Printf("设置已更新: ignore_usage_limit_status = %t", *req.IgnoreUsageLimitStatus)
 	}
+	if req.AutoResetCreditsOnExhaustionEnabled != nil {
+		runtimeCfg.AutoResetCreditsOnExhaustionEnabled = *req.AutoResetCreditsOnExhaustionEnabled
+	}
 	if req.AutoResetCreditsEnabled != nil {
 		runtimeCfg.AutoResetCreditsEnabled = *req.AutoResetCreditsEnabled
 		log.Printf("设置已更新: auto_reset_credits_enabled = %t", *req.AutoResetCreditsEnabled)
@@ -11871,8 +12053,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	// 确认保存成功前，运行态继续使用旧配置，避免持久化失败后后台任务仍然开始执行。
 	runtimeCfg = proxy.NormalizeRuntimeSettings(runtimeCfg)
 	effectiveRuntimeCfg := runtimeCfg
+	// Basispoints routing switches only after the database accepted the change.
+	effectiveRuntimeCfg.CodexBasispointsEnabled = previousBasispointsEnabled
+	effectiveRuntimeCfg.CodexBasispointsModels = previousBasispointsModels
+	effectiveRuntimeCfg.CodexBasispoints403PauseDisabled = previousBasispoints403PauseDisabled
+	effectiveRuntimeCfg.CodexBasispoints403ProbeIntervalMin = previousBasispoints403ProbeIntervalMin
+	effectiveRuntimeCfg.CodexBasispoints429CooldownSec = previousBasispoints429CooldownSec
+	effectiveRuntimeCfg.CodexBasispointsCacheWriteAsInput = previousBasispointsCacheWriteAsInput
 	if autoResetCreditsChanged {
 		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
+		effectiveRuntimeCfg.AutoResetCreditsOnExhaustionEnabled = previousAutoResetCreditsOnExhaustionEnabled
 		effectiveRuntimeCfg.AutoResetCreditsBeforeExpiryMin = previousAutoResetCreditsBeforeExpiryMin
 	}
 	if autoActivate5hChanged {
@@ -11882,6 +12072,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		// CodexSyncedCLIVersion 由后台同步任务独立维护；管理员保存其他设置时
 		// 必须保留临界区内读到的最新值，避免反向回滚同步结果。
 		effectiveRuntimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+		effectiveRuntimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+		effectiveRuntimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+		effectiveRuntimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 		return effectiveRuntimeCfg
 	})
 
@@ -12125,6 +12318,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: runtimeCfg.AutoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -12132,6 +12326,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexRequestCompression:             h.store.CodexRequestCompression(),
+		CodexBasispointsEnabled:             runtimeCfg.CodexBasispointsEnabled,
+		CodexBasispointsModels:              runtimeCfg.CodexBasispointsModels,
+		CodexBasispoints403PauseDisabled:    runtimeCfg.CodexBasispoints403PauseDisabled,
+		CodexBasispointsProbeMinutes:        runtimeCfg.CodexBasispoints403ProbeIntervalMin,
+		CodexBasispoints429CooldownSeconds:  runtimeCfg.CodexBasispoints429CooldownSec,
+		CodexBasispointsCacheWriteAsInput:   runtimeCfg.CodexBasispointsCacheWriteAsInput,
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -12163,6 +12363,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
@@ -12233,6 +12436,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if req.CodexBasispointsEnabled != nil || req.CodexBasispointsModels != nil || req.CodexBasispoints403AutoPause != nil || req.CodexBasispoints403ProbeIntervalMin != nil || req.CodexBasispoints429CooldownSec != nil || req.CodexBasispointsCacheWriteAsInput != nil {
+			writeError(c, http.StatusInternalServerError, "保存 Basis Points 设置失败，设置未生效")
+			return
+		}
 		if req.CodexImagesMainModel != nil {
 			writeError(c, http.StatusInternalServerError, "保存生图设置失败，文本驱动模型未生效")
 			return
@@ -12272,6 +12479,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	} else {
+		proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+			current.CodexBasispointsEnabled = runtimeCfg.CodexBasispointsEnabled
+			current.CodexBasispointsModels = runtimeCfg.CodexBasispointsModels
+			current.CodexBasispoints403PauseDisabled = runtimeCfg.CodexBasispoints403PauseDisabled
+			current.CodexBasispoints403ProbeIntervalMin = runtimeCfg.CodexBasispoints403ProbeIntervalMin
+			current.CodexBasispoints429CooldownSec = runtimeCfg.CodexBasispoints429CooldownSec
+			current.CodexBasispointsCacheWriteAsInput = runtimeCfg.CodexBasispointsCacheWriteAsInput
+			return current
+		})
 		if req.SessionSlotBufferSeconds != nil {
 			h.store.SetSessionSlotBuffer(time.Duration(sessionSlotBufferSeconds) * time.Second)
 			log.Printf("设置已更新: session_slot_buffer_seconds = %d", sessionSlotBufferSeconds)
@@ -12330,6 +12546,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if autoResetCreditsChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 				return runtimeCfg
 			})
 			h.triggerAutoResetCreditsScan()
@@ -12337,6 +12556,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if autoActivate5hChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 				return runtimeCfg
 			})
 			h.triggerAutoActivate5hScan()
@@ -12457,6 +12679,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: runtimeCfg.AutoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -12464,6 +12687,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexRequestCompression:             h.store.CodexRequestCompression(),
+		CodexBasispointsEnabled:             runtimeCfg.CodexBasispointsEnabled,
+		CodexBasispointsModels:              runtimeCfg.CodexBasispointsModels,
+		CodexBasispoints403AutoPause:        !runtimeCfg.CodexBasispoints403PauseDisabled,
+		CodexBasispoints403ProbeIntervalMin: runtimeCfg.CodexBasispoints403ProbeIntervalMin,
+		CodexBasispoints429CooldownSec:      runtimeCfg.CodexBasispoints429CooldownSec,
+		CodexBasispointsCacheWriteAsInput:   runtimeCfg.CodexBasispointsCacheWriteAsInput,
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -12495,6 +12724,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -13058,6 +13290,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
+	h.addDaybreakCatalogModels(&catalog)
 	catalog.GrokModels = h.grokChannelModels()
 	catalog.AntigravityModels = h.antigravityChannelModels()
 	// The request-facing catalog must not advertise models contributed only by
@@ -13151,6 +13384,22 @@ func (h *Handler) SyncCodexCLIVersion(c *gin.Context) {
 		proxyURL = h.store.GetProxyURL()
 	}
 	result, err := proxy.SyncCodexCLIVersion(ctx, h.db, proxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// SyncCodexClientVersions 同步 CLI、Desktop 和 VSCode，并返回各来源的独立结果。
+func (h *Handler) SyncCodexClientVersions(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Minute)
+	defer cancel()
+	proxyURL := ""
+	if h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	result, err := proxy.SyncCodexClientVersions(ctx, h.db, proxyURL)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return

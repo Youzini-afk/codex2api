@@ -85,7 +85,7 @@ func scopedModelOwner(record *scopedModelRecord) string {
 }
 
 func (h *Handler) accountVisibleToAPIKey(account *auth.Account, apiKeyID int64, now time.Time) bool {
-	if h == nil || h.store == nil || account == nil || !account.ModelCatalogEligible() {
+	if h == nil || h.store == nil || account == nil || (!account.ModelCatalogEligible() && !account.DaybreakCatalogEligible()) {
 		return false
 	}
 	if !account.AllowsAPIKey(apiKeyID) || !h.store.APIKeyAllowsAccount(apiKeyID, account) {
@@ -249,7 +249,7 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 
 		default:
 			for _, item := range catalog.Items {
-				if !item.Enabled || !account.SupportsCodexModel(item.ID) {
+				if !account.ModelCatalogEligible() || !item.Enabled || !account.SupportsCodexModel(item.ID) {
 					continue
 				}
 				if item.ProOnly && !isSparkPlanCandidate(account.GetPlanType()) {
@@ -259,6 +259,12 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 				addTarget(item.ID)
 				if item.Source != ModelSourceReasoningEffort {
 					h.addAutomaticScopedReasoningAliases(records, item.ID, modelBackingCodex, targetExists)
+				}
+			}
+			addDaybreakScopedModels(records, account, catalog.Items)
+			for _, alias := range account.DaybreakAliases() {
+				if records[alias] != nil {
+					addTarget(alias)
 				}
 			}
 		}
@@ -292,8 +298,9 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 	// Model allow/deny applies to the name the downstream client requests. An
 	// alias may therefore remain visible while its hidden target is denied; the
 	// request path applies the same source-name policy before mapping.
+	// Daybreak 另外校验目标程序模型，避免映射绕过该 Key 的权限名单。
 	for key, record := range records {
-		if checkAPIKeyModel(record.id, row.Limits) != "" {
+		if checkAPIKeyModel(record.id, row.Limits) != "" || h.daybreakMappedModelDenied(record.id, row.Limits) {
 			delete(records, key)
 		}
 	}

@@ -362,6 +362,67 @@ func TestSchedulerOutboxConsumerLoadsUpdatesAndRemovesAccount(t *testing.T) {
 	}
 }
 
+func TestSchedulerOutboxConsumerConvergesDaybreakCapabilities(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "daybreak-outbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 1, SchedulerEngine: "indexed", LazyMode: true})
+	t.Cleanup(func() { store.Stop(); _ = db.Close() })
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id, err := db.InsertAccountWithCredentials(ctx, "daybreak", map[string]interface{}{
+		"access_token": "synthetic-token", "account_id": "synthetic-workspace",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForSchedulerProjection(t, func() bool { return store.FindByID(id) != nil })
+	account := store.FindByID(id)
+	atomic.StoreInt64(&account.ActiveRequests, 3)
+	snapshot := database.DaybreakSnapshot{
+		Identity: account.DaybreakIdentity(), ObservedAt: 10, CheckedAt: 10,
+		Models: map[string][]string{"gpt-6-sol": {DaybreakBlue}},
+	}
+	if err := db.SaveDaybreakSnapshot(ctx, id, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	waitForSchedulerProjection(t, func() bool { return account.SupportsDaybreak("gpt-6-sol", DaybreakBlue) })
+
+	watermark, err := db.SchedulerOutboxHighWatermark(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := snapshot
+	stale.ObservedAt = 9
+	stale.Models = map[string][]string{"gpt-6-sol": {DaybreakRed}}
+	if err := db.SaveDaybreakSnapshot(ctx, id, stale); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := db.SchedulerOutboxHighWatermark(ctx); err != nil || after != watermark {
+		t.Fatalf("stale snapshot emitted event: before=%d after=%d err=%v", watermark, after, err)
+	}
+	snapshot.ObservedAt = 11
+	snapshot.Models = stale.Models
+	if err := db.SaveDaybreakSnapshot(ctx, id, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	waitForSchedulerProjection(t, func() bool {
+		return account.SupportsDaybreak("gpt-6-sol", DaybreakRed) && !account.SupportsDaybreak("gpt-6-sol", DaybreakBlue)
+	})
+	snapshot.ObservedAt = 12
+	snapshot.Models = map[string][]string{}
+	if err := db.SaveDaybreakSnapshot(ctx, id, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	waitForSchedulerProjection(t, func() bool { return len(account.DaybreakAliases()) == 0 })
+	if store.FindByID(id) != account || atomic.LoadInt64(&account.ActiveRequests) != 3 {
+		t.Fatal("capability reload replaced account or lost live request counters")
+	}
+}
+
 func TestSchedulerOutboxConsumerConvergesReserveAndAntigravityFences(t *testing.T) {
 	ctx := context.Background()
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "scheduler-antigravity-convergence.db"))
