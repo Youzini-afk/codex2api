@@ -893,10 +893,9 @@ func TestStoreNextConcurrentAcquireDoesNotExceedDynamicLimit(t *testing.T) {
 		Status:      StatusReady,
 		PlanType:    "pro",
 	}
-	store := &Store{
-		accounts:       []*Account{acc},
-		maxConcurrency: 1,
-	}
+	store := (&Store{
+		accounts: []*Account{acc},
+	}).withMaxConcurrency(1)
 
 	const workers = 32
 	var entered int64
@@ -951,7 +950,7 @@ func TestStoreNextConcurrentAcquireDoesNotExceedDynamicLimit(t *testing.T) {
 	if acquired != 1 {
 		t.Fatalf("acquired accounts = %d, want 1", acquired)
 	}
-	if got := atomic.LoadInt64(&acc.ActiveRequests); got != 1 {
+	if got := acc.ActiveRequests.Load(); got != 1 {
 		t.Fatalf("ActiveRequests = %d, want 1", got)
 	}
 	store.Release(acc)
@@ -1076,7 +1075,7 @@ func TestStoreNextPrefersPremium7dResetSoonOverProvenAccount(t *testing.T) {
 		UsagePercent7dValid: true,
 		Reset7dAt:           now.Add(5 * 24 * time.Hour),
 	}
-	atomic.StoreInt64(&later.TotalRequests, 450)
+	later.TotalRequests.Store(450)
 	recomputeTestAccount(soon, 2)
 	recomputeTestAccount(later, 2)
 

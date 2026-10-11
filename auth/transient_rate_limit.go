@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/cache"
@@ -157,7 +156,7 @@ func (s *Store) MarkTransientRateLimitedWithPolicy(acc *Account, retryAfter time
 	acc.LastRateLimitedAt = now
 	acc.setCooldownUntilLocked(until, TransientRateLimitedCooldownReason)
 	acc.transientRateLimitUntil = until
-	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	acc.armTransientRateLimitRecoveryLocked(s)
 	record := runtimeCooldownRecord{
 		Kind: cache.CooldownKindTransient, Reason: TransientRateLimitedCooldownReason,
@@ -203,7 +202,7 @@ func (s *Store) reconcileTransientRateLimitPolicies() {
 				acc.setCooldownUntilLocked(desired, TransientRateLimitedCooldownReason)
 				acc.transientRateLimitUntil = desired
 				acc.transientRateLimitBackoff = 0
-				acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+				acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 				acc.armTransientRateLimitRecoveryLocked(s)
 			}
 			acc.mu.Unlock()
@@ -228,7 +227,7 @@ func (s *Store) reconcileTransientRateLimitPolicies() {
 		if acc.HealthTier != HealthTierBanned {
 			acc.HealthTier = HealthTierWarm
 		}
-		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+		acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 		acc.mu.Unlock()
 		s.fastSchedulerUpdate(acc)
 		s.deleteCachedAccountCooldown(acc.DBID)
@@ -274,7 +273,7 @@ func (a *Account) armTransientRateLimitRecoveryLocked(s *Store) {
 			return
 		}
 		a.transientRateLimitTimer = nil
-		a.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+		a.recomputeSchedulerLocked(s.maxConcurrency.Load())
 		a.mu.Unlock()
 		s.fastSchedulerUpdate(a)
 	})

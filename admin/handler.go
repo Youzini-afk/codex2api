@@ -36,6 +36,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/internal/openaiidentity"
+	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -1189,6 +1190,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id/grok/state", h.GetGrokAccountState)
 	api.POST("/accounts/:id/grok/sync", h.SyncGrokAccountState)
 	api.POST("/accounts/:id/grok/capabilities/probe", h.ProbeGrokAccountCapabilities)
+	api.GET("/accounts/:id/grok/auth-json", h.GetGrokAccountAuthJSON)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
@@ -1197,7 +1199,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
 	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
-	api.POST("/accounts/:id/bps-pause/clear", h.ClearAccountExcelBPSPause)
 	api.GET("/channel-monitors", h.ListChannelMonitors)
 	api.GET("/channel-monitors/billing-rates", h.ListChannelMonitorBillingRates)
 	api.POST("/channel-monitors/:id/probe", h.ProbeChannelMonitorNow)
@@ -1228,6 +1229,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/model-detector", h.DetectCodexModel)
+	api.GET("/modeltrace/bank", h.GetModelTraceBank)
+	api.POST("/modeltrace/bank/update", h.UpdateModelTraceBank)
+	api.DELETE("/modeltrace/bank", h.ResetModelTraceBank)
 	api.GET("/accounts/:id/quality-test/options", h.QualityTestOptions)
 	api.POST("/accounts/:id/quality-test", h.CreateQualityTestJob)
 	api.GET("/quality-tests", h.ListQualityTests)
@@ -1269,6 +1273,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/setup-hints", h.GetSetupHints)
 	api.GET("/keys", h.ListAPIKeys)
+	api.GET("/keys-concurrency", h.GetAPIKeyConcurrency)
 	api.POST("/keys", h.CreateAPIKey)
 	api.POST("/keys/reset-all-quotas", h.ResetAllAPIKeyQuotas)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
@@ -1678,10 +1683,6 @@ type accountResponse struct {
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
 	ClaudeAPI                     bool                        `json:"claude_api,omitempty"`
-	ExcelBPSEnabled               bool                        `json:"openai_excel_bps,omitempty"`
-	ExcelBPSOptOut                bool                        `json:"openai_excel_bps_opt_out,omitempty"`
-	ExcelBPSEffective             bool                        `json:"openai_excel_bps_effective,omitempty"`
-	ExcelBPSPause                 *proxy.ExcelBPSPauseView    `json:"bps_pause,omitempty"`
 	ClaudeAuthKind                string                      `json:"claude_auth_kind,omitempty"`
 	ClaudeBaseURL                 string                      `json:"claude_base_url,omitempty"`
 	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
@@ -1768,6 +1769,7 @@ type accountResponse struct {
 	AutoPause7dThreshold          *float64                    `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled           bool                        `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled           bool                        `json:"auto_pause_7d_disabled"`
+	KeepConcurrencyOnDegrade      bool                        `json:"keep_concurrency_on_degrade"`
 	UsageLimitOverride            *bool                       `json:"ignore_usage_limit_status_override"`
 	UsageLimitEffective           bool                        `json:"ignore_usage_limit_status_effective"`
 	DispatchCountLimit            *int64                      `json:"dispatch_count_limit"`
@@ -2133,9 +2135,6 @@ type accountLiteResponse struct {
 	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
 	GrokAPI            bool   `json:"grok_api"`
 	ClaudeAPI          bool   `json:"claude_api"`
-	ExcelBPSEnabled    bool   `json:"openai_excel_bps"`
-	ExcelBPSOptOut     bool   `json:"openai_excel_bps_opt_out"`
-	ExcelBPSEffective  bool   `json:"openai_excel_bps_effective"`
 	AgentIdentity      bool   `json:"agent_identity"`
 	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
 }
@@ -2150,10 +2149,8 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 
 	// 运行时状态覆盖 DB 状态(与完整视图一致),其余富化一律跳过。
 	runtimeStatus := make(map[int64]string)
-	excelBPSEffective := make(map[int64]bool)
 	for _, acc := range h.store.Accounts() {
 		runtimeStatus[acc.DBID] = acc.RuntimeStatus()
-		excelBPSEffective[acc.DBID] = acc.IsExcelBPSEnabled()
 	}
 
 	accounts := make([]accountLiteResponse, 0, len(rows))
@@ -2194,9 +2191,6 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			GrokAPI:            isGrokAccount,
 			ClaudeAPI:          isClaudeAccount,
-			ExcelBPSEnabled:    row.GetCredentialBool(auth.ExcelBPSCredentialKey),
-			ExcelBPSOptOut:     row.GetCredentialBool(auth.ExcelBPSOptOutCredentialKey),
-			ExcelBPSEffective:  excelBPSEffective[row.ID],
 			AgentIdentity:      isAgentIdentityCredentialRow(row),
 			GrokAuthKind:       grokAuthKind,
 		})
@@ -2211,6 +2205,7 @@ type updateAccountSchedulerReq struct {
 	UsageReservePercent5h   json.RawMessage `json:"usage_reserve_percent_5h"`
 	UsageReservePercent7d   json.RawMessage `json:"usage_reserve_percent_7d"`
 	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
+	KeepConcurrency         json.RawMessage `json:"keep_concurrency_on_degrade"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                    json.RawMessage `json:"tags"`
 	GroupIDs                json.RawMessage `json:"group_ids"`
@@ -2230,8 +2225,6 @@ type updateAccountSchedulerReq struct {
 	ClaudeClientVersion     json.RawMessage `json:"claude_client_version"`
 	Timezone                json.RawMessage `json:"timezone"`
 	AccountHref             json.RawMessage `json:"account_href"`
-	ExcelBPSEnabled         json.RawMessage `json:"openai_excel_bps"`
-	ExcelBPSOptOut          json.RawMessage `json:"openai_excel_bps_opt_out"`
 }
 
 type accountSchedulerUpdate struct {
@@ -2240,6 +2233,7 @@ type accountSchedulerUpdate struct {
 	UsageReservePercent5h   database.OptionalNullInt64
 	UsageReservePercent7d   database.OptionalNullInt64
 	SkipWarmTier            database.OptionalBool
+	KeepConcurrency         database.OptionalBool
 	AllowedAPIKeyIDs        database.OptionalInt64Slice
 	Tags                    optionalStringSlice
 	GroupIDs                database.OptionalInt64Slice
@@ -2259,8 +2253,6 @@ type accountSchedulerUpdate struct {
 	ClaudeClientVersion     database.OptionalString
 	Timezone                database.OptionalString
 	AccountHref             database.OptionalString
-	ExcelBPSEnabled         database.OptionalBool
-	ExcelBPSOptOut          database.OptionalBool
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -2283,6 +2275,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	keepConcurrency, err := parseOptionalBoolField(req.KeepConcurrency, auth.KeepConcurrencyOnDegradeCredentialKey)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -2379,14 +2375,6 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	excelBPSEnabled, err := parseOptionalBoolField(req.ExcelBPSEnabled, "openai_excel_bps")
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	excelBPSOptOut, err := parseOptionalBoolField(req.ExcelBPSOptOut, "openai_excel_bps_opt_out")
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
 	if codexFingerprintMode.Set {
 		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
 	}
@@ -2426,12 +2414,6 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		}
 		credentialUpdates[auth.AccountHrefCredentialKey] = normalized
 	}
-	if excelBPSEnabled.Set {
-		credentialUpdates[auth.ExcelBPSCredentialKey] = excelBPSEnabled.Value
-	}
-	if excelBPSOptOut.Set {
-		credentialUpdates[auth.ExcelBPSOptOutCredentialKey] = excelBPSOptOut.Value
-	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
 	}
@@ -2443,6 +2425,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	}
 	if autoPause7dDisabled.Set {
 		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
+	}
+	if keepConcurrency.Set {
+		credentialUpdates[auth.KeepConcurrencyOnDegradeCredentialKey] = keepConcurrency.Value
 	}
 	if ignoreUsageLimitStatusOverride.Set {
 		if ignoreUsageLimitStatusOverride.Value == nil {
@@ -2475,6 +2460,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		UsageReservePercent5h:   usageReserve5h,
 		UsageReservePercent7d:   usageReserve7d,
 		SkipWarmTier:            skipWarmTier,
+		KeepConcurrency:         keepConcurrency,
 		AllowedAPIKeyIDs:        allowedAPIKeyIDs,
 		Tags:                    tags,
 		GroupIDs:                groupIDs,
@@ -2494,8 +2480,6 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ClaudeClientVersion:     claudeClientVersion,
 		Timezone:                timezoneField,
 		AccountHref:             accountHref,
-		ExcelBPSEnabled:         excelBPSEnabled,
-		ExcelBPSOptOut:          excelBPSOptOut,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
 }
@@ -2568,6 +2552,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.UsageReservePercent5h.Set ||
 		u.UsageReservePercent7d.Set ||
 		u.SkipWarmTier.Set ||
+		u.KeepConcurrency.Set ||
 		u.AllowedAPIKeyIDs.Set ||
 		u.Tags.Set ||
 		u.GroupIDs.Set ||
@@ -2586,9 +2571,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.ClaudeVersionPolicy.Set ||
 		u.ClaudeClientVersion.Set ||
 		u.Timezone.Set ||
-		u.AccountHref.Set ||
-		u.ExcelBPSEnabled.Set ||
-		u.ExcelBPSOptOut.Set
+		u.AccountHref.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2830,6 +2813,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			optionalBoolPtr(update.SkipWarmTier),
 		)
 	}
+	if update.KeepConcurrency.Set {
+		h.store.ApplyAccountKeepConcurrencyOnDegrade(id, update.KeepConcurrency.Value)
+	}
 	if update.AllowedAPIKeyIDs.Set {
 		h.store.ApplyAccountAllowedAPIKeys(id, update.AllowedAPIKeyIDs.Values)
 	}
@@ -2928,17 +2914,6 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.Timezone.Set {
 		h.store.ApplyAccountTimezone(id, update.Timezone.Value)
-	}
-	if value, ok := update.CredentialUpdates[auth.ExcelBPSCredentialKey].(bool); ok {
-		h.store.ApplyAccountExcelBPSEnabled(id, value)
-	}
-	if value, ok := update.CredentialUpdates[auth.ExcelBPSOptOutCredentialKey].(bool); ok {
-		h.store.ApplyAccountExcelBPSOptOut(id, value)
-	}
-	// Changing an account's Basispoints mode is an explicit decision; it
-	// supersedes any automatic pause or cooldown of that route.
-	if update.ExcelBPSEnabled.Set || update.ExcelBPSOptOut.Set {
-		proxy.ClearExcelBPSPause(id)
 	}
 }
 
@@ -4634,7 +4609,13 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
+	// 编辑已有账号时带上账号本身：号池画像按账号抽取，统一身份开关下与该账号的
+	// 对话请求取同一份身份（issue #774）；新建账号尚未落库，为空。
+	var account *auth.Account
+	if req.AccountID > 0 && h.store != nil {
+		account = h.store.FindByID(req.AccountID)
+	}
+	models, err := fetchOpenAIResponsesModelIDs(ctx, account, baseURL, req.APIKey, req.ProxyURL, customHeaders)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -4791,7 +4772,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
 }
 
-func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
+func fetchOpenAIResponsesModelIDs(ctx context.Context, account *auth.Account, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -4809,7 +4790,7 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
-	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, baseURL+"|"+apiKey)
+	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, account, baseURL, apiKey)
 	for name, value := range customHeaders {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -4986,7 +4967,7 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
 	daybreakSnapshot := account.BeginDaybreakObservation()
-	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
+	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "", nil)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
 		return
@@ -6768,9 +6749,9 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 			}
 			if value := row.GetCredential(auth.ClaudeUsageWindowsCredentialKey); value != "" {
 				resp["claude_usage_windows_probed"] = true
-				if windows := parseClaudeUsageWindows(value); len(windows) > 0 {
-					resp["claude_usage_windows"] = windows
-				}
+			}
+			if windows := claudeAccountUsageWindows(row); len(windows) > 0 {
+				resp["claude_usage_windows"] = windows
 			}
 		}
 	}
@@ -7937,10 +7918,12 @@ func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
 
 // GetHealth 系统健康检查（扩展版）
 func (h *Handler) GetHealth(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, healthResponse{
-		Status:    "ok",
-		Available: h.store.AvailableCount(),
-		Total:     h.store.AccountCount(),
+		Status:       "ok",
+		Available:    h.store.AvailableCount(),
+		Total:        h.store.AccountCount(),
+		BuildVersion: version.Current(),
 	})
 }
 
@@ -8927,7 +8910,9 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 
 // ==================== API Keys ====================
 
-// ListAPIKeys 获取所有 API 密钥（脱敏版本）
+// ListAPIKeys 获取所有 API 密钥（脱敏版本）。
+// view=lite 只返回密钥行本身,跳过窗口费用与最近使用时间:这两项要聚合 usage_logs,
+// 而筛选下拉、横幅等场景用不到,慢盘 SQLite 上每次打开页面都白扫一遍。
 func (h *Handler) ListAPIKeys(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -8935,6 +8920,14 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	keys, err := h.db.ListAPIKeys(ctx)
 	if err != nil {
 		writeInternalError(c, err)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("view")), "lite") {
+		maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
+		for _, k := range keys {
+			maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		}
+		c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
 		return
 	}
 
@@ -9660,12 +9653,6 @@ type settingsResponse struct {
 	SchedulerEngine                     string `json:"scheduler_engine"`
 	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
 	CodexRequestCompression             bool   `json:"codex_request_compression"`
-	CodexBasispointsEnabled             bool   `json:"codex_basispoints_enabled"`
-	CodexBasispointsModels              string `json:"codex_basispoints_models"`
-	CodexBasispoints403AutoPause        bool   `json:"codex_basispoints_403_auto_pause"`
-	CodexBasispoints403ProbeIntervalMin int    `json:"codex_basispoints_403_probe_interval_minutes"`
-	CodexBasispoints429CooldownSec      int    `json:"codex_basispoints_429_cooldown_seconds"`
-	CodexBasispointsCacheWriteAsInput   bool   `json:"codex_basispoints_cache_creation_as_input"`
 	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         int    `json:"codex_ws_keepalive_interval_sec"`
@@ -9681,6 +9668,7 @@ type settingsResponse struct {
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     int    `json:"codex_ws_downstream_keepalive_slots"`
 	GithubTokenConfigured               bool   `json:"github_token_configured"`
 	GithubProxyURL                      string `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
@@ -9700,6 +9688,9 @@ type settingsResponse struct {
 	CodexSyncedDesktopMacBuild          string `json:"codex_synced_desktop_mac_build"`
 	CodexSyncedDesktopWindowsBuild      string `json:"codex_synced_desktop_windows_build"`
 	CodexSyncedVSCodeBuild              string `json:"codex_synced_vscode_build"`
+
+	CodexClientVersions []proxy.CodexClientVersionTarget `json:"codex_client_versions"`
+
 	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
 	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
 	CodexEffectiveCLIVersion       string `json:"codex_effective_cli_version"`
@@ -9777,6 +9768,7 @@ type settingsResponse struct {
 	CodexUserAgentConfig               string                           `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled              bool                             `json:"codex_telemetry_enabled"`
 	CodexTelemetryTimingDebug          bool                             `json:"codex_telemetry_timing_debug"`
+	CodexUnifiedClientIdentityEnabled  bool                             `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                       string                           `json:"usage_log_mode"`
 	UsageLogBatchSize                  int                              `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       int                              `json:"usage_log_flush_interval_seconds"`
@@ -9787,6 +9779,7 @@ type settingsResponse struct {
 	BillingTierPolicy                  string                           `json:"billing_tier_policy"`
 	ModelsListReadMaxBytes             int64                            `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers               bool                             `json:"show_full_usage_numbers"`
+	ShowUpstreamModelMismatch          bool                             `json:"show_upstream_model_mismatch"`
 	PublicKeyUsagePageEnabled          bool                             `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled       bool                             `json:"public_image_studio_page_enabled"`
 	PublicAccountPortalPageEnabled     bool                             `json:"public_account_portal_page_enabled"`
@@ -9860,12 +9853,6 @@ type updateSettingsReq struct {
 	SchedulerEngine                     *string                          `json:"scheduler_engine"`
 	CodexForceWebsocket                 *bool                            `json:"codex_force_websocket"`
 	CodexRequestCompression             *bool                            `json:"codex_request_compression"`
-	CodexBasispointsEnabled             *bool                            `json:"codex_basispoints_enabled"`
-	CodexBasispointsModels              *string                          `json:"codex_basispoints_models"`
-	CodexBasispoints403AutoPause        *bool                            `json:"codex_basispoints_403_auto_pause"`
-	CodexBasispoints403ProbeIntervalMin *int                             `json:"codex_basispoints_403_probe_interval_minutes"`
-	CodexBasispoints429CooldownSec      *int                             `json:"codex_basispoints_429_cooldown_seconds"`
-	CodexBasispointsCacheWriteAsInput   *bool                            `json:"codex_basispoints_cache_creation_as_input"`
 	CodexWSWeakNetworkMode              *bool                            `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             *bool                            `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         *int                             `json:"codex_ws_keepalive_interval_sec"`
@@ -9881,6 +9868,7 @@ type updateSettingsReq struct {
 	CodexWSBusyOverflowEnabled          *bool                            `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int                             `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               *int                             `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     *int                             `json:"codex_ws_downstream_keepalive_slots"`
 	GithubToken                         *string                          `json:"github_token"`
 	GithubProxyURL                      *string                          `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           *bool                            `json:"codex_overload_pause_enabled"`
@@ -9957,6 +9945,7 @@ type updateSettingsReq struct {
 	CodexUserAgentConfig                *string                          `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled               *bool                            `json:"codex_telemetry_enabled"`
 	CodexTelemetryTimingDebug           *bool                            `json:"codex_telemetry_timing_debug"`
+	CodexUnifiedClientIdentityEnabled   *bool                            `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                        *string                          `json:"usage_log_mode"`
 	UsageLogBatchSize                   *int                             `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds        *int                             `json:"usage_log_flush_interval_seconds"`
@@ -9967,6 +9956,7 @@ type updateSettingsReq struct {
 	BillingTierPolicy                   *string                          `json:"billing_tier_policy"`
 	ModelsListReadMaxBytes              *int64                           `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers                *bool                            `json:"show_full_usage_numbers"`
+	ShowUpstreamModelMismatch           *bool                            `json:"show_upstream_model_mismatch"`
 	PublicKeyUsagePageEnabled           *bool                            `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled        *bool                            `json:"public_image_studio_page_enabled"`
 	PublicAccountPortalPageEnabled      *bool                            `json:"public_account_portal_page_enabled"`
@@ -10607,6 +10597,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	var resinURL, resinPlatformName string
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
+	showUpstreamModelMismatch := true
 	publicKeyUsagePageEnabled := true
 	publicImageStudioPageEnabled := true
 	publicAccountPortalPageEnabled := false
@@ -10617,6 +10608,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
+		showUpstreamModelMismatch = dbSettings.ShowUpstreamModelMismatch
 		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
 		publicImageStudioPageEnabled = dbSettings.PublicImageStudioPageEnabled
 		publicAccountPortalPageEnabled = dbSettings.PublicAccountPortalPageEnabled
@@ -10703,12 +10695,6 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexRequestCompression:             h.store.CodexRequestCompression(),
-		CodexBasispointsEnabled:             runtimeCfg.CodexBasispointsEnabled,
-		CodexBasispointsModels:              runtimeCfg.CodexBasispointsModels,
-		CodexBasispoints403AutoPause:        !runtimeCfg.CodexBasispoints403PauseDisabled,
-		CodexBasispoints403ProbeIntervalMin: runtimeCfg.CodexBasispoints403ProbeIntervalMin,
-		CodexBasispoints429CooldownSec:      runtimeCfg.CodexBasispoints429CooldownSec,
-		CodexBasispointsCacheWriteAsInput:   runtimeCfg.CodexBasispointsCacheWriteAsInput,
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -10724,6 +10710,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -10743,6 +10730,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
 		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
 		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
+		CodexClientVersions:                 proxy.CodexClientVersionCacheView(),
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -10810,6 +10798,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        h.db.GetUsageLogMode(),
 		UsageLogBatchSize:                   h.db.GetUsageLogBatchSize(),
 		UsageLogFlushIntervalSeconds:        h.db.GetUsageLogFlushIntervalSeconds(),
@@ -10820,6 +10809,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
@@ -10949,14 +10939,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	var req updateSettingsReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
-		return
-	}
-	if req.CodexBasispoints403ProbeIntervalMin != nil && !database.ValidCodexBasispoints403ProbeIntervalMinutes(*req.CodexBasispoints403ProbeIntervalMin) {
-		writeError(c, http.StatusBadRequest, "codex_basispoints_403_probe_interval_minutes 必须是 1 到 10080 之间的整数")
-		return
-	}
-	if req.CodexBasispoints429CooldownSec != nil && !database.ValidCodexBasispoints429CooldownSeconds(*req.CodexBasispoints429CooldownSec) {
-		writeError(c, http.StatusBadRequest, "codex_basispoints_429_cooldown_seconds 必须是 1 到 600 之间的整数")
 		return
 	}
 	if req.PromptFilterCustomPatternsExpected != nil && req.PromptFilterCustomPatterns == nil {
@@ -11123,6 +11105,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	siteLogo := ""
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
+	showUpstreamModelMismatch := true
 	publicKeyUsagePageEnabled := true
 	publicImageStudioPageEnabled := true
 	publicAccountPortalPageEnabled := false
@@ -11149,6 +11132,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
+		showUpstreamModelMismatch = existingSettings.ShowUpstreamModelMismatch
 		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
 		publicImageStudioPageEnabled = existingSettings.PublicImageStudioPageEnabled
 		publicAccountPortalPageEnabled = existingSettings.PublicAccountPortalPageEnabled
@@ -11232,20 +11216,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
 	previousAutoResetCreditsOnExhaustionEnabled := runtimeCfg.AutoResetCreditsOnExhaustionEnabled
-	previousBasispointsEnabled := runtimeCfg.CodexBasispointsEnabled
-	previousBasispointsModels := runtimeCfg.CodexBasispointsModels
-	previousBasispoints403PauseDisabled := runtimeCfg.CodexBasispoints403PauseDisabled
-	previousBasispoints403ProbeIntervalMin := runtimeCfg.CodexBasispoints403ProbeIntervalMin
-	previousBasispoints429CooldownSec := runtimeCfg.CodexBasispoints429CooldownSec
-	previousBasispointsCacheWriteAsInput := runtimeCfg.CodexBasispointsCacheWriteAsInput
-	if existingSettings != nil {
-		runtimeCfg.CodexBasispointsEnabled = existingSettings.CodexBasispointsEnabled
-		runtimeCfg.CodexBasispointsModels = existingSettings.CodexBasispointsModels
-		runtimeCfg.CodexBasispoints403PauseDisabled = existingSettings.CodexBasispoints403PauseDisabled
-		runtimeCfg.CodexBasispoints403ProbeIntervalMin = database.NormalizeCodexBasispoints403ProbeIntervalMinutes(existingSettings.CodexBasispointsProbeMinutes)
-		runtimeCfg.CodexBasispoints429CooldownSec = database.NormalizeCodexBasispoints429CooldownSeconds(existingSettings.CodexBasispoints429CooldownSeconds)
-		runtimeCfg.CodexBasispointsCacheWriteAsInput = existingSettings.CodexBasispointsCacheWriteAsInput
-	}
 	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	previousAutoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
@@ -11477,30 +11447,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.CodexRequestCompression = *req.CodexRequestCompression
 		log.Printf("设置已更新: codex_request_compression = %t", *req.CodexRequestCompression)
 	}
-	if req.CodexBasispointsEnabled != nil {
-		runtimeCfg.CodexBasispointsEnabled = *req.CodexBasispointsEnabled
-		log.Printf("设置已更新: codex_basispoints_enabled = %t", *req.CodexBasispointsEnabled)
-	}
-	if req.CodexBasispointsModels != nil {
-		runtimeCfg.CodexBasispointsModels = database.NormalizeCodexBasispointsModels(*req.CodexBasispointsModels)
-		log.Printf("设置已更新: codex_basispoints_models = %q", runtimeCfg.CodexBasispointsModels)
-	}
-	if req.CodexBasispoints403AutoPause != nil {
-		runtimeCfg.CodexBasispoints403PauseDisabled = !*req.CodexBasispoints403AutoPause
-		log.Printf("设置已更新: codex_basispoints_403_auto_pause = %t", *req.CodexBasispoints403AutoPause)
-	}
-	if req.CodexBasispoints403ProbeIntervalMin != nil {
-		runtimeCfg.CodexBasispoints403ProbeIntervalMin = *req.CodexBasispoints403ProbeIntervalMin
-		log.Printf("设置已更新: codex_basispoints_403_probe_interval_minutes = %d", *req.CodexBasispoints403ProbeIntervalMin)
-	}
-	if req.CodexBasispoints429CooldownSec != nil {
-		runtimeCfg.CodexBasispoints429CooldownSec = *req.CodexBasispoints429CooldownSec
-		log.Printf("设置已更新: codex_basispoints_429_cooldown_seconds = %d", *req.CodexBasispoints429CooldownSec)
-	}
-	if req.CodexBasispointsCacheWriteAsInput != nil {
-		runtimeCfg.CodexBasispointsCacheWriteAsInput = *req.CodexBasispointsCacheWriteAsInput
-		log.Printf("设置已更新: codex_basispoints_cache_creation_as_input = %t", *req.CodexBasispointsCacheWriteAsInput)
-	}
 
 	if req.CodexWSWeakNetworkMode != nil {
 		runtimeCfg.CodexWSWeakNetworkMode = *req.CodexWSWeakNetworkMode
@@ -11597,6 +11543,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexWSStatelessSlots(v)
 		runtimeCfg.CodexWSStatelessSlots = v
 		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
+	}
+
+	if req.CodexWSDownstreamKeepaliveSlots != nil {
+		v := database.NormalizeCodexWSDownstreamKeepaliveSlots(*req.CodexWSDownstreamKeepaliveSlots)
+		h.store.SetCodexWSDownstreamKeepaliveSlots(v)
+		runtimeCfg.CodexWSDownstreamKeepaliveSlots = v
+		log.Printf("设置已更新: codex_ws_downstream_keepalive_slots = %d", v)
 	}
 
 	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
@@ -11962,6 +11915,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.CodexTelemetryTimingDebug = *req.CodexTelemetryTimingDebug
 		log.Printf("设置已更新: codex_telemetry_timing_debug = %t", runtimeCfg.CodexTelemetryTimingDebug)
 	}
+	if req.CodexUnifiedClientIdentityEnabled != nil {
+		runtimeCfg.CodexUnifiedClientIdentityEnabled = *req.CodexUnifiedClientIdentityEnabled
+		log.Printf("设置已更新: codex_unified_client_identity_enabled = %t", runtimeCfg.CodexUnifiedClientIdentityEnabled)
+	}
 	if req.StreamFlushPolicy != nil {
 		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
 		log.Printf("设置已更新: stream_flush_policy = %s", runtimeCfg.StreamFlushPolicy)
@@ -11985,6 +11942,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.ShowFullUsageNumbers != nil {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
+	}
+	if req.ShowUpstreamModelMismatch != nil {
+		showUpstreamModelMismatch = *req.ShowUpstreamModelMismatch
+		log.Printf("设置已更新: show_upstream_model_mismatch = %t", showUpstreamModelMismatch)
 	}
 	if req.PublicKeyUsagePageEnabled != nil {
 		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
@@ -12053,13 +12014,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	// 确认保存成功前，运行态继续使用旧配置，避免持久化失败后后台任务仍然开始执行。
 	runtimeCfg = proxy.NormalizeRuntimeSettings(runtimeCfg)
 	effectiveRuntimeCfg := runtimeCfg
-	// Basispoints routing switches only after the database accepted the change.
-	effectiveRuntimeCfg.CodexBasispointsEnabled = previousBasispointsEnabled
-	effectiveRuntimeCfg.CodexBasispointsModels = previousBasispointsModels
-	effectiveRuntimeCfg.CodexBasispoints403PauseDisabled = previousBasispoints403PauseDisabled
-	effectiveRuntimeCfg.CodexBasispoints403ProbeIntervalMin = previousBasispoints403ProbeIntervalMin
-	effectiveRuntimeCfg.CodexBasispoints429CooldownSec = previousBasispoints429CooldownSec
-	effectiveRuntimeCfg.CodexBasispointsCacheWriteAsInput = previousBasispointsCacheWriteAsInput
 	if autoResetCreditsChanged {
 		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
 		effectiveRuntimeCfg.AutoResetCreditsOnExhaustionEnabled = previousAutoResetCreditsOnExhaustionEnabled
@@ -12326,12 +12280,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexRequestCompression:             h.store.CodexRequestCompression(),
-		CodexBasispointsEnabled:             runtimeCfg.CodexBasispointsEnabled,
-		CodexBasispointsModels:              runtimeCfg.CodexBasispointsModels,
-		CodexBasispoints403PauseDisabled:    runtimeCfg.CodexBasispoints403PauseDisabled,
-		CodexBasispointsProbeMinutes:        runtimeCfg.CodexBasispoints403ProbeIntervalMin,
-		CodexBasispoints429CooldownSeconds:  runtimeCfg.CodexBasispoints429CooldownSec,
-		CodexBasispointsCacheWriteAsInput:   runtimeCfg.CodexBasispointsCacheWriteAsInput,
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -12347,6 +12295,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubToken:                         h.store.GithubToken(),
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -12408,6 +12357,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -12417,6 +12367,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
@@ -12436,10 +12387,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
-		if req.CodexBasispointsEnabled != nil || req.CodexBasispointsModels != nil || req.CodexBasispoints403AutoPause != nil || req.CodexBasispoints403ProbeIntervalMin != nil || req.CodexBasispoints429CooldownSec != nil || req.CodexBasispointsCacheWriteAsInput != nil {
-			writeError(c, http.StatusInternalServerError, "保存 Basis Points 设置失败，设置未生效")
-			return
-		}
 		if req.CodexImagesMainModel != nil {
 			writeError(c, http.StatusInternalServerError, "保存生图设置失败，文本驱动模型未生效")
 			return
@@ -12479,15 +12426,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	} else {
-		proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
-			current.CodexBasispointsEnabled = runtimeCfg.CodexBasispointsEnabled
-			current.CodexBasispointsModels = runtimeCfg.CodexBasispointsModels
-			current.CodexBasispoints403PauseDisabled = runtimeCfg.CodexBasispoints403PauseDisabled
-			current.CodexBasispoints403ProbeIntervalMin = runtimeCfg.CodexBasispoints403ProbeIntervalMin
-			current.CodexBasispoints429CooldownSec = runtimeCfg.CodexBasispoints429CooldownSec
-			current.CodexBasispointsCacheWriteAsInput = runtimeCfg.CodexBasispointsCacheWriteAsInput
-			return current
-		})
 		if req.SessionSlotBufferSeconds != nil {
 			h.store.SetSessionSlotBuffer(time.Duration(sessionSlotBufferSeconds) * time.Second)
 			log.Printf("设置已更新: session_slot_buffer_seconds = %d", sessionSlotBufferSeconds)
@@ -12687,12 +12625,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SchedulerEngine:                     h.store.SchedulerEngine(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
 		CodexRequestCompression:             h.store.CodexRequestCompression(),
-		CodexBasispointsEnabled:             runtimeCfg.CodexBasispointsEnabled,
-		CodexBasispointsModels:              runtimeCfg.CodexBasispointsModels,
-		CodexBasispoints403AutoPause:        !runtimeCfg.CodexBasispoints403PauseDisabled,
-		CodexBasispoints403ProbeIntervalMin: runtimeCfg.CodexBasispoints403ProbeIntervalMin,
-		CodexBasispoints429CooldownSec:      runtimeCfg.CodexBasispoints429CooldownSec,
-		CodexBasispointsCacheWriteAsInput:   runtimeCfg.CodexBasispointsCacheWriteAsInput,
 		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
@@ -12708,6 +12640,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -12727,6 +12660,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
 		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
 		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
+		CodexClientVersions:                 proxy.CodexClientVersionCacheView(),
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -12796,6 +12730,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -12806,6 +12741,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,

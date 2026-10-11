@@ -251,6 +251,7 @@ func TestSharedDatabaseSettingsConvergeAcrossStores(t *testing.T) {
 	updated.SchedulerEngine = "shadow"
 	updated.SessionSlotBufferEnabled = true
 	updated.SessionSlotBufferSeconds = 21
+	updated.CodexWSDownstreamKeepaliveSlots = 17
 	updated.CodexForceFastEnabled = true
 	updated.CodexOAuthKeepaliveEnabled = true
 	updated.CodexFastModelAliasEnabled = false
@@ -266,6 +267,7 @@ func TestSharedDatabaseSettingsConvergeAcrossStores(t *testing.T) {
 		return first.GetMaxConcurrency() == 13 && second.GetMaxConcurrency() == 13 &&
 			first.SchedulerEngine() == "shadow" && second.SchedulerEngine() == "shadow" &&
 			first.SessionSlotBufferEnabled() && second.SessionSlotBufferEnabled() &&
+			first.CodexWSDownstreamKeepaliveSlots() == 17 && second.CodexWSDownstreamKeepaliveSlots() == 17 &&
 			first.CodexForceFastEnabled() && second.CodexForceFastEnabled() &&
 			first.GetCodexOAuthKeepalive() && second.GetCodexOAuthKeepalive() &&
 			!first.CodexFastModelAliasEnabled() && !second.CodexFastModelAliasEnabled() &&
@@ -381,7 +383,7 @@ func TestSchedulerOutboxConsumerConvergesDaybreakCapabilities(t *testing.T) {
 	}
 	waitForSchedulerProjection(t, func() bool { return store.FindByID(id) != nil })
 	account := store.FindByID(id)
-	atomic.StoreInt64(&account.ActiveRequests, 3)
+	account.ActiveRequests.Store(3)
 	snapshot := database.DaybreakSnapshot{
 		Identity: account.DaybreakIdentity(), ObservedAt: 10, CheckedAt: 10,
 		Models: map[string][]string{"gpt-6-sol": {DaybreakBlue}},
@@ -418,7 +420,7 @@ func TestSchedulerOutboxConsumerConvergesDaybreakCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForSchedulerProjection(t, func() bool { return len(account.DaybreakAliases()) == 0 })
-	if store.FindByID(id) != account || atomic.LoadInt64(&account.ActiveRequests) != 3 {
+	if store.FindByID(id) != account || account.ActiveRequests.Load() != 3 {
 		t.Fatal("capability reload replaced account or lost live request counters")
 	}
 }
@@ -458,7 +460,7 @@ func TestSchedulerOutboxConsumerConvergesReserveAndAntigravityFences(t *testing.
 	account.mu.Lock()
 	account.SuccessStreak = 6
 	account.mu.Unlock()
-	atomic.StoreInt64(&account.ActiveRequests, 2)
+	account.ActiveRequests.Store(2)
 
 	reserve5h := database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 12, Valid: true}}
 	reserve7d := database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 24, Valid: true}}
@@ -474,8 +476,8 @@ func TestSchedulerOutboxConsumerConvergesReserveAndAntigravityFences(t *testing.
 	account.mu.RLock()
 	successStreak := account.SuccessStreak
 	account.mu.RUnlock()
-	if atomic.LoadInt64(&account.ActiveRequests) != 2 || successStreak != 6 {
-		t.Fatalf("reserve projection clobbered runtime state: active=%d success=%d", atomic.LoadInt64(&account.ActiveRequests), successStreak)
+	if account.ActiveRequests.Load() != 2 || successStreak != 6 {
+		t.Fatalf("reserve projection clobbered runtime state: active=%d success=%d", account.ActiveRequests.Load(), successStreak)
 	}
 
 	clearReserve := database.OptionalNullInt64{Set: true, Value: sql.NullInt64{}}
@@ -539,8 +541,8 @@ func TestSchedulerOutboxConsumerConvergesReserveAndAntigravityFences(t *testing.
 	}
 	assertFence("permanent refresh recovery", false)
 
-	if atomic.LoadInt64(&account.ActiveRequests) != 2 {
-		t.Fatalf("Antigravity projections clobbered active requests: %d", atomic.LoadInt64(&account.ActiveRequests))
+	if account.ActiveRequests.Load() != 2 {
+		t.Fatalf("Antigravity projections clobbered active requests: %d", account.ActiveRequests.Load())
 	}
 }
 
@@ -668,15 +670,15 @@ func TestApplyPersistentAccountSnapshotPreservesRuntimeState(t *testing.T) {
 	store := newIndexedRoutingTestStore(nil)
 	dst := newFastSchedulerTestAccount(1, HealthTierWarm, 100, 1)
 	dst.usageObservedAt = time.Now()
-	atomic.StoreInt64(&dst.ActiveRequests, 3)
+	dst.ActiveRequests.Store(3)
 	dst.SuccessStreak = 5
 	dst.FailureStreak = 4
 	src := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
 	src.CredentialGeneration = dst.CredentialGeneration
 
 	store.applyPersistentAccountSnapshot(dst, src, true)
-	if atomic.LoadInt64(&dst.ActiveRequests) != 3 || dst.SuccessStreak != 5 || dst.FailureStreak != 4 {
-		t.Fatalf("runtime state clobbered: active=%d success=%d failure=%d", atomic.LoadInt64(&dst.ActiveRequests), dst.SuccessStreak, dst.FailureStreak)
+	if dst.ActiveRequests.Load() != 3 || dst.SuccessStreak != 5 || dst.FailureStreak != 4 {
+		t.Fatalf("runtime state clobbered: active=%d success=%d failure=%d", dst.ActiveRequests.Load(), dst.SuccessStreak, dst.FailureStreak)
 	}
 	if dst.usageObservedAt.IsZero() {
 		t.Fatal("persistent snapshot should not erase a newer runtime observation timestamp")
@@ -703,7 +705,7 @@ func TestApplyPersistentAccountSnapshotCopiesAntigravityStateAndClearsFence(t *t
 	dst.GrokLivePlan = "old-grok-plan"
 	dst.UsageReservePercent5h = int64Ptr(5)
 	dst.UsageReservePercent7d = int64Ptr(7)
-	atomic.StoreInt64(&dst.ActiveRequests, 3)
+	dst.ActiveRequests.Store(3)
 	dst.SuccessStreak = 5
 
 	src := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
@@ -747,8 +749,8 @@ func TestApplyPersistentAccountSnapshotCopiesAntigravityStateAndClearsFence(t *t
 	if dst.IsAvailable() {
 		t.Fatal("hard-blocked Antigravity account remained available after snapshot update")
 	}
-	if atomic.LoadInt64(&dst.ActiveRequests) != 3 || dst.SuccessStreak != 5 {
-		t.Fatalf("snapshot clobbered runtime state: active=%d streak=%d", atomic.LoadInt64(&dst.ActiveRequests), dst.SuccessStreak)
+	if dst.ActiveRequests.Load() != 3 || dst.SuccessStreak != 5 {
+		t.Fatalf("snapshot clobbered runtime state: active=%d streak=%d", dst.ActiveRequests.Load(), dst.SuccessStreak)
 	}
 
 	// A successful provider sync clears the durable fence while retaining the

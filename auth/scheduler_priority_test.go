@@ -27,10 +27,9 @@ func TestNextExcludingPrefersHigherSchedulerPriority(t *testing.T) {
 	official := &Account{DBID: 2, AccessToken: "tok-official", PlanType: "free"}
 	official.SetSchedulerPriority(10)
 
-	store := &Store{
-		accounts:       []*Account{relay, official},
-		maxConcurrency: 4,
-	}
+	store := (&Store{
+		accounts: []*Account{relay, official},
+	}).withMaxConcurrency(4)
 
 	for i := 0; i < 5; i++ {
 		acc := store.NextExcluding(0, nil)
@@ -51,10 +50,9 @@ func TestNextExcludingFallsBackToLowerPriorityWhenExcluded(t *testing.T) {
 	preferred := &Account{DBID: 2, AccessToken: "tok-preferred"}
 	preferred.SetSchedulerPriority(10)
 
-	store := &Store{
-		accounts:       []*Account{fallback, preferred},
-		maxConcurrency: 4,
-	}
+	store := (&Store{
+		accounts: []*Account{fallback, preferred},
+	}).withMaxConcurrency(4)
 
 	acc := store.NextExcluding(0, map[int64]bool{2: true})
 	if acc == nil {
@@ -68,7 +66,7 @@ func TestNextExcludingFallsBackToLowerPriorityWhenExcluded(t *testing.T) {
 
 func TestApplyAccountSchedulerPriority(t *testing.T) {
 	acc := &Account{DBID: 7, AccessToken: "tok"}
-	store := &Store{accounts: []*Account{acc}, maxConcurrency: 2}
+	store := (&Store{accounts: []*Account{acc}}).withMaxConcurrency(2)
 
 	value := int64(30)
 	if !store.ApplyAccountSchedulerPriority(7, &value) {
@@ -122,7 +120,7 @@ func TestFastSchedulerPrefersHigherPrioritySegment(t *testing.T) {
 // 全局优先级必须先于历史验证状态：低优先级 proven 账号不能越过高优先级账号。
 func TestFastSchedulerPriorityPrecedesProvenHistory(t *testing.T) {
 	lowProven := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
-	lowProven.TotalRequests = 11
+	lowProven.TotalRequests.Store(11)
 	highUnproven := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
 	highUnproven.SetSchedulerPriority(10)
 

@@ -143,6 +143,9 @@ func main() {
 			SmartPacingWindows:                 "5h,7d",
 			AutoResetCreditsBeforeExpiryMin:    60,
 			UTLSShutdownTimeoutMinutes:         30,
+			ShowUpstreamModelMismatch:          true,
+			CodexWSStatelessSlots:              8,
+			CodexWSDownstreamKeepaliveSlots:    database.DefaultCodexWSDownstreamKeepaliveSlots,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -204,6 +207,9 @@ func main() {
 			SmartPacingWindows:                 "5h,7d",
 			AutoResetCreditsBeforeExpiryMin:    60,
 			UTLSShutdownTimeoutMinutes:         30,
+			ShowUpstreamModelMismatch:          true,
+			CodexWSStatelessSlots:              8,
+			CodexWSDownstreamKeepaliveSlots:    database.DefaultCodexWSDownstreamKeepaliveSlots,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -252,6 +258,9 @@ func main() {
 		auth.SetConfiguredAntigravitySettings(parsed)
 		if len(parsed.ModelRedirects) > 0 {
 			log.Printf("Antigravity 模型重定向已加载: %d 条", len(parsed.ModelRedirects))
+		}
+		if parsed.ExposeThoughts {
+			log.Printf("Antigravity 思考内容下发已开启")
 		}
 	}
 	antigravityCfgCancel()
@@ -441,7 +450,6 @@ func main() {
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 	handler.SetRuntimeCache(tc)
-	proxy.ConfigureExcelBPSReplay(tc)
 	defer handler.CloseAPIKeyAuthCache()
 	adminHandler.SetAPIKeyAuthCacheHandler(handler)
 

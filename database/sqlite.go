@@ -110,6 +110,7 @@ func (db *DB) configureSQLite(ctx context.Context) error {
 
 func (db *DB) migrateSQLite(ctx context.Context) error {
 	statements := []string{
+		codexClientVersionCacheSchema,
 		`CREATE TABLE IF NOT EXISTS accounts (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
@@ -329,6 +330,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				first_token_timeout_seconds INTEGER DEFAULT 0,
 				image_storage_config TEXT DEFAULT '{}',
 				show_full_usage_numbers INTEGER DEFAULT 0,
+				show_upstream_model_mismatch INTEGER DEFAULT 1,
 				public_key_usage_page_enabled INTEGER DEFAULT 1,
 				public_image_studio_page_enabled INTEGER DEFAULT 1,
 				public_account_portal_page_enabled INTEGER DEFAULT 0,
@@ -344,12 +346,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_turn_state_account_mode TEXT DEFAULT 'auto',
 					codex_telemetry_timing_debug INTEGER DEFAULT 0,
 					codex_request_compression INTEGER DEFAULT 1,
-					codex_basispoints_enabled INTEGER DEFAULT 0,
-					codex_basispoints_models TEXT DEFAULT '',
-					codex_basispoints_403_pause_disabled INTEGER DEFAULT 0,
-					codex_basispoints_403_probe_interval_minutes INTEGER DEFAULT 1,
-					codex_basispoints_429_cooldown_seconds INTEGER DEFAULT 5,
-					codex_basispoints_cache_creation_as_input INTEGER DEFAULT 0,
 					codex_ws_weak_network_mode INTEGER DEFAULT 0,
 					codex_ws_keepalive_enabled INTEGER DEFAULT 0,
 					codex_ws_keepalive_interval_sec INTEGER DEFAULT 60,
@@ -365,6 +361,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_ws_busy_overflow_enabled INTEGER DEFAULT 0,
 					codex_ws_busy_patience_sec INTEGER DEFAULT 2,
 					codex_ws_stateless_slots INTEGER DEFAULT 8,
+					codex_ws_downstream_keepalive_slots INTEGER DEFAULT 8,
 					github_token TEXT DEFAULT '',
 					github_proxy_url TEXT DEFAULT '',
 					codex_overload_pause_enabled INTEGER DEFAULT 0,
@@ -392,6 +389,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					ignore_usage_limit_status INTEGER DEFAULT 0,
 					auto_reset_credits_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_on_exhaustion_enabled INTEGER DEFAULT 0,
+					codex_unified_client_identity_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60,
 					auto_activate_5h_window_enabled INTEGER DEFAULT 0,
 					utls_shutdown_timeout_minutes INTEGER DEFAULT 30,
@@ -681,12 +679,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_turn_state_account_mode", "TEXT DEFAULT 'auto'"},
 		{"system_settings", "codex_telemetry_timing_debug", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_request_compression", "INTEGER DEFAULT 1"},
-		{"system_settings", "codex_basispoints_enabled", "INTEGER DEFAULT 0"},
-		{"system_settings", "codex_basispoints_models", "TEXT DEFAULT ''"},
-		{"system_settings", "codex_basispoints_403_pause_disabled", "INTEGER DEFAULT 0"},
-		{"system_settings", "codex_basispoints_403_probe_interval_minutes", "INTEGER DEFAULT 1"},
-		{"system_settings", "codex_basispoints_429_cooldown_seconds", "INTEGER DEFAULT 5"},
-		{"system_settings", "codex_basispoints_cache_creation_as_input", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_weak_network_mode", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_keepalive_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_keepalive_interval_sec", "INTEGER DEFAULT 60"},
@@ -702,6 +694,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_ws_busy_overflow_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_busy_patience_sec", "INTEGER DEFAULT 2"},
 		{"system_settings", "codex_ws_stateless_slots", "INTEGER DEFAULT 8"},
+		{"system_settings", "codex_ws_downstream_keepalive_slots", "INTEGER DEFAULT 8"},
 		{"system_settings", "github_token", "TEXT DEFAULT ''"},
 		{"system_settings", "github_proxy_url", "TEXT DEFAULT ''"},
 		{"system_settings", "codex_overload_pause_enabled", "INTEGER DEFAULT 0"},
@@ -728,6 +721,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "ignore_usage_limit_status", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_on_exhaustion_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_unified_client_identity_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_before_expiry_min", "INTEGER DEFAULT 60"},
 		{"system_settings", "auto_activate_5h_window_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "utls_shutdown_timeout_minutes", "INTEGER DEFAULT 30"},
@@ -802,6 +796,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "billing_tier_policy", "TEXT DEFAULT 'actual'"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "show_full_usage_numbers", "INTEGER DEFAULT 0"},
+		{"system_settings", "show_upstream_model_mismatch", "INTEGER DEFAULT 1"},
 		{"system_settings", "public_key_usage_page_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "public_image_studio_page_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "public_account_portal_page_enabled", "INTEGER DEFAULT 0"},
@@ -1178,105 +1173,4 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 		result = append(result, AccountEventPoint{Bucket: k, Added: agg.added, Deleted: agg.deleted})
 	}
 	return result, nil
-}
-
-// getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）。
-// rangeStart 为零值时回落到"今日"(本地 0 点起);rangeEnd 为零值表示至今。
-func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, includeBreakdowns bool, dim UsageLogFilter) (*UsageStats, error) {
-	now := time.Now()
-	explicitRange := !rangeStart.IsZero()
-	dimFiltered := dim.HasDimensionFilter()
-	if rangeStart.IsZero() {
-		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	}
-	minuteAgo := now.Add(-1 * time.Minute)
-
-	query := `SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(prompt_tokens), 0),
-		COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(cached_tokens), 0),
-		COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0),
-		COALESCE(AVG(duration_ms), 0),
-		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0)
-	FROM usage_logs u WHERE created_at >= $1 AND status_code <> 499
-	  AND TRIM(COALESCE(internal_reason, '')) = ''`
-	args := []interface{}{db.timeArg(rangeStart), db.timeArg(minuteAgo)}
-	if !rangeEnd.IsZero() {
-		query += fmt.Sprintf(" AND created_at < $%d", len(args)+1)
-		args = append(args, db.timeArg(rangeEnd))
-	}
-	if channel != "" {
-		query += fmt.Sprintf(" AND channel = $%d", len(args)+1)
-		args = append(args, channel)
-	}
-	if dimFiltered {
-		dimParts, dimArgs := usageLogDimensionWhere(dim, len(args)+1)
-		for _, part := range dimParts {
-			query += " AND " + part
-		}
-		args = append(args, dimArgs...)
-	}
-
-	stats := &UsageStats{}
-	var err error
-	var todayErrors int64
-	var totalFirstTokenMs float64
-	var totalFirstTokenSamples int64
-	var todayCacheHitRequests int64
-	if err := db.conn.QueryRowContext(ctx, query, args...).Scan(
-		&stats.TodayRequests, &stats.TodayTokens, &stats.TodayPrompt, &stats.TodayCompletion,
-		&stats.TodayCachedTokens, &stats.TodayAccountBilled, &stats.TodayUserBilled,
-		&stats.AvgDurationMs, &totalFirstTokenMs, &totalFirstTokenSamples,
-		&todayCacheHitRequests, &todayErrors, &stats.RPM, &stats.TPM,
-	); err != nil {
-		return nil, err
-	}
-
-	if stats.TodayRequests > 0 {
-		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
-		stats.TodayCacheRate = float64(todayCacheHitRequests) / float64(stats.TodayRequests) * 100
-	}
-	if totalFirstTokenSamples > 0 {
-		stats.AvgFirstTokenMs = totalFirstTokenMs / float64(totalFirstTokenSamples)
-	}
-
-	rollup, err := db.loadUsageStatsRollup(ctx, channel)
-	if err != nil {
-		return nil, fmt.Errorf("读取用量累计汇总: %w", err)
-	}
-	stats.TotalRequests = rollup.TotalRequests
-	stats.TotalTokens = rollup.TotalTokens
-	stats.TotalPrompt = rollup.PromptTokens
-	stats.TotalCompletion = rollup.CompletionTokens
-	stats.TotalCachedTokens = rollup.CachedTokens
-	stats.TotalAccountBilled = rollup.TotalAccountBilled
-	stats.TotalUserBilled = rollup.TotalUserBilled
-	if stats.TotalRequests > 0 {
-		stats.TotalCacheRate = float64(rollup.CacheHitRequests) / float64(stats.TotalRequests) * 100
-	}
-	if !explicitRange && !dimFiltered && rollup.FirstTokenSamples > 0 {
-		stats.AvgFirstTokenMs = rollup.FirstTokenMsSum / float64(rollup.FirstTokenSamples)
-	}
-	if stats.TotalRequests > 0 {
-		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
-		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
-	}
-	if includeBreakdowns {
-		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel, dim)
-		if err != nil {
-			return nil, err
-		}
-		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel, dim); err != nil {
-			return nil, err
-		}
-	} else {
-		stats.ModelStats = []UsageModelStat{}
-		stats.EndpointStats = []UsageEndpointStat{}
-		stats.APIKeyStats = []UsageAPIKeyStat{}
-	}
-
-	return stats, nil
 }
