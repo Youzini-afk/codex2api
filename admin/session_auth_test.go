@@ -68,6 +68,70 @@ func TestLoginAdminSessionRejectsInvalidSecret(t *testing.T) {
 	assertErrorMessage(t, loginResp, "管理密钥错误")
 }
 
+func TestAdminSessionEndpointsShareUpstreamAuthThrottle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{
+		adminSecretEnv:    "super-secret",
+		sessionStore:      newAdminSessionStore(),
+		adminAuthThrottle: newAdminAuthThrottle(),
+	}
+	router := newAdminAuthTestRouter(handler)
+	request := func(path, secret string) *httptest.ResponseRecorder {
+		var req *http.Request
+		if path == "/api/admin/auth/login" {
+			payload, _ := json.Marshal(map[string]string{"secret": secret})
+			req = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			req = httptest.NewRequest(http.MethodGet, path, nil)
+			if secret != "" {
+				req.Header.Set("X-Admin-Key", secret)
+			}
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	paths := []string{"/api/admin/auth/login", "/api/admin/auth/status", "/api/admin/protected"}
+	// Anonymous status polling must not count as a failed password attempt.
+	for range adminAuthMaxFailures + 1 {
+		if rec := request(paths[1], ""); rec.Code != http.StatusOK {
+			t.Fatalf("anonymous status = %d, want 200", rec.Code)
+		}
+	}
+	for i := range adminAuthMaxFailures {
+		rec := request(paths[i%len(paths)], "wrong-secret")
+		if i == adminAuthMaxFailures-1 {
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("threshold status = %d, want 429", rec.Code)
+			}
+		} else if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("attempt %d blocked early", i+1)
+		}
+	}
+	for _, path := range paths {
+		rec := request(path, "super-secret")
+		if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+			t.Fatalf("%s bypassed shared block: %d %s", path, rec.Code, rec.Body)
+		}
+	}
+	handler.adminAuthThrottle.mu.Lock()
+	for _, entry := range handler.adminAuthThrottle.entries {
+		entry.blockedUntil = time.Now().Add(-time.Second)
+	}
+	handler.adminAuthThrottle.mu.Unlock()
+	cookie := loginAdminSessionForTest(t, router, "super-secret")
+	assertAdminSessionAccessForTest(t, router, cookie, http.StatusOK)
+	req := httptest.NewRequest(http.MethodGet, paths[1], nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" ||
+		!bytes.Contains(rec.Body.Bytes(), []byte(`"authenticated":true`)) {
+		t.Fatalf("session status after recovery = %d %s", rec.Code, rec.Body)
+	}
+}
+
 func TestAdminSessionsRejectDatabaseSecretRotationAcrossInstances(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

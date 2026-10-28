@@ -1,3 +1,6 @@
+import { useIntelligenceBars } from "../hooks/useIntelligenceBars";
+import AccountIntelligenceBar, { AccountIntelligenceActions } from "../components/AccountIntelligenceBar";
+import type { IntelligenceBar } from "../lib/intelligenceCheck";
 import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import "./accounts-cards.css";
@@ -356,7 +359,7 @@ function AccountConcurrencyBadge({ account }: { account: AccountRow }) {
 
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
       title={titleLines.join("\n")}
     >
       <span
@@ -1194,6 +1197,8 @@ const AccountTableRow = memo(function AccountTableRow({
   allGroups,
   proxyCtx,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   lazyMode,
   refreshing,
   authJsonExporting,
@@ -1210,6 +1215,8 @@ const AccountTableRow = memo(function AccountTableRow({
   allGroups: AccountGroup[];
   proxyCtx: ProxyBindingContext;
   healthBuckets: AccountHealthBucket[] | undefined;
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   lazyMode: boolean;
   refreshing: boolean;
   authJsonExporting: boolean;
@@ -1552,17 +1559,20 @@ const AccountTableRow = memo(function AccountTableRow({
                                       .filter(Boolean)
                                       .join("\n")}
                                   >
-                                    <div className="flex min-h-6 flex-wrap items-center gap-1.5">
-                                      <StatusBadge
-                                        status={getAccountStatusBadgeStatus(account)}
-                                        detail={
-                                          account.status === "overload_paused"
-                                            ? undefined
-                                            : getAccountRateLimitWindow(account) ??
-                                              undefined
-                                        }
-                                        errorMessage={account.error_message}
-                                      />
+                                    <div className="flex min-h-6 flex-nowrap items-center gap-1.5 whitespace-nowrap">
+                                      <div className="inline-flex shrink-0 items-center gap-1.5">
+                                        <StatusBadge
+                                          status={getAccountStatusBadgeStatus(account)}
+                                          detail={
+                                            account.status === "overload_paused"
+                                              ? undefined
+                                              : getAccountRateLimitWindow(account) ??
+                                                undefined
+                                          }
+                                          errorMessage={account.error_message}
+                                        />
+                                        <AccountIntelligenceActions bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} />
+                                      </div>
                                       <UsingCreditsBadge account={account} />
                                       {account.status !== "overload_paused" && (
                                         <AccountStatusCountdown account={account} />
@@ -1572,6 +1582,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                     <AccountHealthBar
                                       buckets={healthBuckets}
                                     />
+                                    <AccountIntelligenceBar bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} error={intelligenceError} />
                                   </div>
                                 )}
                               </TableCell>
@@ -1733,6 +1744,8 @@ const AccountCardItem = memo(function AccountCardItem({
   lazyMode,
   showEmailDomainTags,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   refreshing,
   authJsonExporting,
   variant,
@@ -1750,6 +1763,8 @@ const AccountCardItem = memo(function AccountCardItem({
   lazyMode: boolean;
   showEmailDomainTags: boolean;
   healthBuckets: AccountHealthBucket[] | undefined;
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   refreshing: boolean;
   authJsonExporting: boolean;
   variant: AccountCardVariant;
@@ -1769,6 +1784,8 @@ const AccountCardItem = memo(function AccountCardItem({
       lazyMode={lazyMode}
       showEmailDomainTags={showEmailDomainTags}
       healthBuckets={healthBuckets}
+      intelligenceBar={intelligenceBar}
+      intelligenceError={intelligenceError}
       refreshing={refreshing}
       authJsonExporting={authJsonExporting}
       variant={variant}
@@ -3044,39 +3061,90 @@ export default function Accounts() {
   );
   // Codex 视图的统计卡/额度分布/列表/批量操作一律排除 Grok 账号
   // （Grok 账号由顶部切换后的 Grok 页单独统计与管理）。
-  const allAccounts = useMemo(
-    () =>
-      data.accounts.map((account) => {
-        const stats = accountPageStats[String(account.id)];
-        if (!stats) return account;
-        // 行自身已带的字段优先(如 refreshAccountRow 拉回的完整详情比
-        // 本页 stats 快照更新),page-stats 只补基础行缺失的部分。
-        // 官方结算例外：点进官方统计刷新后必须以最新快照为准，
-        // 否则行上的旧额度会挡住这次同步时间点。
-        const merged = { ...account };
-        if (merged.billed_5h == null && stats.billed_5h != null) merged.billed_5h = stats.billed_5h;
-        if (merged.billed_7d == null && stats.billed_7d != null) merged.billed_7d = stats.billed_7d;
-        const officialUsd = stats.official_usd ?? stats.official_usd_7d;
-        if (officialUsd != null) {
-          merged.official_usd = officialUsd;
-          merged.official_usd_7d = officialUsd;
-        } else if (stats.official_usage_synced) {
-          merged.official_usd = undefined;
-          merged.official_usd_7d = undefined;
-        }
-        if (stats.official_usage_synced != null) {
-          merged.official_usage_synced = stats.official_usage_synced;
-        }
-        if (!merged.usage_5h_detail && stats.usage_5h_detail) merged.usage_5h_detail = stats.usage_5h_detail;
-        if (!merged.usage_7d_detail && stats.usage_7d_detail) merged.usage_7d_detail = stats.usage_7d_detail;
-        if (!merged.usage_today_detail && stats.usage_today_detail) merged.usage_today_detail = stats.usage_today_detail;
-        return merged;
-      }),
-    [data.accounts, accountPageStats],
-  );
+  const allAccounts = useMemo(() => {
+    const sameOptional = (a: unknown, b: unknown) =>
+      (a ?? undefined) === (b ?? undefined);
+    return data.accounts.map((account) => {
+      const stats = accountPageStats[String(account.id)];
+      if (!stats) return account;
+      // 行自身已带的字段优先(如 refreshAccountRow 拉回的完整详情比
+      // 本页 stats 快照更新),page-stats 只补基础行缺失的部分。
+      // 官方结算例外：点进官方统计刷新后必须以最新快照为准，
+      // 否则行上的旧额度会挡住这次同步时间点。
+      const billed5h =
+        account.billed_5h == null && stats.billed_5h != null
+          ? stats.billed_5h
+          : account.billed_5h;
+      const billed7d =
+        account.billed_7d == null && stats.billed_7d != null
+          ? stats.billed_7d
+          : account.billed_7d;
+      const officialUsd = stats.official_usd ?? stats.official_usd_7d;
+      let nextOfficialUsd = account.official_usd;
+      let nextOfficialUsd7d = account.official_usd_7d;
+      if (officialUsd != null) {
+        nextOfficialUsd = officialUsd;
+        nextOfficialUsd7d = officialUsd;
+      } else if (stats.official_usage_synced) {
+        nextOfficialUsd = undefined;
+        nextOfficialUsd7d = undefined;
+      }
+      const officialSynced =
+        stats.official_usage_synced != null
+          ? stats.official_usage_synced
+          : account.official_usage_synced;
+      const usage5hDetail =
+        !account.usage_5h_detail && stats.usage_5h_detail
+          ? stats.usage_5h_detail
+          : account.usage_5h_detail;
+      const usage7dDetail =
+        !account.usage_7d_detail && stats.usage_7d_detail
+          ? stats.usage_7d_detail
+          : account.usage_7d_detail;
+      const usageTodayDetail =
+        !account.usage_today_detail && stats.usage_today_detail
+          ? stats.usage_today_detail
+          : account.usage_today_detail;
+      // page-stats 对本页每个账号都有条目；合并结果没变时保留行对象，
+      // 否则 1 秒 live 更新会让整页行级 memo 每秒全部失效。
+      if (
+        sameOptional(billed5h, account.billed_5h) &&
+        sameOptional(billed7d, account.billed_7d) &&
+        sameOptional(nextOfficialUsd, account.official_usd) &&
+        sameOptional(nextOfficialUsd7d, account.official_usd_7d) &&
+        sameOptional(officialSynced, account.official_usage_synced) &&
+        sameOptional(usage5hDetail, account.usage_5h_detail) &&
+        sameOptional(usage7dDetail, account.usage_7d_detail) &&
+        sameOptional(usageTodayDetail, account.usage_today_detail)
+      ) {
+        return account;
+      }
+      const merged = { ...account };
+      merged.billed_5h = billed5h;
+      merged.billed_7d = billed7d;
+      merged.official_usd = nextOfficialUsd;
+      merged.official_usd_7d = nextOfficialUsd7d;
+      merged.official_usage_synced = officialSynced;
+      merged.usage_5h_detail = usage5hDetail;
+      merged.usage_7d_detail = usage7dDetail;
+      merged.usage_today_detail = usageTodayDetail;
+      return merged;
+    });
+  }, [data.accounts, accountPageStats]);
   const accounts = useMemo(
     () => allAccounts.filter((account) => !account.grok_api),
     [allAccounts],
+  );
+  // 只随“缺用量、需要补探”的账号集合变化，而不是随 1 秒 live 合并产生的
+  // 数组身份变化；否则下面的补探 effect 每秒被清理重建，定时器永远不触发。
+  const usageReloadIdsKey = useMemo(
+    () =>
+      accounts
+        .filter(needsUsageReload)
+        .map((account) => account.id)
+        .sort((a, b) => a - b)
+        .join(","),
+    [accounts],
   );
   const accountPageIDsKey = useMemo(
     () => accounts.map((account) => account.id).join(","),
@@ -3103,6 +3171,8 @@ export default function Accounts() {
       });
     return () => { cancelled = true; };
   }, [accountPageIDsKey, healthBarsReloadToken]);
+
+  const { bars: intelligenceBars, error: intelligenceBarsError } = useIntelligenceBars(accountPageIDsKey, healthBarsReloadToken);
 
   // 最近一次拉取 page-stats 的时间,供自动刷新节流(任何来源触发都会更新)。
   const pageStatsLoadedAtRef = useRef(0);
@@ -3180,6 +3250,8 @@ export default function Accounts() {
   // 测试连接后需要强制刷新用量的账号 id：即使其用量数据已存在（如已显示 100%），
   // 也要在后台探针跑完后重新拉取，确保进度条更新为最新值。
   const forceUsageReloadRef = useRef<Set<number>>(new Set());
+  // 强制刷新是命令式信号，ref 本身不触发 effect；用计数器明确唤醒补探调度。
+  const [usageReloadTick, setUsageReloadTick] = useState(0);
 
   useEffect(() => {
     persistAnalysisVisibility(showAnalysisCharts);
@@ -3221,12 +3293,14 @@ export default function Accounts() {
 
   useEffect(() => {
     if (providerView !== "codex") return;
-    const missingUsageIds = accounts
-      .filter(needsUsageReload)
-      .map((account) => account.id);
+    const missingUsageIds = usageReloadIdsKey
+      ? usageReloadIdsKey.split(",").map(Number)
+      : [];
     // 测试连接后被标记强制刷新的账号也要参与重拉，即使其用量数据已存在。
     // 仅保留仍在当前列表中的 id，避免泄漏。
-    const accountIdSet = new Set(accounts.map((account) => account.id));
+    const accountIdSet = new Set(
+      accountPageIDsKey ? accountPageIDsKey.split(",").map(Number) : [],
+    );
     const forceIds = Array.from(forceUsageReloadRef.current).filter((id) =>
       accountIdSet.has(id),
     );
@@ -3253,23 +3327,28 @@ export default function Accounts() {
         usageReloadAttemptsRef.current.get(id) ?? 0,
       );
     }
-    for (const id of retryIds) {
-      usageReloadAttemptsRef.current.set(
-        id,
-        (usageReloadAttemptsRef.current.get(id) ?? 0) + 1,
-      );
-    }
-    // 强制刷新的账号已安排本轮重拉，移除标记，避免无谓地反复重拉到上限。
-    // 若重拉后数据仍未更新且该账号确实缺数据，会由 needsUsageReload 接管继续重试。
-    for (const id of forceIds) {
-      forceUsageReloadRef.current.delete(id);
-    }
-
     // 指数退避:2.5s/5s/10s/20s/40s/80s。固定 2.5s 会让列表加载后的十几秒里
     // 反复整树重渲染;退避既压低churn,又把慢探针的覆盖窗口拉长到 ~2.5 分钟。
     // 测试连接触发的强制刷新保持首档延迟,用户在等即时反馈。
     const delay =
       forceIds.length > 0 ? 2500 : 2500 * 2 ** Math.min(minAttempt, 5);
+    const fire = () => {
+      // 只在真正发起重拉时消耗重试次数；被 live 更新取消的定时器不算一次。
+      for (const id of retryIds) {
+        usageReloadAttemptsRef.current.set(
+          id,
+          (usageReloadAttemptsRef.current.get(id) ?? 0) + 1,
+        );
+      }
+      // 强制刷新的账号已安排本轮重拉，移除标记，避免无谓地反复重拉到上限。
+      // 若重拉后数据仍未更新且该账号确实缺数据，会由 needsUsageReload 接管继续重试。
+      for (const id of forceIds) {
+        forceUsageReloadRef.current.delete(id);
+      }
+      void reloadSilently();
+      // 集合不变时也要把下一档退避排上；否则一次尝试后重试链会断。
+      setUsageReloadTick((tick) => tick + 1);
+    };
     let visibilityHandler: (() => void) | null = null;
     const timer = window.setTimeout(() => {
       // 页面在后台时挂起本轮重拉,回到前台再补,不在不可见标签页里空转打请求。
@@ -3278,12 +3357,12 @@ export default function Accounts() {
           if (document.hidden || visibilityHandler === null) return;
           document.removeEventListener("visibilitychange", visibilityHandler);
           visibilityHandler = null;
-          void reloadSilently();
+          fire();
         };
         document.addEventListener("visibilitychange", visibilityHandler);
         return;
       }
-      void reloadSilently();
+      fire();
     }, delay);
 
     return () => {
@@ -3293,13 +3372,24 @@ export default function Accounts() {
         visibilityHandler = null;
       }
     };
-  }, [accounts, reloadSilently, providerView]);
+    // 不依赖 accounts：1 秒 live 合并会不断产生新的数组身份，但只有
+    // “需要补探的 id 集合 / 页面 id 集合 / 强制刷新信号”变化时才应重建定时器。
+  }, [
+    usageReloadIdsKey,
+    usageReloadTick,
+    accountPageIDsKey,
+    reloadSilently,
+    providerView,
+  ]);
 
   // stats_state 补拉:统计缓存分两层(请求数缓存→列表快照)且都是"先返回旧值
   // 后台重建",从 stale 转 ready 需要连续两三次轮询。上面的静默刷新退避后间隔
   // 最长 80s,不补拉的话「统计刷新中…」会常驻几分钟。这里在非 ready 时用 3s
   // 短间隔追到 ready 为止;带次数上限,防后端统计查询持续失败时退化成常驻轮询。
   const statsStaleRetriesRef = useRef(0);
+  // 自增触发重试链，不依赖 data 对象身份：1 秒 live 合并会不断替换 data，
+  // 但 statsState 可能连续多次都是 stale，字符串不变时也必须继续补拉。
+  const [statsRetryTick, setStatsRetryTick] = useState(0);
   useEffect(() => {
     if (loading) return undefined;
     if (data.statsState === "ready") {
@@ -3311,12 +3401,11 @@ export default function Accounts() {
     const timer = window.setTimeout(() => {
       if (document.hidden) return;
       statsStaleRetriesRef.current += 1;
+      setStatsRetryTick((tick) => tick + 1);
       void reloadSilently();
     }, 3000);
     return () => window.clearTimeout(timer);
-    // 依赖 data 本身(而非 data.statsState):连续两次都返回 stale 时字符串不变,
-    // 只有对象身份变化才能把补拉定时器重新拉起来。
-  }, [loading, data, reloadSilently]);
+  }, [loading, data.statsState, data.disabledSorts, statsRetryTick, reloadSilently]);
 
   const accountSummary = {
     totalAccounts: data.summary?.total ?? data.total,
@@ -6398,7 +6487,10 @@ export default function Accounts() {
   if (providerView === "antigravity") {
     return (
       <div key="provider-antigravity" className="animate-channel-switch-in">
-        <AntigravityAccounts headerSlot={providerSwitcher} />
+        <AntigravityAccounts
+          headerSlot={providerSwitcher}
+          showOperationResults={showOperationResults}
+        />
       </div>
     );
   }
@@ -7658,6 +7750,8 @@ export default function Accounts() {
                         lazyMode={lazyMode}
                         showEmailDomainTags={showEmailDomainTags}
                         healthBuckets={healthBars[String(account.id)]}
+                          intelligenceBar={intelligenceBars[String(account.id)]}
+                          intelligenceError={intelligenceBarsError}
                         refreshing={refreshingIds.has(account.id)}
                         authJsonExporting={authJsonExportingIds.has(account.id)}
                         variant={
@@ -7940,6 +8034,8 @@ export default function Accounts() {
                           allGroups={allGroups}
                           proxyCtx={proxyBindingCtx}
                           healthBuckets={healthBars[String(account.id)]}
+                          intelligenceBar={intelligenceBars[String(account.id)]}
+                          intelligenceError={intelligenceBarsError}
                           lazyMode={lazyMode}
                           refreshing={refreshingIds.has(account.id)}
                           authJsonExporting={authJsonExportingIds.has(account.id)}
@@ -9265,6 +9361,7 @@ export default function Accounts() {
                 // 标记该账号强制刷新用量，配合后台探针确保进度条更新为最新值。
                 forceUsageReloadRef.current.add(testingAccount.id);
                 usageReloadAttemptsRef.current.delete(testingAccount.id);
+                setUsageReloadTick((tick) => tick + 1);
                 void reloadSilently();
               }}
               onClose={() => setTestingAccount(null)}
@@ -9280,6 +9377,7 @@ export default function Accounts() {
                 forceUsageReloadRef.current.add(detectorAccount.id);
                 usageReloadAttemptsRef.current.delete(detectorAccount.id);
                 setDetectorAccount(null);
+                setUsageReloadTick((tick) => tick + 1);
                 void reloadSilently();
               }}
             />
@@ -9305,6 +9403,8 @@ export default function Accounts() {
           )}
 
           <AccountDetailSheet
+            intelligenceBar={detailAccount ? intelligenceBars[String(detailAccount.id)] : undefined}
+            intelligenceError={intelligenceBarsError}
             account={detailAccount}
             groups={
               detailAccount
@@ -13167,12 +13267,6 @@ function isRateLimitedAccount(account: AccountRow): boolean {
   if (account.using_credits) return false;
   const status = (account.status || "").toLowerCase();
   const reason = (account.cooldown_reason || "").toLowerCase();
-  if (
-    status === "transient_rate_limited" ||
-    reason === "transient_rate_limited"
-  ) {
-    return true;
-  }
   return getAccountRateLimitWindow(account) !== null;
 }
 
@@ -13183,12 +13277,6 @@ function getAccountRateLimitWindow(
   const reason = (account.cooldown_reason || "").toLowerCase();
   // A seconds-long ordinary 429 is not a 5h/7d usage window. Its own
   // cooldown_until is rendered separately by AccountStatusCountdown.
-  if (
-    status === "transient_rate_limited" ||
-    reason === "transient_rate_limited"
-  ) {
-    return null;
-  }
   const explicitlyRateLimited =
     status === "rate_limited" ||
     status === "responses_rate_limited" ||
@@ -14046,6 +14134,8 @@ function AccountMobileCard({
   lazyMode,
   showEmailDomainTags,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   refreshing,
   authJsonExporting,
   variant = "mobile",
@@ -14083,6 +14173,8 @@ function AccountMobileCard({
   lazyMode: boolean;
   showEmailDomainTags: boolean;
   healthBuckets: AccountHealthBucket[] | undefined;
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   refreshing: boolean;
   authJsonExporting: boolean;
   variant?: AccountCardVariant;
@@ -14267,7 +14359,7 @@ function AccountMobileCard({
                   {account.status !== "overload_paused" && (
                     <AccountStatusCountdown account={account} />
                   )}
-                  <AccountConcurrencyBadge account={account} />
+                  {overlayKind && <AccountConcurrencyBadge account={account} />}
                 </>
               )}
               <DaybreakBadge models={account.daybreak_models} />
@@ -14306,11 +14398,15 @@ function AccountMobileCard({
               {renderAccountStateOverlay(account, t, { compact: true, markerOnly: true })}
             </div>
           ) : !overlayKind && showColumn("status") ? (
-            <StatusBadge
-              status={getAccountStatusBadgeStatus(account)}
-              detail={getAccountRateLimitWindow(account) ?? undefined}
-              errorMessage={account.error_message}
-            />
+            <div className="inline-flex shrink-0 items-center gap-1.5">
+              <StatusBadge
+                status={getAccountStatusBadgeStatus(account)}
+                detail={getAccountRateLimitWindow(account) ?? undefined}
+                errorMessage={account.error_message}
+              />
+              <AccountIntelligenceActions bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} />
+              <AccountConcurrencyBadge account={account} />
+            </div>
           ) : null}
         </div>
       </header>
@@ -14377,6 +14473,7 @@ function AccountMobileCard({
                   </span>
                 </div>
                 <AccountHealthBar buckets={healthBuckets} />
+                <AccountIntelligenceBar bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} error={intelligenceError} />
               </div>
             </section>
           )}
@@ -15337,7 +15434,6 @@ function getAccountStatusCountdownUntil(
   const status = account.status;
   const rateLimited =
     status === "rate_limited" ||
-    status === "transient_rate_limited" ||
     status === "responses_rate_limited" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d";

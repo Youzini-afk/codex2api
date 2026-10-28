@@ -10,7 +10,7 @@ import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import type { AntigravityOAuthClientSetting, AntigravitySettingsResponse, ChannelTestSettings, CodexClientVersionSyncResult, CodexClientVersionTarget, CodexUserAgentCatalog, CodexUserAgentPreview, HealthResponse, ModelInfo, SiteBranding, SystemSettings, UpstreamChannel } from '../types'
-import { ANTIGRAVITY_DEFAULT_MODELS } from '../lib/antigravityModels'
+import { ANTIGRAVITY_DEFAULT_MODELS, isAntigravityDisabledModel } from '../lib/antigravityModels'
 import { countPayloadRules, PAYLOAD_RULE_GROUPS } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
@@ -206,7 +206,7 @@ const RESPONSE_CACHE_BUDGET_KEYS = [
 const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   raw_user_agent: '',
   client_name: 'codex-tui',
-  client_version: '0.153.3',
+  client_version: '0.160.0',
   os_name: 'Mac OS',
   os_version: '15.5.0',
   arch: 'arm64',
@@ -861,7 +861,9 @@ function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'cl
     const list = current && !base.includes(current) ? [current, ...base] : base
     return [
       { value: '', label: t('settings.channelTest.autoModel') },
-      ...list.map((model) => ({ value: model, label: model })),
+      ...list
+        .filter((model) => channel !== 'antigravity' || !isAntigravityDisabledModel(model))
+        .map((model) => ({ value: model, label: model })),
     ]
   }, [catalogChoices, channel, settings?.test_model, t])
 
@@ -875,7 +877,7 @@ function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'cl
         <div className={SETTINGS_FIELD_GRID}>
           <SettingField label={t('settings.testModelLabel')} description={t('settings.channelTest.modelHint')}>
             <Select
-              value={settings?.test_model ?? ''}
+              value={channel === 'antigravity' && isAntigravityDisabledModel(settings?.test_model ?? '') ? '' : settings?.test_model ?? ''}
               onValueChange={(value) => void save({ test_model: value })}
               options={modelChoices}
               disabled={settings === null || saving}
@@ -1048,6 +1050,94 @@ function AntigravityThinkingCard() {
           disabled={exposeThoughts === null || saving}
           onCheckedChange={(checked) => void save(checked)}
         />
+      </div>
+    </SettingsCard>
+  )
+}
+
+// Antigravity 配额自动刷新与硬门禁(Spec §8):保存走后端整 JSON CAS,
+// GET 返回生效值,PUT 缺失字段 = 保留现值,因此这里只提交本次修改的字段。
+function AntigravityQuotaSettingsCard() {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [settings, setSettings] = useState<AntigravitySettingsResponse | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    void api.getAntigravitySettings().then((response) => {
+      if (active) setSettings(response)
+    }).catch((error) => {
+      if (active) showToast(getErrorMessage(error), 'error')
+    })
+    return () => {
+      active = false
+    }
+  }, [showToast])
+
+  const save = useCallback(async (patch: Parameters<typeof api.updateAntigravitySettings>[0]) => {
+    setSaving(true)
+    try {
+      setSettings(await api.updateAntigravitySettings(patch))
+      showToast(t('antigravityQuota.saved'), 'success')
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setSaving(false)
+    }
+  }, [showToast, t])
+
+  const intervalMinutes = settings?.quota_refresh_interval_minutes ?? 10
+
+  return (
+    <SettingsCard
+      title={t('antigravityQuota.cardTitle')}
+      description={t('antigravityQuota.cardDescription')}
+      icon={<Gauge className="size-4" />}
+    >
+      <div className="space-y-4">
+        <div className={SETTINGS_FIELD_GRID}>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium">{t('antigravityQuota.refreshEnabled')}</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t('antigravityQuota.refreshEnabledHint')}</p>
+            </div>
+            <Switch
+              checked={settings?.quota_refresh_enabled ?? false}
+              disabled={settings === null || saving}
+              onCheckedChange={(checked) => void save({ quota_refresh_enabled: checked })}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium">{t('antigravityQuota.gateEnabled')}</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t('antigravityQuota.gateEnabledHint')}</p>
+            </div>
+            <Switch
+              checked={settings?.quota_gate_enabled ?? false}
+              disabled={settings === null || saving}
+              onCheckedChange={(checked) => void save({ quota_gate_enabled: checked })}
+            />
+          </div>
+        </div>
+        <SettingField
+          label={t('antigravityQuota.refreshInterval')}
+          description={t('antigravityQuota.refreshIntervalHint')}
+        >
+          <DraftNumberInput
+            value={intervalMinutes}
+            min={3}
+            max={60}
+            integer
+            disabled={settings === null || saving}
+            className="max-w-32"
+            onValueCommit={(value) => {
+              if (value !== intervalMinutes) void save({ quota_refresh_interval_minutes: value })
+            }}
+            onValueChange={() => {}}
+          />
+        </SettingField>
+        <p className="text-xs text-muted-foreground">{t('antigravityQuota.hint')}</p>
       </div>
     </SettingsCard>
   )
@@ -2684,6 +2774,7 @@ export default function Settings() {
     oauth_model_cooldown_mode: 'adaptive',
     oauth_model_cooldown_seconds: 300,
     oauth_model_cooldown_backoff_enabled: true,
+    oauth_unsupported_model_cooldown_seconds: 1800,
     model_mapping: '{}',
     codex_model_mapping: '{}',
     payload_rules: '{}',
@@ -2709,7 +2800,7 @@ export default function Settings() {
     prompt_filter_review_timeout_seconds: 10,
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
-    codex_min_cli_version: '0.153.3',
+    codex_min_cli_version: '0.160.0',
     codex_images_main_model: '',
     codex_cli_version_sync_enabled: true,
     codex_cli_version_sync_interval_hours: 12,
@@ -4822,7 +4913,7 @@ export default function Settings() {
                         <Input
                           className="font-mono text-xs"
                           value={codexUserAgentConfig.raw_user_agent ?? ''}
-                          placeholder="codex-tui/0.153.3 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.153.3)"
+                          placeholder="codex-tui/0.160.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.160.0)"
                           onChange={(e: ChangeEvent<HTMLInputElement>) => updateCodexUserAgentConfig({ raw_user_agent: e.target.value })}
                           onBlur={saveCodexUserAgentConfig}
                         />
@@ -5158,6 +5249,7 @@ export default function Settings() {
               <ChannelConnectivityTestCard channel="antigravity" />
               <AntigravityModelRedirectCard />
               <AntigravityThinkingCard />
+              <AntigravityQuotaSettingsCard />
               <SettingsCard
                 title={t('settings.antigravityOAuth.title')}
                 description={t('settings.antigravityOAuth.description')}
@@ -6007,6 +6099,19 @@ export default function Settings() {
                         checked={settingsForm.oauth_model_cooldown_backoff_enabled}
                         disabled={settingsForm.oauth_model_cooldown_mode !== 'adaptive'}
                         onCheckedChange={(checked) => autoSaveBooleanField('oauth_model_cooldown_backoff_enabled', checked)}
+                      />
+                    </SettingField>
+                    <SettingField
+                      label={t('settings.unsupportedModelCooldownSeconds')}
+                      description={t('settings.unsupportedModelCooldownSecondsDesc')}
+                      suffix={t('settings.unit.sec')}
+                    >
+                      <DraftNumberInput
+                        min={0}
+                        max={1800}
+                        value={settingsForm.oauth_unsupported_model_cooldown_seconds}
+                        onValueChange={(value) => setSettingsForm(f => ({ ...f, oauth_unsupported_model_cooldown_seconds: value }))}
+                        onValueCommit={(value) => void autoSaveSettingsPatch({ oauth_unsupported_model_cooldown_seconds: value })}
                       />
                     </SettingField>
                   </div>

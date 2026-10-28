@@ -251,7 +251,7 @@ func TestSchedulerOutboxTriggersAccountReserveChanges(t *testing.T) {
 	}
 }
 
-func TestSchedulerOutboxTriggersAntigravitySchedulingFactsOnly(t *testing.T) {
+func TestSchedulerOutboxTriggersAntigravityQuotaAndSchedulingFacts(t *testing.T) {
 	db, err := New("sqlite", filepath.Join(t.TempDir(), "scheduler-antigravity-trigger.db"))
 	if err != nil {
 		t.Fatalf("New(sqlite): %v", err)
@@ -292,18 +292,21 @@ func TestSchedulerOutboxTriggersAntigravitySchedulingFactsOnly(t *testing.T) {
 	}
 
 	update("project change", map[string]interface{}{"project_id": "project-b"}, true)
+	// Quota observations now drive upstream scheduling weights and hard gates.
+	// Every changed quota snapshot must reach other instances, including healthy
+	// usage updates; other metadata still emits only when its scheduling fact changes.
 	update("healthy quota snapshot", map[string]interface{}{
 		"antigravity_quota": `{"models":[{"model_id":"gemini","remaining_percent":80}],"updated_at":"2026-08-27T00:00:00Z"}`,
-	}, false)
+	}, true)
 	update("quota usage-only refresh", map[string]interface{}{
 		"antigravity_quota": `{"models":[{"model_id":"gemini","remaining_percent":60}],"updated_at":"2026-08-27T00:05:00Z"}`,
-	}, false)
+	}, true)
 	update("quota forbidden", map[string]interface{}{
 		"antigravity_quota": `{"models":[],"forbidden":true,"updated_at":"2026-08-27T00:06:00Z"}`,
 	}, true)
 	update("quota forbidden refresh", map[string]interface{}{
 		"antigravity_quota": `{"models":[],"forbidden":true,"updated_at":"2026-08-27T00:07:00Z"}`,
-	}, false)
+	}, true)
 	update("quota recovered", map[string]interface{}{
 		"antigravity_quota": `{"models":[{"model_id":"gemini","remaining_percent":100}],"updated_at":"2026-08-27T00:08:00Z"}`,
 	}, true)

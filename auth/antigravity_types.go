@@ -18,6 +18,11 @@ const (
 	AntigravityAuthKindOAuth  = "oauth"
 	AntigravityAuthKindAPIKey = "api_key"
 
+	// AntigravityUserProjectIDCredentialKey stores the operator-supplied Google
+	// Cloud project. It is kept apart from project_id, which is always rebuilt
+	// from loadCodeAssist/onboardUser on every identity sync.
+	AntigravityUserProjectIDCredentialKey = "antigravity_user_project_id"
+
 	// AntigravityExperimentalInteractionsEnv gates the API-key Interactions
 	// executor. Its request/response wire adapter is still incomplete, so live
 	// inference is fail-closed unless an operator explicitly opts in.
@@ -159,7 +164,7 @@ func (a *Account) applyAntigravitySchedulerOverrideLocked(baseLimit int64, tier 
 		return tier, limit, available
 	}
 	// Administrative fences are never bypassed by the OAuth refresh escape hatch.
-	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 || a.Status == StatusError {
+	if atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) || a.Status == StatusError {
 		return tier, limit, false
 	}
 	recoverUnauthorized := a.antigravityUnauthorizedRecoveryLocked(time.Now())
@@ -228,11 +233,15 @@ type AntigravityCredential struct {
 	Name                 string
 	AvatarURL            string
 	ProjectID            string
-	OAuthClientKey       string
-	ClientID             string
-	ClientSecret         string
-	Scope                string
-	ExpiresAt            time.Time
+	// UserProjectID is an operator-supplied Google Cloud project. Workspace /
+	// enterprise tiers (Gemini Code Assist Standard/Enterprise) are never given
+	// a managed project by onboardUser and must run against a caller-owned one.
+	UserProjectID  string
+	OAuthClientKey string
+	ClientID       string
+	ClientSecret   string
+	Scope          string
+	ExpiresAt      time.Time
 }
 
 type AntigravityProfile struct {
@@ -251,6 +260,9 @@ type AntigravityTier struct {
 	QuotaTier string `json:"quota_tier,omitempty"`
 	Slug      string `json:"slug,omitempty"`
 	IsDefault bool   `json:"is_default,omitempty"`
+	// UserDefinedProject mirrors userDefinedCloudaicompanionProject: the tier
+	// runs against a Google Cloud project the account owner must supply.
+	UserDefinedProject bool `json:"user_defined_project,omitempty"`
 }
 
 type AntigravityIneligibleTier struct {
@@ -270,10 +282,33 @@ type AntigravityEntitlements struct {
 	UpdatedAt       time.Time                   `json:"updated_at"`
 }
 
+// SourceMeta 记录单个配额来源（如 "groups"、"credits"）的生产者与观测元数据。
+// V2 快照用它区分"上游确实报了这个值"与"该键缺席/不可信"。
+type SourceMeta struct {
+	Producer           string    `json:"producer"`
+	Trigger            string    `json:"trigger"`
+	CredentialFamilyID string    `json:"credential_family_id"`
+	QuotaIdentityScope string    `json:"quota_identity_scope"`
+	Generation         int64     `json:"generation"`
+	CurrentAttemptSeq  int64     `json:"current_attempt_seq"`
+	AppliedSeq         int64     `json:"applied_seq"`
+	ObservedAt         time.Time `json:"observed_at"`
+	LastAttemptAt      time.Time `json:"last_attempt_at"`
+	LastSuccessAt      time.Time `json:"last_success_at"`
+	FailureCount       int       `json:"failure_count"`
+	NotBefore          time.Time `json:"not_before"`
+	PresenceVerified   bool      `json:"presence_verified"`
+	ContractVersion    string    `json:"contract_version,omitempty"`
+	SummaryIntegrity   bool      `json:"summary_integrity"`
+}
+
 type AntigravityModelQuota struct {
-	ModelID           string          `json:"model_id"`
-	DisplayName       string          `json:"display_name,omitempty"`
-	RemainingFraction float64         `json:"remaining_fraction"`
+	ModelID     string `json:"model_id"`
+	DisplayName string `json:"display_name,omitempty"`
+	// RemainingFraction 为 nil 表示上游未报该值；仅当 FractionPresent 为 true
+	// 时数值才可信（legacy 不可信、不得硬封）。
+	RemainingFraction *float64        `json:"remaining_fraction"`
+	FractionPresent   bool            `json:"fraction_present"`
 	RemainingPercent  int             `json:"remaining_percent"`
 	ResetTime         string          `json:"reset_time,omitempty"`
 	SupportsImages    *bool           `json:"supports_images,omitempty"`
@@ -286,12 +321,18 @@ type AntigravityModelQuota struct {
 }
 
 type AntigravityQuotaBucket struct {
-	BucketID          string  `json:"bucket_id,omitempty"`
-	Window            string  `json:"window,omitempty"`
-	RemainingFraction float64 `json:"remaining_fraction"`
-	ResetTime         string  `json:"reset_time,omitempty"`
-	DisplayName       string  `json:"display_name,omitempty"`
-	Description       string  `json:"description,omitempty"`
+	BucketID string `json:"bucket_id,omitempty"`
+	Window   string `json:"window,omitempty"`
+	// RemainingFraction 为 nil 表示上游未报该值；仅当 FractionPresent 为 true
+	// 时数值才可信（legacy 不可信、不得硬封）。
+	RemainingFraction *float64  `json:"remaining_fraction"`
+	FractionPresent   bool      `json:"fraction_present"`
+	ResetTime         string    `json:"reset_time,omitempty"`
+	DisplayName       string    `json:"display_name,omitempty"`
+	Description       string    `json:"description,omitempty"`
+	ObservedAt        time.Time `json:"observed_at"`
+	ObservationSeq    int64     `json:"observation_seq"`
+	TTLSeconds        int       `json:"ttl_seconds"`
 }
 
 type AntigravityQuotaGroup struct {
@@ -306,6 +347,9 @@ type AntigravityAICredits struct {
 }
 
 type AntigravityQuotaSnapshot struct {
+	// SchemaVersion 为 2 表示 V2 契约（pointer fraction + presence + 来源元数据）；
+	// 0 表示历史快照，其数值不可作为硬封禁依据。
+	SchemaVersion int `json:"schema_version,omitempty"`
 	// Includes models with no quotaInfo; absence of quota is not zero capacity.
 	CatalogModelIDs      []string                `json:"catalog_model_ids,omitempty"`
 	InternalModelIDs     []string                `json:"internal_model_ids,omitempty"`
@@ -314,6 +358,7 @@ type AntigravityQuotaSnapshot struct {
 	ModelForwardingRules map[string]string       `json:"model_forwarding_rules,omitempty"`
 	AICredits            *AntigravityAICredits   `json:"ai_credits,omitempty"`
 	Forbidden            bool                    `json:"forbidden,omitempty"`
+	SourceMetadata       map[string]SourceMeta   `json:"source_metadata,omitempty"`
 	UpdatedAt            time.Time               `json:"updated_at"`
 }
 

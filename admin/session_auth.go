@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -145,6 +146,10 @@ func (h *Handler) authorizeAdminRequest(c *gin.Context) (bool, string, string) {
 		return false, source, ""
 	}
 
+	if writeAdminAuthRetry(c, h.adminAuthThrottle.retryAfter(c.ClientIP(), time.Now())) {
+		return false, source, ""
+	}
+
 	if expiresAt, ok := h.validateAdminSession(c.Request, adminSecret); ok {
 		c.Set("admin_session_expires_at", expiresAt.Format(time.RFC3339))
 		return true, source, "session"
@@ -177,55 +182,34 @@ func (h *Handler) validateAdminSession(r *http.Request, adminSecret string) (tim
 }
 
 func (h *Handler) GetAdminSessionStatus(c *gin.Context) {
-	adminSecret, source := h.resolveAdminSecret(c.Request.Context())
-	if adminSecret == "" {
-		c.JSON(http.StatusOK, adminSessionStatusResponse{
-			AuthRequired:    true,
-			Authenticated:   false,
-			AdminAuthSource: source,
-			AuthMethod:      "none",
-		})
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
+	authenticated, source, method := h.authorizeAdminRequest(c)
+	if c.IsAborted() {
 		return
 	}
-
-	if expiresAt, ok := h.validateAdminSession(c.Request, adminSecret); ok {
-		c.JSON(http.StatusOK, adminSessionStatusResponse{
-			AuthRequired:    true,
-			Authenticated:   true,
-			AdminAuthSource: source,
-			AuthMethod:      "session",
-			ExpiresAt:       expiresAt.Format(time.RFC3339),
-		})
-		return
-	}
-
-	adminKey := c.GetHeader("X-Admin-Key")
-	if adminKey == "" {
-		authHeader := c.GetHeader("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			adminKey = strings.TrimPrefix(authHeader, "Bearer ")
+	if authenticated {
+		h.adminAuthThrottle.reset(c.ClientIP())
+	} else if source != "disabled" && (c.GetHeader("X-Admin-Key") != "" || strings.HasPrefix(c.GetHeader("Authorization"), "Bearer ")) {
+		if writeAdminAuthRetry(c, h.adminAuthThrottle.recordFailure(c.ClientIP(), time.Now())) {
+			return
 		}
 	}
-	adminKey = security.SanitizeInput(adminKey)
-	if security.SecureCompare(adminKey, adminSecret) {
-		c.JSON(http.StatusOK, adminSessionStatusResponse{
-			AuthRequired:    true,
-			Authenticated:   true,
-			AdminAuthSource: source,
-			AuthMethod:      "header",
-		})
-		return
+	if method == "" {
+		method = "none"
 	}
-
 	c.JSON(http.StatusOK, adminSessionStatusResponse{
 		AuthRequired:    true,
-		Authenticated:   false,
+		Authenticated:   authenticated,
 		AdminAuthSource: source,
-		AuthMethod:      "none",
+		AuthMethod:      method,
+		ExpiresAt:       c.GetString("admin_session_expires_at"),
 	})
 }
 
 func (h *Handler) LoginAdminSession(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
 	var req struct {
 		Secret string `json:"secret"`
 	}
@@ -243,12 +227,19 @@ func (h *Handler) LoginAdminSession(c *gin.Context) {
 		return
 	}
 
+	if writeAdminAuthRetry(c, h.adminAuthThrottle.retryAfter(c.ClientIP(), time.Now())) {
+		return
+	}
 	secret := security.SanitizeInput(strings.TrimSpace(req.Secret))
 	if !security.SecureCompare(secret, adminSecret) {
 		security.SecurityAuditLog("ADMIN_LOGIN_FAILED", fmt.Sprintf("ip=%s source=%s", c.ClientIP(), source))
+		if writeAdminAuthRetry(c, h.adminAuthThrottle.recordFailure(c.ClientIP(), time.Now())) {
+			return
+		}
 		writeError(c, http.StatusUnauthorized, "管理密钥错误")
 		return
 	}
+	h.adminAuthThrottle.reset(c.ClientIP())
 	if h.sessionStore == nil {
 		h.sessionStore = newAdminSessionStore()
 	}
@@ -271,6 +262,8 @@ func (h *Handler) LoginAdminSession(c *gin.Context) {
 }
 
 func (h *Handler) LogoutAdminSession(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
 	if h.sessionStore != nil {
 		if cookie, err := c.Request.Cookie(adminSessionCookieName); err == nil && cookie != nil {
 			h.sessionStore.Delete(security.SanitizeInput(cookie.Value))
@@ -314,4 +307,15 @@ func isSecureRequest(r *http.Request) bool {
 		return true
 	}
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+// writeAdminAuthRetry shares upstream authentication throttling across cookie
+// login, header authentication, and the public session status endpoint.
+func writeAdminAuthRetry(c *gin.Context, retry time.Duration) bool {
+	if retry <= 0 {
+		return false
+	}
+	c.Header("Retry-After", strconv.Itoa(int((retry+time.Second-1)/time.Second)))
+	c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "认证失败次数过多，请稍后再试"})
+	return true
 }

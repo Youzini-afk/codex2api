@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "node --experimental-strip-types --test src/lib/*.test.mjs",
     "test:svg": "node --experimental-strip-types --test tests/qualityTestSVG.browser.test.mjs",
+    "test:intelligence": "node --experimental-strip-types --test tests/intelligenceCheck.browser.test.mjs",
     "test:version": "node --experimental-strip-types --test tests/useVersionCheck.browser.test.mjs",
     "typecheck": "tsc --noEmit",
     "audit:ci": "node scripts/audit-gate.mjs"
@@ -38,6 +39,6 @@
     "playwright": "^1.63.0",
     "prettier": "^3.9.6",
     "typescript": "^5.9.3",
-    "vite": "^8.0.2"
+    "vite": "^8.3.5"
   }
 }

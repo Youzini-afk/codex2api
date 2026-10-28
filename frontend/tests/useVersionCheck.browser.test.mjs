@@ -23,7 +23,7 @@ before(async () => {
       enforce: 'pre',
       resolveId(id, importer) {
         if (id === 'virtual:version-check-harness') return '\0version-check-harness'
-        if (id === '../api' && importer === hookPath) return '\0version-check-api'
+        if (id === '../api' && importer?.replaceAll('\\', '/') === hookPath.replaceAll('\\', '/')) return '\0version-check-api'
       },
       load(id) {
         if (id === '\0version-check-api') {
@@ -64,6 +64,7 @@ before(async () => {
   })
   const bundle = Array.isArray(result) ? result[0] : result
   harnessScript = bundle.output.find((item) => item.type === 'chunk').code
+  assert.ok(harnessScript.includes('window.__request'), 'version hook must use the mocked API')
   browser = await chromium.launch({ headless: true })
 })
 

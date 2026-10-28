@@ -23,7 +23,8 @@ import (
 
 // CodexModelsManifestHandler 向 Codex 客户端提供模型清单。
 //
-// 有可调度的 ChatGPT OAuth 账号时，凭据实时转发官方清单（响应体与 ETag 原样透传）。
+// 有可调度的 ChatGPT OAuth 账号时，使用官方清单并按当前账号池的能力交集收窄。
+// 客户端缓存使用网关表示的 ETag，避免上游 304 绕过账号范围/凭据变化。
 // Antigravity / 仅中转号池没有 ChatGPT 账号：把与 Cockpit 相同的 /v1/models
 // 目录改写成 Codex 期望的 {"models":[{"slug":...}]}，避免客户端 503 后静默
 // 冻结在本地缓存（选单不全、模型信息联不通）。
@@ -44,20 +45,16 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	}
 	restrictManifest := codexManifestNeedsFiltering(row, account)
 	extraModels := h.extraRelayManifestModels(c.Request.Context(), row)
-	ifNoneMatch := c.GetHeader("If-None-Match")
-	if restrictManifest || len(extraModels) > 0 {
-		// Restricted responses use a gateway ETag derived from the filtered
-		// or locally merged representation. It is not an upstream validator, and
-		// forwarding it can produce a body-less 304 that cannot be rebuilt safely.
-		ifNoneMatch = ""
-	}
+	// Capability intersections can change when account scope or credentials
+	// change, even if the source descriptor is unchanged. Always fetch a body
+	// and compare the client's validator against the final gateway descriptor.
 
 	manifest, err := FetchCodexModelsManifest(
 		c.Request.Context(),
 		account,
 		h.store.ResolveProxyForAccount(account),
 		c.Query("client_version"),
-		ifNoneMatch,
+		"",
 		c.Request.Header,
 	)
 	if err != nil {
@@ -86,21 +83,20 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 				http.StatusBadGateway)
 			return
 		}
-		h.learnManifestModelsAsync(manifest.Body, account)
+		h.learnFetchedManifestAsync(manifest)
 		h.writeMergedCodexManifest(c, body, "", extraModels)
 		return
 	}
 
 	if manifest.NotModified {
-		if manifest.ETag != "" {
-			c.Header("ETag", manifest.ETag)
-		}
-		c.Status(http.StatusNotModified)
+		api.SendErrorWithStatus(c,
+			api.NewAPIError(api.ErrCodeUpstreamError, "codex models manifest returned an unusable 304", api.ErrorTypeUpstream),
+			http.StatusBadGateway)
 		return
 	}
 	// 顺手把清单里注册表不认识的新模型学习进注册表（只增不改不删），
 	// 让选单里出现的新模型立即通过请求侧模型校验，无需等手动同步。
-	h.learnManifestModelsAsync(manifest.Body, account)
+	h.learnFetchedManifestAsync(manifest)
 	h.writeMergedCodexManifest(c, manifest.Body, manifest.ETag, extraModels)
 }
 
@@ -136,6 +132,7 @@ func (h *Handler) writeMergedCodexManifest(c *gin.Context, body []byte, upstream
 			merged = next
 		}
 	}
+	merged = h.applyUpstreamModelCapabilities(c.Request.Context(), apiKeyRowFromContext(c), merged)
 	etag := upstreamETag
 	if etag == "" || string(merged) != string(body) {
 		etag = ""
@@ -247,10 +244,10 @@ func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
 			for _, level := range available {
 				item.SupportedReasoningLevels = append(item.SupportedReasoningLevels, codexReasoningLevel{Effort: level, Description: "Antigravity " + level + " reasoning"})
 			}
-			item.DefaultReasoningLevel = available[0]
+			item.DefaultReasoningLevel = antigravityModelChoiceDefaultLevel(slug, available)
 			item.SupportsReasoningSummaries = true
 		}
-		if slug == "gemini-3.8-flash" {
+		if slug == "gemini-3.8-flash" || (slug == "gemini-4-argon" && len(levels[slug]) > 0) {
 			item.ContextWindow = 1048576
 			// The current OAuth adapter accepts text parts only, even though the
 			// upstream model itself has vision. Advertise the gateway contract.
@@ -379,6 +376,27 @@ func (h *Handler) learnManifestModelsAsync(manifestBody []byte, accounts ...*aut
 	for _, account := range accounts {
 		h.learnModelCapabilitiesAsync(account, manifestBody)
 	}
+	h.learnManifestModelRegistryAsync(manifestBody)
+}
+
+// learnFetchedManifestAsync carries the credential generation captured before
+// the upstream request into capability persistence. The response body must
+// never be re-associated with a generation read after a token rotation.
+func (h *Handler) learnFetchedManifestAsync(manifest *CodexModelsManifest) {
+	if manifest == nil {
+		return
+	}
+	if manifest.capabilityAccount != nil {
+		h.learnModelCapabilitiesAsyncAtGeneration(
+			manifest.capabilityAccount,
+			manifest.capabilitySnapshot.CredentialGeneration,
+			manifest.Body,
+		)
+	}
+	h.learnManifestModelRegistryAsync(manifest.Body)
+}
+
+func (h *Handler) learnManifestModelRegistryAsync(manifestBody []byte) {
 	if len(manifestBody) == 0 {
 		return
 	}
@@ -447,6 +465,9 @@ type CodexModelsManifest struct {
 	Body        []byte
 	ETag        string
 	NotModified bool
+
+	capabilityAccount  *auth.Account
+	capabilitySnapshot database.ModelCapabilitySnapshot
 }
 
 // FetchCodexModelsManifest 用账号凭据向 ChatGPT 后端实时拉取 Codex 模型清单。
@@ -469,7 +490,10 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	if account == nil {
 		return nil, fmt.Errorf("account is nil")
 	}
-	accessToken := account.GetAccessToken()
+	account.Mu().RLock()
+	accessToken := strings.TrimSpace(account.AccessToken)
+	generation := account.CredentialGeneration
+	account.Mu().RUnlock()
 	if accessToken == "" {
 		return nil, fmt.Errorf("account has no access token")
 	}
@@ -538,5 +562,12 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	if err != nil {
 		return nil, fmt.Errorf("read codex models response: %w", err)
 	}
-	return &CodexModelsManifest{Body: body, ETag: resp.Header.Get("ETag")}, nil
+	observedAt := time.Now().UnixNano()
+	return &CodexModelsManifest{
+		Body: body, ETag: resp.Header.Get("ETag"),
+		capabilityAccount: account,
+		capabilitySnapshot: database.ModelCapabilitySnapshot{
+			AccountID: account.ID(), CredentialGeneration: generation, ObservedAt: observedAt,
+		},
+	}, nil
 }

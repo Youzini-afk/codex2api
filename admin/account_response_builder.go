@@ -254,6 +254,7 @@ func (h *Handler) buildAccountResponse(
 		AvatarURL:                    row.GetCredential("avatar_url"),
 		VerifiedEmail:                row.GetCredentialBool("verified_email"),
 		ProjectID:                    row.GetCredential("project_id"),
+		AntigravityUserProjectID:     row.GetCredential(auth.AntigravityUserProjectIDCredentialKey),
 		AntigravityQuota:             antigravityQuota,
 		AntigravityPermissions:       antigravityPermissions,
 		AntigravitySyncWarning:       row.GetCredential("antigravity_sync_warning"),
@@ -313,12 +314,6 @@ func (h *Handler) buildAccountResponse(
 	resp.SchedulerPriority = accountSchedulerPriority(row)
 
 	now := time.Now()
-	if includeDetails {
-		// Rows that are intentionally disabled or lack usable credentials do not
-		// exist in the runtime store, but their persisted overrides and global
-		// effective policy are still part of the account detail contract.
-		applyAccountModelCooldownPolicyFromRow(&resp, row, h.store.GetModelCooldownSettings(), isOpenAIResponsesAccount)
-	}
 	if runtimeAccount != nil {
 		if includeDetails {
 			resp.ModelCooldownModeOverride, resp.ModelCooldownSecondsOverride, resp.ModelCooldownBackoffOverride = runtimeAccount.GetModelCooldownPolicyOverride()

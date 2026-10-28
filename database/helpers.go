@@ -6,9 +6,6 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
-	"net/url"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -443,40 +440,6 @@ func (db *DB) insertRowID(ctx context.Context, postgresQuery string, sqliteQuery
 	var id int64
 	err := db.conn.QueryRowContext(ctx, postgresQuery, args...).Scan(&id)
 	return id, err
-}
-
-func ensureSQLiteParentDir(dsn string) error {
-	path := sqlitePathFromDSN(dsn)
-	if path == "" {
-		return nil
-	}
-	dir := filepath.Dir(path)
-	if dir == "" || dir == "." {
-		return nil
-	}
-	return os.MkdirAll(dir, 0o755)
-}
-
-func sqlitePathFromDSN(dsn string) string {
-	raw := strings.TrimSpace(dsn)
-	if raw == "" || raw == ":memory:" || strings.Contains(raw, "mode=memory") {
-		return ""
-	}
-	if strings.HasPrefix(raw, "file:") {
-		if parsed, err := url.Parse(raw); err == nil && parsed.Path != "" {
-			raw = parsed.Path
-		} else {
-			raw = strings.TrimPrefix(raw, "file:")
-		}
-	}
-	if idx := strings.Index(raw, "?"); idx >= 0 {
-		raw = raw[:idx]
-	}
-	raw = strings.TrimSpace(raw)
-	if raw == "" || raw == ":memory:" {
-		return ""
-	}
-	return filepath.Clean(raw)
 }
 
 // decodeInt64SliceValue parses a JSON array of integers from a JSONB or TEXT column.

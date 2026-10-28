@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,23 +23,6 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 
 	if got := db.Driver(); got != "sqlite" {
 		t.Fatalf("Driver() = %q, want %q", got, "sqlite")
-	}
-}
-
-func TestNewSQLiteCreatesParentDirectories(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "nested", "data", "codex2api.db")
-
-	db, err := New("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("New(sqlite) 返回错误: %v", err)
-	}
-	defer db.Close()
-
-	if got := sqlitePathFromDSN(dbPath); got != dbPath {
-		t.Fatalf("sqlitePathFromDSN() = %q, want %q", got, dbPath)
-	}
-	if _, err := os.Stat(filepath.Dir(dbPath)); err != nil {
-		t.Fatalf("SQLite 数据目录未创建: %v", err)
 	}
 }
 
@@ -95,8 +77,8 @@ func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
 	if strings.TrimSpace(settings.PromptFilterAdvancedConfig) != "{}" {
 		t.Fatalf("compatibility advanced config = %q, want {}", settings.PromptFilterAdvancedConfig)
 	}
-	if settings.CodexMinCLIVersion != "0.153.3" {
-		t.Fatalf("fresh SQLite minimum Codex CLI version = %q, want 0.153.3", settings.CodexMinCLIVersion)
+	if settings.CodexMinCLIVersion != "0.160.0" {
+		t.Fatalf("fresh SQLite minimum Codex CLI version = %q, want 0.160.0", settings.CodexMinCLIVersion)
 	}
 	if settings.SessionSlotBufferEnabled || settings.SessionSlotBufferSeconds != 10 {
 		t.Fatalf("session slot buffer defaults = enabled:%t seconds:%d, want false/10", settings.SessionSlotBufferEnabled, settings.SessionSlotBufferSeconds)

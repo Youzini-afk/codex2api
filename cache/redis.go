@@ -76,15 +76,6 @@ func NewRedisWithOptions(cfg RedisOptions) (TokenCache, error) {
 	return &redisTokenCache{client: client}, nil
 }
 
-// NewRedisFromURL 使用 Redis URL 创建缓存实例。
-func NewRedisFromURL(rawURL string, poolSize ...int) (TokenCache, error) {
-	size := 0
-	if len(poolSize) > 0 && poolSize[0] > 0 {
-		size = poolSize[0]
-	}
-	return NewRedisWithOptions(RedisOptions{Addr: rawURL, PoolSize: size})
-}
-
 // defaultRedisLoadingWait 默认等待 Redis 加载数据集的时长。
 // 大体量 AOF/RDB（数十 GB）重启后加载需要数分钟，期间 Redis 接受连接
 // 但对命令返回 -LOADING；直接失败会让进程陷入崩溃重启循环。

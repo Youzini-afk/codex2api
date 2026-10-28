@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -127,9 +128,10 @@ type antigravityTierPayload struct {
 	Slug      string `json:"slug"`
 	// Cloud Code emits camelCase (isDefault); the snake_case alias is kept so
 	// stored snapshots and any proto-JSON variant still parse.
-	IsDefault        bool `json:"isDefault"`
-	IsDefaultSnake   bool `json:"is_default"`
-	AvailableCredits []struct {
+	IsDefault                          bool `json:"isDefault"`
+	IsDefaultSnake                     bool `json:"is_default"`
+	UserDefinedCloudaicompanionProject bool `json:"userDefinedCloudaicompanionProject"`
+	AvailableCredits                   []struct {
 		CreditAmount any `json:"creditAmount"`
 	} `json:"availableCredits"`
 }
@@ -647,7 +649,13 @@ func (c *AntigravityClient) fetchIdentityContext(ctx context.Context, credential
 	if preserveProject {
 		projectID = strings.TrimSpace(credential.ProjectID)
 	}
-	entitlements, entitlementErr := c.fetchEntitlements(ctx, credential.AccessToken)
+	userProjectID := strings.TrimSpace(credential.UserProjectID)
+	entitlements, entitlementErr := c.fetchEntitlements(ctx, credential.AccessToken, userProjectID)
+	if entitlementErr == nil && entitlements.ProjectID == "" && entitlements.CurrentTier != nil && userProjectID != "" {
+		// Already onboarded to a tier that runs against a caller-owned project:
+		// loadCodeAssist never echoes that project back.
+		entitlements.ProjectID = userProjectID
+	}
 	if entitlements.ProjectID == "" {
 		entitlements.ProjectID = projectID
 	}
@@ -655,7 +663,7 @@ func (c *AntigravityClient) fetchIdentityContext(ctx context.Context, credential
 		// loadCodeAssist succeeded but the account has no companion project
 		// yet. Provision one the way the native client does; otherwise the
 		// account is stored healthy but is never dispatchable.
-		onboarded, onboardErr := c.onboardProject(ctx, credential.AccessToken, entitlements)
+		onboarded, onboardErr := c.onboardProject(ctx, credential.AccessToken, entitlements, userProjectID)
 		if onboardErr != nil {
 			entitlementErr = fmt.Errorf("Antigravity project provisioning (onboardUser) failed: %w", onboardErr)
 		} else {
@@ -680,19 +688,43 @@ func antigravityOnboardTierID(entitlements AntigravityEntitlements) string {
 	return antigravityOnboardDefaultTier
 }
 
+// antigravityProjectRequiredError explains why onboardUser finished without a
+// project: only the free/consumer tiers get a Google-managed project.
+func antigravityProjectRequiredError(tierID string, entitlements AntigravityEntitlements) error {
+	userDefined := false
+	for _, tier := range entitlements.AllowedTiers {
+		if tier.ID == tierID && tier.UserDefinedProject {
+			userDefined = true
+		}
+	}
+	if entitlements.CurrentTier != nil && entitlements.CurrentTier.UserDefinedProject {
+		userDefined = true
+	}
+	reason := "onboardUser completed without a project id"
+	if userDefined {
+		reason = fmt.Sprintf("tier %q requires a caller-owned Google Cloud project", tierID)
+	}
+	return fmt.Errorf("%s; Workspace / enterprise accounts (Gemini Code Assist Standard or Enterprise) are not given a managed project, set the GCP project ID on this account and sync again", reason)
+}
+
 // onboardProject calls v1internal:onboardUser and polls the returned
 // long-running operation until it reports done with a project id.
-func (c *AntigravityClient) onboardProject(ctx context.Context, accessToken string, entitlements AntigravityEntitlements) (string, error) {
+func (c *AntigravityClient) onboardProject(ctx context.Context, accessToken string, entitlements AntigravityEntitlements, userProjectID string) (string, error) {
 	if len(c.endpoints.OnboardUser) == 0 {
 		return "", errors.New("no onboardUser endpoint configured")
 	}
-	payload := map[string]any{
-		"tierId": antigravityOnboardTierID(entitlements),
-		"metadata": map[string]any{
-			"ideType":    "ANTIGRAVITY",
-			"platform":   "PLATFORM_UNSPECIFIED",
-			"pluginType": "GEMINI",
-		},
+	tierID := antigravityOnboardTierID(entitlements)
+	metadata := map[string]any{
+		"ideType":    "ANTIGRAVITY",
+		"platform":   "PLATFORM_UNSPECIFIED",
+		"pluginType": "GEMINI",
+	}
+	payload := map[string]any{"tierId": tierID, "metadata": metadata}
+	// The free tier runs on a Google-managed project; naming a project there
+	// makes onboardUser fail with FAILED_PRECONDITION.
+	if userProjectID != "" && tierID != antigravityOnboardDefaultTier {
+		payload["cloudaicompanionProject"] = userProjectID
+		metadata["duetProject"] = userProjectID
 	}
 	var lastErr error
 	for _, endpoint := range c.endpoints.OnboardUser {
@@ -722,7 +754,10 @@ func (c *AntigravityClient) onboardProject(ctx context.Context, accessToken stri
 				lastErr = errors.New("onboardUser operation is still pending")
 				continue
 			}
-			lastErr = errors.New("onboardUser completed without a project id")
+			if userProjectID != "" {
+				return userProjectID, nil
+			}
+			lastErr = antigravityProjectRequiredError(tierID, entitlements)
 			break
 		}
 	}
@@ -874,11 +909,17 @@ func (c *AntigravityClient) fetchProfile(ctx context.Context, accessToken string
 	return profile, nil
 }
 
-func (c *AntigravityClient) fetchEntitlements(ctx context.Context, accessToken string) (AntigravityEntitlements, error) {
+func (c *AntigravityClient) fetchEntitlements(ctx context.Context, accessToken, userProjectID string) (AntigravityEntitlements, error) {
+	metadata := map[string]any{"ideType": "ANTIGRAVITY"}
+	request := map[string]any{"metadata": metadata}
+	if userProjectID != "" {
+		request["cloudaicompanionProject"] = userProjectID
+		metadata["duetProject"] = userProjectID
+	}
 	var lastErr error
 	for _, endpoint := range c.endpoints.LoadProject {
 		var payload antigravityLoadProjectResponse
-		status, err := c.postJSON(ctx, endpoint, accessToken, map[string]any{"metadata": map[string]any{"ideType": "ANTIGRAVITY"}}, &payload)
+		status, err := c.postJSON(ctx, endpoint, accessToken, request, &payload)
 		if err == nil {
 			return normalizeAntigravityEntitlements(payload, c.now()), nil
 		}
@@ -904,22 +945,9 @@ func normalizeAntigravityEntitlements(payload antigravityLoadProjectResponse, no
 	if result.Restricted {
 		result.Reason = "Google marked one or more subscription tiers as ineligible"
 	}
-	if result.PaidTier != nil {
-		result.EffectiveTier = firstNonEmpty(result.PaidTier.Name, result.PaidTier.ID)
-	}
-	if result.EffectiveTier == "" && !result.Restricted && result.CurrentTier != nil {
-		result.EffectiveTier = firstNonEmpty(result.CurrentTier.Name, result.CurrentTier.ID)
-	}
-	if result.EffectiveTier == "" && len(result.AllowedTiers) > 0 {
-		selected := result.AllowedTiers[0]
-		for _, tier := range result.AllowedTiers {
-			if tier.IsDefault {
-				selected = tier
-				break
-			}
-		}
-		result.EffectiveTier = firstNonEmpty(selected.Name, selected.ID)
-		if result.Restricted && result.EffectiveTier != "" {
+	if tier, fromAllowed := effectiveAntigravityTier(&result); tier != nil {
+		result.EffectiveTier = firstNonEmpty(tier.Name, tier.ID)
+		if fromAllowed && result.Restricted {
 			result.EffectiveTier += " (Restricted)"
 		}
 	}
@@ -933,6 +961,7 @@ func convertAntigravityTier(tier *antigravityTierPayload) *AntigravityTier {
 	return &AntigravityTier{
 		ID: strings.TrimSpace(tier.ID), Name: strings.TrimSpace(tier.Name),
 		QuotaTier: strings.TrimSpace(tier.QuotaTier), Slug: strings.TrimSpace(tier.Slug), IsDefault: tier.isDefaultTier(),
+		UserDefinedProject: tier.UserDefinedCloudaicompanionProject,
 	}
 }
 
@@ -989,19 +1018,27 @@ func normalizeAntigravityQuota(payload antigravityQuotaResponse, now time.Time) 
 		if model.QuotaInfo == nil || !isTrackedAntigravityModel(modelID) {
 			continue
 		}
-		fraction := 0.0
+		var fraction *float64
+		fractionPresent := false
 		if model.QuotaInfo.RemainingFraction != nil {
-			fraction = *model.QuotaInfo.RemainingFraction
+			value := *model.QuotaInfo.RemainingFraction
+			if value < 0 {
+				value = 0
+			}
+			if value > 1 {
+				value = 1
+			}
+			fraction = &value
+			fractionPresent = true
 		}
-		if fraction < 0 {
-			fraction = 0
-		}
-		if fraction > 1 {
-			fraction = 1
+		percent := 0
+		if fractionPresent {
+			percent = int(*fraction * 100)
 		}
 		result.Models = append(result.Models, AntigravityModelQuota{
-			ModelID: modelID, DisplayName: model.DisplayName, RemainingFraction: fraction,
-			RemainingPercent: int(fraction * 100), ResetTime: model.QuotaInfo.ResetTime,
+			ModelID: modelID, DisplayName: model.DisplayName,
+			RemainingFraction: fraction, FractionPresent: fractionPresent,
+			RemainingPercent: percent, ResetTime: model.QuotaInfo.ResetTime,
 			SupportsImages: model.SupportsImages, SupportsThinking: model.SupportsThinking,
 			ThinkingBudget: model.ThinkingBudget, Recommended: model.Recommended,
 			MaxTokens: model.MaxTokens, MaxOutputTokens: model.MaxOutputTokens,
@@ -1032,6 +1069,119 @@ func isTrackedAntigravityModel(model string) bool {
 	return false
 }
 
+// NormalizeAntigravityWindow 把上游 window 字段规整为白名单内的稳定标识。
+// 白名单之外（daily/monthly/未知）一律 ok=false，调用方不得据此做出配额判定。
+func NormalizeAntigravityWindow(raw string) (string, bool) {
+	norm := strings.ToLower(strings.TrimSpace(raw))
+	switch norm {
+	case "5h", "five_hour", "5_hour", "fivehour":
+		return "5h", true
+	case "weekly", "week", "7d", "seven_day":
+		return "weekly", true
+	default:
+		return "", false
+	}
+}
+
+// ValidateResetTime 解析 RFC3339 的 reset_time，并检查它晚于 observedAt 且落在
+// 对应窗口的物理上限内（5h <= 6h，weekly <= 8d）。任何不成立的情形返回零值，
+// 由调用方回落到 TTL 推算，绝不把越界时标当成权威重置时刻。
+func ValidateResetTime(resetStr string, observedAt time.Time, window string) (time.Time, bool) {
+	if strings.TrimSpace(resetStr) == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(resetStr))
+	if err != nil {
+		return time.Time{}, false
+	}
+	if !parsed.After(observedAt) {
+		return time.Time{}, false
+	}
+	diff := parsed.Sub(observedAt)
+	switch window {
+	case "5h":
+		if diff > 6*time.Hour {
+			return time.Time{}, false
+		}
+	case "weekly":
+		if diff > 8*24*time.Hour {
+			return time.Time{}, false
+		}
+	default:
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
+// ClassifyAntigravityFraction 按 Spec §3.2 把单个桶数值收敛为四态（absent 由
+// summary_integrity 权威清单在合并层判定，解析层只区分 known_positive/known_zero/unknown）。
+func ClassifyAntigravityFraction(value *float64, present bool) string {
+	if !present || value == nil {
+		return "unknown"
+	}
+	v := *value
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0.0 || v > 1.0 {
+		return "unknown"
+	}
+	if v == 0.0 {
+		return "known_zero"
+	}
+	return "known_positive"
+}
+
+// ApplyQuotaGroupsV2 按 Spec §3.2 合并一次 groups 观测：
+//   - incoming 为空：整体残缺，不得推进成功（返回 advanced=false），保留 prev；
+//   - incoming 非空：替换所有已返回桶（坏桶按 presence 判 unknown，绝不复活旧零），
+//     未返回旧桶原样保留 observed_at/observation_seq（不洗新）；
+//   - 仅 summaryIntegrity=true（完整权威清单）才删除未返回桶。
+func ApplyQuotaGroupsV2(prev *AntigravityQuotaSnapshot, incoming []AntigravityQuotaGroup, summaryIntegrity bool, observedAt time.Time, ttlSeconds int, seq int64) (AntigravityQuotaSnapshot, bool) {
+	if len(incoming) == 0 {
+		if prev == nil {
+			return AntigravityQuotaSnapshot{SchemaVersion: 2}, false
+		}
+		return *prev, false
+	}
+	next := AntigravityQuotaSnapshot{SchemaVersion: 2}
+	if prev != nil {
+		next.SourceMetadata = prev.SourceMetadata
+		next.Models = prev.Models
+		next.UpdatedAt = prev.UpdatedAt
+	}
+	returned := make(map[string]bool)
+	for _, group := range incoming {
+		g := group
+		for i := range g.Buckets {
+			b := g.Buckets[i]
+			if w, known := NormalizeAntigravityWindow(b.Window); known {
+				b.Window = w
+			}
+			b.ObservedAt = observedAt
+			b.ObservationSeq = seq
+			b.TTLSeconds = ttlSeconds
+			if !b.FractionPresent {
+				b.RemainingFraction = nil // 坏桶隔离：unknown，绝不沿用旧数值
+			}
+			returned[b.BucketID+"|"+b.Window] = true
+			g.Buckets[i] = b
+		}
+		next.Groups = append(next.Groups, g)
+	}
+	if prev != nil && !summaryIntegrity {
+		for _, group := range prev.Groups {
+			var retained []AntigravityQuotaBucket
+			for _, b := range group.Buckets {
+				if !returned[b.BucketID+"|"+b.Window] {
+					retained = append(retained, b)
+				}
+			}
+			if len(retained) > 0 {
+				next.Groups = append(next.Groups, AntigravityQuotaGroup{DisplayName: group.DisplayName, Description: group.Description, Buckets: retained})
+			}
+		}
+	}
+	return next, true
+}
+
 func (c *AntigravityClient) fetchQuotaSummary(ctx context.Context, accessToken, projectID string) ([]AntigravityQuotaGroup, bool, antigravityUpstreamFailure) {
 	payload := map[string]any{}
 	if strings.TrimSpace(projectID) != "" {
@@ -1055,12 +1205,18 @@ func (c *AntigravityClient) fetchQuotaSummary(ctx context.Context, accessToken, 
 		for _, group := range response.Groups {
 			item := AntigravityQuotaGroup{DisplayName: group.DisplayName, Description: group.Description, Buckets: []AntigravityQuotaBucket{}}
 			for _, bucket := range group.Buckets {
-				fraction := 0.0
+				// 保留上游真实指针与 presence：缺失值保持 nil/false（unknown），
+				// 绝不退化成 0.0，否则坏桶会被下游当成"配额耗尽"硬封账号。
+				var fraction *float64
+				fractionPresent := false
 				if bucket.RemainingFraction != nil {
-					fraction = *bucket.RemainingFraction
+					value := *bucket.RemainingFraction
+					fraction = &value
+					fractionPresent = true
 				}
 				item.Buckets = append(item.Buckets, AntigravityQuotaBucket{
-					BucketID: bucket.BucketID, Window: bucket.Window, RemainingFraction: fraction,
+					BucketID: bucket.BucketID, Window: bucket.Window,
+					RemainingFraction: fraction, FractionPresent: fractionPresent,
 					ResetTime: bucket.ResetTime, DisplayName: bucket.DisplayName, Description: bucket.Description,
 				})
 			}

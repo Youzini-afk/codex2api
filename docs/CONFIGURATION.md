@@ -9,10 +9,21 @@
 - [系统设置（数据库）](#系统设置数据库)
 - [模型与价格自动更新](#模型与价格自动更新)
 - [API Key 模型周请求次数预算](#api-key-模型周请求次数预算)
+- [降智检测与目标分组](#降智检测与目标分组)
+- [Codex 出站 attestation](#codex-出站-attestation)
 - [配置文件示例](#配置文件示例)
 - [配置优先级](#配置优先级)
 
 ---
+
+## 降智检测与目标分组
+
+管理后台「降智检测」支持 Codex 和 Claude 账号。「新增账号默认检测」只影响之后创建的账号，不会修改已有账号的检测开关。
+
+- 自动处置为「不自动处置」或「暂停业务调度」时，两个通道的新账号均按默认开关决定是否参与检测。
+- 自动处置为「切换分组」时，仅与目标分组通道一致的新账号默认参与检测；其他通道的账号仍可正常创建。目标分组不存在或通道不兼容时，新账号不自动参与检测。
+- 当前配置只有一个目标分组。已有账号同时启用了两个通道的检测时，保存切组策略会返回冲突账号的 ID、名称和通道。页面可查看账号检测记录，或关闭所列账号的自动检测后重新保存；超过 200 个冲突时分批处理。关闭检测不会关闭账号的业务调度，也不会删除检测历史或已有处置的恢复状态。
+- 升级会替换 SQLite 和 PostgreSQL 的新账号触发器，但保留已有账号的检测开关。旧版本产生的冲突需要通过上述入口处理；仅关闭「新增账号默认检测」不会清除已有冲突。
 
 ## 模型与价格自动更新
 
@@ -24,7 +35,21 @@
 
 Codex 注册表中管理员禁用的模型不会重新启用，账号清单学习只增加模型，不因单个账号缺少权限而删除模型；官方目录来源的非内置旧条目沿用现有同步清理规则。Grok、Claude 成功刷新后按上游结果更新账号目录。所有渠道的手工价格优先于同步价。单渠道发现失败不阻断其他渠道刷新及后续价格同步，失败会在同步警告和服务日志中报告；未公布价格的新型号暂用现有兜底价，后续轮询获得价格后自动生效。
 
+价格同步读取官方 HTML 网页，按列名识别价格，不解析 Markdown。OpenAI 折叠模型从页面内嵌数据补全，长上下文价读取该页面引用的官方价格组件，仅解码数据而不执行脚本；结构变化时拒绝不完整价格并进入参考来源回退。写入前校验表格结构、数值类型、非负有限价格、缓存读取价不高于对应输入价，以及已知模型的长上下文档位。官方抓取失败、格式变化、价格校验失败或模型缺价时，按模型依次尝试 **LiteLLM → models.dev → 项目默认 pricing.json**；仍无有效价格时清除该模型旧的同步覆盖，恢复内置默认定价。已获取的高优先级价格不会被后续来源覆盖，未勾选的渠道不受影响，管理员自定义价格始终优先。
+
+「参考 JSON 来源」提供 LiteLLM、models.dev、项目默认及自定义 URL 的手动导入。LiteLLM 的每 token 单价会转换为页面统一的 USD / 1M tokens；第三方目录只使用 OpenAI、Anthropic、xAI 第一方条目，避免混入转售商价格。自动回退顺序固定，不改写手动导入 URL。成功回退和使用内置默认价通过同步结果的普通提示展示；最近警告仅记录抓取、解析及校验异常。gpt-image-2 的 2K/4K 变体缺少独立价目时继承基础模型 token 价，仍可分别设置自定义价格。
+
+Daybreak 派生别名（如 `gpt-6-sol-daybreak-blue`、`gpt-6.1-sol-daybreak-blue`）按基础型号同步完整标准、Fast 和长上下文价格，不要求参考 JSON 单独收录别名。别名有精确价目时优先采用；别名自定义价优先，基础模型自定义价也不会被别名同步价压过。未查到基础型号价格时继续按既定来源顺序回退。官方 `gpt-daybreak-blue-latest`、`gpt-daybreak-red-latest` 的默认快照目前分别是 `gpt-5.6-sol`、`gpt-5.6-cyber`；Cyber 使用独立公开定价，不再按 Sol 兜底。来源：[Daybreak 指南](https://developers.openai.com/api/docs/guides/daybreak)、[官方价格页](https://developers.openai.com/api/docs/pricing)。
+
 Antigravity 模型仍使用「刷新全部模型」。「立即同步官方价」保持仅同步价格，模型发现由定时轮询执行。新协议、特殊权限或特殊计费规则仍可能需要更新程序。
+
+## Codex 出站 attestation
+
+Codex HTTP、WebSocket 和 Live 共用出站证明服务，按最终 User-Agent 选择平台：
+Windows 自动发送平台不可用状态，Linux 不自动补头，macOS 尝试原生 DeviceCheck，
+生成失败时发送桌面端对应的内层错误状态。证明统一由本项目生成，忽略客户端及账号
+自定义请求头中的 `X-Oai-Attestation`；Live sideband 复用服务端冻结的建连结果。
+无需新增环境变量或数据库设置；详见 [平台矩阵、Mac 依赖与 Live 快照](CODEX_ATTESTATION.md)。
 
 ## 配置层级
 
@@ -87,18 +112,33 @@ Codex2API 采用三层配置架构：
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
+| `CODEX_WS_USAGE_FRAME_PERSIST_SECONDS` | 否 | `30` | WS 逐帧用量快照落库的最小间隔（秒），正整数，重启生效。内存快照每帧更新；落库由每账号合并的异步 worker 执行，不阻塞上游响应流；跨自动暂停阈值、5pp 变化或 100% 时仍强制落库。大号池可按数据库承压调大 |
+| `CODEX_WS_USAGE_FRAME_INGEST` | 否 | `true` | 是否消费 WS 上游每轮及终态后连接级 `codex.rate_limits` / `codex.response.metadata` 配额帧；设为 `false` 时回退到 WHAM 探针与 HTTP 响应头，重启生效 |
 | `CODEX_SESSION_AFFINITY_TTL` | 否 | `1h` | Codex 会话到账号/代理的黏性 TTL，支持 `1h`、`90m` 或秒数 |
 | `CODEX_COMPACTION_AFFINITY_TTL` | 否 | `168h` | 加密压缩状态的来源亲和 TTL。缓存仅保存密文的 SHA-256 摘要、来源账号和兼容域；已知状态不会跨 Codex 官方、不同 Responses 中转或 Grok 上游流转 |
 | `CODEX_FINGERPRINT_DEBUG` | 否 | `false` | 输出脱敏指纹策略诊断日志，不记录 token |
 | `CODEX_REQUEST_COMPRESSION` | 否 | 跟随系统设置 | 覆盖系统设置「Codex HTTP 请求体压缩」。`zstd`/`on`/`true`/`1` 强制开启，`off`/`false`/`0` 强制关闭，未设置或取值无法识别时以系统设置为准。作为部署级逃生阀存在：DB 不可达或后台打不开时仍可整机切换 |
+| `CODEX_MULTI_AGENT_V2_COMPAT` | 否 | `false` | 实验性：为官方 Codex 客户端的 Multi-Agent v2 协作工具启用明文参数兼容。仅原生 Codex 账号生效，重启生效；开启后匹配的 v2 子任务正文会以明文发送。详见 `docs/CODEX_MULTI_AGENT_V2_COMPAT.md` |
 | `CODEX_TELEMETRY_ENABLED` | 否 | 跟随系统设置 | 设为 `false` 时无视管理后台「客户端遥测」开关，部署层强制关闭模拟遥测外发 |
 | `CODEX_STATSIG_API_KEY` | 否 | 内置公开 key | 覆盖 Codex Desktop/CLI 共用的公开 Statsig SDK key，仅遥测开启时使用 |
 | `CODEX_SESSION_HEADER_MODE` | 否 | `native` | 出站会话头形态。`native` 发真实客户端的 `session-id` / `thread-id` / `x-client-request-id`；`legacy` 回退到旧的 `Session_id`（WS 另带 `Conversation_id`） |
 | `CODEX_SESSION_HEADER_ALIGN_CONVERGED` | 否 | `false` | 开启后 `session-id` 头改用指纹收敛后的会话身份，与 turn metadata 的 `session_id` 对齐。默认关：请求体 `prompt_cache_key` 始终独立隔离，但上游是否也拿该头参与缓存分组无法从客户端源码确认 |
-| `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` | 否 | `30s` | 下游 HTTP/SSE 保活周期，使用 Go duration；`0` 关闭。流式端点从首个心跳起建立 SSE 200，发送注释或 Messages ping；非流式端点发送 HTTP 102 |
+| `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` | 否 | `30s` | 下游 HTTP/SSE 保活周期，使用 Go duration；`0` 关闭。流式端点从首个心跳起建立 SSE 200，发送注释或 Messages ping；非流式端点发送 HTTP 102，但 Codex/GPT Images 除外：其非流式请求不发送中间响应，直接等待最终 JSON |
 | `DOWNSTREAM_WS_KEEPALIVE_INTERVAL` | 否 | `45s` | 下游 WebSocket Ping 周期，使用 Go duration；`0` 关闭。覆盖 Responses、Realtime 与 Live Sideband |
 
+配额帧读路径只更新内存和调度器；用量、credits、套餐及冷却的写库共用后台合并路径。并发观测锁争用时，每账号最多保留 64 个待应用 partial 帧，按原始时间顺序处理；溢出保留最新的有界尾部，并通过已有探针补齐权威快照。停机丢弃未完成的缓存写，重启后由探针重建。冷却写失败会在后续观测重试，不重复计入失败次数。
+
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
+>
+> WS 传输下，服务端会消费上游每轮下发的 `codex.rate_limits` 帧，以及响应终态后 1–2 秒补发的连接级用量帧，实时更新账号的 5h/7d 用量快照；自动暂停阈值不再需要等待 WHAM 探针周期即可生效。这些帧随对话本身下发，不产生额外上游请求。
+
+### Antigravity 调度开关
+
+Antigravity 渠道的首绑 / Fresh 选号默认启用加权避险：候选账号按并发占用、已用配额与近期限流惩罚打分，刚被上游 429 的账号排到队尾，从而把新会话摊到健康账号上。
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `ANTIGRAVITY_BALANCED_AFFINITY` | 否 | `true` | 加权避险开关。取 `0` / `false` / `off` / `none` / `no`（大小写不敏感）时关闭，回退为原有 round-robin；其它值按开启处理。进程启动时读取一次，改动需重启生效。冷却正确性修复不受该开关影响、始终生效：public / wire 冷却写入（Gemini 配额耗尽时追加 family 键）、共享 wire / family 冷却不被更短事件缩短、跨实例冷却过滤（Antigravity 候选查三键） |
 
 ### 数据库配置
 
@@ -115,7 +155,6 @@ Codex2API 采用三层配置架构：
 | `DATABASE_SCHEMA` | 否 | - | PostgreSQL schema；适合 Supabase 等多项目共享 database 的场景。配置后启动时自动 `CREATE SCHEMA IF NOT EXISTS` 并将所有连接的 `search_path` 指向该 schema。仅允许字母/数字/下划线，长度 ≤63；留空保持默认（通常是 `public`）。|
 | `DATABASE_SSLMODE` | 否 | disable | SSL 模式: disable/require/verify-full |
 
-也支持连接字符串形式，例如 `DATABASE_URL`、`POSTGRES_CONNECTION_STRING`、`POSTGRESQL_CONNECTION_STRING`。
 ### 生图工作台
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -143,8 +182,6 @@ Codex2API 采用三层配置架构：
 | `DATABASE_DRIVER` | 是 | sqlite | 固定值: sqlite |
 | `DATABASE_PATH` | 是 | - | SQLite 数据库文件路径，如 `/data/codex2api.db` |
 
-在 Zeabur 环境中，如果未配置数据库且未显式指定 `DATABASE_DRIVER`，会自动回退为 SQLite，并默认使用 `/data/codex2api.db`。
-
 ### 缓存配置
 
 #### Redis 模式
@@ -161,15 +198,11 @@ Codex2API 采用三层配置架构：
 
 > Aiven、Upstash 等云 Redis 通常要求 TLS。优先使用平台提供的 `rediss://...` 连接串；如果只填写 `host:port`，请设置 `REDIS_TLS=true`，否则可能在启动时出现 `Redis 连接失败: EOF`。
 
-也支持连接字符串形式，例如 `REDIS_URL`、`REDIS_CONNECTION_STRING`。
-
 #### 内存缓存模式
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `CACHE_DRIVER` | 是 | memory | 固定值: memory |
-
-在 Zeabur 环境中，如果未配置 Redis 且未显式指定 `CACHE_DRIVER`，会自动回退为 `memory`。
 
 #### API Key 鉴权缓存
 
@@ -205,7 +238,7 @@ CLI/应用版本留空使用自动配对；手填字段独立覆盖。`auto` 模
 
 #### 窗口用量与连接池
 
-API Key 启用多个 RPM/RPD/费用/Token 窗口时，Redis 会通过一次 `MGET` 读取这些窗口的统计缓存；缺失、损坏或读取失败仍按原有顺序回源数据库。自然日和滑动窗口的定义、60 秒统计缓存 TTL、错误码均保持不变。Memory 驱动提供同等批量读取语义。
+API Key 启用多个 RPM/RPD/费用/Token 窗口时，Redis 会通过一次 `MGET` 读取这些窗口的统计缓存；缺失、损坏或读取失败仍按原有顺序回源数据库。自然日和滑动窗口的定义、60 秒统计缓存 TTL 均保持不变。Memory 驱动提供同等批量读取语义。RPM/RPD 的准入点在缓存值之外另有进程内原子计数：RPM 按秒桶计数，RPD 按滑动 24 小时计数，同一分钟内的记录合并到最后一次准入过期（最多保守多保留不到一分钟）。该计数不依赖当前请求是否写用量日志，但按进程独立且不持久化；多实例或重启后的历史额度仍需共享、持久的计量方案。最多保留 8,192 个 Key，满表且无可回收记录时新 Key 返回 `503`，不淘汰仍有效的计数。
 
 分组/账号预算的三个共享分钟桶通过 Pipeline 一起读取，同一个 Key 的并发回源合并为一次，继续复用原有 5 秒本地快照。共享增量最多启动 16 个后台写入，槽位满时由调用方同步写入并承受背压；Redis 故障时仍以数据库用量聚合为后备。
 
@@ -301,9 +334,7 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 
 等待队列还暴露 `max_waiters`、`max_waiters_per_key`、`waiters`、`wait_rejected`（全部队列拒绝）、`wait_rejected_per_key`（其中因单 Key 上限被拒绝的子集）、`wait_granted`、`wait_duration_ns`，以及 `10ms/100ms/1s/10s/30s/+Inf` 的 `wait_duration_buckets` 累积直方图。等待耗时统计包含成功、取消和超时，拒绝入队不计入；`wait_wakeups / wait_granted` 的增量比可辅助观察无效唤醒，不能当作上游吞吐指标。Docker 部署应将两个新环境变量传给应用容器；项目标准/SQLite compose 的 `env_file` 会读取 `.env`，2004 专用 compose 可用 `environment` 覆盖。
 
-启动会自动创建 `scheduler_outbox` 和 `maintenance_jobs` 及相应索引/触发器，PostgreSQL 与 SQLite 均无需手工迁移。多实例对账号、API Key、分组、代理和请求热路径系统设置的变化按 outbox 水位增量重放；高频用量计数不会产生调度事件。系统设置同步使用同一份已提交快照，覆盖 Store 持有的调度/重试/会话设置、proxy `RuntimeSettings`、`GlobalRPM`、PostgreSQL 连接池、用量日志和模型定价覆盖。环境变量 `CODEX_SCHEDULER_ENGINE`、`CODEX_BILLING_TIER_POLICY` 和 `CODEX_REQUEST_COMPRESSION` 仍高于数据库值。
-
-并非所有基础设施或专用配置都适合通过这条 outbox 路径重建：`RedisPoolSize`、图片存储后端和 Resin 配置在其他实例上需要重启；Responses 上下文缓存继续使用独立的 generation 轮询器，不由 settings 事件代替。
+启动会自动创建 `scheduler_outbox` 和 `maintenance_jobs` 及相应索引/触发器，PostgreSQL 与 SQLite 均无需手工迁移。多实例对账号、API Key、分组、代理和调度设置的变化按 outbox 水位增量重放；高频用量计数不会产生调度事件。环境变量 `CODEX_SCHEDULER_ENGINE` 一旦设置，会固定本实例引擎并覆盖管理后台值。
 
 `ContinuousRetryPolicy` 是默认关闭的独立持续重试策略，持久化为 JSON：
 
@@ -321,9 +352,11 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 
 `catch_all` 是默认关闭的超级模式。开启后不再依赖已知类别或错误码清单；除明确的上游 `cyber_policy` 外，任何真实上游 HTTP、传输、流读取、`error`、`response.failed` 或未知失败都会进入持续重试，包括永久额度、余额、鉴权、无效请求和其他结构化安全策略错误。明确的上游 `cyber_policy` 始终终止当前请求，不换号、不重放。文本推理只接受上游 HTTP `200` 及协议正常终态；其他状态、失败终态及无终态 EOF 都会丢弃整次尝试并继续。管理界面的超级开关会在一次保存中同时设置 `enabled=true` 和 `catch_all=true`；关闭总开关会同步清除 `catch_all`，避免隐藏启用。
 
-持续重试会把每次流式上游尝试完整暂存；失败整次丢弃，正常终态才一次性回放。目标端点等待上游响应头、读取响应体或流数据时保持下游连接：Responses、Chat Completions 和 Images 在首个保活周期到达时建立 SSE 200 并发送 `: keepalive` 注释，Messages 发送 Anthropic 原生 `event: ping`；Responses、Realtime 与 Live Sideband WebSocket 使用 Ping 控制帧。原生 Grok SSE 仍保留上游帧格式并允许插入保活帧。心跳提交 SSE 后，随后的上游错误会使用协议错误事件，不再改变 HTTP 200。非流式 JSON（包括 relay/native Responses、compact、Images、Grok 图片和 Alpha Search）使用标准 HTTP `102 Processing` 信息响应，不提交最终状态或 JSON；Cloudflare 收到 102 后仍要求在 125 秒内收到最终响应，因此它只能延长等待，不是无限期保活。`max_duration_seconds` 设置无限预算的墙钟时间上限（默认 600 秒，范围 1 到 900 秒），从请求第一次进入无限重试时开始，后续尝试不会重置。期限到达会立即取消上游并返回最近一次真实上游失败；仅在尚无失败可返回时使用 `504 upstream_timeout`。普通自选模式不会无限重试未选中的结构化安全策略拒绝；`catch_all` 可覆盖其他拒绝，但不能覆盖明确的上游 `cyber_policy` 或本地重试期限。
+持续重试会把每次流式上游尝试完整暂存；失败整次丢弃，正常终态才一次性回放。目标端点等待上游响应头、读取响应体或流数据时保持下游连接：Responses、Chat Completions 和 Images 在首个保活周期到达时建立 SSE 200 并发送 `: keepalive` 注释，Messages 发送 Anthropic 原生 `event: ping`；Responses、Realtime 与 Live Sideband WebSocket 使用 Ping 控制帧。原生 Grok SSE 仍保留上游帧格式并允许插入保活帧。心跳提交 SSE 后，随后的上游错误会使用协议错误事件，不再改变 HTTP 200。非流式 JSON（包括 relay/native Responses、compact、Grok 图片和 Alpha Search，但不包括 Codex/GPT Images）使用标准 HTTP `102 Processing` 信息响应，不提交最终状态或 JSON；Cloudflare 收到 102 后仍要求在 125 秒内收到最终响应，因此它只能延长等待，不是无限期保活。`max_duration_seconds` 设置无限预算的墙钟时间上限（默认 600 秒，范围 1 到 900 秒），从请求第一次进入无限重试时开始，后续尝试不会重置。期限到达会立即取消上游并返回最近一次真实上游失败；仅在尚无失败可返回时使用 `504 upstream_timeout`。普通自选模式不会无限重试未选中的结构化安全策略拒绝；`catch_all` 可覆盖其他拒绝，但不能覆盖明确的上游 `cyber_policy` 或本地重试期限。
 
-上述 HTTP/SSE 保活覆盖 `/v1/responses`（含 relay/native、stream 与 non-stream）、`/v1/chat/completions`、`/v1/messages`、`/v1/responses/compact`、`/v1/alpha/search`、`/v1/images/generations` 和 `/v1/images/edits`；视频、image jobs 与 `POST /v1/live` 不启用这套保活。Claude 原生 Messages 的首字前及已提交流保活继续由 `stream_keepalive_enabled` 共同控制，缺省为开启。
+Codex/GPT Images 在 `stream=false` 或省略 `stream` 时不发送 HTTP 102、不提前提交 200，直接等待最终 JSON，避免部分反向代理错误转发信息响应；调用方仍需为完整生成时长设置足够的等待/空闲超时。其 `stream=true` 请求继续使用 SSE 心跳。此例外不改变 Grok 图片或其他非流式端点的 102 行为，也不改变重试和截止时间。
+
+上述 HTTP/SSE 保活覆盖 `/v1/responses`（含 relay/native、stream 与 non-stream）、`/v1/chat/completions`、`/v1/messages`、`/v1/responses/compact`、`/v1/alpha/search`、`/v1/images/generations` 和 `/v1/images/edits`（Codex/GPT 仅覆盖 `stream=true`，Grok 图片的 HTTP 102 保活保持不变）；视频、image jobs 与 `POST /v1/live` 不启用这套保活。Claude 原生 Messages 的首字前及已提交流保活继续由 `stream_keepalive_enabled` 共同控制，缺省为开启。
 
 配置 API Key 模型请求次数预算时，额度准入完成前不会因保活提交 SSE 200；准入或重试也不会重新开启已关闭的 Claude 保活。普通 Responses、Chat Completions 和 Messages 请求在下游取消后停止发送心跳，并沿用最多 5 秒的上游 usage 补读窗口；持续重试的响应读取仍随下游取消立即结束。
 
@@ -593,9 +626,8 @@ TZ=Asia/Shanghai
 
 **调度参数:**
 
-- `MaxConcurrency`、`GlobalRPM`、调度/重试/会话参数、proxy 请求热路径参数、用量日志和模型定价覆盖修改后会在所有实例热生效
+- `MaxConcurrency`、`GlobalRPM` 等修改后立即生效
 - 通过管理后台修改时会自动持久化到数据库
-- `RedisPoolSize`、图片存储后端和 Resin 配置需要重启其他实例；Responses 上下文缓存使用独立的 generation 轮询同步
 
 ---
 

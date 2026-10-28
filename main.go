@@ -40,6 +40,12 @@ func migrateOnlyEnabled() bool {
 	return value == "1" || strings.EqualFold(value, "true")
 }
 
+func configureCodexIdleUsageObserver(store *auth.Store) {
+	wsrelay.SetIdleMetadataObserver(func(account *auth.Account, eventType string, payload []byte) {
+		proxy.ApplyCodexIdleUsageFrame(store, account, eventType, payload)
+	})
+}
+
 // main 加载配置、初始化存储与路由，并启动 Codex2API HTTP 服务。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -113,7 +119,7 @@ func main() {
 			PromptFilterCustomPatterns:         "[]",
 			PromptFilterDisabledPatterns:       "[]",
 			ClientCompatMode:                   proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                 "0.153.3",
+			CodexMinCLIVersion:                 "0.160.0",
 			UsageLogMode:                       database.UsageLogModeFull,
 			UsageLogBatchSize:                  200,
 			UsageLogFlushIntervalSeconds:       5,
@@ -144,7 +150,7 @@ func main() {
 			AutoResetCreditsBeforeExpiryMin:    60,
 			UTLSShutdownTimeoutMinutes:         30,
 			ShowUpstreamModelMismatch:          true,
-			CodexWSStatelessSlots:              8,
+			CodexWSStatelessSlots:              proxy.DefaultRuntimeSettings().CodexWSStatelessSlots,
 			CodexWSDownstreamKeepaliveSlots:    database.DefaultCodexWSDownstreamKeepaliveSlots,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
@@ -177,7 +183,7 @@ func main() {
 			PromptFilterCustomPatterns:         "[]",
 			PromptFilterDisabledPatterns:       "[]",
 			ClientCompatMode:                   proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                 "0.153.3",
+			CodexMinCLIVersion:                 "0.160.0",
 			UsageLogMode:                       database.UsageLogModeFull,
 			UsageLogBatchSize:                  200,
 			UsageLogFlushIntervalSeconds:       5,
@@ -208,12 +214,12 @@ func main() {
 			AutoResetCreditsBeforeExpiryMin:    60,
 			UTLSShutdownTimeoutMinutes:         30,
 			ShowUpstreamModelMismatch:          true,
-			CodexWSStatelessSlots:              8,
+			CodexWSStatelessSlots:              proxy.DefaultRuntimeSettings().CodexWSStatelessSlots,
 			CodexWSDownstreamKeepaliveSlots:    database.DefaultCodexWSDownstreamKeepaliveSlots,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
-			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
+			security.MaskURLCredentials(settings.ProxyURL), settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
 	}
 	modelCooldownCtx, modelCooldownCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	modelCooldownSettings, modelCooldownErr := db.GetModelCooldownSettings(modelCooldownCtx)
@@ -228,6 +234,8 @@ func main() {
 	settings.OAuthModelCooldownMode = modelCooldownSettings.OAuthMode
 	settings.OAuthModelCooldownSeconds = modelCooldownSettings.OAuthSeconds
 	settings.OAuthModelCooldownBackoffEnabled = modelCooldownSettings.OAuthBackoffEnabled
+	settings.OAuthUnsupportedModelCooldownDisabled = modelCooldownSettings.OAuthUnsupportedDisabled
+	settings.OAuthUnsupportedModelCooldownSeconds = modelCooldownSettings.OAuthUnsupportedSeconds
 	if envPolicy := strings.TrimSpace(os.Getenv("CODEX_BILLING_TIER_POLICY")); envPolicy != "" {
 		settings.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(envPolicy)
 	}
@@ -284,9 +292,8 @@ func main() {
 	case "memory":
 		tc = cache.NewMemory(redisPoolSize)
 	default:
-		redisAddr := redisConnectionTarget(cfg.Cache.Redis)
 		tc, err = cache.NewRedisWithOptions(cache.RedisOptions{
-			Addr:               redisAddr,
+			Addr:               cfg.Cache.Redis.Addr,
 			Username:           cfg.Cache.Redis.Username,
 			Password:           cfg.Cache.Redis.Password,
 			DB:                 cfg.Cache.Redis.DB,
@@ -303,8 +310,7 @@ func main() {
 	case "memory":
 		log.Printf("%s 缓存已启用: pool_size=%d", cfg.Cache.Label(), redisPoolSize)
 	default:
-		redisTarget := redisConnectionTarget(cfg.Cache.Redis)
-		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), cache.RedactRedisAddr(redisTarget), redisPoolSize)
+		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), cache.RedactRedisAddr(cfg.Cache.Redis.Addr), redisPoolSize)
 	}
 	proxy.SetResponseContextCache(tc)
 
@@ -381,6 +387,9 @@ func main() {
 
 	// 启动后台刷新
 	store.StartBackgroundRefresh()
+	// Antigravity groups summary 周期巡检（Spec §5.3）：随 Store 生命周期启动，
+	// Store.Stop 在关闭 stopCh 前收口。
+	store.StartAntigravityQuotaScheduler()
 	store.TriggerUsageProbeAsync()
 	store.TriggerRecoveryProbeAsync()
 	store.TriggerAutoCleanupAsync()
@@ -404,6 +413,12 @@ func main() {
 	// Responses API 渠道监控按账号启用，健康检查和倍率探测分别调度。
 	adminHandler.StartChannelMonitor(backgroundCtx)
 
+	// 版本闸与套餐闸上游同文案：版本抬升后旧版本下学到的模型不支持冷却作废（issue #793）。
+	proxy.OnCodexClientVersionRaised(func() {
+		if cleared := store.ClearModelCooldownsByReason(auth.ModelCooldownReasonUnsupported, 0); cleared > 0 {
+			log.Printf("Codex 客户端版本已抬升，清除 %d 条模型不支持冷却", cleared)
+		}
+	})
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
 	// CODEX_DISABLE_CLI_VERSION_SYNC 为硬关闭。
@@ -455,6 +470,20 @@ func main() {
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
+	// 连接级（终态后补发）的用量帧也交给 proxy 更新内存快照；observer 必须非阻塞。
+	configureCodexIdleUsageObserver(store)
+	// WS 逐帧用量落库节流；大号池可按数据库承压情况调大，0/非法值保持默认 30s。
+	if raw := strings.TrimSpace(os.Getenv("CODEX_WS_USAGE_FRAME_PERSIST_SECONDS")); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+			proxy.SetCodexUsageFramePersistInterval(time.Duration(seconds) * time.Second)
+		}
+	}
+	// 帧摄入的部署级逃生阀；false 时回退到 WHAM 探针与 HTTP 响应头。
+	if raw := strings.TrimSpace(os.Getenv("CODEX_WS_USAGE_FRAME_INGEST")); raw != "" {
+		if enabled, err := strconv.ParseBool(raw); err == nil {
+			proxy.SetCodexUsageFrameIngestEnabled(enabled)
+		}
+	}
 
 	// 注册 Agent Identity task 确保函数（proxy 无 Store 引用，启动时注入）
 	proxy.EnsureCodexAgentIdentityTaskFunc = store.EnsureCodexAgentIdentityTask
@@ -486,6 +515,7 @@ func main() {
 		log.Fatalf("Initialize image maintenance: %v", err)
 	}
 	adminHandler.StartPromptIntelligence(backgroundCtx)
+	adminHandler.StartIntelligenceChecks(backgroundCtx, deviceCfg)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件
@@ -664,9 +694,12 @@ func main() {
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: r,
-		// ReadHeaderTimeout 防 Slowloris 慢速攻击；IdleTimeout 回收空闲 keep-alive 连接。
+		// ReadHeaderTimeout 防 Slowloris 慢速攻击；ReadTimeout 限制整个请求体读取，
+		// 防止“声明大 Content-Length 但不发 body”长期占用连接/内存预算；
+		// IdleTimeout 回收空闲 keep-alive 连接。
 		// 注意：WriteTimeout 必须保持 0 —— LLM 流式响应可持续数分钟，任何固定写超时都会中途切断长回答。
 		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       10 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
@@ -690,6 +723,7 @@ func main() {
 	adminHandler.WaitAutoResetCredits()
 	adminHandler.WaitAutoActivate5hWindow()
 	adminHandler.WaitQualityTests()
+	adminHandler.WaitIntelligenceChecks()
 	wsKeepalive.Stop()
 	wsrelay.ShutdownExecutor()
 	if !proxy.DrainResponseCacheBackendWrites(2 * time.Second) {
@@ -702,16 +736,6 @@ func main() {
 	}
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
-}
-
-// redisConnectionTarget keeps a configured redis:// / rediss:// URL intact so
-// go-redis can retain its scheme, ACL username and TLS settings. Split host
-// fields remain the fallback for deployments that do not provide a URL.
-func redisConnectionTarget(cfg config.RedisConfig) string {
-	if rawURL := strings.TrimSpace(cfg.URL); rawURL != "" {
-		return rawURL
-	}
-	return strings.TrimSpace(cfg.Addr)
 }
 
 // configureTrustedProxies 配置 Gin 的可信代理列表。
@@ -811,6 +835,10 @@ func printSecurityBanner(db *database.DB, cfg *config.Config, settings *database
 		log.Println("⚠ 尚未配置 ADMIN_SECRET（环境变量与数据库均为空）。")
 		log.Printf("  请使用浏览器访问管理台 http://%s:%d/admin/ 完成首次初始化，", bannerDisplayHost(bind), cfg.Port)
 		log.Println("  设置一个强随机的管理密钥；该密钥也将作为登录密钥。")
+		log.Println("  初始化页面需要填写下面的一次性令牌，以证明操作者能读到本服务日志：")
+		if _, err := admin.EnsureBootstrapToken(); err != nil {
+			log.Printf("  生成初始化令牌失败: %v", err)
+		}
 		log.Println("  在初始化完成之前，所有 /api/admin/* 接口（除初始化端点外）均返回 503。")
 	case envSecret != "":
 		log.Println("✓ ADMIN_SECRET 来源：环境变量 (.env)")

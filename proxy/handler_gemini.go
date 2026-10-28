@@ -167,10 +167,26 @@ func (h *Handler) GeminiModelsAction(c *gin.Context) {
 	}
 }
 
+// geminiCountTokensInboundEndpoint 返回 native countTokens 入口的入站端点标识，
+// 与上游端点（v1internal:countTokens）区分，供日志、错误与用量记录归因使用。
 func geminiCountTokensInboundEndpoint() string {
 	return "/v1beta/models:countTokens"
 }
 
+// geminiNativeSelectionOptions 组装 native Gemini 入口（generateContent /
+// streamGenerateContent / countTokens）的选号上下文。
+//
+// 这两个入口的候选池被 antigravityOAuthChannelAccountFilter 硬限定为 Antigravity OAuth，
+// 因此渠道必须按候选池的真实归属取 antigravity：auto 渠道 Key（requestUpstreamChannel 为
+// 空）走这里时，若沿用请求渠道，auth 侧 isAntigravityProvider("") 为 false，首绑 / Fresh
+// 加权避险会整体失效。
+func geminiNativeSelectionOptions(c *gin.Context, model string, policy auth.DispatchPolicy) auth.SelectionOptions {
+	return selectionOptionsForRequestWithProvider(c, model, policy, database.UpstreamChannelAntigravity)
+}
+
+// handleGeminiCountTokens 处理 native Gemini models:countTokens 请求：先过 Key 限额
+// 与并发额度，候选池被硬限定为 Antigravity OAuth 并叠加跨实例冷却、渠道与预算过滤，
+// 随后在重试循环内带重试排除项与亲和守卫选号，转发到上游 v1internal:countTokens。
 func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody []byte) {
 	if h.enforceAPIKeyLimitsAndReply(c, model) {
 		return
@@ -184,7 +200,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	}
 
 	accountFilter := antigravityOAuthChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), model, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), model, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, model, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -203,6 +219,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	dispatchPolicy := dispatchPolicyForModel(model)
+	selectionOpts := geminiNativeSelectionOptions(c, model, dispatchPolicy)
 	inboundEndpoint := geminiCountTokensInboundEndpoint()
 	upstreamEndpoint := "/v1internal:countTokens"
 
@@ -213,9 +230,15 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	for attempt := 0; ; attempt++ {
 		affinityGuard = auth.SessionAffinityGuard{}
 		account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(
-			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy,
+			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts,
 		)
 		if account == nil {
+			// 选号失败只有在「候选集合全部因 Antigravity 配额硬门禁被阻断」时才改答 429
+			// （D8=A，Spec §6.2 #3）：其余无号成因（选号超时、队列准入被拒、上游 404、
+			// 不可重试传输错误）一律保持既有 200 + 本地估算回退。
+			if writeCountTokensQuotaGateError(c, selectionErr) {
+				return
+			}
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolOpenAI) {
 				return
 			}
@@ -269,7 +292,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 			_ = resp.Body.Close()
 			lastStatusCode = resp.StatusCode
 			lastBody = errBody
@@ -289,12 +312,16 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			// countTokens 与 generateContent 打到的是同一个 Cloud Code 配额池：漏掉
+			// 这里就等于 429/503 只被计数、从不写模型冷却，被上游限流的账号会立刻在
+			// 下一次选号中重新入选（wireModel 联动与 family 冷却也一并丢失）。
+			h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, model)
 			log.Printf("Gemini native countTokens upstream error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			if shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) {
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -328,6 +355,22 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 		})
 		return
 	}
+}
+
+// writeCountTokensQuotaGateError 把 native countTokens 的选号失败中「候选集合全部因
+// Antigravity 配额硬门禁被阻断」这一种成因转成 429 + Retry-After + reason，返回 true
+// 表示响应已写出（Spec §6.2 #3、验收 #25）。
+//
+// 其余成因（选号超时、队列准入被拒、上游 404、不可重试传输错误）返回 false：调用方保持
+// 既有 200 + estimateInputTokens 估算回退，countTokens 是客户端计费探针，D8=A 只收紧
+// 「整池配额阻断」这一个分支，绝不把估算兜底整体换成错误。
+func writeCountTokensQuotaGateError(c *gin.Context, selectionErr error) bool {
+	retryAfterSeconds, reason, ok := schedulerQuotaExhaustion(selectionErr)
+	if !ok {
+		return false
+	}
+	writeSchedulerQuotaExhaustedError(c, retryAfterSeconds, reason)
+	return true
 }
 
 func geminiInboundEndpoint(stream bool) string {
@@ -412,6 +455,10 @@ func writeGeminiNativeError(c *gin.Context, status int, message string) {
 	}
 }
 
+// handleGeminiGenerateContent 处理 native Gemini generateContent /
+// streamGenerateContent 请求：候选池被硬限定为 Antigravity OAuth 并叠加跨实例冷却、
+// 渠道与预算过滤，按 stream 决定是否安装 SSE 心跳，并在持续重试策略下带重试排除项
+// 与亲和守卫选号转发上游。
 func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawBody []byte, stream bool) {
 	if h.enforceAPIKeyLimitsAndReply(c, model) {
 		return
@@ -425,7 +472,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	}
 
 	accountFilter := antigravityOAuthChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), model, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), model, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, model, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -458,6 +505,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	dispatchPolicy := dispatchPolicyForModel(model)
+	selectionOpts := geminiNativeSelectionOptions(c, model, dispatchPolicy)
 	inboundEndpoint := geminiInboundEndpoint(stream)
 	upstreamEndpoint := antigravityUpstreamEndpoint(stream)
 
@@ -468,7 +516,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	for attempt := 0; ; attempt++ {
 		affinityGuard = auth.SessionAffinityGuard{}
 		account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(
-			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy,
+			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts,
 		)
 		if account == nil {
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolGemini) {
@@ -541,7 +589,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			_ = resp.Body.Close()
 			upstreamCancel()
@@ -565,7 +613,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			}
 
 			antigravityRefreshFailed := resp.StatusCode == http.StatusUnauthorized && antigravityRefreshRetried[account.ID()]
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)

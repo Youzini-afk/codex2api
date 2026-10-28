@@ -34,6 +34,26 @@
 ## 赞助商
 
 <p align="center">
+  <a href="https://proxylane.dev/?r=r4zpan9djwesjumv0vamthoz&amp;utm_source=codex2api&amp;utm_medium=partnership&amp;utm_campaign=codex2api_sponsor_202610&amp;utm_content=github_readme"><img src="assets/proxylane-banner.png" alt="ProxyLane 住宅代理：首单七折 CODEX2API30" width="100%"></a>
+</p>
+
+<p align="center">
+  <b><a href="https://proxylane.dev/?r=r4zpan9djwesjumv0vamthoz&amp;utm_source=codex2api&amp;utm_medium=partnership&amp;utm_campaign=codex2api_sponsor_202610&amp;utm_content=github_readme">ProxyLane</a></b> 提供住宅代理，支持 HTTP / HTTPS / SOCKS5，提供中文界面及 USDT 付款。<br>
+  免费 3GB 测试流量，限前 50 名，兑换码：<code>CODEX2API3GB</code>。<br>
+  首次购买使用优惠码 <code>CODEX2API30</code> 享七折优惠。
+</p>
+
+<p align="center">
+  <a href="https://www.rapidproxy.io/?ref=codex2api"><img src="assets/rapidproxy-banner.png" alt="RapidProxy 代理 IP：动态住宅 $0.55/GB 起，静态住宅 $5/IP/月" width="100%"></a>
+</p>
+
+<p align="center">
+  <b><a href="https://www.rapidproxy.io/?ref=codex2api">RapidProxy</a></b> 为开发者和企业提供高性能代理 IP 服务，覆盖全球 200+ 国家和地区的 9000 万+ 住宅 IP，支持智能轮换、精准地理定位、流量永不过期及高并发连接。<br>
+  广泛适用于网页采集、AI 数据获取、SEO 监控和电商分析，支持 HTTP / HTTPS / SOCKS5 协议。<br>
+  支持免费试用，九折优惠码：<code>RAPID10</code>
+</p>
+
+<p align="center">
   <a href="https://www.ipwo.net/?ref=githubcodex2api"><img src="assets/ipwo-banner.webp" alt="IPWO 住宅代理" width="100%"></a>
 </p>
 
@@ -237,6 +257,7 @@ Antigravity 作为独立 Google 渠道管理，支持浏览器/导入 OAuth 凭�
 | [API 文档](docs/API.md) | 所有 API 端点、请求/响应示例、错误码说明 | `docs/API.md` |
 | [使用指南](docs/USAGE.md) | 客户端接入、SDK 示例、媒体任务与常见错误排查 | `docs/USAGE.md` |
 | [Antigravity 接入](docs/ANTIGRAVITY.md) | Google OAuth、实验性 API Key 渠道、模型、风险与协议验证状态 | `docs/ANTIGRAVITY.md` |
+| [Codex Multi-Agent v2 兼容](docs/CODEX_MULTI_AGENT_V2_COMPAT.md) | 第三方子 Agent 明文字段兼容、风险、灰度与回滚 | `docs/CODEX_MULTI_AGENT_V2_COMPAT.md` |
 | [部署文档](docs/DEPLOYMENT.md) | 各种部署模式、升级指南、备份恢复 | `docs/DEPLOYMENT.md` |
 | [配置文档](docs/CONFIGURATION.md) | 环境变量、系统设置、配置优先级 | `docs/CONFIGURATION.md` |
 | [架构文档](docs/ARCHITECTURE.md) | 系统架构、调度算法、存储设计 | `docs/ARCHITECTURE.md` |
@@ -350,6 +371,7 @@ Redis 模式下，共享上下文只要没有超过重建上限，即使大于 L
 - **管理后台 Admin Secret**：
   - 如果 `.env` 中设置了 `ADMIN_SECRET`，则优先使用环境变量。
   - 如果未设置 `ADMIN_SECRET`，则回退到数据库中的 `AdminSecret`。
+  - 两者都为空时，访问 `/admin` 会进入首次初始化页面，需要填写服务日志里打印的一次性初始化令牌（`docker compose logs codex2api | grep "bootstrap token"`）；令牌仅当前进程有效，重启后重新生成，初始化成功后立即作废。
   - 鉴权生效时，首次访问 `/admin` 会弹出密码输入框；前端登录成功后通过 `X-Admin-Key` 请求头访问 `/api/admin/*`。
 
 ---

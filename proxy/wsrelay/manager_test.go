@@ -387,7 +387,7 @@ func TestAcquireConnectionKeepsActualHandshakeUserAgentWhenReused(t *testing.T) 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 
 	first, pending, err := manager.AcquireConnection(
-		context.Background(), account, wsURL, "session-ua", http.Header{"User-Agent": []string{"codex-first/1.0"}}, "",
+		context.Background(), account, wsURL, "session-ua", http.Header{"User-Agent": []string{"codex-first/1.0"}, "Version": []string{"0.159.0"}}, "",
 	)
 	if err != nil {
 		t.Fatalf("first AcquireConnection error = %v", err)
@@ -405,7 +405,7 @@ func TestAcquireConnectionKeepsActualHandshakeUserAgentWhenReused(t *testing.T) 
 	manager.ReleaseConnection(first)
 
 	reused, pending, err := manager.AcquireConnection(
-		context.Background(), account, wsURL, "session-ua", http.Header{"User-Agent": []string{"codex-new-setting/2.0"}}, "",
+		context.Background(), account, wsURL, "session-ua", http.Header{"User-Agent": []string{"codex-new-setting/2.0"}, "Version": []string{"0.160.0"}}, "",
 	)
 	if err != nil {
 		t.Fatalf("second AcquireConnection error = %v", err)
@@ -424,6 +424,9 @@ func TestAcquireConnectionKeepsActualHandshakeUserAgentWhenReused(t *testing.T) 
 	if got := reused.upstreamUserAgent; got != "codex-first/1.0" {
 		t.Fatalf("reused connection User-Agent = %q, want original handshake value", got)
 	}
+	if got := reused.upstreamVersion; got != "0.159.0" {
+		t.Fatalf("reused connection Version = %q, want original handshake value", got)
+	}
 }
 
 func TestAcquireConnectionTrimsIdleConnectionsAfterConfiguredSlotDecrease(t *testing.T) {
@@ -434,10 +437,9 @@ func TestAcquireConnectionTrimsIdleConnectionsAfterConfiguredSlotDecrease(t *tes
 	account := &auth.Account{DBID: 42, DynamicConcurrencyLimit: 3}
 	wsURL := "wss://example.test/responses"
 	connections := make([]*WsConnection, 0, 3)
+	// Windows clock ticks can tie; this test requires a strict idle-age ordering.
+	idleSince := time.Now().Add(-3 * time.Second)
 
-	// Use explicit, past timestamps: rapid connection creation can share one
-	// wall-clock tick, which does not define an LRU order.
-	idleSince := time.Now().Add(-time.Minute)
 	for i := 0; i < 3; i++ {
 		wc, _ := newTestSlotConnection(manager, account, wsURL, fmt.Sprintf("session-%d", i))
 		wc.lastUsed.Store(idleSince.Add(time.Duration(i) * time.Second).UnixNano())
@@ -473,7 +475,7 @@ func TestAcquireConnectionTrimsIdleConnectionsAfterConfiguredSlotDecrease(t *tes
 	got.session.RemovePendingRequest(pending.RequestID)
 	manager.ReleaseConnection(got)
 	if manager.ConnectionCount() != 1 || !protected.IsConnected() || connections[2].IsConnected() {
-		t.Fatalf("completed request should replace the older idle connection: count=%d protected=%t older=%t lastUsed=%d/%d", manager.ConnectionCount(), protected.IsConnected(), connections[2].IsConnected(), protected.lastUsed.Load(), connections[2].lastUsed.Load())
+		t.Fatal("completed request should replace the older idle connection")
 	}
 }
 

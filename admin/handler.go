@@ -46,22 +46,25 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	imageQueue         *imageJobQueue
-	qualityTestContext context.Context
-	qualityTestWG      sync.WaitGroup
-	store              *auth.Store
-	modelRefreshFuncs  map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
-	proxyRiskJobsMu    sync.RWMutex
-	proxyRiskJobs      map[string]*proxyRiskScoringJob
-	cache              cache.TokenCache
-	authCacheProxy     *proxy.Handler
-	db                 *database.DB
-	cacheCfgStore      responseCacheSettingsStore
-	rateLimiter        *proxy.RateLimiter
-	systemUpdate       *systemUpdater
-	systemUpdateOnce   sync.Once
-	refreshAccount     func(context.Context, int64) error
-	probeUsage         func(context.Context, *auth.Account) error
+	intelligenceDeviceConfig *proxy.DeviceProfileConfig
+	intelligenceOnce         sync.Once
+	intelligenceWG           sync.WaitGroup
+	imageQueue               *imageJobQueue
+	qualityTestContext       context.Context
+	qualityTestWG            sync.WaitGroup
+	store                    *auth.Store
+	modelRefreshFuncs        map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
+	proxyRiskJobsMu          sync.RWMutex
+	proxyRiskJobs            map[string]*proxyRiskScoringJob
+	cache                    cache.TokenCache
+	authCacheProxy           *proxy.Handler
+	db                       *database.DB
+	cacheCfgStore            responseCacheSettingsStore
+	rateLimiter              *proxy.RateLimiter
+	systemUpdate             *systemUpdater
+	systemUpdateOnce         sync.Once
+	refreshAccount           func(context.Context, int64) error
+	probeUsage               func(context.Context, *auth.Account) error
 
 	codexUsageRefreshRunning atomic.Bool
 
@@ -108,6 +111,7 @@ type Handler struct {
 	cacheLabel                 string
 	adminSecretEnv             string
 	sessionStore               *adminSessionStore
+	adminAuthThrottle          *adminAuthThrottle
 	imageProxy                 *proxy.Handler
 	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
 	antigravityCapabilityProbe antigravityCapabilityExecutor
@@ -425,6 +429,9 @@ const (
 	importTierRecoveryDelay   = 5 * time.Second
 	importDBWaitBackoff       = 10 * time.Second
 )
+
+// maxAdminPage 限制分页页码，避免 (page-1)*page_size 溢出为负 OFFSET。
+const maxAdminPage = 100000
 
 type importRuntimeLoadSnapshot struct {
 	RPM         int64
@@ -1041,6 +1048,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheLabel:           tc.Label(),
 		adminSecretEnv:       adminSecretEnv,
 		sessionStore:         newAdminSessionStore(),
+		adminAuthThrottle:    newAdminAuthThrottle(),
 		imageProxy:           proxy.NewHandler(store, db, nil, nil),
 		chartCacheData:       make(map[string]*chartCacheEntry),
 		accountListCache:     make(map[string]*accountListSnapshot),
@@ -1141,7 +1149,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id", h.GetAccount)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
-	api.POST("/accounts/push-token", h.PushTokenAccount)
 	api.POST("/accounts/codex/agent-identity", h.ImportCodexAgentIdentity)
 	api.POST("/accounts/codex/agent-identity/import", h.BatchImportCodexAgentIdentity)
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
@@ -1176,6 +1183,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/antigravity/export", h.ExportAntigravityAccounts)
 	api.POST("/accounts/antigravity/import", h.BatchImportAntigravityAccounts)
 	api.POST("/accounts/antigravity/refresh", h.BatchRefreshAntigravityAccounts)
+	// 运维止血：清除配额事实并递增 quota_epoch（Spec §8.2），与批量刷新同为账号级入口。
+	api.POST("/accounts/antigravity/quota/clear", h.ClearAntigravityQuotaHandler)
 	api.POST("/accounts/antigravity/oauth/start", h.StartAntigravityOAuth)
 	api.GET("/accounts/antigravity/oauth/status", h.GetAntigravityOAuthStatus)
 	api.POST("/accounts/antigravity/oauth/complete", h.CompleteAntigravityOAuth)
@@ -1234,6 +1243,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/modeltrace/bank", h.ResetModelTraceBank)
 	api.GET("/accounts/:id/quality-test/options", h.QualityTestOptions)
 	api.POST("/accounts/:id/quality-test", h.CreateQualityTestJob)
+	h.registerIntelligenceCheckRoutes(api)
 	api.GET("/quality-tests", h.ListQualityTests)
 	api.GET("/quality-tests/:id", h.GetQualityTest)
 	api.POST("/quality-tests/:id/cancel", h.CancelQualityTest)
@@ -1420,6 +1430,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authorized, source, method := h.authorizeAdminRequest(c)
+		if c.IsAborted() {
+			return
+		}
+		clientIP := c.ClientIP()
 		if !authorized {
 			if source == "disabled" {
 				security.SecurityAuditLog("ADMIN_BLOCKED_NO_SECRET", fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
@@ -1431,13 +1445,21 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 				return
 			}
 			// 记录安全审计日志
-			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
+			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, security.SanitizeLog(clientIP), source))
+			if writeAdminAuthRetry(c, h.adminAuthThrottle.recordFailure(clientIP, time.Now())) {
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "管理密钥无效或缺失",
 			})
 			c.Abort()
 			return
 		}
+		h.adminAuthThrottle.reset(clientIP)
+
+		// 管理端响应包含 raw_key、auth.json、settings 等秘密，禁止中间缓存保存。
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
 
 		// 成功认证，记录审计日志
 		if security.IsSensitiveEndpoint(c.Request.URL.Path) {
@@ -1638,11 +1660,11 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 	switch status {
-	case "rate_limited", auth.TransientRateLimitedCooldownReason, auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
 		return true
 	}
 	switch cooldownReason {
-	case "rate_limited", auth.TransientRateLimitedCooldownReason, auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
 		return true
 	}
 	return false
@@ -1697,6 +1719,7 @@ type accountResponse struct {
 	AvatarURL                     string                      `json:"avatar_url,omitempty"`
 	VerifiedEmail                 bool                        `json:"verified_email,omitempty"`
 	ProjectID                     string                      `json:"project_id,omitempty"`
+	AntigravityUserProjectID      string                      `json:"antigravity_user_project_id,omitempty"`
 	AntigravityQuota              json.RawMessage             `json:"antigravity_quota,omitempty"`
 	AntigravityPermissions        json.RawMessage             `json:"antigravity_permissions,omitempty"`
 	AntigravitySyncWarning        string                      `json:"antigravity_sync_warning,omitempty"`
@@ -1827,36 +1850,6 @@ type accountUsageWindow struct {
 	ModelCounts          map[string]int64   `json:"model_counts,omitempty"`
 	ModelSuccessCounts   map[string]int64   `json:"model_success_counts,omitempty"`
 	ModelAvgFirstTokenMs map[string]float64 `json:"model_avg_first_token_ms,omitempty"`
-}
-
-func applyAccountModelCooldownPolicyFromRow(resp *accountResponse, row *database.AccountRow, settings database.ModelCooldownSettings, relayStyle bool) {
-	if resp == nil || row == nil {
-		return
-	}
-	settings = database.NormalizeModelCooldownSettings(settings)
-	resp.ModelCooldownModeEffective = settings.OAuthMode
-	resp.ModelCooldownSecondsEffective = settings.OAuthSeconds
-	resp.ModelCooldownBackoffEffective = settings.OAuthBackoffEnabled
-	if relayStyle {
-		resp.ModelCooldownModeEffective = settings.RelayMode
-		resp.ModelCooldownSecondsEffective = settings.RelaySeconds
-		resp.ModelCooldownBackoffEffective = settings.RelayBackoffEnabled
-	}
-
-	if rawMode := strings.TrimSpace(row.GetCredential("model_cooldown_mode_override")); database.IsValidModelCooldownMode(rawMode) {
-		mode := database.NormalizeModelCooldownMode(rawMode, resp.ModelCooldownModeEffective)
-		resp.ModelCooldownModeOverride = &mode
-		resp.ModelCooldownModeEffective = mode
-	}
-	if rawSeconds, ok := row.GetCredentialInt64("model_cooldown_seconds_override"); ok && rawSeconds >= 1 && rawSeconds <= database.MaxModelCooldownSeconds {
-		seconds := int(rawSeconds)
-		resp.ModelCooldownSecondsOverride = &seconds
-		resp.ModelCooldownSecondsEffective = database.NormalizeModelCooldownSeconds(seconds, resp.ModelCooldownSecondsEffective)
-	}
-	if backoff := row.GetCredentialOptionalBool("model_cooldown_backoff_override"); backoff != nil {
-		resp.ModelCooldownBackoffOverride = backoff
-		resp.ModelCooldownBackoffEffective = *backoff
-	}
 }
 
 func accountEmailDomain(email string) string {
@@ -3936,17 +3929,6 @@ type addATAccountReq struct {
 	GroupIDs json.RawMessage `json:"group_ids"`
 }
 
-type pushTokenAccountReq struct {
-	Name         string `json:"name"`
-	Email        string `json:"email"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	IDToken      string `json:"id_token"`
-	AccountID    string `json:"account_id"`
-	ProxyURL     string `json:"proxy_url"`
-	Source       string `json:"source"`
-}
-
 // AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
 func (h *Handler) AddATAccount(c *gin.Context) {
 	var req addATAccountReq
@@ -4140,133 +4122,6 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		"failed":       failCount,
 		"bound_groups": boundGroups,
 		"group_ids":    groupIDs,
-	})
-}
-
-// PushTokenAccount 接收外部注册器推送的单个 token 包，自动按 RT / AT-only 路径入库。
-func (h *Handler) PushTokenAccount(c *gin.Context) {
-	var req pushTokenAccountReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeError(c, http.StatusBadRequest, "请求格式错误")
-		return
-	}
-
-	req.Name = security.SanitizeInput(req.Name)
-	req.Email = security.SanitizeInput(req.Email)
-	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
-	req.AccountID = security.SanitizeInput(req.AccountID)
-	req.Source = security.SanitizeInput(req.Source)
-
-	if req.RefreshToken == "" && req.AccessToken == "" {
-		writeError(c, http.StatusBadRequest, "refresh_token 或 access_token 至少需要一个")
-		return
-	}
-	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
-		writeError(c, http.StatusBadRequest, "代理URL无效")
-		return
-	}
-
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		name = strings.TrimSpace(req.Email)
-	}
-	if name == "" {
-		if req.RefreshToken != "" {
-			name = "push-rt-account"
-		} else {
-			name = "push-at-account"
-		}
-	}
-	if utf8.RuneCountInString(name) > 100 {
-		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-		refreshToken: req.RefreshToken,
-		accessToken:  req.AccessToken,
-		idToken:      req.IDToken,
-		accountID:    req.AccountID,
-		email:        req.Email,
-	})
-
-	if req.RefreshToken != "" {
-		existingRTs, err := h.db.GetAllRefreshTokens(ctx)
-		if err == nil && existingRTs[req.RefreshToken] {
-			c.JSON(http.StatusOK, gin.H{
-				"message":   "refresh_token 已存在，跳过导入",
-				"duplicate": true,
-				"mode":      "refresh_token",
-			})
-			return
-		}
-
-		id, err := h.db.InsertAccount(ctx, name, req.RefreshToken, req.ProxyURL)
-		if err != nil {
-			writeError(c, http.StatusInternalServerError, "导入 RT 账号失败: "+err.Error())
-			return
-		}
-
-		h.db.InsertAccountEventAsync(id, "added", "push_token")
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		if credentials := tokenCredentialMap(seed); len(credentials) > 0 {
-			if err := h.db.UpdateCredentials(ctx, id, credentials); err != nil {
-				log.Printf("推送 RT 账号 %d 更新 credentials 失败: %v", id, err)
-			}
-		}
-
-		if h.refreshAccount != nil {
-			h.startDBBackgroundTask(func(ctx context.Context) {
-				h.refreshImportedAccountAndProbe(ctx, id, "push_token")
-			})
-		}
-
-		security.SecurityAuditLog("ACCOUNT_PUSH_IMPORTED", fmt.Sprintf("mode=rt id=%d ip=%s source=%s", id, c.ClientIP(), req.Source))
-		c.JSON(http.StatusOK, gin.H{
-			"message":   "RT 账号已导入",
-			"id":        id,
-			"duplicate": false,
-			"mode":      "refresh_token",
-		})
-		return
-	}
-
-	existingATs, err := h.db.GetAllAccessTokens(ctx)
-	if err == nil && existingATs[req.AccessToken] {
-		c.JSON(http.StatusOK, gin.H{
-			"message":   "access_token 已存在，跳过导入",
-			"duplicate": true,
-			"mode":      "access_token",
-		})
-		return
-	}
-
-	id, err := h.db.InsertATAccount(ctx, name, req.AccessToken, req.ProxyURL)
-	if err != nil {
-		writeError(c, http.StatusInternalServerError, "导入 AT 账号失败: "+err.Error())
-		return
-	}
-
-	h.db.InsertAccountEventAsync(id, "added", "push_token_at")
-	newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
-	h.store.AddAccount(newAcc)
-
-	if credentials := tokenCredentialMap(seed); len(credentials) > 0 {
-		if err := h.db.UpdateCredentials(ctx, id, credentials); err != nil {
-			log.Printf("推送 AT 账号 %d 更新 credentials 失败: %v", id, err)
-		}
-	}
-
-	security.SecurityAuditLog("ACCOUNT_PUSH_IMPORTED", fmt.Sprintf("mode=at id=%d ip=%s source=%s", id, c.ClientIP(), req.Source))
-	c.JSON(http.StatusOK, gin.H{
-		"message":   "AT 账号已导入",
-		"id":        id,
-		"duplicate": false,
-		"mode":      "access_token",
 	})
 }
 
@@ -4973,6 +4828,10 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		return
 	}
 	proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
+	if err := manifest.SaveCapabilities(ctx, h.db); err != nil {
+		writeError(c, http.StatusBadGateway, "保存 Codex 能力快照失败: "+err.Error())
+		return
+	}
 	if err := (proxy.DaybreakObservation{Account: account, Snapshot: daybreakSnapshot, Body: manifest.Body}).Save(ctx, h.db); err != nil {
 		writeError(c, http.StatusBadGateway, "保存 Daybreak 能力失败: "+err.Error())
 		return
@@ -7399,6 +7258,11 @@ func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
 }
 
 func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	// Antigravity 没有 Codex 式的 AT 刷新：单号/批量刷新统一走控制面同步，
+	// 同时刷新凭据、项目、权限与配额快照。
+	if h.isAntigravityAccountID(ctx, id) {
+		return h.syncAntigravityAccountByID(ctx, id)
+	}
 	return h.refreshAccountByIDWithProbe(ctx, id, true)
 }
 
@@ -8999,21 +8863,23 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 }
 
 type createKeyReq struct {
-	Name            string                 `json:"name"`
-	Key             string                 `json:"key"`
-	QuotaLimit      *float64               `json:"quota_limit"`
-	Quota           *float64               `json:"quota"`
-	ExpiresAt       string                 `json:"expires_at"`
-	ExpiresInDays   *int                   `json:"expires_in_days"`
-	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
-	Limits          *database.APIKeyLimits `json:"limits"`
+	Name            string              `json:"name"`
+	Key             string              `json:"key"`
+	QuotaLimit      *float64            `json:"quota_limit"`
+	Quota           *float64            `json:"quota"`
+	ExpiresAt       string              `json:"expires_at"`
+	ExpiresInDays   *int                `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage     `json:"allowed_group_ids"`
+	Limits          *createAPIKeyLimits `json:"limits"`
 }
 
 // generateKey 生成随机 API Key
-func generateKey() string {
+func generateKey() (string, error) {
 	b := make([]byte, 24)
-	rand.Read(b)
-	return "sk-" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate api key: %w", err)
+	}
+	return "sk-" + hex.EncodeToString(b), nil
 }
 
 // CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
@@ -9070,7 +8936,12 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	key := req.Key
 	if key == "" {
-		key = generateKey()
+		var err error
+		key, err = generateKey()
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
 	} else {
 		// 验证用户提供的key格式
 		key = security.SanitizeInput(key)
@@ -9098,9 +8969,8 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		}
 	}
 
-	var limits database.APIKeyLimits
+	limits := sanitizeAPIKeyLimits(req.Limits.withDefaults())
 	if req.Limits != nil {
-		limits = sanitizeAPIKeyLimits(*req.Limits)
 		limits.ModelRequestLimits, err = normalizeAdminAPIKeyModelRequestLimits(req.Limits.ModelRequestLimits, nil)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, err.Error())
@@ -9350,6 +9220,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
 		AllowLive:              in.AllowLive,
+		ExternalScheduler:      in.ExternalScheduler,
 		UpstreamChannel:        in.ResolveUpstreamChannel(),
 		ScopeLimits:            database.NormalizeAPIKeyScopeLimits(in.ScopeLimits),
 		ModelRequestLimits:     in.ModelRequestLimits,
@@ -9456,6 +9327,9 @@ var knownAPIKeyPlanFilters = map[string]struct{}{
 	// labels so a Claude-bound key's plan gate survives normalization.
 	"claude": {}, "max": {}, "max-5x": {}, "max-20x": {},
 	"enterprise": {}, "business": {},
+	// Antigravity keys derived from Google tier ids (g1-ultra-tier → ultra,
+	// standard-tier → standard); free/pro/api are shared with the lists above.
+	"ultra": {}, "standard": {},
 }
 
 // cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
@@ -9810,6 +9684,7 @@ type settingsResponse struct {
 	OAuthModelCooldownMode             string                           `json:"oauth_model_cooldown_mode"`
 	OAuthModelCooldownSeconds          int                              `json:"oauth_model_cooldown_seconds"`
 	OAuthModelCooldownBackoffEnabled   bool                             `json:"oauth_model_cooldown_backoff_enabled"`
+	OAuthUnsupportedCooldownSeconds    int                              `json:"oauth_unsupported_model_cooldown_seconds"`
 }
 
 type rawJSON = json.RawMessage
@@ -9987,6 +9862,7 @@ type updateSettingsReq struct {
 	OAuthModelCooldownMode              *string                          `json:"oauth_model_cooldown_mode"`
 	OAuthModelCooldownSeconds           *int                             `json:"oauth_model_cooldown_seconds"`
 	OAuthModelCooldownBackoffEnabled    *bool                            `json:"oauth_model_cooldown_backoff_enabled"`
+	OAuthUnsupportedCooldownSeconds     *int                             `json:"oauth_unsupported_model_cooldown_seconds"`
 }
 
 func updateSettingsHasFieldsOtherThanCustomPatterns(req updateSettingsReq) bool {
@@ -10669,6 +10545,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		OAuthUnsupportedCooldownSeconds:     modelCooldownSettings.UnsupportedCooldownSeconds(),
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -10968,7 +10845,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		req.RelayModelCooldownBackoffEnabled != nil ||
 		req.OAuthModelCooldownMode != nil ||
 		req.OAuthModelCooldownSeconds != nil ||
-		req.OAuthModelCooldownBackoffEnabled != nil
+		req.OAuthModelCooldownBackoffEnabled != nil ||
+		req.OAuthUnsupportedCooldownSeconds != nil
 	if req.RelayModelCooldownMode != nil && !database.IsValidModelCooldownMode(*req.RelayModelCooldownMode) {
 		writeError(c, http.StatusBadRequest, "relay_model_cooldown_mode 必须是 off、fixed 或 adaptive")
 		return
@@ -10985,6 +10863,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("%s 必须在 1-%d 之间", field, database.MaxModelCooldownSeconds))
 			return
 		}
+	}
+	if value := req.OAuthUnsupportedCooldownSeconds; value != nil && (*value < 0 || *value > database.MaxModelCooldownSeconds) {
+		writeError(c, http.StatusBadRequest, fmt.Sprintf("oauth_unsupported_model_cooldown_seconds 必须在 0-%d 之间（0 表示关闭）", database.MaxModelCooldownSeconds))
+		return
 	}
 	var submittedPromptFilterCustomPatterns []promptfilter.PatternConfig
 	var promptFilterPatternQuarantines []promptfilter.PatternQuarantine
@@ -11354,7 +11236,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	if req.ProxyURL != nil {
 		h.store.SetProxyURL(*req.ProxyURL)
-		log.Printf("设置已更新: proxy_url = %s", *req.ProxyURL)
+		log.Printf("设置已更新: proxy_url = %s", security.MaskURLCredentials(*req.ProxyURL))
 	}
 
 	if req.PgMaxConns != nil {
@@ -11563,7 +11445,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := strings.TrimSpace(*req.GithubProxyURL)
 		h.store.SetGithubProxyURL(v)
 		runtimeCfg.GithubProxyURL = v
-		log.Printf("设置已更新: github_proxy_url = %s", v)
+		log.Printf("设置已更新: github_proxy_url = %s", security.MaskURLCredentials(v))
 	}
 
 	// Codex 过载熔断（配置只存 RuntimeSettings，热更新生效）
@@ -12526,12 +12408,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			OAuthMode:           req.OAuthModelCooldownMode,
 			OAuthSeconds:        req.OAuthModelCooldownSeconds,
 			OAuthBackoffEnabled: req.OAuthModelCooldownBackoffEnabled,
+
+			OAuthUnsupportedSeconds: req.OAuthUnsupportedCooldownSeconds,
 		})
 		if updateErr != nil {
 			writeError(c, http.StatusInternalServerError, updateErr.Error())
 			return
 		}
+		previousUnsupported := h.store.UnsupportedModelCooldown()
 		h.store.SetModelCooldownSettings(committed)
+		// Existing cooldowns longer than the new setting would otherwise keep
+		// blocking the model after it was disabled or shortened.
+		if next := h.store.UnsupportedModelCooldown(); next < previousUnsupported {
+			if cleared := h.store.ClearModelCooldownsByReason(auth.ModelCooldownReasonUnsupported, next); cleared > 0 {
+				log.Printf("设置已更新: oauth_unsupported_model_cooldown_seconds = %d，已清除 %d 条超出新时长的模型不支持冷却", committed.UnsupportedCooldownSeconds(), cleared)
+			}
+		}
 	}
 
 	if responseCacheUpdateRequested {
@@ -12599,6 +12491,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		OAuthUnsupportedCooldownSeconds:     modelCooldownSettings.UnsupportedCooldownSeconds(),
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -13264,16 +13157,10 @@ func (h *Handler) grokChannelModels() []string {
 }
 
 func (h *Handler) antigravityChannelModels() []string {
-	if h == nil || h.store == nil {
-		return proxy.AntigravityPublishedModelIDs(auth.AntigravityDefaultModelIDs())
-	}
 	seen := make(map[string]struct{})
 	models := make([]string, 0)
-	for _, account := range h.store.Accounts() {
-		if account == nil || !account.IsAntigravityAPI() {
-			continue
-		}
-		for _, model := range proxy.AntigravityPublishedModelIDs(account.AntigravityModels()) {
+	collect := func(list []string) {
+		for _, model := range list {
 			key := strings.ToLower(strings.TrimSpace(model))
 			if key == "" {
 				continue
@@ -13285,9 +13172,20 @@ func (h *Handler) antigravityChannelModels() []string {
 			models = append(models, model)
 		}
 	}
-	if len(models) == 0 {
-		models = proxy.AntigravityPublishedModelIDs(auth.AntigravityDefaultModelIDs())
+
+	if h != nil && h.store != nil {
+		for _, account := range h.store.Accounts() {
+			if account == nil || !account.IsAntigravityAPI() {
+				continue
+			}
+			collect(proxy.AntigravityPublishedModelIDs(account.AntigravityModels()))
+		}
 	}
+	if len(models) == 0 {
+		collect(proxy.AntigravityPublishedModelIDs(auth.AntigravityDefaultModelIDs()))
+	}
+	// 无论是否有账号，逻辑模型（裸名如 gemini-3.8-flash）均需暴露给定价管理
+	collect(proxy.AntigravityLogicalModelIDs())
 	sort.Strings(models)
 	return models
 }

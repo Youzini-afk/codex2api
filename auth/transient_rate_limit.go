@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/codex2api/cache"
-	"github.com/codex2api/database"
 )
 
 const (
@@ -22,22 +21,12 @@ const (
 
 // nextTransientRateLimitCooldown returns the freeze duration for the given
 // backoff level, never shorter than Retry-After and never longer than the cap.
-func nextTransientRateLimitCooldownWithBase(level int, retryAfter, base time.Duration) time.Duration {
+func nextTransientRateLimitCooldown(level int, retryAfter time.Duration) time.Duration {
 	if level < 0 {
 		level = 0
 	}
-	if base <= 0 {
-		base = TransientRateLimitBackoffBase
-	}
-	if base > TransientRateLimitBackoffMax {
-		base = TransientRateLimitBackoffMax
-	}
-	cooldown := base
+	cooldown := TransientRateLimitBackoffBase
 	for step := 0; step < level && cooldown < TransientRateLimitBackoffMax; step++ {
-		if cooldown > TransientRateLimitBackoffMax/2 {
-			cooldown = TransientRateLimitBackoffMax
-			break
-		}
 		cooldown *= 2
 	}
 	if retryAfter > cooldown {
@@ -46,60 +35,24 @@ func nextTransientRateLimitCooldownWithBase(level int, retryAfter, base time.Dur
 	if cooldown > TransientRateLimitBackoffMax {
 		cooldown = TransientRateLimitBackoffMax
 	}
-	if cooldown < base {
-		cooldown = base
+	if cooldown < TransientRateLimitBackoffBase {
+		cooldown = TransientRateLimitBackoffBase
 	}
 	return cooldown
-}
-
-func nextTransientRateLimitCooldown(level int, retryAfter time.Duration) time.Duration {
-	return nextTransientRateLimitCooldownWithBase(level, retryAfter, TransientRateLimitBackoffBase)
-}
-
-func transientRateLimitPolicyDuration(policy ModelCooldownPolicy) (base time.Duration, fixed, backoff bool) {
-	base = time.Duration(policy.Seconds) * time.Second
-	if policy.Seconds <= 0 || base <= 0 {
-		base = TransientRateLimitBackoffBase
-	}
-	if base > TransientRateLimitBackoffMax {
-		base = TransientRateLimitBackoffMax
-	}
-	fixed = policy.Mode == database.ModelCooldownModeFixed
-	backoff = policy.Mode == database.ModelCooldownModeAdaptive && policy.BackoffEnabled
-	return base, fixed, backoff
 }
 
 // MarkTransientRateLimited applies an account-wide short freeze for a Codex
 // throttle. Concurrent 429s that land while the current window is still open
 // reuse that deadline instead of climbing the backoff ladder. An already
-// longer quota cooldown is left untouched. The runtime reason is deliberately
-// distinct from ResponsesRateLimitedCooldownReason so a seconds-long throttle
-// cannot be rendered as a 5h/7d quota reset.
+// longer quota cooldown is left untouched.
 //
 // Unlike a quota cooldown the freeze is seconds long, so it neither triggers
 // a WHAM usage probe nor is written to the database: under a burst that would
 // turn every throttled account into one probe plus one write per window.
 // The scheduler and the cross-instance cooldown cache are still updated.
 func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration) time.Duration {
-	return s.MarkTransientRateLimitedWithPolicy(acc, retryAfter, ModelCooldownPolicy{
-		Mode:           database.ModelCooldownModeAdaptive,
-		Seconds:        int(TransientRateLimitBackoffBase / time.Second),
-		BackoffEnabled: true,
-	})
-}
-
-// MarkTransientRateLimitedWithPolicy applies the effective account policy to a
-// short, account-wide upstream throttle. Fixed mode is deliberately exact: an
-// upstream Retry-After cannot turn a configured 20-second freeze into another
-// multi-minute freeze. Adaptive mode uses the configured seconds as its base;
-// exponential growth is enabled only when BackoffEnabled is true.
-func (s *Store) MarkTransientRateLimitedWithPolicy(acc *Account, retryAfter time.Duration, policy ModelCooldownPolicy) time.Duration {
-	base, fixed, backoffEnabled := transientRateLimitPolicyDuration(policy)
 	if s == nil || acc == nil {
-		if fixed {
-			return base
-		}
-		return nextTransientRateLimitCooldownWithBase(0, retryAfter, base)
+		return nextTransientRateLimitCooldown(0, retryAfter)
 	}
 	now := time.Now()
 	acc.mu.Lock()
@@ -113,10 +66,6 @@ func (s *Store) MarkTransientRateLimitedWithPolicy(acc *Account, retryAfter time
 			return remaining
 		}
 		acc.LastRateLimitedAt = now
-		if fixed {
-			acc.mu.Unlock()
-			return remaining
-		}
 		extension := now.Add(min(retryAfter, TransientRateLimitBackoffMax))
 		if retryAfter <= 0 || !extension.After(until) {
 			acc.mu.Unlock()
@@ -126,26 +75,14 @@ func (s *Store) MarkTransientRateLimitedWithPolicy(acc *Account, retryAfter time
 	} else {
 		if accountDispatchBlocked(acc) || acc.Status == StatusError || acc.healthTierLocked() == HealthTierBanned {
 			acc.mu.Unlock()
-			if fixed {
-				return base
-			}
-			return nextTransientRateLimitCooldownWithBase(0, retryAfter, base)
+			return nextTransientRateLimitCooldown(0, retryAfter)
 		}
-		level := 0
-		if backoffEnabled {
-			level = acc.transientRateLimitBackoff
-		}
-		cooldown := base
-		if !fixed {
-			cooldown = nextTransientRateLimitCooldownWithBase(level, retryAfter, base)
-		}
+		cooldown := nextTransientRateLimitCooldown(acc.transientRateLimitBackoff, retryAfter)
 		until = now.Add(cooldown)
 		// An upstream hint at the cap must not prevent this new window from
 		// advancing the local ladder; hints and backoff are separate inputs.
-		if backoffEnabled && nextTransientRateLimitCooldownWithBase(acc.transientRateLimitBackoff, 0, base) < TransientRateLimitBackoffMax {
+		if nextTransientRateLimitCooldown(acc.transientRateLimitBackoff, 0) < TransientRateLimitBackoffMax {
 			acc.transientRateLimitBackoff++
-		} else if !backoffEnabled {
-			acc.transientRateLimitBackoff = 0
 		}
 		acc.LastFailureAt = now
 		acc.FailureStreak++
@@ -154,12 +91,12 @@ func (s *Store) MarkTransientRateLimitedWithPolicy(acc *Account, retryAfter time
 	// Publish all local fields in one critical section; concurrent failures
 	// cannot observe the new backoff without the window that caused it.
 	acc.LastRateLimitedAt = now
-	acc.setCooldownUntilLocked(until, TransientRateLimitedCooldownReason)
+	acc.setCooldownUntilLocked(until, ResponsesRateLimitedCooldownReason)
 	acc.transientRateLimitUntil = until
 	acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	acc.armTransientRateLimitRecoveryLocked(s)
 	record := runtimeCooldownRecord{
-		Kind: cache.CooldownKindTransient, Reason: TransientRateLimitedCooldownReason,
+		Kind: cache.CooldownKindTransient, Reason: ResponsesRateLimitedCooldownReason,
 		ResetAt: until, UpdatedAt: now, BackoffLevel: acc.transientRateLimitBackoff,
 	}
 	acc.mu.Unlock()
@@ -172,75 +109,8 @@ func (s *Store) MarkTransientRateLimitedWithPolicy(acc *Account, retryAfter time
 	return max(time.Until(deadline), 0)
 }
 
-// reconcileTransientRateLimitPolicies applies settings changes to already
-// active short freezes. In particular, switching to fixed mode must shorten a
-// previously escalated adaptive window immediately; otherwise the UI would
-// show the old two-minute deadline until it naturally expired.
-func (s *Store) reconcileTransientRateLimitPolicies() {
-	if s == nil {
-		return
-	}
-	for _, acc := range s.accountSnapshotAccounts() {
-		if acc == nil {
-			continue
-		}
-		policy := s.ResolveModelCooldownPolicy(acc)
-		acc.mu.Lock()
-		if !acc.isTransientRateLimitCooldownLocked() {
-			acc.mu.Unlock()
-			continue
-		}
-		if policy.Mode != database.ModelCooldownModeOff {
-			base, fixed, backoffEnabled := transientRateLimitPolicyDuration(policy)
-			if !fixed && backoffEnabled {
-				acc.mu.Unlock()
-				continue
-			}
-			desired := time.Now().Add(base)
-			shortened := desired.Before(acc.CooldownUtil)
-			if shortened {
-				acc.setCooldownUntilLocked(desired, TransientRateLimitedCooldownReason)
-				acc.transientRateLimitUntil = desired
-				acc.transientRateLimitBackoff = 0
-				acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
-				acc.armTransientRateLimitRecoveryLocked(s)
-			}
-			acc.mu.Unlock()
-			if shortened {
-				s.fastSchedulerUpdate(acc)
-				s.cacheAccountCooldownRecord(acc.DBID, runtimeCooldownRecord{
-					Kind: cache.CooldownKindTransient, Reason: TransientRateLimitedCooldownReason,
-					ResetAt: desired, UpdatedAt: time.Now(), BackoffLevel: 0,
-				})
-			}
-			continue
-		}
-		acc.Status = StatusReady
-		acc.CooldownUtil = time.Time{}
-		acc.CooldownReason = ""
-		acc.transientRateLimitUntil = time.Time{}
-		acc.transientRateLimitBackoff = 0
-		if acc.transientRateLimitTimer != nil {
-			acc.transientRateLimitTimer.Stop()
-			acc.transientRateLimitTimer = nil
-		}
-		if acc.HealthTier != HealthTierBanned {
-			acc.HealthTier = HealthTierWarm
-		}
-		acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
-		acc.mu.Unlock()
-		s.fastSchedulerUpdate(acc)
-		s.deleteCachedAccountCooldown(acc.DBID)
-	}
-}
-
-func (s *Store) clearDisabledTransientRateLimitCooldowns() {
-	// Kept as a small compatibility wrapper for callers in older integrations.
-	s.reconcileTransientRateLimitPolicies()
-}
-
 func (a *Account) isTransientRateLimitCooldownLocked() bool {
-	return a.Status == StatusCooldown && a.CooldownReason == TransientRateLimitedCooldownReason &&
+	return a.Status == StatusCooldown && a.CooldownReason == ResponsesRateLimitedCooldownReason &&
 		!a.transientRateLimitUntil.IsZero() && a.CooldownUtil.Equal(a.transientRateLimitUntil)
 }
 

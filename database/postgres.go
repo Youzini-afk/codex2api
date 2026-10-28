@@ -395,9 +395,6 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	// 测试注册了 schema 模板且目标文件尚不存在时，直接复制模板并跳过迁移。
 	fromSchemaTemplate := false
 	if driver == "sqlite" {
-		if err := ensureSQLiteParentDir(dsn); err != nil {
-			return nil, fmt.Errorf("创建 SQLite 数据目录失败: %w", err)
-		}
 		if target, ok := sqliteSchemaTemplateTarget(dsn); ok {
 			fromSchemaTemplate = applySQLiteSchemaTemplate(target)
 		}
@@ -498,6 +495,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		ctx = postGrokCtx
 		if err := db.ensureCodexRefreshSchema(ctx); err != nil {
 			return nil, fmt.Errorf("初始化 Codex 刷新保护表失败: %w", err)
+		}
+		if err := db.ensureIntelligenceCheckSchema(ctx); err != nil {
+			return nil, fmt.Errorf("initialize intelligence checks: %w", err)
 		}
 		if err := db.ensureChannelMonitorSchema(ctx); err != nil {
 			return nil, fmt.Errorf("初始化渠道监控表失败: %w", err)
@@ -1185,28 +1185,6 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS skip_warm_tier BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_generation BIGINT NOT NULL DEFAULT 1;
-	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_family_id TEXT NOT NULL DEFAULT '';
-
-	-- 官方每日用量是上游短期窗口的持久快照，旧日期无法重新抓取。
-	CREATE TABLE IF NOT EXISTS account_daily_usage (
-		account_id BIGINT NOT NULL,
-		day VARCHAR(10) NOT NULL,
-		credits DOUBLE PRECISION NOT NULL DEFAULT 0,
-		users INT NOT NULL DEFAULT 0,
-		threads INT NOT NULL DEFAULT 0,
-		turns INT NOT NULL DEFAULT 0,
-		uncached_input_tokens BIGINT NOT NULL DEFAULT 0,
-		cached_input_tokens BIGINT NOT NULL DEFAULT 0,
-		output_tokens BIGINT NOT NULL DEFAULT 0,
-		total_tokens BIGINT NOT NULL DEFAULT 0,
-		settled BOOLEAN NOT NULL DEFAULT FALSE,
-		clients_json TEXT NOT NULL DEFAULT '[]',
-		models_json TEXT NOT NULL DEFAULT '[]',
-		synced_at TIMESTAMPTZ NOT NULL,
-		PRIMARY KEY (account_id, day)
-	);
-	CREATE INDEX IF NOT EXISTS idx_account_daily_usage_day ON account_daily_usage(day);
-
 	CREATE TABLE IF NOT EXISTS account_groups (
 		id                        SERIAL PRIMARY KEY,
 		name                      VARCHAR(80) UNIQUE NOT NULL,
@@ -1442,19 +1420,6 @@ func (db *DB) migrate(ctx context.Context) error {
 		updated_at TIMESTAMPTZ DEFAULT NOW(),
 		PRIMARY KEY (api_key_id, scope_type, scope_id)
 	);
-	-- 只在这里建空表，不插入默认 singleton；自动导入的空目标检查必须保持
-	-- 无业务行，源 SQLite 若已有用户配置则由导入事务原样复制。
-	CREATE TABLE IF NOT EXISTS official_pricing_sync_config (
-		singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-		enabled BOOLEAN NOT NULL DEFAULT FALSE,
-		interval_minutes INTEGER NOT NULL DEFAULT 1440,
-		include_openai BOOLEAN NOT NULL DEFAULT TRUE,
-		include_grok BOOLEAN NOT NULL DEFAULT TRUE,
-		last_attempt_at TIMESTAMPTZ NULL,
-		last_success_at TIMESTAMPTZ NULL,
-		last_error TEXT NOT NULL DEFAULT '',
-		last_warning TEXT NOT NULL DEFAULT ''
-	);
 	CREATE TABLE IF NOT EXISTS account_model_cooldowns (
 		account_id BIGINT NOT NULL,
 		model VARCHAR(100) NOT NULL,
@@ -1541,8 +1506,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	SET test_model = 'gpt-5.5'
 	WHERE LOWER(COALESCE(test_model, '')) IN ('gpt-5.4', 'gpt-5.4-mini');
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.153.3';
-	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.153.3';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.160.0';
+	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.160.0';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_telemetry_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_turn_state_template_cache_enabled BOOLEAN DEFAULT FALSE;
@@ -1634,6 +1599,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_backoff_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_unsupported_model_cooldown_seconds INT NOT NULL DEFAULT 1800;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -1928,7 +1894,7 @@ type APIKeyLimits struct {
 	// 而不是直接把 400 透传给下游。默认关闭。
 	AutoCompactOnOverflow bool `json:"auto_compact_overflow,omitempty"`
 	// AllowLive 为 true 时，该 Key 可以使用 ChatGPT Live（/v1/live 与
-	// /backend-api/codex/realtime/calls）。默认关闭。
+	// /backend-api/codex/realtime/calls）。管理端新建 auto/codex Key 时默认开启。
 	AllowLive bool `json:"allow_live,omitempty"`
 	// UpstreamChannel 限定该 Key 的请求只调度到指定上游渠道的账号：
 	//   - ""/auto: 不限（默认，按模型路由）
@@ -1941,6 +1907,10 @@ type APIKeyLimits struct {
 	// 与上面的 Cost/Token 限额不同，它只统计该 Key 打到对应 scope 的用量，超额后默认
 	// 把该 scope 的账号从候选池剔除（自动落到其它分组），详见 APIKeyScopeLimit。
 	ScopeLimits []APIKeyScopeLimit `json:"scope_limits,omitempty"`
+	// ExternalScheduler 为 true 时，该 Key 由外部调度器管理（issue #831）：每个执行请求
+	// 必须用 X-Codex2API-Account-ID 指定账号，网关只在该账号上执行，不做内部选号、
+	// 换号或重试，也不以冷却 / 并发 / 自动暂停等内部调度判断拒绝请求。默认关闭。
+	ExternalScheduler bool `json:"external_scheduler,omitempty"`
 }
 
 // 图片工具策略取值。
@@ -2021,6 +1991,7 @@ func (l APIKeyLimits) IsZero() bool {
 		!l.DisableImageGeneration &&
 		!l.AutoCompactOnOverflow &&
 		!l.AllowLive &&
+		!l.ExternalScheduler &&
 		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow &&
 		l.ResolveUpstreamChannel() == UpstreamChannelAuto
 }
@@ -2597,6 +2568,9 @@ type SystemSettings struct {
 	OAuthModelCooldownMode           string
 	OAuthModelCooldownSeconds        int
 	OAuthModelCooldownBackoffEnabled bool
+	// Zero values keep the unsupported-model cooldown enabled at its default.
+	OAuthUnsupportedModelCooldownDisabled bool
+	OAuthUnsupportedModelCooldownSeconds  int
 
 	// PreservePromptFilterCustomPatterns is an update-only concurrency guard.
 	// When true, an existing row keeps its current custom-pattern value instead
@@ -2747,7 +2721,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_review_timeout_seconds, 10),
 		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
-		       COALESCE(codex_min_cli_version, '0.153.3'),
+		       COALESCE(codex_min_cli_version, '0.160.0'),
 		       COALESCE(codex_user_agent_config, '{}'),
 		       COALESCE(usage_log_mode, 'full'),
 		       COALESCE(usage_log_batch_size, 200),
@@ -7676,6 +7650,12 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 		}
 		defer tx.Rollback()
 
+		if groupIDs.Set {
+			if err := db.intelligenceManualMutationTx(ctx, tx, []int64{id}, false); err != nil {
+				return err
+			}
+		}
+
 		query := `SELECT credentials FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
 		if db.isSQLite() {
 			query = `SELECT credentials FROM accounts WHERE id = ? AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
@@ -7799,6 +7779,12 @@ func (db *DB) BatchUpdateAccountMetadata(ctx context.Context, ids []int64, updat
 			return err
 		}
 		defer tx.Rollback()
+
+		if update.Enabled.Set || update.GroupIDs.Set {
+			if err := db.intelligenceManualMutationTx(ctx, tx, ids, update.Enabled.Set); err != nil {
+				return err
+			}
+		}
 
 		credentialUpdates := cloneCredentialUpdates(update.CredentialUpdates)
 		if update.AllowedAPIKeyIDs.Set {
@@ -8030,18 +8016,23 @@ func nullableInt64Value(v sql.NullInt64) interface{} {
 
 // SetAccountEnabled 设置账号是否参与调度选择
 func (db *DB) SetAccountEnabled(ctx context.Context, id int64, enabled bool) error {
-	res, err := db.conn.ExecContext(ctx, `UPDATE accounts SET enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, enabled, id)
-	if err != nil {
-		return err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := db.intelligenceManualMutationTx(ctx, tx, []int64{id}, true); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE accounts SET enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, enabled, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 }
 
 // SetAccountLocked 设置账号的锁定状态
@@ -8885,23 +8876,21 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 	)
 }
 
-// InsertPendingAccountWithCredentials atomically inserts a disabled account
-// together with its review metadata, so a partially completed self-service
-// submission can never become schedulable after a restart.
+// InsertPendingAccountWithCredentials atomically saves a disabled account and
+// its review metadata together with the credential family.
 func (db *DB) InsertPendingAccountWithCredentials(ctx context.Context, name string, credentials map[string]interface{}, proxyURL, note string, tags []string) (int64, error) {
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
 	if err != nil {
 		return 0, err
 	}
-	tagsJSON := encodeTagsJSON(tags)
-
-	return db.insertRowID(ctx,
-		`INSERT INTO accounts (name, credentials, proxy_url, enabled, note, tags) VALUES ($1, $2, $3, false, $4, $5::jsonb) RETURNING id`,
-		`INSERT INTO accounts (name, credentials, proxy_url, enabled, note, tags) VALUES (?, ?, ?, 0, ?, ?)`,
-		name, credJSON, proxyURL, note, tagsJSON,
+	return db.insertAccountRowWithFamily(ctx,
+		`INSERT INTO accounts (name, credentials, proxy_url, enabled, note, tags) VALUES ($1, $2, $3, FALSE, $4, $5::jsonb) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url, enabled, note, tags) VALUES ($1, $2, $3, FALSE, $4, $5)`,
+		credentials,
+		name, credJSON, proxyURL, note, encodeTagsJSON(tags),
 	)
 }
 

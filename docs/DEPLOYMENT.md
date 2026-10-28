@@ -54,44 +54,6 @@ docker compose -f docker-compose.sqlite.yml pull
 docker compose -f docker-compose.sqlite.yml up -d
 ```
 
-### 3. Zeabur 自动部署
-
-适用于 Zeabur 直接从 Git 仓库自动构建部署的场景。
-
-**推荐做法：**
-
-1. 使用仓库根目录的 `Dockerfile`
-2. 在 Zeabur 中为服务挂载持久化目录到 `/data`
-3. 至少设置 `ADMIN_SECRET`
-4. 将健康检查路径指向 `/health`
-
-**二改 fork 注意事项：**
-
-- 推荐在 Zeabur 选择“从 Git 仓库部署”，仓库指向你的 fork，并使用根目录 `Dockerfile` 构建。
-- 如果 Zeabur 服务使用“Docker Image”部署，镜像地址必须指向你的 fork 镜像，例如 `ghcr.io/<your-github-user>/codex2api:latest`；继续使用上游 `ghcr.io/james-6-23/codex2api:latest` 会看不到 fork 中的新功能。
-- 本仓库的镜像构建工作流会在 `main` 分支推送后自动发布 `latest` 镜像，适合 Zeabur 镜像部署模式。
-
-**默认行为：**
-
-- 检测到 Zeabur 环境且未配置 PostgreSQL / Redis 时，服务会自动回退到 `SQLite + Memory`
-- SQLite 默认写入 `/data/codex2api.db`
-- Zeabur 自动注入的 `PORT` 会被自动识别，无需手动设置 `CODEX_PORT`
-
-**如果接入 Zeabur 托管 PostgreSQL / Redis：**
-
-可直接绑定以下变量：
-
-```bash
-DATABASE_URL=${POSTGRES_CONNECTION_STRING}
-REDIS_URL=${REDIS_CONNECTION_STRING}
-```
-
-也兼容分拆变量，例如 `POSTGRESQL_HOST`、`POSTGRES_PORT`、`POSTGRESQL_USERNAME`、`POSTGRES_PASSWORD`、`POSTGRES_DATABASE`、`REDIS_HOST`、`REDIS_PORT` 等。
-
-**示例文件：**
-
-- 根目录 `.env.zeabur.example`
-
 ---
 
 ## Docker 部署
@@ -273,7 +235,7 @@ https://<your-service>.onrender.com/health
 
 ### 环境要求
 
-- Go 1.26.9+
+- Go 1.26.10+
 - Node.js 22.12+
 - PostgreSQL 14+ (可选，可用 SQLite)
 - Redis 7+ (可选，可用内存缓存)
@@ -373,6 +335,10 @@ REDIS_ADDR=rediss://default:your-redis-password@your-redis-host:6379/0
 ```bash
 # 快速调度器
 FAST_SCHEDULER_ENABLED=true
+
+# 实验性：Codex Multi-Agent v2 第三方子 Agent 明文兼容（默认关闭）
+# CODEX_MULTI_AGENT_V2_COMPAT=false
+# 说明与灰度步骤见 docs/CODEX_MULTI_AGENT_V2_COMPAT.md
 ```
 
 ### 2. 系统设置（通过管理后台）
@@ -544,9 +510,8 @@ docker compose up -d
 ### SQLite 模式升级
 
 ```bash
-# 先停止所有写入实例，再生成 SQLite 一致备份
-docker compose -f docker-compose.sqlite.yml stop
-sqlite3 /path/to/codex2api.db ".backup '/path/to/codex2api.db.backup_$(date +%Y%m%d_%H%M%S)'"
+# 备份 SQLite 数据库
+cp /path/to/codex2api.db /path/to/codex2api.db.backup_$(date +%Y%m%d_%H%M%S)
 
 # 升级
 docker compose -f docker-compose.sqlite.yml pull
@@ -606,11 +571,12 @@ docker compose start codex2api
 ### SQLite 备份
 
 ```bash
-# 首选：SQLite 一致备份
+# 备份
 sqlite3 /data/codex2api.db ".backup '/backup/codex2api_$(date +%Y%m%d_%H%M%S).db'"
-```
 
-如果只能使用文件级冷备，必须先完全停止所有读写 SQLite 的进程，再把主库与存在的 `-wal` / `-shm` 文件作为一组一致复制。不要在 WAL 模式下单独复制主库文件。
+# 或简单复制
+cp /data/codex2api.db /backup/codex2api_$(date +%Y%m%d_%H%M%S).db
+```
 
 ### SQLite 恢复
 

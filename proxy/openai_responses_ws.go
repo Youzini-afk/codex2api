@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -25,7 +23,12 @@ const (
 	openAIResponsesWebsocketBetaHeader = "responses_websockets=2026-02-06"
 	openAIResponsesWSMaxConns          = 8
 	openAIResponsesWSMaxAge            = 30 * time.Minute
+	// gorilla 的 SetReadLimit 按压缩后的帧字节计数；解压后的消息大小必须
+	// 单独限制，否则小体积 deflate 炸弹可以放大成 GB 级内存。
+	openAIResponsesWSMaxMessageBytes = 32 << 20
 )
+
+var errOpenAIResponsesWSMessageTooLarge = fmt.Errorf("upstream websocket message exceeds %d bytes", openAIResponsesWSMaxMessageBytes)
 
 // openAIResponsesRelayUsesUpstreamWebsocket 判断这一次出站是否拨中转账号自己的
 // Responses WebSocket。生图仍走 HTTP。全局 codex_force_websocket 不参与这个判断。
@@ -58,6 +61,9 @@ func prepareOpenAIResponsesWebsocketBody(body []byte) []byte {
 		return []byte(`{"type":"response.create","stream":true}`)
 	}
 	wsBody := stripResponsesImageGenerationTool(bytes.Clone(body))
+	// This pool owns one response lease per socket. Named ingress lanes are
+	// handled by the gateway; do not project their envelope into the provider.
+	wsBody, _ = sjson.DeleteBytes(wsBody, "stream_id")
 	wsBody, err := sjson.SetBytes(wsBody, "type", "response.create")
 	if err != nil {
 		return body
@@ -126,14 +132,19 @@ func executeOpenAIResponsesWebsocket(ctx context.Context, account *auth.Account,
 		return nil, err
 	}
 	body := prepareOpenAIResponsesWebsocketBody(requestBody)
+	boundProxy, accountBound := AccountBoundEgress(ctx)
+	if accountBound {
+		proxyURL = boundProxy
+	}
 	record := beginUpstreamTrace(ctx, account, proxyURL, true)
 	resp, err := openAIResponsesWebsocketPool.roundTrip(ctx, openAIResponsesWSSpec{
-		accountID: account.ID(),
-		baseURL:   strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		keyHash:   openAIResponsesWSKeyHash(apiKey),
-		proxyURL:  strings.TrimSpace(proxyURL),
-		wsURL:     wsURL,
-		headers:   headers,
+		accountID:    account.ID(),
+		accountBound: accountBound,
+		baseURL:      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		keyHash:      openAIResponsesWSKeyHash(apiKey),
+		proxyURL:     strings.TrimSpace(proxyURL),
+		wsURL:        wsURL,
+		headers:      headers,
 	}, body)
 	record(resp)
 	return resp, err
@@ -145,16 +156,21 @@ func openAIResponsesWSKeyHash(apiKey string) string {
 }
 
 type openAIResponsesWSSpec struct {
-	accountID int64
-	baseURL   string
-	keyHash   string
-	proxyURL  string
-	wsURL     string
-	headers   http.Header
+	accountBound bool
+	accountID    int64
+	baseURL      string
+	keyHash      string
+	proxyURL     string
+	wsURL        string
+	headers      http.Header
 }
 
 func (s openAIResponsesWSSpec) id() string {
-	return fmt.Sprintf("%d\n%s\n%s\n%s", s.accountID, s.baseURL, s.keyHash, s.proxyURL)
+	key := fmt.Sprintf("%d\n%s\n%s\n%s", s.accountID, s.baseURL, s.keyHash, s.proxyURL)
+	if s.accountBound {
+		key = "account-bound\n" + key
+	}
+	return key
 }
 
 type openAIResponsesWSConn struct {
@@ -248,25 +264,28 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 	resp.Header.Set("Content-Type", "text/event-stream")
 	resp.Header.Set("Cache-Control", "no-cache")
 	resp.Header.Set("Connection", "keep-alive")
+	control := &openAIResponsesWSInterrupt{}
+	unregisterInterrupt := RegisterResponsesWSInterrupt(ctx, func(payload []byte) error {
+		return control.send(ctx, conn.conn, payload)
+	})
 
 	go func() {
 		defer pw.Close()
-		var finished atomic.Bool
+		defer unregisterInterrupt()
+		defer control.stop()
 		stop := make(chan struct{})
 		socket := conn.conn
 		go func() {
 			select {
 			case <-ctx.Done():
-				if !finished.Load() && socket != nil {
-					_ = socket.Close()
-				}
+				control.closeIfUnfinished(socket)
 			case <-stop:
 			}
 		}()
 		defer close(stop)
 
 		terminal := false
-		err := readOpenAIResponsesWS(conn.conn, func(frame []byte) bool {
+		emit := func(frame []byte) bool {
 			if id := strings.TrimSpace(gjson.GetBytes(frame, "response.id").String()); id != "" {
 				pool.bind(conn, id)
 			}
@@ -274,28 +293,27 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 			case "response.completed", "response.failed", "response.incomplete", "error":
 				terminal = true
 			}
-			line := frame
-			if bytes.IndexByte(frame, '\n') >= 0 {
-				var compacted bytes.Buffer
-				if json.Compact(&compacted, frame) == nil {
-					line = compacted.Bytes()
-				} else {
-					line = bytes.ReplaceAll(frame, []byte("\n"), []byte(" "))
-				}
-			}
-			if _, err := pw.Write([]byte("data: ")); err != nil {
+			if err := writeOpenAIResponsesSSE(pw, frame); err != nil {
 				return false
 			}
-			if _, err := pw.Write(line); err != nil {
+			return true
+		}
+		var controlErr error
+		err := readOpenAIResponsesWS(conn.conn, func(frame []byte) bool {
+			frame, err := control.accept(frame)
+			if err != nil {
+				controlErr = err
 				return false
 			}
-			if _, err := pw.Write([]byte("\n\n")); err != nil {
+			if len(frame) > 0 && !emit(frame) {
 				return false
 			}
-			return !terminal
+			return !control.done()
 		})
-		finished.Store(true)
-		if err != nil || !terminal || ctx.Err() != nil {
+		if controlErr != nil {
+			err = controlErr
+		}
+		if err != nil || !terminal {
 			pool.retire(conn)
 			if err != nil && err != io.EOF {
 				_ = pw.CloseWithError(err)
@@ -308,11 +326,18 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 }
 
 func readOpenAIResponsesWS(conn *websocket.Conn, emit func([]byte) bool) error {
-	conn.SetReadLimit(32 << 20)
+	conn.SetReadLimit(openAIResponsesWSMaxMessageBytes)
 	for {
-		_, data, err := conn.ReadMessage()
+		_, reader, err := conn.NextReader()
 		if err != nil {
 			return err
+		}
+		data, err := io.ReadAll(io.LimitReader(reader, openAIResponsesWSMaxMessageBytes+1))
+		if err != nil {
+			return err
+		}
+		if len(data) > openAIResponsesWSMaxMessageBytes {
+			return errOpenAIResponsesWSMessageTooLarge
 		}
 		if len(bytes.TrimSpace(data)) == 0 {
 			continue
@@ -393,6 +418,9 @@ func (p *openAIResponsesWSPool) dial(ctx context.Context, spec openAIResponsesWS
 		HandshakeTimeout:  30 * time.Second,
 		EnableCompression: true,
 		Proxy:             http.ProxyFromEnvironment,
+	}
+	if spec.accountBound {
+		dialer.Proxy = nil
 	}
 	if spec.proxyURL != "" {
 		if err := configureOpenAIResponsesWSProxy(dialer, spec.proxyURL); err != nil {
