@@ -123,6 +123,10 @@ export interface AntigravitySettingsResponse {
   quota_refresh_interval_minutes?: number
   /** 配额硬门禁开关：开启后配额耗尽账号直接 429，不进入排队。 */
   quota_gate_enabled?: boolean
+  /** 临期优先调度开关：周配额临近重置且仍有存量的账号优先承接新会话（仅 round_robin）。 */
+  expiry_priority_enabled?: boolean
+  /** 临期时间窗（小时），允许范围 1–168。 */
+  expiry_priority_horizon_hours?: number
   /** 渠道配置 CAS 版本号（只读，后端下发）。 */
   config_revision?: number
   choices: AntigravityRedirectChoice[]
@@ -2226,7 +2230,6 @@ export interface SystemSettings {
   codex_force_websocket: boolean
   codex_telemetry_enabled: boolean
   codex_telemetry_timing_debug: boolean
-  codex_unified_client_identity_enabled: boolean
   codex_request_compression: boolean
   codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
@@ -2317,6 +2320,12 @@ export interface SystemSettings {
   response_cache_reconstruct_max_bytes: number
   response_cache_write_policy: ResponseCacheWritePolicy
   readonly response_cache_config_generation: number
+  output_guard_enabled: boolean
+  output_guard_max_tool_argument_bytes: number
+  output_guard_max_tool_argument_deltas: number
+  output_guard_max_channel_bytes: number
+  output_guard_max_request_bytes: number
+  readonly output_guard_config_generation: number
   relay_model_cooldown_mode: ModelCooldownMode
   relay_model_cooldown_seconds: number
   relay_model_cooldown_backoff_enabled: boolean
@@ -4106,6 +4115,8 @@ export interface PublicAPIKeyUsageLog {
   billed_image_count?: number
   id: number
   channel?: UpstreamChannel | ''
+  client_ip: string
+  client_user_agent: string
   endpoint: string
   model: string
   effective_model: string
@@ -4115,7 +4126,11 @@ export interface PublicAPIKeyUsageLog {
   first_token_ms: number
   input_tokens: number
   output_tokens: number
+  reasoning_tokens: number
+  reasoning_effort: string
   cached_tokens: number
+  cache_write_5m_tokens?: number
+  cache_write_1h_tokens?: number
   total_tokens: number
   user_billed: number
   input_cost: number
@@ -4441,4 +4456,28 @@ export interface ClaudeGlobalConfig {
   max_output_tokens: number
   max_tool_count: number
   max_tool_schema_bytes: number
+}
+
+
+export interface ScheduledConnectionTestConfig {
+  enabled: boolean
+  model: string
+  content: string
+  weekday_times: string[]
+  weekend_times: string[]
+}
+export interface ScheduledConnectionTestRecord {
+  scheduled_at: string
+  attempted_at?: string
+  account_id: number
+  model?: string
+  status: 'success' | 'failed' | 'skipped' | 'unknown'
+  success: boolean
+  error?: string
+  next_reset_5h_at?: string
+}
+export interface ScheduledConnectionTestResponse {
+  config: ScheduledConnectionTestConfig
+  timezone: string
+  records: ScheduledConnectionTestRecord[]
 }
