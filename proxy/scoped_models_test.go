@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -279,6 +282,37 @@ func TestScopedModelsIncludeExperimentalAPIKeyAntigravityWithoutGrokGates(t *tes
 		if strings.HasPrefix(model.ID, "grok-") || model.Owner == "xai" {
 			t.Fatalf("Grok catalog polluted Antigravity-only model list: %+v", models)
 		}
+	}
+}
+
+func TestScopedModelsLogsRedactedReasonWhenClaudeAccountIsFiltered(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	const secret = "super-secret-claude-token"
+	account := &auth.Account{
+		DBID: 867, UpstreamType: auth.UpstreamClaude, AccessToken: secret, RefreshToken: "refresh-secret",
+		Status: auth.StatusReady, Models: []string{"claude-sonnet-4-5"},
+	}
+	store.AddAccount(account)
+	store.MarkCooldownWithError(account, time.Hour, "unauthorized", "upstream 401 "+secret)
+	atomic.StoreInt32(&account.Disabled, 1)
+	handler := NewHandler(store, nil, nil, nil)
+	catalogEmptyLogMu.Lock()
+	delete(catalogEmptyLogAt, 8)
+	catalogEmptyLogMu.Unlock()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 8, Limits: database.APIKeyLimits{UpstreamChannel: database.UpstreamChannelClaude}})
+	if len(models) != 0 {
+		t.Fatalf("filtered Claude account still published models: %+v", models)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "model catalog empty") || !strings.Contains(logged, "id=867") || !strings.Contains(logged, "disabled_banned") {
+		t.Fatalf("diagnostic log = %q", logged)
+	}
+	if strings.Contains(logged, secret) || strings.Contains(logged, "refresh-secret") {
+		t.Fatalf("diagnostic log leaked credentials: %s", logged)
 	}
 }
 

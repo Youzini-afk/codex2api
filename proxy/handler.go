@@ -178,6 +178,12 @@ func dispatchPolicyForModel(model string) auth.DispatchPolicy {
 	return auth.DispatchPolicyStandard
 }
 
+// DispatchPolicyForModel 供请求处理之外的调用方（如后台检测）按模型取得与选号一致的
+// 用量窗口口径。
+func DispatchPolicyForModel(model string) auth.DispatchPolicy {
+	return dispatchPolicyForModel(model)
+}
+
 // withModelCooldownFilter 在既有过滤器上叠加单一公开模型的跨实例共享缓存冷却检查，
 // 其它实例写入的冷却也能在本实例选号时滤掉该账号；store 未装配时原样返回入参过滤器。
 func (h *Handler) withModelCooldownFilter(ctx context.Context, model string, filter auth.AccountFilter) auth.AccountFilter {
@@ -187,15 +193,15 @@ func (h *Handler) withModelCooldownFilter(ctx context.Context, model string, fil
 	return h.store.WithModelCooldownFilterContext(ctx, model, filter)
 }
 
-// antigravityRequestCooldownKeys 解析 public model 对应的 wireModel 与（Gemini 家族）
-// 共享 familyKey，供跨实例三键冷却检查使用。wireModel 取自模型目录
+// antigravityRequestCooldownKeys 解析 public model 对应的 wireModel 与（Argon / 普通 Gemini）
+// 各自共享的 familyKey，供跨实例三键冷却检查使用。wireModel 取自模型目录
 // （AntigravityWireModelID），与 antigravityResolvePublicModelForAccount 对受支持账号返回
 // 的 wire 完全一致；账号是否具备该 wire 支撑已由 antigravityChannelAccountFilter 单独把关，
 // 这里只负责冷却键。非 Gemini 模型的 familyKey 为空串。
 func antigravityRequestCooldownKeys(model string) (wireModel string, familyKey string) {
 	wireModel, _ = AntigravityWireModelID(model)
 	if antigravityIsGeminiModel(model) || antigravityIsGeminiModel(wireModel) {
-		familyKey = antigravityGeminiFamilyCooldownKey
+		familyKey = antigravityGeminiQuotaCooldownKey(model, wireModel)
 	}
 	return wireModel, familyKey
 }
@@ -9327,7 +9333,7 @@ func syncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 		// 被动 /responses 头刷新了 5h 窗口重置时刻：武装「到点即探」，窗口翻新即刷新进度条。
 		store.WakeBoundaryProbe(result.Reset5hAt)
 	}
-	if !opts.asyncPersist && usageApplied && result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
+	if !opts.asyncPersist && usageApplied && result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && result.Reset5hAt.After(observedAt) && !account.SkipsUsageWindowLimits() {
 		if store != nil {
 			// The per-frame path may decide not to persist this observation; a
 			// repeated 100% frame must not issue another cooldown write.

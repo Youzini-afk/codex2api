@@ -311,17 +311,17 @@ OpenAI Responses 中转账号默认仍用 HTTP POST `/v1/responses`。账号设�
 
 **端点:** `POST /v1/images/generations`
 
-**说明:** OpenAI Images 兼容入口。外部请求使用 `gpt-image-2`、`gpt-image-2.5-flare` 或 `gpt-image-2.5-sunburst`（支持日期快照及 `-2k` / `-4k` 档位后缀），内部按 `CLIProxyAPI/` 与 `sub2api/` 的链路转换为 Codex `/responses`：主模型默认 `gpt-5.6-luna`（优先使用「系统设置 → Codex → 生图设置」中的文本模型，未配置时沿用环境变量 `CODEX_IMAGES_MAIN_MODEL`；被上游拒绝时按 `gpt-5.5` → `gpt-5.6-terra` → `gpt-5.6-sol` → `gpt-6-astra` 顺序换驱动重试），图像模型写入 `tools[0].model`。
+**说明:** OpenAI Images 兼容入口。外部请求使用 `gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.6-flare`、`gpt-image-2.6-sunburst` 或 `gpt-image-2.6`（支持日期快照及 `-2k` / `-4k` 档位后缀），内部按 `CLIProxyAPI/` 与 `sub2api/` 的链路转换为 Codex `/responses`：主模型默认 `gpt-5.6-luna`（优先使用「系统设置 → Codex → 生图设置」中的文本模型，未配置时沿用环境变量 `CODEX_IMAGES_MAIN_MODEL`；被上游拒绝时按 `gpt-5.5` → `gpt-5.6-terra` → `gpt-5.6-sol` → `gpt-6-astra` 顺序换驱动重试），图像模型写入 `tools[0].model`。
 
 Images 入口及后台生图自动构造的 Codex 请求不强制 `reasoning.effort`，由上游选择默认值，避免显式 effort 被作为图片 complexity 拒绝。`reasoning.summary`、加密 reasoning 元数据及图片工具的 `quality` 参数保持原有语义。
 
 Codex/GPT 图片生成与编辑在 `stream=false` 或省略 `stream` 时，只返回最终 JSON，不发送 HTTP `102 Processing` 或提前提交 HTTP 200；`stream=true` 仍使用原有 SSE 心跳。`DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` 不再为这两个入口的 Codex/GPT 非流式分支提供保活。客户端和反向代理仍需给完整生成时长足够的等待/空闲超时；需要异步调用时可使用下文的图片任务接口。Grok 图片分支不受此例外影响，仍保留既有 102 行为。
 
-GPT Image 2.5 支持 `auto`、`low`、`medium`、`high`、`xhigh`、`max`。质量参数原样传给图片工具；工作台切回旧型号时会将 `xhigh` / `max` 调整为 `high`。省略模型仍默认使用 `gpt-image-2`。`-2k` / `-4k` 是本项目的尺寸与超分别名，发往上游前会剥掉该后缀。
+GPT Image 2.5 / 2.6 支持 `auto`、`low`、`medium`、`high`、`xhigh`、`max`。质量参数原样传给图片工具；工作台切回旧型号时会将 `xhigh` / `max` 调整为 `high`。省略模型仍默认使用 `gpt-image-2`。`-2k` / `-4k` 是本项目的尺寸与超分别名，发往上游前会剥掉该后缀。
 
 直接使用 `/v1/responses` 时，文本主控放在顶层 `model`，图片模型放在 `tools[].model`；显式文本主控优先于后台生图设置及 `CODEX_IMAGES_MAIN_MODEL`。顶层 `model` 直接填图像模型时，则使用后台配置的文本主控。工具模型省略时仍补为 `gpt-image-2`。
 
-Images 入口的 2.5 token 计费区分文本输入、图片输入与各自缓存：内置费率分别为 $5、$8、$1.25、$2 / 百万 token，图片输出 $30 / 百万 token（[官方价格](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst)，2026-09-09 核对）。Flare/Sunburst 各有独立定价键，日期快照和尺寸别名使用对应基础型号费率；自定义覆盖优先。usage 日志新增 `image_input_tokens`、`image_output_tokens`、`cached_image_input_tokens`，是总输入/输出/缓存的子集，不重复计费。历史日志无法补回未记录的图片 token 明细。
+Images 入口的 2.5/2.6 token 计费区分文本输入、图片输入与各自缓存：内置费率分别为 $5、$8、$1.25、$2 / 百万 token，图片输出 $30 / 百万 token（[官方价格](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst)，2026-09-09 核对）。Flare/Sunburst 各有独立定价键，日期快照和尺寸别名使用对应基础型号费率；自定义覆盖优先。usage 日志新增 `image_input_tokens`、`image_output_tokens`、`cached_image_input_tokens`，是总输入/输出/缓存的子集，不重复计费。历史日志无法补回未记录的图片 token 明细。
 
 **请求示例:**
 
@@ -2836,6 +2836,17 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 - `global_rpm = 0`: 无限流
 - `global_rpm > 0`: 启用 RPM 限流
 
+### API Key 自助账号用量与重置卡
+
+管理员可在 API Key 页面设置全局账号查看、重置权限，并选择单个 Key 进一步收紧。两个全局开关默认关闭；Key 的默认设置继承全局，不能突破全局限制。查看关闭时重置也不可用。
+
+- `GET /api/admin/key-usage-account-permissions/:id` / `PUT /api/admin/key-usage-account-permissions/:id`：需要管理鉴权；`id=0` 为全局，其他值为 API Key ID。PUT 的 JSON 为 `{"view_enabled":true,"reset_enabled":false}`，两个字段均必填。
+- `GET /api/key-usage/accounts`：使用自助页的 API Key 鉴权，返回当前允许范围内的账号、套餐、状态、用量窗口、更新时间和缓存的重置卡数量；不返回上游凭据、代理或自定义请求头。未装载到运行池的账号显示为 `unavailable`，用量未知且不能重置；当这类账号的渠道或套餐权限无法确定时不予返回。已删除账号不在列表中。页面或查看权限关闭返回 404。
+- `POST /api/key-usage/accounts/:id/reset-credits`：使用同一 API Key 鉴权，必须传入每次操作唯一的 `Idempotency-Key` UUID；同一请求 ID 再次提交返回 409，不重复调用上游。需要查看和重置权限，并重新校验 Key、账号分组、渠道、套餐和账号反向授权。过期 Key 不能重置。只允许支持的 Codex 账号。操作消耗该账号的上游重置卡，会影响共享同一工作区的其他用户；近期已重置或结果不确定的工作区会暂时拒绝新操作。网络异常后请先检查账号状态，勿盲目重试。
+- 自助或自动重置发出后若结果不明确，会持久保留待核实状态，禁止该工作区的自助重置以及新请求 ID 的自动重置；自动流程可以用原有稳定请求 ID 重试，确认成功后清除标记。管理员确认上游卡券及用量后，也可在 API Key 管理页输入账号 ID 解除待核实，或使用管理鉴权调用 `DELETE /api/admin/key-usage-reset-uncertain/:id`；该操作不使用重置卡，也不会清除短时冷却。
+
+自助账号列表的 5h/长窗口是账号运行态缓存，可能滞后；未知值为 `null`，不是 0。`long_window_seconds` 给出长窗口的实际上游周期（未知为 0）；部分套餐可能是月窗口，而非 7 天。API Key 的金额与请求预算和上游账号用量是不同的额度。空的 API Key 分组限制表示不限分组；公开账号信息之前，管理员应检查 Key 的授权范围。
+
 ### API Key 级窗口限额
 
 `limits.rpm`、`limits.rpd` 以及 cost/token 窗口在每次请求转发前检查。同一进程内另有原子准入计数；RPM 使用秒桶，RPD 使用滑动 24 小时计数。同一分钟内的 RPD 准入合并，在该桶最后一次准入满 24 小时后过期，因此最多保守多保留不到一分钟，不会提前释放额度。多实例部署时计数按副本独立，重启也会丢失进程内记录；持久历史检查仍依赖用量日志。准入表最多保留 8,192 个 Key；满表且没有可过期记录时，新 Key 返回 `503`，不会通过淘汰活跃计数来重置额度。
@@ -2993,4 +3004,4 @@ Retry-After: 3600
 
 ### 自适应降智检测配置
 
-`PUT /api/admin/intelligence-check/settings` 支持 `adaptive_enabled`、`pause_initial_seconds`、`pause_max_seconds`、`recovery_initial_seconds`、`recovery_min_seconds`。仍需提交当前 `revision` 和完整设置。字段语义、边界与兼容规则见 [自适应降智检测](INTELLIGENCE_BACKOFF.md)。检测 bars 增加 `probe_phase`、`next_interval_seconds`、`passed_streak`、`next_due_at`，用于展示退避或恢复确认进度。
+`PUT /api/admin/intelligence-check/settings` 支持 `adaptive_enabled`、`pause_initial_seconds`、`pause_max_seconds`、`recovery_initial_seconds`、`recovery_min_seconds`。仍需提交当前 `revision` 和完整设置。字段语义、边界与兼容规则见 [自适应降智检测](INTELLIGENCE_BACKOFF.md)。检测 bars 增加 `probe_phase`、`next_interval_seconds`、`passed_streak`、`next_due_at`，用于展示退避或恢复确认进度。账号限流或额度耗尽、自动检测正在等待恢复时，`probe_phase` 为 `quota_wait` 且不返回 `next_due_at`。

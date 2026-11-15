@@ -317,3 +317,47 @@ test('account bar shows recovery progress and persisted next probe', async t => 
  await page.getByText(/恢复确认 · 连续通过 1 次 · 下次/).waitFor({timeout:6000})
  await page.screenshot({path:path.join(artifactDir,'account-recovering.png'),fullPage:true})
 })
+
+
+test('source switches preserve legacy defaults, change independently and save without altering adaptive policy', async t => {
+ const page = await fixture(t)
+ const source = label => page.getByRole('switch', {name: label + ' 自动降智检测', exact: true})
+ for (const [label, value] of [['GPT / Codex','true'],['Claude','true'],['Grok','false'],['Antigravity','false']]) {
+  assert.equal(await source(label).getAttribute('aria-checked'), value)
+ }
+ await source('Claude').click()
+ assert.equal(await source('GPT / Codex').getAttribute('aria-checked'), 'true')
+ assert.equal(await source('Antigravity').getAttribute('aria-checked'), 'false')
+ await source('Grok').click()
+ assert.equal(await source('Claude').getAttribute('aria-checked'), 'false')
+ await page.getByLabel('Grok 检测模型', {exact:true}).fill('grok-4.7')
+ assert.equal(await page.evaluate(()=>window.__calls.filter(c=>c.name==='saveIntelligenceSettings').length),0)
+ await page.getByRole('button',{name:'保存配置',exact:true}).click()
+ await page.getByRole('button',{name:'保存配置',exact:true,disabled:true}).waitFor()
+ const config = await page.evaluate(()=>window.__config)
+ assert.deepEqual(config.channels, {codex:true,claude:false,grok:true,antigravity:false})
+ assert.equal(config.grok_model,'grok-4.7')
+ assert.equal(config.enabled,false)
+ assert.equal(config.pause_initial_seconds,1800)
+ assert.equal(config.recovery_initial_seconds,300)
+ assert.equal(config.adaptive_enabled,false)
+})
+
+test('adding a question works on insecure HTTP origins without crypto.randomUUID', async t => {
+ const page = await fixture(t)
+ // 模拟非安全上下文（HTTP 站点）：randomUUID 不存在，但 getRandomValues 仍在。
+ await page.evaluate(() => {
+  const source = window.crypto
+  const getRandomValues = source.getRandomValues.bind(source)
+  Object.defineProperty(window, 'crypto', { value: { getRandomValues } })
+ })
+ assert.equal(await page.evaluate(() => typeof crypto.randomUUID), 'undefined')
+ await page.getByRole('region', { name: '检测题库' }).getByRole('button', { name: '新增题目' }).click()
+ await page.getByLabel('题目正文').fill('回退题目正文')
+ await page.getByRole('button', { name: '保存配置', exact: true }).click()
+ const ids = await page.evaluate(() => window.__config.questions.map(q => q.id))
+ assert.equal(ids.length, 2)
+ assert.notEqual(ids[1], ids[0])
+ assert.match(ids[1], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+ assert.equal(await page.evaluate(() => window.__config.questions[1].prompt), '回退题目正文')
+})

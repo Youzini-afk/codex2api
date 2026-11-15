@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -298,13 +300,14 @@ type Account struct {
 	// 客户端压缩阈值。仅内存保留：值只能在收到响应后才知道，落库也救不了首个请求。
 	grokContextWindow int64
 	// grokFreeQuota 是免费额度耗尽 429 解析出的权威用量快照，随 credentials 落库。
-	grokFreeQuota               *GrokFreeQuotaSnapshot
-	Status                      AccountStatus
-	CooldownUtil                time.Time
-	CooldownReason              string // rate_limited / rate_limited_5h / responses_rate_limited / unauthorized / 空
-	usageCooldownPersistMu      sync.Mutex
-	usageCooldownPersistPending bool
-	ErrorMsg                    string
+	grokFreeQuota                  *GrokFreeQuotaSnapshot
+	Status                         AccountStatus
+	CooldownUtil                   time.Time
+	CooldownReason                 string // rate_limited / rate_limited_5h / responses_rate_limited / unauthorized / 空
+	usageCooldownPersistMu         sync.Mutex
+	usageCooldownPersistPending    bool
+	usageCooldownClearErrorPending bool
+	ErrorMsg                       string
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d      float64 // 7d 窗口使用率 0-100+
@@ -4125,6 +4128,7 @@ type Store struct {
 	promptRiskTrustPolicies            map[string]database.PromptRiskTrustPolicy
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
+	claudeTokenRefresh                 func(context.Context, string, string) (*ClaudeTokenData, error)
 	usageProbeCompletion               func()
 	usageProbeBatch                    atomic.Bool
 	antigravityCatalogBatch            atomic.Bool
@@ -10571,6 +10575,25 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	allowedPlans := s.apiKeyAllowedPlanSets[apiKeyID]
 	channel := s.apiKeyUpstreamChannels[apiKeyID]
 	s.apiKeyGroupsMu.RUnlock()
+	return apiKeyAllowsAccountConstraints(acc, allowedGroups, noAffinityGroups, allowedPlans, channel)
+}
+
+// APIKeyRowAllowsAccount evaluates the current database row without relying on
+// asynchronously refreshed scheduler caches.
+func APIKeyRowAllowsAccount(row *database.APIKeyRow, acc *Account) bool {
+	if row == nil || acc == nil || row.ID <= 0 || !acc.AllowsAPIKey(row.ID) {
+		return false
+	}
+	groups := int64Set(normalizeAllowedGroupIDs(row.AllowedGroupIDs))
+	noAffinity := int64Set(normalizeAllowedGroupIDs(row.Limits.NoAffinityGroupIDs))
+	plans := make(map[string]struct{})
+	for _, plan := range normalizeAllowedPlans(row.Limits.PlanAllow) {
+		plans[plan] = struct{}{}
+	}
+	return apiKeyAllowsAccountConstraints(acc, groups, noAffinity, plans, row.Limits.ResolveUpstreamChannel())
+}
+
+func apiKeyAllowsAccountConstraints(acc *Account, allowedGroups, noAffinityGroups map[int64]struct{}, allowedPlans map[string]struct{}, channel string) bool {
 	// 渠道限定是硬门：grok 渠道只允许 Grok 账号，codex 渠道排除 Grok 账号。
 	switch channel {
 	case database.UpstreamChannelGrok:
@@ -12912,9 +12935,101 @@ func antigravityCredentialRotated(row *database.AccountRow, credential Antigravi
 }
 
 const (
-	antigravityIdentityRevalidationErrorPrefix    = "Antigravity credential rotated before Google identity could be reverified"
-	antigravityPermanentRefreshErrorCredentialKey = "antigravity_permanent_refresh_error"
+	antigravityIdentityRevalidationErrorPrefix         = "Antigravity credential rotated before Google identity could be reverified"
+	antigravityPermanentRefreshErrorCredentialKey      = "antigravity_permanent_refresh_error"
+	antigravityPendingRevalidationAccountCredentialKey = "antigravity_pending_revalidation_account_id"
 )
+
+// antigravityRowNeedsIdentityRevalidation 判断持久化账号行是否因换票后 /userinfo 未能
+// 完成身份复验而处于待复验隔离状态（且非永久刷新失败）。
+func antigravityRowNeedsIdentityRevalidation(row *database.AccountRow) bool {
+	if row == nil {
+		return false
+	}
+	syncErr := strings.TrimSpace(row.GetCredential("antigravity_sync_error"))
+	if !strings.HasPrefix(syncErr, antigravityIdentityRevalidationErrorPrefix) {
+		return false
+	}
+	if permanentErr := strings.TrimSpace(row.GetCredential(antigravityPermanentRefreshErrorCredentialKey)); permanentErr != "" && permanentErr == syncErr {
+		return false
+	}
+	return true
+}
+
+// antigravityRowHasPrincipalTransitionFence 判断持久化账号行是否正处于跨 Google 主体
+// 变更隔离状态（需管理端执行身份替换同步）。
+func antigravityRowHasPrincipalTransitionFence(row *database.AccountRow) bool {
+	if row == nil {
+		return false
+	}
+	syncErr := strings.ToLower(strings.TrimSpace(row.GetCredential("antigravity_sync_error")))
+	return strings.Contains(syncErr, "changed google principal")
+}
+
+// antigravityPriorSubjectID 提取账号在进入待复验或跨主体隔离前已确认的原始 Google 主体 ID。
+// 当账号处于待复验或跨主体隔离状态时，优先读取 antigravity_pending_revalidation_account_id
+// （含 "unknown" 哨兵），避免隔离期间写入的临时 account_id 在再次刷新时自证通过。
+func antigravityPriorSubjectID(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	if antigravityRowNeedsIdentityRevalidation(row) || antigravityRowHasPrincipalTransitionFence(row) {
+		if pending := strings.TrimSpace(row.GetCredential(antigravityPendingRevalidationAccountCredentialKey)); pending != "" {
+			return pending
+		}
+	}
+	return firstNonEmpty(
+		row.GetCredential("account_id"),
+		row.GetCredential(antigravityPendingRevalidationAccountCredentialKey),
+	)
+}
+
+// antigravitySubjectCredentialFamilyID 按 Google 主体 ID (sub) 计算标准凭据家族哈希。
+func antigravitySubjectCredentialFamilyID(profileID string) string {
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("antigravity-credential-v1\x00google-sub\x00" + profileID))
+	return "ag_" + hex.EncodeToString(sum[:])
+}
+
+// antigravityRowMatchesSubjectFamily 判断账号持久化的 credential_family_id 是否已经
+// 绑定到指定的 Google 主体 profileID。
+func antigravityRowMatchesSubjectFamily(row *database.AccountRow, profileID string) bool {
+	if row == nil {
+		return false
+	}
+	expected := antigravitySubjectCredentialFamilyID(profileID)
+	if expected == "" {
+		return false
+	}
+	familyID := firstNonEmpty(row.CredentialFamilyID, row.GetCredential("credential_family_id"))
+	return strings.EqualFold(familyID, expected)
+}
+
+// antigravityIdentityTransitionTarget 判定当前同步结果是否发生了跨主体迁移或无法确认
+// 先前主体，返回需要记录的原主体描述与是否需要转入管理端身份同步隔离。
+func antigravityIdentityTransitionTarget(row *database.AccountRow, nextID string) (string, bool) {
+	nextID = strings.TrimSpace(nextID)
+	if nextID == "" {
+		return "", false
+	}
+	previousID := antigravityPriorSubjectID(row)
+	if (previousID == "" || previousID == "unknown") && antigravityRowMatchesSubjectFamily(row, nextID) {
+		previousID = nextID
+	}
+	if previousID == "unknown" {
+		return "unknown", true
+	}
+	if previousID != "" && previousID != nextID {
+		return previousID, true
+	}
+	if previousID == "" && (antigravityRowNeedsIdentityRevalidation(row) || antigravityRowHasPrincipalTransitionFence(row)) {
+		return "unknown", true
+	}
+	return previousID, false
+}
 
 func antigravityRefreshCredentialUpdates(row *database.AccountRow, result AntigravitySyncResult, syncErr error) (map[string]any, error) {
 	credential := result.Credential
@@ -12932,15 +13047,16 @@ func antigravityRefreshCredentialUpdates(row *database.AccountRow, result Antigr
 	} else {
 		updates["expires_at"] = credential.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	previousID := strings.TrimSpace(row.GetCredential("account_id"))
+	previousID := antigravityPriorSubjectID(row)
 	nextID := strings.TrimSpace(result.Profile.ID)
-	if previousID != "" && nextID != "" && previousID != nextID {
+	if priorLabel, transitioned := antigravityIdentityTransitionTarget(row, nextID); transitioned {
 		// A rotated RT must not be lost, but it is equally unsafe to publish the
 		// new principal under the old project/catalog. Persist the new token
 		// generation in a quarantined shape; the administrative identity sync can
 		// then establish the replacement family and authoritative snapshots.
-		transitionErr := fmt.Sprintf("Antigravity refresh changed Google principal from %s to %s; administrative identity sync required", previousID, nextID)
+		transitionErr := fmt.Sprintf("Antigravity refresh changed Google principal from %s to %s; administrative identity sync required", priorLabel, nextID)
 		updates["account_id"] = nextID
+		updates[antigravityPendingRevalidationAccountCredentialKey] = priorLabel
 		updates["email"] = strings.TrimSpace(result.Profile.Email)
 		updates["name"] = strings.TrimSpace(result.Profile.Name)
 		updates["avatar_url"] = strings.TrimSpace(result.Profile.Picture)
@@ -12957,13 +13073,32 @@ func antigravityRefreshCredentialUpdates(row *database.AccountRow, result Antigr
 		return updates, nil
 	}
 	if syncErr != nil {
+		if antigravityRowHasPrincipalTransitionFence(row) {
+			existingFence := strings.TrimSpace(row.GetCredential("antigravity_sync_error"))
+			updates[antigravityPendingRevalidationAccountCredentialKey] = firstNonEmpty(previousID, "unknown")
+			updates["project_id"] = ""
+			updates["plan_type"] = ""
+			updates["models"] = []string{}
+			updates["antigravity_quota"] = ""
+			updates["antigravity_permissions"] = ""
+			updates["antigravity_entitlements"] = ""
+			updates["antigravity_capabilities"] = ""
+			updates["antigravity_capability_last_probe_at"] = ""
+			updates["antigravity_catalog_source"] = ""
+			updates["antigravity_catalog_verified"] = false
+			updates["antigravity_last_synced_at"] = ""
+			updates["antigravity_sync_error"] = existingFence
+			updates["antigravity_sync_warning"] = result.Warning
+			return updates, nil
+		}
 		profileVerified := result.Profile.VerifiedEmail && strings.TrimSpace(result.Profile.ID) != "" && strings.TrimSpace(result.Profile.Email) != ""
-		if antigravityCredentialRotated(row, credential) && !profileVerified {
+		if (antigravityCredentialRotated(row, credential) && !profileVerified) || antigravityRowNeedsIdentityRevalidation(row) {
 			// A rotating refresh token may belong to a different Google principal.
 			// Keep the newly issued token durable, but never publish it with the
 			// prior subject's project, catalog, quota, or capability proof.
 			quarantineErr := antigravityIdentityRevalidationErrorPrefix + ": " + syncErr.Error()
 			updates["account_id"] = ""
+			updates[antigravityPendingRevalidationAccountCredentialKey] = firstNonEmpty(previousID, "unknown")
 			updates["email"] = ""
 			updates["name"] = ""
 			updates["avatar_url"] = ""
@@ -12995,6 +13130,7 @@ func antigravityRefreshCredentialUpdates(row *database.AccountRow, result Antigr
 		return nil, err
 	}
 	updates["account_id"] = strings.TrimSpace(result.Profile.ID)
+	updates[antigravityPendingRevalidationAccountCredentialKey] = ""
 	updates["email"] = strings.TrimSpace(result.Profile.Email)
 	updates["name"] = strings.TrimSpace(result.Profile.Name)
 	updates["avatar_url"] = strings.TrimSpace(result.Profile.Picture)
@@ -13348,7 +13484,8 @@ func (s *Store) refreshAntigravityAccountDurable(ctx context.Context, acc *Accou
 			}
 			criticalCtx := lease.CriticalContext()
 			result, syncErr := client.Sync(criticalCtx, credential)
-			if syncErr != nil && !antigravityCredentialRotated(lockedRow, result.Credential) {
+			_, principalChanged := antigravityIdentityTransitionTarget(lockedRow, result.Profile.ID)
+			if syncErr != nil && !antigravityCredentialRotated(lockedRow, result.Credential) && !principalChanged {
 				if isNonRetryable(syncErr) {
 					return s.persistAntigravityPermanentRefreshFailure(criticalCtx, acc, lockedRow, syncErr)
 				}
@@ -13397,6 +13534,11 @@ func (s *Store) refreshAntigravityAccountDurable(ctx context.Context, acc *Accou
 				s.projectAntigravityManualAccessFence(criticalCtx, current)
 			}
 			if syncErr != nil {
+				if principalChanged || antigravityRowHasPrincipalTransitionFence(current) {
+					if reason, _ := antigravityPersistedHardFence(current); reason != "" {
+						return fmt.Errorf("%s: %w", reason, syncErr)
+					}
+				}
 				return syncErr
 			}
 			if reason, _ := antigravityPersistedHardFence(current); reason != "" {

@@ -150,6 +150,18 @@ type Handler struct {
 	reqCountCache      map[string]*requestCountCacheEntry
 	reqCountRefreshMu  sync.Mutex
 	reqCountRefreshing map[string]bool
+	// reqCountRefreshBreakdown is true while the in-flight channel refresh
+	// includes error-code and model breakdowns (small pools). The paged list
+	// reuses that scan instead of starting a second one.
+	reqCountRefreshBreakdown map[string]bool
+	// pageRequestCountHook, when set, replaces the usage-log aggregation.
+	// Production leaves it nil. Tests use it to simulate a slow scan.
+	pageRequestCountHook func(context.Context, []int64) (map[int64]*database.AccountRequestCount, error)
+	// Visible-page breakdowns for pools whose channel cache stores totals
+	// only. Filled off the list request.
+	pageBreakdownMu       sync.Mutex
+	pageBreakdown         map[string]*pageRequestBreakdown
+	pageBreakdownInflight map[string]string
 	// 大池分批聚合的断点续跑半成品,见 requestCountStaging。
 	reqCountStagingMu sync.Mutex
 	reqCountStaging   map[string]*requestCountStaging
@@ -1111,6 +1123,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
 	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
 	keyUsage.GET("/concurrency", h.GetPublicAPIKeyConcurrency)
+	keyUsage.GET("/accounts", h.GetPublicKeyUsageAccounts)
+	keyUsage.POST("/accounts/:id/reset-credits", h.ResetPublicKeyUsageAccountCredits)
 
 	// 账号自助添加公开门户（无 admin 鉴权；开关门控 + IP 限流；见 self_service.go）
 	accountPortal := r.Group("/api/account-portal")
@@ -1147,6 +1161,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		}
 	})
 	api.GET("/stats", h.GetStats)
+	api.GET("/key-usage-account-permissions/:id", h.GetKeyUsageAccountPermissions)
+	api.PUT("/key-usage-account-permissions/:id", h.SetKeyUsageAccountPermissions)
+	api.DELETE("/key-usage-reset-uncertain/:id", h.ClearKeyUsageResetUncertain)
 	api.GET("/accounts", h.ListAccounts)
 	api.GET("/accounts/analysis", h.GetAccountAnalysis)
 	api.GET("/accounts/page-stats", h.GetAccountPageStats)
@@ -1971,16 +1988,16 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	var reqCounts map[int64]*database.AccountRequestCount
 	var usage5h, usage7d map[int64]*database.AccountTimeRangeUsage
+	var requestCountsPending bool
 	if view == "page" {
 		pageIDs := make([]int64, 0, len(rows))
 		for _, row := range rows {
 			pageIDs = append(pageIDs, row.ID)
 		}
-		reqCounts, err = h.db.GetAccountRequestCountsByIDs(ctx, pageIDs)
-		if err != nil {
-			log.Printf("获取当前页账号请求统计失败: %v", err)
-			reqCounts = make(map[int64]*database.AccountRequestCount)
-		}
+		// Totals, error codes, and model mix scan usage_logs. A slow scan must
+		// not block the account rows: read the channel cache, or fill this
+		// page in the background, and let stats_state tell the client to poll.
+		reqCounts, requestCountsPending = h.pageRequestCounts(channel, pageIDs)
 		usage5h = make(map[int64]*database.AccountTimeRangeUsage)
 		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
 	} else {
@@ -2044,11 +2061,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	}
 
 	if pageSelection != nil {
+		statsState := pageSelection.StatsState
+		if requestCountsPending {
+			statsState = combineAccountStatsState(statsState, "stale")
+		}
 		c.JSON(http.StatusOK, accountsPageResponse{
 			Accounts: accounts,
 			Page:     pageSelection.Page, PageSize: pageSelection.PageSize, Total: pageSelection.Total,
 			Summary: pageSelection.Summary, Facets: pageSelection.Facets,
-			SnapshotAt: pageSelection.SnapshotAt.Format(time.RFC3339), StatsState: pageSelection.StatsState,
+			SnapshotAt: pageSelection.SnapshotAt.Format(time.RFC3339), StatsState: statsState,
 			DisabledSorts: pageSelection.DisabledSorts,
 		})
 		return
@@ -3556,7 +3577,7 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 		log.Printf("获取账号请求统计失败: %v", err)
 		return make(map[int64]*database.AccountRequestCount)
 	}
-	h.storeRequestCountCache(cacheKey, counts, nil, time.Time{})
+	h.storeRequestCountCache(cacheKey, counts, nil, time.Time{}, false, nil)
 	return counts
 }
 
